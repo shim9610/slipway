@@ -1,0 +1,12904 @@
+use eframe::egui;
+use slipway_core::{
+    BackendCapabilityReport, BackendInputEvent, BackendInputTrace, BackendParityAdmission,
+    BackendVisibleCapability, BackendVisibleCapabilityRequirement, BaselineShift, Capability,
+    CapabilityProfileKind, ChildPlacement, CursorCapability, DeclaredEventDispatchKind, Diagnostic,
+    EmittedMessageEvidence, EventOutcome, EvidenceSource, FocusRegionDeclaration,
+    FocusTraversalMember, FontResolutionRequest, FontStyle, FontWeight, FrameIdentity,
+    HitRegionDeclaration, HitTestInput, InputEvent, KeyEventKind, KeyLocation, KeyboardDetails,
+    KeyboardEvent, LayoutConstraints, LayoutInput, LayoutIntentProbe, LayoutOutput, Modifiers,
+    PaintOp, PaintUnit, PathCommand, PathDeclaration, Point, PointerButton, PointerButtons,
+    PointerCaptureIntent, PointerDetails, PointerDeviceKind, PointerEventCoordinateSpace,
+    PointerEventKind, PresentationGeometryIndex, PresentationRegionId, ProbeCollector,
+    ProbeProduct, ProviderHitTestEvidence, ProviderSnapshotEvidence, ProviderSnapshotRequest,
+    ProviderSurfaceKind, ProviderSurfaceRequest, Rect, RenderSurfaceDeclaration,
+    ResourceSourceDeclaration, ResourceSourceKind, ScrollEvent, ScrollRegionDeclaration,
+    ShapeDeclaration, ShapeKind, Size, SlipwayAuthoredWidget, SlipwayBackendCapabilityProbe,
+    SlipwayBackendParityAdmission, SlipwayCanvasProvider, SlipwayEventDispositionPolicy,
+    SlipwayEventRoutingPolicy, SlipwayFontResolutionPolicy, SlipwayGpuSurfaceProvider,
+    SlipwayLayoutIntent, SlipwayLogic, SlipwayMediaProvider, SlipwayPlotProvider,
+    SlipwayProviderHitTestPolicy, SlipwayProviderSnapshotPolicy, SlipwayRenderSurfaces,
+    SlipwayScrollableContainerCapability, SlipwaySsot, SlipwayTextInputCapability,
+    SlipwayUnsupportedCapabilityEvidence, SlipwayView, SlipwayViewDefinition, SlipwayWidget,
+    SlipwayWidgetTypes, SourceValidityKind, StateObservation, StateProbe, TargetLocalRect,
+    TextCompositionEvent, TextCompositionPhase, TextEditEvent, TextEditKind,
+    TextEditRegionDeclaration, TextInputEvent, TextMeasurementEvidence, TextSelectionRange,
+    TextStyle, TopologyNode, TopologyProbe, UnsupportedCapabilityEvidence, ViewDefinition,
+    ViewDefinitionInput, WidgetId, WidgetSlot, WidgetSlotAddress, paint_unit_sort_key,
+    scroll_region_from_scrollable_capability, text_edit_focus_region_from_capability,
+    view_definition_contract_diagnostics_for_capabilities,
+    view_definition_has_blocking_contract_diagnostic,
+};
+use slipway_debug_bridge::{
+    DebugCommand, DebugCommandKind, DebugFailure, DebugPhysicalControl, DebugReplyProduct,
+};
+use slipway_runtime::{
+    SlipwayRuntime, SlipwayRuntimeDrainBudget, SlipwayRuntimeMcpTransport,
+    SlipwayRuntimePendingNativeMcpCall,
+};
+use std::fs;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::{Arc, mpsc};
+use std::thread;
+
+mod native_runner;
+
+pub const EGUI_BACKEND_ID: &str = "slipway-backend-egui";
+const EGUI_PROVIDER_SURFACE_REQUIREMENT: &str = "egui.provider_surface.native_wrapper";
+
+#[derive(Clone, Debug, Default)]
+pub struct EguiBackendAdmission;
+
+pub fn egui_backend_admission() -> EguiBackendAdmission {
+    EguiBackendAdmission
+}
+
+impl EguiBackendAdmission {
+    pub fn admit_view_definition(&self, view: &ViewDefinition) -> BackendParityAdmission {
+        self.admit_view_definition_with_capabilities(&[], view)
+    }
+
+    pub fn admit_view_definition_with_capabilities(
+        &self,
+        capabilities: &[Capability],
+        view: &ViewDefinition,
+    ) -> BackendParityAdmission {
+        let mut visible_requirements = Vec::new();
+        let mut unsupported = Vec::new();
+        let contract_diagnostics =
+            view_definition_contract_diagnostics_for_capabilities(view, capabilities);
+
+        push_view_requirement(
+            &mut visible_requirements,
+            "view.hit_regions",
+            Some(view.target.clone()),
+            BackendVisibleCapability::HitRegions,
+        );
+        push_view_requirement(
+            &mut visible_requirements,
+            "view.backend_presented_evidence",
+            Some(view.target.clone()),
+            BackendVisibleCapability::BackendPresentedEvidence,
+        );
+
+        if view_definition_has_blocking_contract_diagnostic(&contract_diagnostics) {
+            push_view_requirement(
+                &mut visible_requirements,
+                "view.contract",
+                Some(view.target.clone()),
+                BackendVisibleCapability::Custom("view_contract".to_string()),
+            );
+            unsupported.push(UnsupportedCapabilityEvidence {
+                backend_id: EGUI_BACKEND_ID.to_string(),
+                target: Some(view.target.clone()),
+                capability: Capability::CapabilityAdmission,
+                visible_capability: Some(BackendVisibleCapability::Custom(
+                    "view_contract".to_string(),
+                )),
+                requirement_id: Some("view.contract".to_string()),
+                reason: "view definition contract diagnostics contain blocking errors".to_string(),
+                source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "visible-admission"),
+                diagnostics: contract_diagnostics.clone(),
+            });
+        }
+
+        if view
+            .hit_regions
+            .iter()
+            .any(|region| region.capture != PointerCaptureIntent::None)
+        {
+            push_view_requirement(
+                &mut visible_requirements,
+                "view.pointer_capture",
+                Some(view.target.clone()),
+                BackendVisibleCapability::PointerCapture,
+            );
+        }
+
+        if !view.focus_regions.is_empty() {
+            push_view_requirement(
+                &mut visible_requirements,
+                "view.focus_regions",
+                Some(view.target.clone()),
+                BackendVisibleCapability::FocusRegions,
+            );
+        }
+
+        if view
+            .focus_regions
+            .iter()
+            .any(|region| region.text_edit.is_some())
+        {
+            push_view_requirement(
+                &mut visible_requirements,
+                "view.text_edit_regions",
+                Some(view.target.clone()),
+                BackendVisibleCapability::TextEditRegions,
+            );
+        }
+
+        if !view.scroll_regions.is_empty() {
+            push_view_requirement(
+                &mut visible_requirements,
+                "view.scroll_regions",
+                Some(view.target.clone()),
+                BackendVisibleCapability::ScrollRegions,
+            );
+        }
+
+        if view
+            .paint
+            .iter()
+            .any(|op| paint_op_uses_shape_path_or_clip(op))
+        {
+            push_view_requirement(
+                &mut visible_requirements,
+                "view.shape_path_clip",
+                Some(view.target.clone()),
+                BackendVisibleCapability::ShapePathClip,
+            );
+        }
+
+        let paint_diagnostics =
+            unsupported_egui_visible_paint_diagnostics(&view.target, &view.paint);
+        if !paint_diagnostics.is_empty() {
+            push_view_requirement(
+                &mut visible_requirements,
+                "view.shape_path_clip",
+                Some(view.target.clone()),
+                BackendVisibleCapability::ShapePathClip,
+            );
+            unsupported.push(UnsupportedCapabilityEvidence {
+                backend_id: EGUI_BACKEND_ID.to_string(),
+                target: Some(view.target.clone()),
+                capability: Capability::Paint,
+                visible_capability: Some(BackendVisibleCapability::ShapePathClip),
+                requirement_id: Some("view.shape_path_clip".to_string()),
+                reason:
+                    "egui backend refuses visible shape/path/clip declarations it cannot present"
+                        .to_string(),
+                source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "visible-admission"),
+                diagnostics: paint_diagnostics,
+            });
+        }
+
+        if view_requires_font_installation(view) {
+            push_view_requirement(
+                &mut visible_requirements,
+                "view.font_resource_installation",
+                Some(view.target.clone()),
+                BackendVisibleCapability::FontInstallation,
+            );
+        }
+
+        BackendParityAdmission {
+            backend_id: EGUI_BACKEND_ID.to_string(),
+            accepted: unsupported.is_empty(),
+            required_profiles: Vec::new(),
+            visible_requirements,
+            unsupported,
+            source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "visible-admission"),
+            diagnostics: contract_diagnostics,
+        }
+    }
+}
+
+impl SlipwayBackendCapabilityProbe for EguiBackendAdmission {
+    fn backend_capabilities(&self) -> BackendCapabilityReport {
+        BackendCapabilityReport {
+            backend_id: EGUI_BACKEND_ID.to_string(),
+            capabilities: vec![
+                Capability::PointerInput,
+                Capability::KeyboardInput,
+                Capability::TextInput,
+                Capability::WheelInput,
+                Capability::FocusInput,
+                Capability::HitRegionPresentation,
+                Capability::FocusRegionPresentation,
+                Capability::TextEditRegionPresentation,
+                Capability::ScrollRegionPresentation,
+                Capability::ShapePathClipPresentation,
+                Capability::FontResourceInstallation,
+                Capability::BackendPresentedEvidence,
+                Capability::CapabilityAdmission,
+                Capability::BackendCapabilityNegotiation,
+                Capability::RenderSurface,
+                Capability::ProviderSurfacePolicy,
+                Capability::Layout,
+                Capability::Paint,
+            ],
+            profiles: vec![
+                CapabilityProfileKind::TextInput,
+                CapabilityProfileKind::ScrollableContainer,
+                CapabilityProfileKind::ProviderSurface,
+                CapabilityProfileKind::BackendAdapter,
+            ],
+            visible_capabilities: vec![
+                BackendVisibleCapability::HitRegions,
+                BackendVisibleCapability::Cursor,
+                BackendVisibleCapability::PointerCapture,
+                BackendVisibleCapability::FocusRegions,
+                BackendVisibleCapability::TextEditRegions,
+                BackendVisibleCapability::ScrollRegions,
+                BackendVisibleCapability::ShapePathClip,
+                BackendVisibleCapability::FontInstallation,
+                BackendVisibleCapability::BackendPresentedEvidence,
+                egui_provider_surface_visible_capability(),
+            ],
+        }
+    }
+}
+
+impl SlipwayUnsupportedCapabilityEvidence for EguiBackendAdmission {
+    fn unsupported_capabilities(
+        &self,
+        required: &[Capability],
+    ) -> Vec<UnsupportedCapabilityEvidence> {
+        let report = self.backend_capabilities();
+        required
+            .iter()
+            .filter(|capability| !report.capabilities.iter().any(|owned| owned == *capability))
+            .map(|capability| UnsupportedCapabilityEvidence {
+                backend_id: EGUI_BACKEND_ID.to_string(),
+                target: None,
+                capability: capability.clone(),
+                visible_capability: None,
+                requirement_id: Some(format!("capability::{capability:?}")),
+                reason: "capability is not declared by the egui visible backend".to_string(),
+                source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "capability-admission"),
+                diagnostics: Vec::new(),
+            })
+            .collect()
+    }
+}
+
+impl SlipwayBackendParityAdmission for EguiBackendAdmission {
+    fn backend_parity_admission(
+        &self,
+        required_profiles: &[CapabilityProfileKind],
+    ) -> BackendParityAdmission {
+        backend_profile_admission(
+            EGUI_BACKEND_ID,
+            &self.backend_capabilities(),
+            required_profiles,
+        )
+    }
+}
+
+pub trait SlipwayEguiWidgetListVisitor<ExternalState, AppMessage> {
+    fn visit_egui_child<W>(
+        &mut self,
+        widget: &W,
+        external: &ExternalState,
+        local: &W::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        W: SlipwayEguiBackendChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>;
+
+    fn visit_egui_native_child<N>(
+        &mut self,
+        widget: &N,
+        external: &ExternalState,
+        local: &N::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        N: SlipwayEguiNativeChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>;
+}
+
+#[derive(Clone, Debug)]
+pub struct EguiNativeWidgetContext<'a> {
+    pub slot: &'a WidgetSlotAddress,
+    pub frame: &'a FrameIdentity,
+    pub placement: ChildPlacement,
+    pub rect: egui::Rect,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EguiNativeWidgetOutput {
+    pub input_events: Vec<BackendInputEvent>,
+    pub state: Vec<StateObservation>,
+    pub diagnostics: Vec<Diagnostic>,
+    pub request_repaint: bool,
+}
+
+pub trait SlipwayEguiNativeChildWidget: SlipwayWidget + SlipwayViewDefinition {
+    fn egui_native_ui(
+        &self,
+        ui: &mut egui::Ui,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        context: EguiNativeWidgetContext<'_>,
+    ) -> EguiNativeWidgetOutput;
+}
+
+pub trait SlipwayEguiNativeWidgetSpec: SlipwayWidgetTypes {
+    fn id(&self) -> WidgetId;
+
+    fn capabilities(&self) -> Vec<Capability> {
+        Vec::new()
+    }
+
+    fn unsupported(&self) -> Vec<Diagnostic> {
+        Vec::new()
+    }
+
+    fn initial_local_state(&self) -> Self::LocalState;
+
+    fn handle_event(
+        &self,
+        _external: &Self::ExternalState,
+        _local: &mut Self::LocalState,
+        _event: InputEvent,
+    ) -> EventOutcome<Self::AppMessage> {
+        EventOutcome::ignored()
+    }
+
+    fn layout(
+        &self,
+        _external: &Self::ExternalState,
+        _local: &Self::LocalState,
+        input: LayoutInput,
+    ) -> LayoutOutput {
+        LayoutOutput {
+            bounds: input.viewport,
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn observe_state(
+        &self,
+        _external: &Self::ExternalState,
+        _local: &Self::LocalState,
+    ) -> Vec<StateObservation> {
+        Vec::new()
+    }
+
+    fn egui_native_ui(
+        &self,
+        ui: &mut egui::Ui,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        context: EguiNativeWidgetContext<'_>,
+    ) -> EguiNativeWidgetOutput;
+}
+
+pub trait SlipwayEguiProviderSurfaceSpec: SlipwayEguiNativeWidgetSpec {
+    fn provider_surface_request(&self) -> ProviderSurfaceRequest;
+
+    fn provider_surface_capabilities(&self) -> Vec<String> {
+        match self.provider_surface_request().kind {
+            ProviderSurfaceKind::Canvas => vec!["canvas".to_string()],
+            ProviderSurfaceKind::Gpu => vec!["gpu".to_string()],
+            ProviderSurfaceKind::Media => vec!["media".to_string()],
+            ProviderSurfaceKind::Plot => vec!["plot".to_string()],
+            ProviderSurfaceKind::Map => vec!["map".to_string()],
+            ProviderSurfaceKind::Terminal => vec!["terminal".to_string()],
+            ProviderSurfaceKind::RasterImage => vec!["raster-image".to_string()],
+            ProviderSurfaceKind::Custom(name) => vec![name],
+        }
+    }
+
+    fn render_surface_declaration(
+        &self,
+        _external: &Self::ExternalState,
+        _local: &Self::LocalState,
+    ) -> RenderSurfaceDeclaration {
+        let request = self.provider_surface_request();
+        RenderSurfaceDeclaration {
+            id: request.target,
+            provider_id: request.provider_id,
+            bounds: request.bounds,
+            payload_ref: request.payload_ref,
+            dirty_regions: request.dirty_regions,
+            capabilities: self.provider_surface_capabilities(),
+        }
+    }
+
+    fn provider_hit_test(&self, request: HitTestInput) -> ProviderHitTestEvidence {
+        let surface = self.provider_surface_request();
+        let diagnostic = Diagnostic::unsupported(
+            Some(request.target.clone()),
+            "egui.provider_surface.hit_test_unsupported",
+            "egui provider surface did not implement backend-specific provider_hit_test",
+        );
+        ProviderHitTestEvidence {
+            target: request.target,
+            provider_id: surface.provider_id,
+            point: request.point,
+            hit: None,
+            diagnostics: vec![diagnostic],
+        }
+    }
+
+    fn provider_snapshot(&mut self, request: ProviderSnapshotRequest) -> ProviderSnapshotEvidence {
+        let diagnostic = Diagnostic::unsupported(
+            Some(request.target.clone()),
+            "egui.provider_surface.snapshot_unsupported",
+            "egui provider surface did not implement backend-specific provider_snapshot",
+        );
+        ProviderSnapshotEvidence {
+            target: request.target,
+            provider_id: request.provider_id,
+            snapshot_ref: None,
+            frame: request.frame,
+            diagnostics: vec![diagnostic],
+        }
+    }
+}
+
+pub struct EguiGpuSurfacePrepareContext<'a> {
+    pub target: &'a WidgetId,
+    pub provider_id: &'a str,
+    pub frame: Option<&'a FrameIdentity>,
+    pub bounds: Rect,
+    pub viewport: Rect,
+    pub device: &'a egui_wgpu::wgpu::Device,
+    pub queue: &'a egui_wgpu::wgpu::Queue,
+    pub format: egui_wgpu::wgpu::TextureFormat,
+}
+
+pub struct EguiGpuSurfacePaintContext<'a, 'pass, Prepared> {
+    pub target: &'a WidgetId,
+    pub provider_id: &'a str,
+    pub frame: Option<&'a FrameIdentity>,
+    pub bounds: Rect,
+    pub viewport: Rect,
+    pub prepared: &'a Prepared,
+    pub render_pass: &'a mut egui_wgpu::wgpu::RenderPass<'pass>,
+}
+
+pub trait SlipwayEguiSplitGpuProviderSurfaceSpec: SlipwayEguiProviderSurfaceSpec {
+    type PreparedFrame;
+
+    fn prepare_egui_gpu_surface(
+        &mut self,
+        context: EguiGpuSurfacePrepareContext<'_>,
+    ) -> Result<Self::PreparedFrame, Vec<Diagnostic>>;
+
+    fn paint_prepared_egui_gpu_surface(
+        &self,
+        context: EguiGpuSurfacePaintContext<'_, '_, Self::PreparedFrame>,
+    ) -> Result<(), Vec<Diagnostic>>;
+}
+
+pub trait SlipwayEguiSplitGpuSurfaceProvider: SlipwayGpuSurfaceProvider {
+    type PreparedFrame;
+
+    fn prepare_egui_gpu_surface(
+        &mut self,
+        context: EguiGpuSurfacePrepareContext<'_>,
+    ) -> Result<Self::PreparedFrame, Vec<Diagnostic>>;
+
+    fn paint_prepared_egui_gpu_surface(
+        &self,
+        context: EguiGpuSurfacePaintContext<'_, '_, Self::PreparedFrame>,
+    ) -> Result<(), Vec<Diagnostic>>;
+}
+
+#[derive(Clone, Debug)]
+pub struct SlipwayEguiNativeWidget<N> {
+    native: N,
+}
+
+impl<N> SlipwayEguiNativeWidget<N> {
+    pub fn new(native: N) -> Self {
+        Self { native }
+    }
+
+    pub fn native(&self) -> &N {
+        &self.native
+    }
+
+    pub fn native_mut(&mut self) -> &mut N {
+        &mut self.native
+    }
+
+    pub fn into_inner(self) -> N {
+        self.native
+    }
+}
+
+impl<N> SlipwayWidgetTypes for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiNativeWidgetSpec,
+{
+    type ExternalState = N::ExternalState;
+    type LocalState = N::LocalState;
+    type AppMessage = N::AppMessage;
+}
+
+impl<N> SlipwaySsot for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiNativeWidgetSpec,
+{
+    fn id(&self) -> WidgetId {
+        self.native.id()
+    }
+
+    fn capabilities(&self) -> Vec<Capability> {
+        self.native.capabilities()
+    }
+
+    fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+        TopologyNode {
+            id: self.id(),
+            children: Vec::new(),
+            local_state_slot: None,
+        }
+    }
+
+    fn unsupported(&self) -> Vec<Diagnostic> {
+        self.native.unsupported()
+    }
+}
+
+impl<N> SlipwayLogic for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiNativeWidgetSpec,
+{
+    fn handle_event(
+        &self,
+        external: &Self::ExternalState,
+        local: &mut Self::LocalState,
+        event: InputEvent,
+    ) -> EventOutcome<Self::AppMessage> {
+        self.native.handle_event(external, local, event)
+    }
+}
+
+impl<N> SlipwayView for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiNativeWidgetSpec,
+{
+    fn initial_local_state(&self) -> Self::LocalState {
+        self.native.initial_local_state()
+    }
+
+    fn layout(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        input: LayoutInput,
+    ) -> LayoutOutput {
+        self.native.layout(external, local, input)
+    }
+
+    fn paint(
+        &self,
+        _external: &Self::ExternalState,
+        _local: &Self::LocalState,
+        _layout: &LayoutOutput,
+    ) -> Vec<PaintOp> {
+        Vec::new()
+    }
+
+    fn observe_state(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+    ) -> Vec<StateObservation> {
+        self.native.observe_state(external, local)
+    }
+}
+
+impl<N> SlipwayViewDefinition for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiNativeWidgetSpec,
+{
+    fn view_definition(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        input: ViewDefinitionInput,
+    ) -> ViewDefinition {
+        let layout = self.layout(external, local, input.layout_input);
+        ViewDefinition {
+            target: self.id(),
+            frame: input.frame,
+            layout,
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: self.unsupported(),
+        }
+    }
+}
+
+impl<N> SlipwayEguiNativeChildWidget for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiNativeWidgetSpec,
+{
+    fn egui_native_ui(
+        &self,
+        ui: &mut egui::Ui,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        context: EguiNativeWidgetContext<'_>,
+    ) -> EguiNativeWidgetOutput {
+        self.native.egui_native_ui(ui, external, local, context)
+    }
+}
+
+impl<N> SlipwayRenderSurfaces for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiProviderSurfaceSpec,
+{
+    fn render_surfaces(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+    ) -> Vec<RenderSurfaceDeclaration> {
+        vec![self.native.render_surface_declaration(external, local)]
+    }
+}
+
+impl<N> SlipwayCanvasProvider for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiProviderSurfaceSpec,
+{
+    fn canvas_surfaces(&self) -> Vec<ProviderSurfaceRequest> {
+        let request = self.native.provider_surface_request();
+        if request.kind == ProviderSurfaceKind::Canvas {
+            vec![request]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+impl<N> SlipwayGpuSurfaceProvider for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiProviderSurfaceSpec,
+{
+    fn gpu_surfaces(&self) -> Vec<ProviderSurfaceRequest> {
+        let request = self.native.provider_surface_request();
+        if request.kind == ProviderSurfaceKind::Gpu {
+            vec![request]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+impl<N> SlipwayEguiSplitGpuSurfaceProvider for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiSplitGpuProviderSurfaceSpec,
+{
+    type PreparedFrame = N::PreparedFrame;
+
+    fn prepare_egui_gpu_surface(
+        &mut self,
+        context: EguiGpuSurfacePrepareContext<'_>,
+    ) -> Result<Self::PreparedFrame, Vec<Diagnostic>> {
+        self.native.prepare_egui_gpu_surface(context)
+    }
+
+    fn paint_prepared_egui_gpu_surface(
+        &self,
+        context: EguiGpuSurfacePaintContext<'_, '_, Self::PreparedFrame>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        self.native.paint_prepared_egui_gpu_surface(context)
+    }
+}
+
+impl<N> SlipwayMediaProvider for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiProviderSurfaceSpec,
+{
+    fn media_surfaces(&self) -> Vec<ProviderSurfaceRequest> {
+        let request = self.native.provider_surface_request();
+        if request.kind == ProviderSurfaceKind::Media {
+            vec![request]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+impl<N> SlipwayPlotProvider for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiProviderSurfaceSpec,
+{
+    fn plot_surfaces(&self) -> Vec<ProviderSurfaceRequest> {
+        let request = self.native.provider_surface_request();
+        if request.kind == ProviderSurfaceKind::Plot {
+            vec![request]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+impl<N> SlipwayProviderHitTestPolicy for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiProviderSurfaceSpec,
+{
+    fn provider_hit_test(&self, request: HitTestInput) -> ProviderHitTestEvidence {
+        self.native.provider_hit_test(request)
+    }
+}
+
+impl<N> SlipwayProviderSnapshotPolicy for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiProviderSurfaceSpec,
+{
+    fn provider_snapshot(&mut self, request: ProviderSnapshotRequest) -> ProviderSnapshotEvidence {
+        self.native.provider_snapshot(request)
+    }
+}
+
+pub trait SlipwayEguiWidgetListEntry: SlipwayWidget + SlipwayViewDefinition {
+    fn visit_egui_entry<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        slot: WidgetSlotAddress,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>;
+}
+
+impl<W> SlipwayEguiWidgetListEntry for W
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    fn visit_egui_entry<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        slot: WidgetSlotAddress,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+    {
+        visitor.visit_egui_child(self, external, local, slot);
+    }
+}
+
+impl<N> SlipwayEguiWidgetListEntry for SlipwayEguiNativeWidget<N>
+where
+    N: SlipwayEguiNativeWidgetSpec,
+{
+    fn visit_egui_entry<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        slot: WidgetSlotAddress,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+    {
+        visitor.visit_egui_native_child(self, external, local, slot);
+    }
+}
+
+pub trait SlipwayEguiWidgetList {
+    type ExternalState;
+    type LocalState;
+    type AppMessage;
+
+    fn visit_egui_children<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        parent_slot: &WidgetSlotAddress,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>;
+
+    fn visit_egui_children_in_paint_order<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        parent_slot: &WidgetSlotAddress,
+        parent_view: &ViewDefinition,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>;
+}
+
+impl SlipwayEguiWidgetList for () {
+    type ExternalState = ();
+    type LocalState = ();
+    type AppMessage = ();
+
+    fn visit_egui_children<V>(
+        &self,
+        _external: &Self::ExternalState,
+        _local: &Self::LocalState,
+        _parent_slot: &WidgetSlotAddress,
+        _visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+    {
+    }
+
+    fn visit_egui_children_in_paint_order<V>(
+        &self,
+        _external: &Self::ExternalState,
+        _local: &Self::LocalState,
+        _parent_slot: &WidgetSlotAddress,
+        _parent_view: &ViewDefinition,
+        _visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+    {
+    }
+}
+
+macro_rules! impl_egui_widget_list_tuple {
+    ($first:ident $first_index:tt $(, $widget:ident $index:tt)*) => {
+        impl<$first $(, $widget)*> SlipwayEguiWidgetList for ($first, $($widget,)*)
+        where
+            $first: SlipwayEguiWidgetListEntry,
+            $(
+                $widget: SlipwayEguiWidgetListEntry<
+                    ExternalState = <$first as SlipwayWidgetTypes>::ExternalState,
+                    AppMessage = <$first as SlipwayWidgetTypes>::AppMessage,
+                >,
+            )*
+        {
+            type ExternalState = <$first as SlipwayWidgetTypes>::ExternalState;
+            type LocalState = (
+                <$first as SlipwayWidgetTypes>::LocalState,
+                $(<$widget as SlipwayWidgetTypes>::LocalState,)*
+            );
+            type AppMessage = <$first as SlipwayWidgetTypes>::AppMessage;
+
+            fn visit_egui_children<V>(
+                &self,
+                external: &Self::ExternalState,
+                local: &Self::LocalState,
+                parent_slot: &WidgetSlotAddress,
+                visitor: &mut V,
+            ) where
+                V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+            {
+                self.$first_index.visit_egui_entry(
+                    external,
+                    &local.$first_index,
+                    parent_slot.child(self.$first_index.id(), $first_index),
+                    visitor,
+                );
+                $(
+                    self.$index.visit_egui_entry(
+                        external,
+                        &local.$index,
+                        parent_slot.child(self.$index.id(), $index),
+                        visitor,
+                    );
+                )*
+            }
+
+            fn visit_egui_children_in_paint_order<V>(
+                &self,
+                external: &Self::ExternalState,
+                local: &Self::LocalState,
+                parent_slot: &WidgetSlotAddress,
+                parent_view: &ViewDefinition,
+                visitor: &mut V,
+            ) where
+                V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+            {
+                let mut order = vec![(
+                    egui_child_paint_sort_key(
+                        &self.$first_index,
+                        external,
+                        &local.$first_index,
+                        parent_slot,
+                        $first_index,
+                        parent_view,
+                    ),
+                    $first_index,
+                )];
+                $(
+                    order.push((
+                        egui_child_paint_sort_key(
+                            &self.$index,
+                            external,
+                            &local.$index,
+                            parent_slot,
+                            $index,
+                            parent_view,
+                        ),
+                        $index,
+                    ));
+                )*
+                order.sort_by_key(|(key, _)| *key);
+
+                for (_, index) in order {
+                    match index {
+                        $first_index => self.$first_index.visit_egui_entry(
+                            external,
+                            &local.$first_index,
+                            parent_slot.child(self.$first_index.id(), $first_index),
+                            visitor,
+                        ),
+                        $(
+                            $index => self.$index.visit_egui_entry(
+                                external,
+                                &local.$index,
+                                parent_slot.child(self.$index.id(), $index),
+                                visitor,
+                            ),
+                        )*
+                        _ => {}
+                    }
+                }
+            }
+        }
+    };
+}
+
+impl_egui_widget_list_tuple!(A 0);
+impl_egui_widget_list_tuple!(A 0, B 1);
+impl_egui_widget_list_tuple!(A 0, B 1, C 2);
+impl_egui_widget_list_tuple!(A 0, B 1, C 2, D 3);
+impl_egui_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4);
+impl_egui_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5);
+impl_egui_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6);
+impl_egui_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7);
+
+pub trait SlipwayEguiAuthoredChildren: SlipwayAuthoredWidget {
+    fn visit_egui_authored_children<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>;
+
+    fn visit_egui_authored_children_in_paint_order<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        _parent_view: &ViewDefinition,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+    {
+        self.visit_egui_authored_children(external, local, visitor);
+    }
+}
+
+pub trait SlipwayEguiBackendContract:
+    SlipwayWidget
+    + SlipwayViewDefinition
+    + SlipwayEventRoutingPolicy
+    + SlipwayEventDispositionPolicy
+    + SlipwayFontResolutionPolicy
+    + SlipwayEguiAuthoredChildren
+{
+}
+
+impl<W> SlipwayEguiBackendContract for W where
+    W: SlipwayWidget
+        + SlipwayViewDefinition
+        + SlipwayEventRoutingPolicy
+        + SlipwayEventDispositionPolicy
+        + SlipwayFontResolutionPolicy
+        + SlipwayEguiAuthoredChildren
+{
+}
+
+impl<A> SlipwayEguiAuthoredChildren for slipway_core::SlipwayAppWidget<A>
+where
+    A: slipway_core::SlipwayApp,
+    A::Widgets: SlipwayEguiWidgetList<
+            ExternalState = A::ExternalState,
+            LocalState = <A::Widgets as slipway_core::SlipwayWidgetList>::LocalState,
+            AppMessage = A::AppMessage,
+        >,
+{
+    fn visit_egui_authored_children<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+    {
+        let root_slot = WidgetSlotAddress::new(self.app.id(), 0);
+        self.app
+            .widgets()
+            .visit_egui_children(external, &local.widgets, &root_slot, visitor);
+    }
+
+    fn visit_egui_authored_children_in_paint_order<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        parent_view: &ViewDefinition,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+    {
+        let root_slot = WidgetSlotAddress::new(self.app.id(), 0);
+        self.app.widgets().visit_egui_children_in_paint_order(
+            external,
+            &local.widgets,
+            &root_slot,
+            parent_view,
+            visitor,
+        );
+    }
+}
+
+pub trait SlipwayEguiBackendChildWidget: SlipwayEguiBackendContract {}
+
+impl<W> SlipwayEguiBackendChildWidget for W where W: SlipwayEguiBackendContract {}
+
+pub trait SlipwayEguiTextInputBackendWidget:
+    SlipwayEguiBackendChildWidget + SlipwayTextInputCapability
+{
+}
+
+impl<W> SlipwayEguiTextInputBackendWidget for W where
+    W: SlipwayEguiBackendChildWidget + SlipwayTextInputCapability
+{
+}
+
+pub trait SlipwayEguiScrollableContainerBackendWidget:
+    SlipwayEguiBackendChildWidget + SlipwayScrollableContainerCapability
+{
+}
+
+impl<W> SlipwayEguiScrollableContainerBackendWidget for W where
+    W: SlipwayEguiBackendChildWidget + SlipwayScrollableContainerCapability
+{
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn egui_text_edit_focus_region_from_capability<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    id: PresentationRegionId,
+    address: Option<WidgetSlotAddress>,
+    bounds: TargetLocalRect,
+    member: Option<FocusTraversalMember>,
+    enabled: bool,
+    layout_input: &LayoutInput,
+    measurement: Option<&TextMeasurementEvidence>,
+) -> FocusRegionDeclaration
+where
+    W: SlipwayEguiTextInputBackendWidget,
+{
+    text_edit_focus_region_from_capability(
+        widget,
+        external,
+        local,
+        id,
+        address,
+        bounds,
+        member,
+        enabled,
+        layout_input,
+        measurement,
+    )
+}
+
+pub fn egui_scroll_region_from_capability<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    input: &LayoutInput,
+    region_id: Option<PresentationRegionId>,
+    address: Option<WidgetSlotAddress>,
+    enabled: bool,
+) -> ScrollRegionDeclaration
+where
+    W: SlipwayEguiScrollableContainerBackendWidget,
+{
+    scroll_region_from_scrollable_capability(
+        widget, external, local, input, region_id, address, enabled,
+    )
+}
+
+pub trait SlipwayEguiBackendWidget: SlipwayAuthoredWidget + SlipwayEguiBackendChildWidget {}
+
+impl<W> SlipwayEguiBackendWidget for W where W: SlipwayAuthoredWidget + SlipwayEguiBackendChildWidget
+{}
+
+pub trait SlipwayEguiLayoutIntentBackendWidget:
+    SlipwayEguiBackendWidget + SlipwayLayoutIntent
+{
+}
+
+impl<W> SlipwayEguiLayoutIntentBackendWidget for W where
+    W: SlipwayEguiBackendWidget + SlipwayLayoutIntent
+{
+}
+
+pub trait SlipwayEguiLayoutIntentBackendChildWidget:
+    SlipwayEguiBackendChildWidget + SlipwayLayoutIntent
+{
+}
+
+impl<W> SlipwayEguiLayoutIntentBackendChildWidget for W where
+    W: SlipwayEguiBackendChildWidget + SlipwayLayoutIntent
+{
+}
+
+/// Egui-facing context used to create a backend-neutral Slipway layout input.
+pub struct EguiLayoutContext<'a> {
+    pub ui: &'a egui::Ui,
+    pub available_size: egui::Vec2,
+    pub pixels_per_point: f32,
+}
+
+/// Egui-facing context used to translate host interaction into Slipway input events.
+pub struct EguiInputContext<'a> {
+    pub ui: &'a egui::Ui,
+    pub widget_id: WidgetId,
+    pub frame: &'a FrameIdentity,
+    pub rect: egui::Rect,
+    pub layout: &'a LayoutOutput,
+    pub geometry_index: &'a PresentationGeometryIndex,
+    pub hit_regions: &'a [HitRegionDeclaration],
+    pub focus_regions: &'a [FocusRegionDeclaration],
+    pub scroll_regions: &'a [ScrollRegionDeclaration],
+    pub response: &'a egui::Response,
+    pub regions: &'a [EguiPresentedRegion],
+}
+
+#[derive(Clone, Debug)]
+struct EguiRawInputSnapshot {
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+    hover_pos: Option<egui::Pos2>,
+}
+
+fn egui_raw_input_snapshot(ui: &egui::Ui) -> EguiRawInputSnapshot {
+    ui.input(|input| EguiRawInputSnapshot {
+        events: input.events.clone(),
+        modifiers: input.modifiers,
+        hover_pos: input.pointer.hover_pos(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum EguiPresentedRegionKind {
+    Hit,
+    Focus,
+    TextEdit,
+    Scroll,
+}
+
+#[derive(Clone, Debug)]
+pub struct EguiTextEditChange {
+    pub before: String,
+    pub after: String,
+    pub selection_before: Option<TextSelectionRange>,
+    pub selection_after: Option<TextSelectionRange>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EguiScrollRegionState {
+    pub declared_offset: Point,
+    pub egui_offset: Point,
+    pub content_size: Size,
+    pub inner_rect: Rect,
+}
+
+#[derive(Clone, Debug)]
+pub struct EguiPresentedRegion {
+    pub kind: EguiPresentedRegionKind,
+    pub region_id: PresentationRegionId,
+    pub target: WidgetId,
+    pub address: Option<WidgetSlotAddress>,
+    pub event_target: WidgetId,
+    pub event_target_slot: Option<WidgetSlotAddress>,
+    pub declared_bounds: Rect,
+    pub target_origin: egui::Pos2,
+    pub target_bounds: Rect,
+    pub event_coordinate_space: PointerEventCoordinateSpace,
+    pub response: egui::Response,
+    pub cursor: CursorCapability,
+    pub enabled: bool,
+    pub text_edit_change: Option<EguiTextEditChange>,
+    pub scroll_state: Option<EguiScrollRegionState>,
+}
+
+/// Egui-facing context used to translate Slipway paint declarations into egui paint calls.
+pub struct EguiPaintContext<'a> {
+    pub ui: &'a egui::Ui,
+    pub painter: egui::Painter,
+    pub rect: egui::Rect,
+    pub layout: &'a LayoutOutput,
+}
+
+/// Egui-facing context for explicit state/topology observation.
+pub struct EguiObservationContext {
+    pub widget_id: WidgetId,
+    pub capabilities: Vec<Capability>,
+    pub topology: TopologyNode,
+    pub unsupported: Vec<Diagnostic>,
+    pub state: Vec<StateObservation>,
+    pub layout_intent: Option<LayoutIntentProbe>,
+}
+
+/// Backend-owned conversion boundary between egui callbacks and Slipway core I/O.
+///
+/// This trait is deliberately mechanical: it converts host framework data to
+/// backend-neutral core declarations and renders returned declarations. It does
+/// not define widget semantics, local state transitions, or app messages.
+pub trait EguiSlipwayBridge<W: SlipwayAuthoredWidget> {
+    fn layout_input(&mut self, context: EguiLayoutContext<'_>) -> LayoutInput;
+
+    fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2;
+
+    fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent>;
+
+    fn paint(&mut self, context: EguiPaintContext<'_>, ops: &[PaintOp]);
+
+    fn messages(&mut self, outcome: EventOutcome<W::AppMessage>) -> Vec<W::AppMessage>;
+
+    fn visible_admission_refused(&mut self, _admission: BackendParityAdmission) {}
+
+    fn wants_observation(&mut self) -> bool {
+        false
+    }
+
+    fn observe(&mut self, _context: EguiObservationContext) {}
+}
+
+#[derive(Debug, Default)]
+pub struct DefaultEguiBridge {
+    probes: ProbeCollector,
+    observe_next_frame: bool,
+    focused_target: Option<WidgetId>,
+    hovered_region: Option<PresentationRegionId>,
+    refused_admissions: Vec<BackendParityAdmission>,
+}
+
+impl DefaultEguiBridge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn request_observation(&mut self) {
+        self.observe_next_frame = true;
+    }
+
+    pub fn take_probe_products(&mut self) -> Vec<ProbeProduct> {
+        self.probes.take()
+    }
+
+    pub fn take_refused_admissions(&mut self) -> Vec<BackendParityAdmission> {
+        std::mem::take(&mut self.refused_admissions)
+    }
+}
+
+impl<W> EguiSlipwayBridge<W> for DefaultEguiBridge
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    fn layout_input(&mut self, context: EguiLayoutContext<'_>) -> LayoutInput {
+        let width = context.available_size.x.max(0.0);
+        let height = context.available_size.y.max(0.0);
+
+        LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size { width, height },
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: Size { width, height },
+            },
+        }
+    }
+
+    fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
+        egui::vec2(
+            layout.bounds.size.width.max(0.0),
+            layout.bounds.size.height.max(0.0),
+        )
+    }
+
+    fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
+        let mut events = Vec::new();
+        let root_target = context.widget_id.clone();
+
+        for region in context.regions {
+            if region.response.gained_focus() {
+                self.focused_target = Some(region.target.clone());
+                let event = InputEvent::Focus(slipway_core::FocusEvent {
+                    target: region.target.clone(),
+                    target_slot: region.address.clone(),
+                    focused: true,
+                });
+                events.push(egui_focus_backend_input_event(
+                    &context,
+                    region,
+                    DeclaredEventDispatchKind::Focus,
+                    event,
+                ));
+            }
+
+            if region.response.lost_focus() {
+                if self.focused_target.as_ref() == Some(&region.target) {
+                    self.focused_target = None;
+                }
+                let event = InputEvent::Focus(slipway_core::FocusEvent {
+                    target: region.target.clone(),
+                    target_slot: region.address.clone(),
+                    focused: false,
+                });
+                events.push(egui_focus_backend_input_event(
+                    &context,
+                    region,
+                    DeclaredEventDispatchKind::Focus,
+                    event,
+                ));
+            }
+
+            if region.response.clicked() && egui_region_can_request_focus(region) {
+                region.response.request_focus();
+                self.focused_target = Some(region.target.clone());
+            }
+
+            if let Some(change) = &region.text_edit_change {
+                let event = InputEvent::TextEdit(TextEditEvent {
+                    target: region.target.clone(),
+                    target_slot: region.address.clone(),
+                    kind: TextEditKind::ReplaceBuffer,
+                    text: Some(change.after.clone()),
+                    selection_before: change.selection_before.clone(),
+                    selection_after: change.selection_after.clone(),
+                });
+                events.push(egui_focus_backend_input_event(
+                    &context,
+                    region,
+                    DeclaredEventDispatchKind::Text,
+                    event,
+                ));
+            }
+
+            if let Some(scroll) = &region.scroll_state {
+                let delta_x = scroll.egui_offset.x - scroll.declared_offset.x;
+                let delta_y = scroll.egui_offset.y - scroll.declared_offset.y;
+                if delta_x.abs() > f32::EPSILON || delta_y.abs() > f32::EPSILON {
+                    let event = InputEvent::Scroll(ScrollEvent {
+                        target: region.target.clone(),
+                        target_slot: region.address.clone(),
+                        region_id: region.region_id.clone(),
+                        offset_x: scroll.egui_offset.x,
+                        offset_y: scroll.egui_offset.y,
+                        viewport: TargetLocalRect::new(scroll.inner_rect),
+                        content_bounds: TargetLocalRect::new(Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: scroll.content_size,
+                        }),
+                    });
+                    if let Some(event) = egui_scroll_backend_input_event(&context, region, event) {
+                        events.push(event);
+                    }
+                }
+            }
+        }
+
+        let mut focus_request_after_input = None;
+
+        let raw_input = egui_raw_input_snapshot(context.ui);
+        for event in &raw_input.events {
+            match event {
+                egui::Event::PointerMoved(position) => {
+                    let region = egui_region_at_position(context.regions, *position);
+                    let next_hovered = region.map(|region| region.region_id.clone());
+                    if self.hovered_region != next_hovered {
+                        if let Some(previous_id) = self.hovered_region.take() {
+                            if let Some(previous) = egui_region_by_id(context.regions, &previous_id)
+                            {
+                                let leave_position =
+                                    egui_region_anchor_position(&context, previous);
+                                if let Some(event) = egui_backend_pointer_input_event(
+                                    &context,
+                                    previous,
+                                    leave_position,
+                                    PointerEventKind::Leave,
+                                    None,
+                                    egui_pointer_details(raw_input.modifiers, None),
+                                    false,
+                                ) {
+                                    events.push(event);
+                                }
+                            }
+                        }
+
+                        if let Some(region) = region {
+                            if let Some(event) = egui_backend_pointer_input_event(
+                                &context,
+                                region,
+                                *position,
+                                PointerEventKind::Enter,
+                                None,
+                                egui_pointer_details(raw_input.modifiers, None),
+                                false,
+                            ) {
+                                events.push(event);
+                            }
+                        }
+                        self.hovered_region = next_hovered;
+                    }
+
+                    if let Some(region) = region {
+                        if let Some(event) = egui_backend_pointer_input_event(
+                            &context,
+                            region,
+                            *position,
+                            PointerEventKind::Move,
+                            None,
+                            egui_pointer_details(raw_input.modifiers, None),
+                            false,
+                        ) {
+                            events.push(event);
+                        }
+                    }
+                }
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    ..
+                } => {
+                    let Some(region) = egui_region_at_position(context.regions, *pos) else {
+                        continue;
+                    };
+                    if *pressed {
+                        self.focused_target = Some(region.target.clone());
+                        if egui_region_can_request_focus(region) {
+                            focus_request_after_input = Some(region.region_id.clone());
+                        }
+                    }
+                    if let Some(event) = egui_backend_pointer_input_event(
+                        &context,
+                        region,
+                        *pos,
+                        if *pressed {
+                            PointerEventKind::Press
+                        } else {
+                            PointerEventKind::Release
+                        },
+                        Some(egui_pointer_button(*button)),
+                        egui_pointer_details(raw_input.modifiers, Some(*button)),
+                        *pressed,
+                    ) {
+                        events.push(event);
+                    }
+                }
+                egui::Event::PointerGone => {
+                    let region = self
+                        .hovered_region
+                        .as_ref()
+                        .and_then(|id| egui_region_by_id(context.regions, id))
+                        .or_else(|| focused_region(context.regions, self.focused_target.as_ref()));
+                    if let Some(region) = region {
+                        let position = egui_region_anchor_position(&context, region);
+                        if let Some(event) = egui_backend_pointer_input_event(
+                            &context,
+                            region,
+                            position,
+                            PointerEventKind::Cancel,
+                            None,
+                            egui_pointer_details(raw_input.modifiers, None),
+                            false,
+                        ) {
+                            events.push(event);
+                        }
+                    }
+                    self.hovered_region = None;
+                }
+                egui::Event::Text(text) if self.focused_target.is_some() => {
+                    let (target, target_slot) = focused_event_target(
+                        context.regions,
+                        self.focused_target.as_ref(),
+                        &root_target,
+                    );
+                    let event = InputEvent::Text(TextInputEvent {
+                        target,
+                        target_slot,
+                        text: text.clone(),
+                    });
+                    if let Some(event) = egui_focused_backend_input_event(
+                        &context,
+                        self.focused_target.as_ref(),
+                        DeclaredEventDispatchKind::Text,
+                        event,
+                    ) {
+                        events.push(event);
+                    }
+                }
+                egui::Event::Paste(text) if self.focused_target.is_some() => {
+                    let (target, target_slot) = focused_event_target(
+                        context.regions,
+                        self.focused_target.as_ref(),
+                        &root_target,
+                    );
+                    let event = InputEvent::Text(TextInputEvent {
+                        target,
+                        target_slot,
+                        text: text.clone(),
+                    });
+                    if let Some(event) = egui_focused_backend_input_event(
+                        &context,
+                        self.focused_target.as_ref(),
+                        DeclaredEventDispatchKind::Text,
+                        event,
+                    ) {
+                        events.push(event);
+                    }
+                }
+                egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    repeat,
+                    modifiers,
+                    ..
+                } if self.focused_target.is_some() => {
+                    let (target, target_slot) = focused_event_target(
+                        context.regions,
+                        self.focused_target.as_ref(),
+                        &root_target,
+                    );
+                    let event = InputEvent::Keyboard(KeyboardEvent {
+                        target,
+                        target_slot,
+                        key: format!("{key:?}"),
+                        kind: if *pressed {
+                            KeyEventKind::Press
+                        } else {
+                            KeyEventKind::Release
+                        },
+                        modifiers: egui_modifiers(*modifiers),
+                        details: KeyboardDetails {
+                            logical_key: Some(format!("{key:?}")),
+                            physical_key: physical_key.map(|key| format!("{key:?}")),
+                            text: None,
+                            repeat: *repeat,
+                            location: KeyLocation::Unknown,
+                        },
+                    });
+                    if let Some(event) = egui_focused_backend_input_event(
+                        &context,
+                        self.focused_target.as_ref(),
+                        DeclaredEventDispatchKind::Keyboard,
+                        event,
+                    ) {
+                        events.push(event);
+                    }
+                }
+                egui::Event::Ime(ime) if self.focused_target.is_some() => {
+                    let (target, target_slot) = focused_event_target(
+                        context.regions,
+                        self.focused_target.as_ref(),
+                        &root_target,
+                    );
+                    if let egui::ImeEvent::Commit(text) = ime {
+                        let event = InputEvent::Text(TextInputEvent {
+                            target: target.clone(),
+                            target_slot: target_slot.clone(),
+                            text: text.clone(),
+                        });
+                        if let Some(event) = egui_focused_backend_input_event(
+                            &context,
+                            self.focused_target.as_ref(),
+                            DeclaredEventDispatchKind::Text,
+                            event,
+                        ) {
+                            events.push(event);
+                        }
+                    }
+                    if let Some(event) = egui_composition_event(Some(target), target_slot, ime) {
+                        if let Some(event) = egui_focused_backend_input_event(
+                            &context,
+                            self.focused_target.as_ref(),
+                            DeclaredEventDispatchKind::Text,
+                            InputEvent::TextComposition(event),
+                        ) {
+                            events.push(event);
+                        }
+                    }
+                }
+                egui::Event::MouseWheel { delta, .. } => {
+                    let Some(position) = raw_input.hover_pos else {
+                        continue;
+                    };
+                    if let Some(event) =
+                        egui_backend_wheel_input_event(&context, position, delta.x, delta.y)
+                    {
+                        events.push(event);
+                    }
+                }
+                egui::Event::Copy if self.focused_target.is_some() => {
+                    let (target, target_slot) = focused_event_target(
+                        context.regions,
+                        self.focused_target.as_ref(),
+                        &root_target,
+                    );
+                    let event = InputEvent::Command(slipway_core::CommandEvent {
+                        target,
+                        target_slot,
+                        command: "copy".to_string(),
+                        payload_ref: None,
+                        source: None,
+                    });
+                    if let Some(event) = egui_focused_backend_input_event(
+                        &context,
+                        self.focused_target.as_ref(),
+                        DeclaredEventDispatchKind::Command,
+                        event,
+                    ) {
+                        events.push(event);
+                    }
+                }
+                egui::Event::Cut if self.focused_target.is_some() => {
+                    let (target, target_slot) = focused_event_target(
+                        context.regions,
+                        self.focused_target.as_ref(),
+                        &root_target,
+                    );
+                    let event = InputEvent::Command(slipway_core::CommandEvent {
+                        target,
+                        target_slot,
+                        command: "cut".to_string(),
+                        payload_ref: None,
+                        source: None,
+                    });
+                    if let Some(event) = egui_focused_backend_input_event(
+                        &context,
+                        self.focused_target.as_ref(),
+                        DeclaredEventDispatchKind::Command,
+                        event,
+                    ) {
+                        events.push(event);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(region_id) = focus_request_after_input {
+            if let Some(region) = context
+                .regions
+                .iter()
+                .find(|region| region.region_id == region_id)
+            {
+                region.response.request_focus();
+            }
+        }
+
+        events
+    }
+
+    fn paint(&mut self, context: EguiPaintContext<'_>, ops: &[PaintOp]) {
+        for op in ops {
+            paint_op(&context.painter, context.rect.min, op);
+        }
+    }
+
+    fn messages(&mut self, outcome: EventOutcome<W::AppMessage>) -> Vec<W::AppMessage> {
+        self.probes.extend(outcome.probes);
+        self.probes.extend(
+            outcome
+                .diagnostics
+                .into_iter()
+                .map(ProbeProduct::Diagnostic),
+        );
+        outcome
+            .emitted_messages
+            .into_iter()
+            .map(|message| message.message)
+            .collect()
+    }
+
+    fn visible_admission_refused(&mut self, admission: BackendParityAdmission) {
+        self.refused_admissions.push(admission);
+    }
+
+    fn wants_observation(&mut self) -> bool {
+        let requested = self.observe_next_frame;
+        self.observe_next_frame = false;
+        requested
+    }
+
+    fn observe(&mut self, context: EguiObservationContext) {
+        let traversal = context.topology.traverse_depth_first();
+        self.probes.push(ProbeProduct::Topology(TopologyProbe {
+            root: context.topology,
+            traversal,
+        }));
+        self.probes.push(ProbeProduct::State(StateProbe {
+            target: context.widget_id,
+            observations: context.state,
+        }));
+        if let Some(layout_intent) = context.layout_intent {
+            self.probes.push(ProbeProduct::LayoutIntent(layout_intent));
+        }
+        self.probes.extend(
+            context
+                .unsupported
+                .into_iter()
+                .map(ProbeProduct::Diagnostic),
+        );
+    }
+}
+
+/// A single authored Slipway widget lifted into egui's custom widget path.
+///
+/// The wrapper preserves the authored widget identity and local state slot it
+/// was given. It does not merge the application into one backend-visible widget.
+pub struct SlipwayEguiWidget<'a, W, B>
+where
+    W: SlipwayEguiBackendWidget,
+    B: EguiSlipwayBridge<W>,
+{
+    widget: &'a W,
+    external: &'a W::ExternalState,
+    local: &'a mut W::LocalState,
+    bridge: &'a mut B,
+    messages: &'a mut Vec<W::AppMessage>,
+    backend_traces: Option<&'a mut Vec<BackendInputTrace>>,
+    sense: egui::Sense,
+    presented_viewport: Option<&'a mut Option<Rect>>,
+    native_physical_operation: Option<&'a DebugPhysicalControl>,
+}
+
+impl<'a, W, B> SlipwayEguiWidget<'a, W, B>
+where
+    W: SlipwayEguiBackendWidget,
+    B: EguiSlipwayBridge<W>,
+{
+    pub fn new(
+        widget: &'a W,
+        external: &'a W::ExternalState,
+        local: &'a mut W::LocalState,
+        bridge: &'a mut B,
+        messages: &'a mut Vec<W::AppMessage>,
+    ) -> Self {
+        Self {
+            widget,
+            external,
+            local,
+            bridge,
+            messages,
+            backend_traces: None,
+            sense: egui::Sense::hover(),
+            presented_viewport: None,
+            native_physical_operation: None,
+        }
+    }
+
+    pub fn sense(mut self, sense: egui::Sense) -> Self {
+        self.sense = sense;
+        self
+    }
+
+    pub fn record_presented_viewport(mut self, viewport: &'a mut Option<Rect>) -> Self {
+        self.presented_viewport = Some(viewport);
+        self
+    }
+
+    pub fn record_backend_traces(mut self, backend_traces: &'a mut Vec<BackendInputTrace>) -> Self {
+        self.backend_traces = Some(backend_traces);
+        self
+    }
+
+    fn native_physical_operation(mut self, operation: Option<&'a DebugPhysicalControl>) -> Self {
+        self.native_physical_operation = operation;
+        self
+    }
+}
+
+impl<W, B> egui::Widget for SlipwayEguiWidget<'_, W, B>
+where
+    W: SlipwayEguiBackendWidget,
+    W::LocalState: Clone,
+    B: EguiSlipwayBridge<W>,
+{
+    fn ui(mut self, ui: &mut egui::Ui) -> egui::Response {
+        let layout_input = self.bridge.layout_input(EguiLayoutContext {
+            ui,
+            available_size: ui.available_size(),
+            pixels_per_point: ui.ctx().pixels_per_point(),
+        });
+        if let Some(presented_viewport) = self.presented_viewport {
+            *presented_viewport = Some(layout_input.viewport.into_rect());
+        }
+        let frame = egui_frame_identity(ui, &self.widget.id(), layout_input.viewport.into_rect());
+        let view = self.widget.visible_backend_view_definition(
+            self.external,
+            self.local,
+            ViewDefinitionInput {
+                frame,
+                layout_input,
+            },
+        );
+        let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+        let capabilities = self.widget.capabilities();
+        let admission =
+            egui_backend_admission().admit_view_definition_with_capabilities(&capabilities, &view);
+        let desired_size = self.bridge.desired_size(&view.layout);
+        let (rect, response) = ui.allocate_exact_size(desired_size, self.sense);
+        if !admission.accepted {
+            self.bridge.visible_admission_refused(admission);
+            return response;
+        }
+
+        for admission in install_declared_fonts(ui, self.widget, self.external, self.local, &view) {
+            self.bridge.visible_admission_refused(admission);
+        }
+        if ui.is_rect_visible(rect) {
+            self.bridge.paint(
+                EguiPaintContext {
+                    ui,
+                    painter: ui.painter_at(rect),
+                    rect,
+                    layout: &view.layout,
+                },
+                &view.paint,
+            );
+        }
+
+        let child_slots = authored_child_slots(self.widget, self.external, self.local);
+        let mut child_assembly = EguiChildAssembly::default();
+        let mut regions = allocate_presentation_regions(
+            ui,
+            self.widget,
+            self.external,
+            self.local,
+            rect.min,
+            &view,
+            &geometry_index,
+            &child_slots,
+            &mut child_assembly,
+            self.native_physical_operation,
+        );
+        let skipped_slots = child_assembly.presented_slots.clone();
+        child_assembly.extend(present_authored_children(
+            ui,
+            self.widget,
+            self.external,
+            self.local,
+            &view,
+            &geometry_index,
+            rect.min,
+            &skipped_slots,
+            None,
+            self.native_physical_operation,
+        ));
+        for admission in child_assembly.refused_admissions.drain(..) {
+            self.bridge.visible_admission_refused(admission);
+        }
+        regions.extend(child_assembly.regions);
+        let presented_views = child_assembly.presented_views;
+
+        apply_egui_native_physical_region_effect(self.native_physical_operation, &regions);
+        let mut input_events = child_assembly.input_events;
+        input_events.extend(self.bridge.input_events(EguiInputContext {
+            ui,
+            widget_id: self.widget.id(),
+            frame: &view.frame,
+            rect,
+            layout: &view.layout,
+            geometry_index: &geometry_index,
+            hit_regions: &view.hit_regions,
+            focus_regions: &view.focus_regions,
+            scroll_regions: &view.scroll_regions,
+            response: &response,
+            regions: &regions,
+        }));
+        for event in input_events {
+            let validation_view =
+                egui_backend_input_validation_view(&view, &presented_views, &event);
+            let contract_diagnostics =
+                slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+                    validation_view,
+                    &event,
+                    Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+                    Some(EGUI_BACKEND_ID),
+                );
+            if !contract_diagnostics.is_empty() {
+                if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                    backend_traces.push(egui_refused_backend_input_trace(
+                        self.widget,
+                        self.external,
+                        self.local,
+                        event,
+                        contract_diagnostics,
+                    ));
+                }
+                continue;
+            }
+            let input = event.event.clone();
+            let declaration = slipway_core::declared_event_handling(
+                self.widget,
+                self.external,
+                &*self.local,
+                &input,
+            );
+            let route_diagnostics =
+                slipway_core::dispatch_evidence_event_route_contract_diagnostics(
+                    &event,
+                    &declaration,
+                );
+            if slipway_core::view_definition_has_blocking_contract_diagnostic(&route_diagnostics) {
+                let outcome = EventOutcome {
+                    handled: false,
+                    propagate: true,
+                    emitted_messages: Vec::new(),
+                    changes: Vec::new(),
+                    observations: Vec::new(),
+                    probes: Vec::new(),
+                    diagnostics: route_diagnostics,
+                };
+                if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                    backend_traces.push(egui_backend_input_trace(
+                        self.widget,
+                        self.external,
+                        self.local,
+                        event,
+                        &outcome,
+                    ));
+                }
+                continue;
+            }
+            if !declaration.disposition.final_disposition.handled {
+                let outcome = slipway_core::refuse_event_declared_unhandled(declaration);
+                if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                    backend_traces.push(egui_backend_input_trace(
+                        self.widget,
+                        self.external,
+                        self.local,
+                        event,
+                        &outcome,
+                    ));
+                }
+                continue;
+            }
+            let local_before = self.local.clone();
+            let raw_outcome = self
+                .widget
+                .handle_event(self.external, self.local, input.clone());
+            let outcome =
+                slipway_core::apply_physical_event_handling_declaration(declaration, raw_outcome);
+            if slipway_core::event_outcome_has_physical_declaration_mismatch(&outcome) {
+                *self.local = local_before;
+            }
+            if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                backend_traces.push(egui_backend_input_trace(
+                    self.widget,
+                    self.external,
+                    self.local,
+                    event,
+                    &outcome,
+                ));
+            }
+            if outcome.handled {
+                ui.ctx().request_repaint();
+            }
+            self.messages.extend(self.bridge.messages(outcome));
+        }
+
+        if self.bridge.wants_observation() {
+            self.bridge.observe(EguiObservationContext {
+                widget_id: self.widget.id(),
+                capabilities: self.widget.capabilities(),
+                topology: self.widget.topology(self.external),
+                unsupported: self.widget.unsupported(),
+                state: self.widget.observe_state(self.external, self.local),
+                layout_intent: None,
+            });
+        }
+
+        response
+    }
+}
+
+/// A layout-intent-aware egui lift for authored widgets that explicitly opt in.
+///
+/// This wrapper does not infer or calculate policy. It only calls
+/// `SlipwayLayoutIntent::layout_intent` during explicit observation requests and
+/// forwards the returned probe product to the bridge.
+pub struct SlipwayEguiLayoutIntentWidget<'a, W, B>
+where
+    W: SlipwayEguiLayoutIntentBackendWidget,
+    B: EguiSlipwayBridge<W>,
+{
+    widget: &'a W,
+    external: &'a W::ExternalState,
+    local: &'a mut W::LocalState,
+    bridge: &'a mut B,
+    messages: &'a mut Vec<W::AppMessage>,
+    backend_traces: Option<&'a mut Vec<BackendInputTrace>>,
+    sense: egui::Sense,
+}
+
+impl<'a, W, B> SlipwayEguiLayoutIntentWidget<'a, W, B>
+where
+    W: SlipwayEguiLayoutIntentBackendWidget,
+    B: EguiSlipwayBridge<W>,
+{
+    pub fn new(
+        widget: &'a W,
+        external: &'a W::ExternalState,
+        local: &'a mut W::LocalState,
+        bridge: &'a mut B,
+        messages: &'a mut Vec<W::AppMessage>,
+    ) -> Self {
+        Self {
+            widget,
+            external,
+            local,
+            bridge,
+            messages,
+            backend_traces: None,
+            sense: egui::Sense::hover(),
+        }
+    }
+
+    pub fn sense(mut self, sense: egui::Sense) -> Self {
+        self.sense = sense;
+        self
+    }
+
+    pub fn record_backend_traces(mut self, backend_traces: &'a mut Vec<BackendInputTrace>) -> Self {
+        self.backend_traces = Some(backend_traces);
+        self
+    }
+}
+
+impl<W, B> egui::Widget for SlipwayEguiLayoutIntentWidget<'_, W, B>
+where
+    W: SlipwayEguiLayoutIntentBackendWidget,
+    W::LocalState: Clone,
+    B: EguiSlipwayBridge<W>,
+{
+    fn ui(mut self, ui: &mut egui::Ui) -> egui::Response {
+        let layout_input = self.bridge.layout_input(EguiLayoutContext {
+            ui,
+            available_size: ui.available_size(),
+            pixels_per_point: ui.ctx().pixels_per_point(),
+        });
+        let frame = egui_frame_identity(ui, &self.widget.id(), layout_input.viewport.into_rect());
+        let view = self.widget.visible_backend_view_definition(
+            self.external,
+            self.local,
+            ViewDefinitionInput {
+                frame,
+                layout_input: layout_input.clone(),
+            },
+        );
+        let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+        let capabilities = self.widget.capabilities();
+        let admission =
+            egui_backend_admission().admit_view_definition_with_capabilities(&capabilities, &view);
+        let desired_size = self.bridge.desired_size(&view.layout);
+        let (rect, response) = ui.allocate_exact_size(desired_size, self.sense);
+        if !admission.accepted {
+            self.bridge.visible_admission_refused(admission);
+            return response;
+        }
+
+        for admission in install_declared_fonts(ui, self.widget, self.external, self.local, &view) {
+            self.bridge.visible_admission_refused(admission);
+        }
+        if ui.is_rect_visible(rect) {
+            self.bridge.paint(
+                EguiPaintContext {
+                    ui,
+                    painter: ui.painter_at(rect),
+                    rect,
+                    layout: &view.layout,
+                },
+                &view.paint,
+            );
+        }
+
+        let child_slots = authored_child_slots(self.widget, self.external, self.local);
+        let mut child_assembly = EguiChildAssembly::default();
+        let mut regions = allocate_presentation_regions(
+            ui,
+            self.widget,
+            self.external,
+            self.local,
+            rect.min,
+            &view,
+            &geometry_index,
+            &child_slots,
+            &mut child_assembly,
+            None,
+        );
+        let skipped_slots = child_assembly.presented_slots.clone();
+        child_assembly.extend(present_authored_children(
+            ui,
+            self.widget,
+            self.external,
+            self.local,
+            &view,
+            &geometry_index,
+            rect.min,
+            &skipped_slots,
+            None,
+            None,
+        ));
+        for admission in child_assembly.refused_admissions.drain(..) {
+            self.bridge.visible_admission_refused(admission);
+        }
+        regions.extend(child_assembly.regions);
+        let presented_views = child_assembly.presented_views;
+
+        let mut input_events = child_assembly.input_events;
+        input_events.extend(self.bridge.input_events(EguiInputContext {
+            ui,
+            widget_id: self.widget.id(),
+            frame: &view.frame,
+            rect,
+            layout: &view.layout,
+            geometry_index: &geometry_index,
+            hit_regions: &view.hit_regions,
+            focus_regions: &view.focus_regions,
+            scroll_regions: &view.scroll_regions,
+            response: &response,
+            regions: &regions,
+        }));
+        for event in input_events {
+            let validation_view =
+                egui_backend_input_validation_view(&view, &presented_views, &event);
+            let contract_diagnostics =
+                slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+                    validation_view,
+                    &event,
+                    Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+                    Some(EGUI_BACKEND_ID),
+                );
+            if !contract_diagnostics.is_empty() {
+                if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                    backend_traces.push(egui_refused_backend_input_trace(
+                        self.widget,
+                        self.external,
+                        self.local,
+                        event,
+                        contract_diagnostics,
+                    ));
+                }
+                continue;
+            }
+            let input = event.event.clone();
+            let declaration = slipway_core::declared_event_handling(
+                self.widget,
+                self.external,
+                &*self.local,
+                &input,
+            );
+            let route_diagnostics =
+                slipway_core::dispatch_evidence_event_route_contract_diagnostics(
+                    &event,
+                    &declaration,
+                );
+            if slipway_core::view_definition_has_blocking_contract_diagnostic(&route_diagnostics) {
+                let outcome = EventOutcome {
+                    handled: false,
+                    propagate: true,
+                    emitted_messages: Vec::new(),
+                    changes: Vec::new(),
+                    observations: Vec::new(),
+                    probes: Vec::new(),
+                    diagnostics: route_diagnostics,
+                };
+                if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                    backend_traces.push(egui_backend_input_trace(
+                        self.widget,
+                        self.external,
+                        self.local,
+                        event,
+                        &outcome,
+                    ));
+                }
+                continue;
+            }
+            if !declaration.disposition.final_disposition.handled {
+                let outcome = slipway_core::refuse_event_declared_unhandled(declaration);
+                if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                    backend_traces.push(egui_backend_input_trace(
+                        self.widget,
+                        self.external,
+                        self.local,
+                        event,
+                        &outcome,
+                    ));
+                }
+                continue;
+            }
+            let local_before = self.local.clone();
+            let raw_outcome = self
+                .widget
+                .handle_event(self.external, self.local, input.clone());
+            let outcome =
+                slipway_core::apply_physical_event_handling_declaration(declaration, raw_outcome);
+            if slipway_core::event_outcome_has_physical_declaration_mismatch(&outcome) {
+                *self.local = local_before;
+            }
+            if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                backend_traces.push(egui_backend_input_trace(
+                    self.widget,
+                    self.external,
+                    self.local,
+                    event,
+                    &outcome,
+                ));
+            }
+            if outcome.handled {
+                ui.ctx().request_repaint();
+            }
+            self.messages.extend(self.bridge.messages(outcome));
+        }
+
+        if self.bridge.wants_observation() {
+            self.bridge.observe(EguiObservationContext {
+                widget_id: self.widget.id(),
+                capabilities: self.widget.capabilities(),
+                topology: self.widget.topology(self.external),
+                unsupported: self.widget.unsupported(),
+                state: self.widget.observe_state(self.external, self.local),
+                layout_intent: Some(self.widget.layout_intent(
+                    self.external,
+                    self.local,
+                    &layout_input,
+                )),
+            });
+        }
+
+        response
+    }
+}
+
+/// Generic eframe application shell for N authored Slipway widget slots.
+pub struct SlipwayEguiApp<W, B, F>
+where
+    W: SlipwayEguiBackendWidget,
+    B: EguiSlipwayBridge<W>,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+{
+    external: W::ExternalState,
+    slots: Vec<WidgetSlot<W>>,
+    bridge: B,
+    on_messages: F,
+    sense: egui::Sense,
+}
+
+impl<W, B, F> SlipwayEguiApp<W, B, F>
+where
+    W: SlipwayEguiBackendWidget,
+    B: EguiSlipwayBridge<W>,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+{
+    pub fn new(
+        external: W::ExternalState,
+        widgets: impl IntoIterator<Item = W>,
+        bridge: B,
+        on_messages: F,
+    ) -> Self {
+        let slots = widgets
+            .into_iter()
+            .map(|widget| {
+                let local_state = widget.initial_local_state();
+                WidgetSlot {
+                    widget,
+                    local_state,
+                }
+            })
+            .collect();
+
+        Self {
+            external,
+            slots,
+            bridge,
+            on_messages,
+            sense: egui::Sense::hover(),
+        }
+    }
+
+    pub fn sense(mut self, sense: egui::Sense) -> Self {
+        self.sense = sense;
+        self
+    }
+
+    pub fn widget_count(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+impl<W, B, F> eframe::App for SlipwayEguiApp<W, B, F>
+where
+    W: SlipwayEguiBackendWidget + 'static,
+    W::ExternalState: 'static,
+    W::LocalState: Clone + 'static,
+    W::AppMessage: 'static,
+    B: EguiSlipwayBridge<W> + 'static,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>) + 'static,
+{
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        fill_egui_host_background(ui);
+        let mut messages = Vec::new();
+
+        for slot in &mut self.slots {
+            ui.add(
+                SlipwayEguiWidget::new(
+                    &slot.widget,
+                    &self.external,
+                    &mut slot.local_state,
+                    &mut self.bridge,
+                    &mut messages,
+                )
+                .sense(self.sense),
+            );
+        }
+
+        if !messages.is_empty() {
+            (self.on_messages)(&mut self.external, messages);
+        }
+    }
+}
+
+/// Launch a generic egui application for authored Slipway widgets.
+pub fn run_slipway_egui_app<W, B, F>(
+    title: impl Into<String>,
+    external: W::ExternalState,
+    widgets: impl IntoIterator<Item = W>,
+    bridge: B,
+    on_messages: F,
+) -> eframe::Result<()>
+where
+    W: SlipwayEguiBackendWidget + 'static,
+    W::ExternalState: 'static,
+    W::LocalState: Clone + 'static,
+    W::AppMessage: 'static,
+    B: EguiSlipwayBridge<W> + 'static,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>) + 'static,
+{
+    let title = title.into();
+    let app = SlipwayEguiApp::new(external, widgets, bridge, on_messages);
+
+    eframe::run_native(
+        &title,
+        eframe::NativeOptions::default(),
+        Box::new(|_creation_context| Ok(Box::new(app))),
+    )
+}
+
+pub fn run_slipway_egui_app_with_default_bridge<W, F>(
+    title: impl Into<String>,
+    external: W::ExternalState,
+    widgets: impl IntoIterator<Item = W>,
+    on_messages: F,
+) -> eframe::Result<()>
+where
+    W: SlipwayEguiBackendWidget + 'static,
+    W::ExternalState: 'static,
+    W::LocalState: Clone + 'static,
+    W::AppMessage: 'static,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>) + 'static,
+{
+    run_slipway_egui_app(
+        title,
+        external,
+        widgets,
+        DefaultEguiBridge::new(),
+        on_messages,
+    )
+}
+
+/// Generic eframe application shell for one assembled Slipway runtime.
+///
+/// Unlike `SlipwayEguiApp`, this type does not own a separate widget slot. The
+/// authored widget, external state, local state, frame identity, and debug
+/// bridge live inside `SlipwayRuntime`, so visible backend events and MCP/debug
+/// commands route through the same app owner.
+pub struct SlipwayEguiRuntimeApp<W, B, F>
+where
+    W: SlipwayEguiBackendWidget,
+    W::LocalState: Clone,
+    B: EguiSlipwayBridge<W>,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+{
+    runtime: SlipwayRuntime<W>,
+    bridge: B,
+    on_messages: F,
+    sense: egui::Sense,
+    debug_mcp_transport: Option<SlipwayRuntimeMcpTransport>,
+    egui_mcp_wake_rx: Option<mpsc::Receiver<()>>,
+    pending_native_physical: Option<PendingEguiNativePhysicalControl>,
+}
+
+enum PendingEguiNativePhysicalControl {
+    WaitingForDebugLease(SlipwayRuntimePendingNativeMcpCall),
+    WaitingForBackendTrace {
+        pending: SlipwayRuntimePendingNativeMcpCall,
+        lease: slipway_debug_bridge::DebugCommandLease,
+    },
+}
+
+impl<W, B, F> SlipwayEguiRuntimeApp<W, B, F>
+where
+    W: SlipwayEguiBackendWidget,
+    W::LocalState: Clone,
+    B: EguiSlipwayBridge<W>,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+{
+    pub fn new(runtime: SlipwayRuntime<W>, bridge: B, on_messages: F) -> Self {
+        Self {
+            runtime,
+            bridge,
+            on_messages,
+            sense: egui::Sense::hover(),
+            debug_mcp_transport: None,
+            egui_mcp_wake_rx: None,
+            pending_native_physical: None,
+        }
+    }
+
+    pub fn runtime(&self) -> &SlipwayRuntime<W> {
+        &self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut SlipwayRuntime<W> {
+        &mut self.runtime
+    }
+
+    pub fn with_debug_mcp_transport(mut self, transport: SlipwayRuntimeMcpTransport) -> Self {
+        self.debug_mcp_transport = Some(transport);
+        self
+    }
+
+    pub fn debug_mcp_transport_addr(&self) -> Option<SocketAddr> {
+        self.debug_mcp_transport
+            .as_ref()
+            .map(SlipwayRuntimeMcpTransport::local_addr)
+    }
+
+    pub fn drain_debug_pending(&mut self) -> (usize, Option<String>) {
+        match self.runtime.drain_live_debug_turn_with_app_reducer(
+            SlipwayRuntimeDrainBudget::default(),
+            &mut self.on_messages,
+        ) {
+            Ok(report) => (
+                report.debug_replies_drained + report.runtime_mcp_replies_drained,
+                None,
+            ),
+            Err(error) => (0, Some(format!("{error:?}"))),
+        }
+    }
+
+    fn inject_pending_native_physical_into_raw_input(
+        &mut self,
+        raw_input: &mut egui::RawInput,
+    ) -> (usize, Option<String>) {
+        let mut drained = 0usize;
+        loop {
+            let pending = match self.pending_native_physical.take() {
+                Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                    pending,
+                    lease,
+                }) => {
+                    self.pending_native_physical =
+                        Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                            pending,
+                            lease,
+                        });
+                    break;
+                }
+                Some(PendingEguiNativePhysicalControl::WaitingForDebugLease(pending)) => pending,
+                None => {
+                    let pending = match self.runtime.take_pending_native_mcp_call() {
+                        Ok(Some(pending)) => pending,
+                        Ok(None) => break,
+                        Err(error) => return (drained, Some(format!("{error:?}"))),
+                    };
+                    drained += 1;
+                    pending
+                }
+            };
+
+            let lease = match self.runtime.take_debug_command_lease() {
+                Ok(Some(lease)) => lease,
+                Ok(None) => {
+                    self.pending_native_physical = Some(
+                        PendingEguiNativePhysicalControl::WaitingForDebugLease(pending),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    self.pending_native_physical = Some(
+                        PendingEguiNativePhysicalControl::WaitingForDebugLease(pending),
+                    );
+                    return (drained, Some(format!("{error:?}")));
+                }
+            };
+
+            let command = lease.command().clone();
+            let DebugCommandKind::PhysicalControl { operation, .. } = &command.kind else {
+                let product = self
+                    .runtime
+                    .handle_debug_command_with_app_reducer(command, &mut self.on_messages);
+                if let Err(error) = lease.complete(product) {
+                    return (drained, Some(format!("{error:?}")));
+                }
+                if let Err(error) = pending.try_finish_and_respond() {
+                    return (drained, Some(format!("{error:?}")));
+                }
+                continue;
+            };
+
+            let plan = match native_runner::egui_events_for_native_physical_operation(
+                operation, raw_input,
+            ) {
+                Ok(plan) => plan,
+                Err(unsupported) => {
+                    let product = DebugReplyProduct::Error(DebugFailure {
+                        code: unsupported.code.to_string(),
+                        message: unsupported.message.to_string(),
+                        dispatch_evidence: None,
+                    });
+                    if let Err(error) = lease.complete(product) {
+                        return (drained, Some(format!("{error:?}")));
+                    }
+                    if let Err(error) = pending.try_finish_and_respond() {
+                        return (drained, Some(format!("{error:?}")));
+                    }
+                    continue;
+                }
+            };
+
+            match plan {
+                native_runner::NativePhysicalControlPlan::RawInputEvents(events) => {
+                    if events.is_empty() {
+                        let product = DebugReplyProduct::Error(DebugFailure {
+                            code: "native-physical-control-empty-events".to_string(),
+                            message: "egui native physical conversion produced no RawInput events"
+                                .to_string(),
+                            dispatch_evidence: None,
+                        });
+                        if let Err(error) = lease.complete(product) {
+                            return (drained, Some(format!("{error:?}")));
+                        }
+                        if let Err(error) = pending.try_finish_and_respond() {
+                            return (drained, Some(format!("{error:?}")));
+                        }
+                        continue;
+                    }
+                    raw_input.events.extend(events);
+                }
+                native_runner::NativePhysicalControlPlan::BackendNativeMutation => {}
+            }
+
+            self.pending_native_physical =
+                Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace { pending, lease });
+            break;
+        }
+
+        (drained, None)
+    }
+
+    pub fn handle_backend_presented_physical_control(
+        &mut self,
+        command: DebugCommand,
+        backend_input: BackendInputEvent,
+    ) -> DebugReplyProduct {
+        self.runtime
+            .handle_backend_presented_physical_control_with_app_reducer(
+                command,
+                backend_input,
+                &mut self.on_messages,
+            )
+    }
+
+    pub fn sense(mut self, sense: egui::Sense) -> Self {
+        self.sense = sense;
+        self
+    }
+
+    fn render_ui(&mut self, ui: &mut egui::Ui) {
+        fill_egui_host_background(ui);
+        let mut messages = Vec::new();
+        let mut backend_traces = Vec::new();
+        let mut presented_viewport = None;
+        let sense = self.sense;
+        let revision_before = self.runtime.last_frame_identity().revision;
+        let native_physical_operation = self.pending_native_physical_operation().cloned();
+
+        self.runtime
+            .with_widget_state_mut(|widget, external, local| {
+                ui.add(
+                    SlipwayEguiWidget::new(
+                        widget,
+                        external,
+                        local,
+                        &mut self.bridge,
+                        &mut messages,
+                    )
+                    .sense(sense)
+                    .record_backend_traces(&mut backend_traces)
+                    .record_presented_viewport(&mut presented_viewport)
+                    .native_physical_operation(native_physical_operation.as_ref()),
+                );
+            });
+        if let Some(viewport) = presented_viewport {
+            self.runtime.record_presented_viewport(viewport);
+        }
+
+        self.runtime
+            .apply_app_messages(messages, &mut self.on_messages);
+        let revision_after = self.runtime.last_frame_identity().revision;
+
+        for mut trace in backend_traces {
+            trace.revision_before = trace.revision_before.or(Some(revision_before));
+            trace.revision_after = trace.revision_after.or(Some(revision_after));
+            self.try_complete_pending_native_physical(&trace);
+            self.runtime.record_backend_input_trace(trace);
+        }
+        self.fail_unmatched_pending_native_physical();
+    }
+
+    fn ensure_mcp_wake_forwarder(&mut self, ctx: &egui::Context) {
+        if self.egui_mcp_wake_rx.is_some() {
+            return;
+        }
+
+        let Some(transport) = &self.debug_mcp_transport else {
+            return;
+        };
+
+        let wake_rx = transport.wake_receiver();
+        let ctx = ctx.clone();
+        let (wake_tx, wake_rx_for_app) = mpsc::sync_channel(1);
+        let spawn_result = thread::Builder::new()
+            .name("slipway-egui-mcp-wake".to_string())
+            .spawn(move || {
+                while wake_rx.recv() {
+                    let _ = wake_tx.try_send(());
+                    ctx.request_repaint();
+                }
+            });
+
+        if spawn_result.is_ok() {
+            self.egui_mcp_wake_rx = Some(wake_rx_for_app);
+        }
+    }
+
+    fn drain_egui_mcp_wakes(&mut self) -> usize {
+        let Some(wake_rx) = &self.egui_mcp_wake_rx else {
+            return 0;
+        };
+
+        let mut drained = 0;
+        while wake_rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        drained
+    }
+
+    fn try_complete_pending_native_physical(&mut self, trace: &BackendInputTrace) {
+        let Some(pending_state) = self.pending_native_physical.take() else {
+            return;
+        };
+        let PendingEguiNativePhysicalControl::WaitingForBackendTrace { pending, lease } =
+            pending_state
+        else {
+            self.pending_native_physical = Some(pending_state);
+            return;
+        };
+
+        let product = self
+            .runtime
+            .backend_presented_physical_control_product_from_trace(lease.command().clone(), trace);
+        if matches!(product, DebugReplyProduct::Error(_)) {
+            self.pending_native_physical =
+                Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace { pending, lease });
+            return;
+        }
+
+        let _ = lease.complete(product);
+        let _ = pending.try_finish_and_respond();
+    }
+
+    fn fail_unmatched_pending_native_physical(&mut self) {
+        let Some(pending_state) = self.pending_native_physical.take() else {
+            return;
+        };
+        let PendingEguiNativePhysicalControl::WaitingForBackendTrace { pending, lease } =
+            pending_state
+        else {
+            self.pending_native_physical = Some(pending_state);
+            return;
+        };
+
+        let product = DebugReplyProduct::Error(DebugFailure {
+            code: "native-physical-control-no-backend-trace".to_string(),
+            message: "egui RawInput received the requested physical operation, but the visible backend produced no matching backend-presented trace in this frame".to_string(),
+            dispatch_evidence: None,
+        });
+        let _ = lease.complete(product);
+        let _ = pending.try_finish_and_respond();
+    }
+
+    fn pending_native_physical_operation(&self) -> Option<&DebugPhysicalControl> {
+        let Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace { lease, .. }) =
+            self.pending_native_physical.as_ref()
+        else {
+            return None;
+        };
+        let DebugCommandKind::PhysicalControl { operation, .. } = &lease.command().kind else {
+            return None;
+        };
+        Some(operation)
+    }
+}
+
+impl<W, B, F> eframe::App for SlipwayEguiRuntimeApp<W, B, F>
+where
+    W: SlipwayEguiBackendWidget + 'static,
+    W::ExternalState: 'static,
+    W::LocalState: Clone + 'static,
+    W::AppMessage: 'static,
+    B: EguiSlipwayBridge<W> + 'static,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>) + 'static,
+{
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ensure_mcp_wake_forwarder(ctx);
+        if self.drain_egui_mcp_wakes() > 0 {
+            ctx.request_repaint();
+        }
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let (drained, error) = self.inject_pending_native_physical_into_raw_input(raw_input);
+        if drained > 0 || error.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render_ui(ui);
+    }
+}
+
+fn fill_egui_host_background(ui: &mut egui::Ui) {
+    ui.painter()
+        .rect_filled(ui.max_rect(), 0.0, ui.visuals().panel_fill);
+}
+
+pub fn run_slipway_egui_runtime_app<W, B, F>(
+    title: impl Into<String>,
+    runtime: SlipwayRuntime<W>,
+    bridge: B,
+    on_messages: F,
+) -> eframe::Result<()>
+where
+    W: SlipwayEguiBackendWidget + 'static,
+    W::ExternalState: 'static,
+    W::LocalState: Clone + 'static,
+    W::AppMessage: 'static,
+    B: EguiSlipwayBridge<W> + 'static,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>) + 'static,
+{
+    let title = title.into();
+    let debug_mcp_transport = runtime
+        .start_debug_mcp_transport()
+        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
+    let title = format!("{title} (MCP {})", debug_mcp_transport.local_addr());
+    let app = SlipwayEguiRuntimeApp::new(runtime, bridge, on_messages)
+        .with_debug_mcp_transport(debug_mcp_transport);
+
+    native_runner::run_slipway_egui_runtime_app_native(&title, app)
+}
+
+pub fn run_slipway_egui_runtime_app_with_default_bridge<W, F>(
+    title: impl Into<String>,
+    runtime: SlipwayRuntime<W>,
+    on_messages: F,
+) -> eframe::Result<()>
+where
+    W: SlipwayEguiBackendWidget + 'static,
+    W::ExternalState: 'static,
+    W::LocalState: Clone + 'static,
+    W::AppMessage: 'static,
+    F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>) + 'static,
+{
+    run_slipway_egui_runtime_app(title, runtime, DefaultEguiBridge::new(), on_messages)
+}
+
+fn backend_profile_admission(
+    backend_id: &str,
+    report: &BackendCapabilityReport,
+    required_profiles: &[CapabilityProfileKind],
+) -> BackendParityAdmission {
+    let mut visible_requirements = Vec::new();
+    for profile in required_profiles {
+        for capability in profile_visible_requirements(profile) {
+            push_view_requirement(
+                &mut visible_requirements,
+                &format!("profile::{profile:?}::{capability:?}"),
+                None,
+                capability,
+            );
+        }
+    }
+
+    let unsupported = visible_requirements
+        .iter()
+        .filter(|requirement| requirement.required)
+        .filter(|requirement| {
+            !report
+                .visible_capabilities
+                .iter()
+                .any(|capability| capability == &requirement.capability)
+        })
+        .map(|requirement| UnsupportedCapabilityEvidence {
+            backend_id: backend_id.to_string(),
+            target: requirement.target.clone(),
+            capability: Capability::BackendCapabilityNegotiation,
+            visible_capability: Some(requirement.capability.clone()),
+            requirement_id: Some(requirement.requirement_id.clone()),
+            reason: "required visible backend capability is not declared".to_string(),
+            source: EvidenceSource::backend_presented(backend_id, "profile-admission"),
+            diagnostics: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+
+    BackendParityAdmission {
+        backend_id: backend_id.to_string(),
+        accepted: unsupported.is_empty(),
+        required_profiles: required_profiles.to_vec(),
+        visible_requirements,
+        unsupported,
+        source: EvidenceSource::backend_presented(backend_id, "profile-admission"),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn profile_visible_requirements(profile: &CapabilityProfileKind) -> Vec<BackendVisibleCapability> {
+    match profile {
+        CapabilityProfileKind::TextInput => vec![
+            BackendVisibleCapability::FocusRegions,
+            BackendVisibleCapability::TextEditRegions,
+            BackendVisibleCapability::FontInstallation,
+        ],
+        CapabilityProfileKind::ScrollableContainer => vec![BackendVisibleCapability::ScrollRegions],
+        CapabilityProfileKind::ProviderSurface => vec![egui_provider_surface_visible_capability()],
+        CapabilityProfileKind::BackendAdapter => vec![
+            BackendVisibleCapability::HitRegions,
+            BackendVisibleCapability::Cursor,
+            BackendVisibleCapability::FocusRegions,
+            BackendVisibleCapability::TextEditRegions,
+            BackendVisibleCapability::ScrollRegions,
+            BackendVisibleCapability::ShapePathClip,
+            BackendVisibleCapability::FontInstallation,
+            BackendVisibleCapability::BackendPresentedEvidence,
+            egui_provider_surface_visible_capability(),
+        ],
+        other => vec![BackendVisibleCapability::Custom(format!("{other:?}"))],
+    }
+}
+
+fn egui_provider_surface_visible_capability() -> BackendVisibleCapability {
+    BackendVisibleCapability::Custom(EGUI_PROVIDER_SURFACE_REQUIREMENT.to_string())
+}
+
+fn push_view_requirement(
+    requirements: &mut Vec<BackendVisibleCapabilityRequirement>,
+    id: impl Into<String>,
+    target: Option<WidgetId>,
+    capability: BackendVisibleCapability,
+) {
+    let requirement_id = id.into();
+    if requirements.iter().any(|requirement| {
+        requirement.requirement_id == requirement_id
+            && requirement.target == target
+            && requirement.capability == capability
+    }) {
+        return;
+    }
+
+    requirements.push(BackendVisibleCapabilityRequirement {
+        requirement_id,
+        target,
+        capability,
+        required: true,
+    });
+}
+
+fn unsupported_egui_visible_paint_diagnostics(
+    target: &WidgetId,
+    ops: &[PaintOp],
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    collect_unsupported_egui_visible_paint(target, ops, &mut diagnostics);
+    diagnostics
+}
+
+fn collect_unsupported_egui_visible_paint(
+    target: &WidgetId,
+    ops: &[PaintOp],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for op in ops {
+        match op {
+            PaintOp::Fill { shape, .. } | PaintOp::Stroke { shape, .. } => {
+                if shape.clip.as_ref().is_some_and(|clip| clip.path.is_some()) {
+                    diagnostics.push(Diagnostic::unsupported(
+                        Some(target.clone()),
+                        "egui.visible_paint.unsupported_shape_clip_path",
+                        "egui visible renderer supports rectangular shape clips only in this backend build",
+                    ));
+                }
+            }
+            PaintOp::Group { clip, ops, .. } => {
+                if clip.as_ref().is_some_and(|clip| clip.path.is_some()) {
+                    diagnostics.push(Diagnostic::unsupported(
+                        Some(target.clone()),
+                        "egui.visible_paint.unsupported_group_clip_path",
+                        "egui visible renderer supports rectangular group clips only in this backend build",
+                    ));
+                }
+                collect_unsupported_egui_visible_paint(target, ops, diagnostics);
+            }
+            PaintOp::Text { .. } => {}
+        }
+    }
+}
+
+fn view_requires_font_installation(view: &ViewDefinition) -> bool {
+    view.paint.iter().any(paint_op_requires_font_installation)
+        || view.focus_regions.iter().any(|focus| {
+            focus.text_edit.as_ref().is_some_and(|text_edit| {
+                text_font_installation_required(&text_edit.buffer.text, &TextStyle::default())
+            })
+        })
+}
+
+fn paint_op_requires_font_installation(op: &PaintOp) -> bool {
+    match op {
+        PaintOp::Text { content, style, .. } => text_font_installation_required(content, style),
+        PaintOp::Group { ops, .. } => ops.iter().any(paint_op_requires_font_installation),
+        PaintOp::Fill { .. } | PaintOp::Stroke { .. } => false,
+    }
+}
+
+fn text_font_installation_required(content: &str, style: &TextStyle) -> bool {
+    text_style_requires_font_installation(style) || text_requires_cjk_font_evidence(content)
+}
+
+fn text_style_requires_font_installation(style: &TextStyle) -> bool {
+    !matches!(
+        style.font_family.trim().to_ascii_lowercase().as_str(),
+        "" | "system-ui" | "sans-serif" | "serif" | "monospace"
+    )
+}
+
+fn text_requires_cjk_font_evidence(content: &str) -> bool {
+    content.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x1100..=0x11FF
+                | 0x2E80..=0x2EFF
+                | 0x2F00..=0x2FDF
+                | 0x3040..=0x30FF
+                | 0x3130..=0x318F
+                | 0x31F0..=0x31FF
+                | 0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xAC00..=0xD7AF
+                | 0xF900..=0xFAFF
+        )
+    })
+}
+
+fn paint_op_uses_shape_path_or_clip(op: &PaintOp) -> bool {
+    match op {
+        PaintOp::Fill { shape, .. } | PaintOp::Stroke { shape, .. } => {
+            shape.path.is_some() || shape.clip.is_some()
+        }
+        PaintOp::Group { clip, ops, .. } => {
+            clip.is_some() || ops.iter().any(paint_op_uses_shape_path_or_clip)
+        }
+        PaintOp::Text { .. } => false,
+    }
+}
+
+fn egui_position(position: egui::Pos2, origin: egui::Pos2) -> Point {
+    Point {
+        x: position.x - origin.x,
+        y: position.y - origin.y,
+    }
+}
+
+fn egui_frame_identity(ui: &egui::Ui, widget_id: &WidgetId, viewport: Rect) -> FrameIdentity {
+    FrameIdentity {
+        surface_id: "slipway-egui".to_string(),
+        surface_instance_id: widget_id.as_str().to_string(),
+        revision: ui.ctx().cumulative_pass_nr(),
+        frame_index: ui.ctx().cumulative_frame_nr(),
+        viewport,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EguiAuthoredChildSlot {
+    child: WidgetId,
+    slot: WidgetSlotAddress,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EguiChildAssembly {
+    regions: Vec<EguiPresentedRegion>,
+    presented_views: Vec<ViewDefinition>,
+    refused_admissions: Vec<BackendParityAdmission>,
+    presented_slots: Vec<WidgetSlotAddress>,
+    input_events: Vec<BackendInputEvent>,
+    state: Vec<StateObservation>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl EguiChildAssembly {
+    fn extend(&mut self, other: EguiChildAssembly) {
+        self.regions.extend(other.regions);
+        self.presented_views.extend(other.presented_views);
+        self.refused_admissions.extend(other.refused_admissions);
+        self.presented_slots.extend(other.presented_slots);
+        self.input_events.extend(other.input_events);
+        self.state.extend(other.state);
+        self.diagnostics.extend(other.diagnostics);
+    }
+}
+
+fn egui_backend_input_validation_view<'a>(
+    root_view: &'a ViewDefinition,
+    presented_views: &'a [ViewDefinition],
+    input: &BackendInputEvent,
+) -> &'a ViewDefinition {
+    let Some(evidence) = input.dispatch_evidence.as_ref() else {
+        return root_view;
+    };
+    if evidence.frame == root_view.frame {
+        return root_view;
+    }
+    presented_views
+        .iter()
+        .find(|view| view.frame == evidence.frame)
+        .unwrap_or(root_view)
+}
+
+#[derive(Clone, Debug, Default)]
+struct EguiScrollAllocation {
+    region: Option<EguiPresentedRegion>,
+    child_assembly: EguiChildAssembly,
+}
+
+struct EguiAuthoredChildSlotCollector {
+    slots: Vec<EguiAuthoredChildSlot>,
+}
+
+impl<ExternalState, AppMessage> SlipwayEguiWidgetListVisitor<ExternalState, AppMessage>
+    for EguiAuthoredChildSlotCollector
+{
+    fn visit_egui_child<C>(
+        &mut self,
+        widget: &C,
+        _external: &ExternalState,
+        _local: &C::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        C: SlipwayEguiBackendChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+        self.slots.push(EguiAuthoredChildSlot {
+            child: widget.id(),
+            slot,
+        });
+    }
+
+    fn visit_egui_native_child<N>(
+        &mut self,
+        widget: &N,
+        _external: &ExternalState,
+        _local: &N::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        N: SlipwayEguiNativeChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+        self.slots.push(EguiAuthoredChildSlot {
+            child: widget.id(),
+            slot,
+        });
+    }
+}
+
+fn authored_child_slots<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+) -> Vec<EguiAuthoredChildSlot>
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let mut collector = EguiAuthoredChildSlotCollector { slots: Vec::new() };
+    widget.visit_egui_authored_children(external, local, &mut collector);
+    collector.slots
+}
+
+struct EguiAuthoredChildPresenter<'a> {
+    ui: &'a mut egui::Ui,
+    parent_view: &'a ViewDefinition,
+    view_origin: egui::Pos2,
+    skipped_slots: &'a [WidgetSlotAddress],
+    parent_geometry_index: &'a PresentationGeometryIndex,
+    scroll: Option<&'a ScrollRegionDeclaration>,
+    native_physical_operation: Option<&'a DebugPhysicalControl>,
+    output: EguiChildAssembly,
+}
+
+impl<ExternalState, AppMessage> SlipwayEguiWidgetListVisitor<ExternalState, AppMessage>
+    for EguiAuthoredChildPresenter<'_>
+{
+    fn visit_egui_child<C>(
+        &mut self,
+        widget: &C,
+        external: &ExternalState,
+        local: &C::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        C: SlipwayEguiBackendChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+        if self.skipped_slots.iter().any(|skipped| skipped == &slot) {
+            return;
+        }
+
+        let Some(placement) = self
+            .parent_view
+            .layout
+            .child_placements
+            .iter()
+            .find(|placement| child_placement_matches_slot(placement, &widget.id(), &slot))
+        else {
+            self.output
+                .refused_admissions
+                .push(child_without_placement_refusal(widget.id(), &slot, false));
+            return;
+        };
+
+        if let Some(scroll) = self.scroll {
+            if !scroll_contains_placement_with_geometry_index(
+                self.parent_geometry_index,
+                scroll,
+                placement,
+            ) {
+                return;
+            }
+        }
+
+        present_egui_child(
+            self.ui,
+            widget,
+            external,
+            local,
+            placement.clone(),
+            slot,
+            self.view_origin,
+            &mut self.output,
+            self.native_physical_operation,
+        );
+    }
+
+    fn visit_egui_native_child<N>(
+        &mut self,
+        widget: &N,
+        external: &ExternalState,
+        local: &N::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        N: SlipwayEguiNativeChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+        if self.skipped_slots.iter().any(|skipped| skipped == &slot) {
+            return;
+        }
+
+        let Some(placement) = self
+            .parent_view
+            .layout
+            .child_placements
+            .iter()
+            .find(|placement| child_placement_matches_slot(placement, &widget.id(), &slot))
+        else {
+            self.output
+                .refused_admissions
+                .push(child_without_placement_refusal(widget.id(), &slot, true));
+            return;
+        };
+
+        if let Some(scroll) = self.scroll {
+            if !scroll_contains_placement_with_geometry_index(
+                self.parent_geometry_index,
+                scroll,
+                placement,
+            ) {
+                return;
+            }
+        }
+
+        present_egui_native_child(
+            self.ui,
+            widget,
+            external,
+            local,
+            placement.clone(),
+            slot,
+            self.view_origin,
+            &mut self.output,
+        );
+    }
+}
+
+fn present_authored_children<W>(
+    ui: &mut egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    parent_view: &ViewDefinition,
+    parent_geometry_index: &PresentationGeometryIndex,
+    view_origin: egui::Pos2,
+    skipped_slots: &[WidgetSlotAddress],
+    scroll: Option<&ScrollRegionDeclaration>,
+    native_physical_operation: Option<&DebugPhysicalControl>,
+) -> EguiChildAssembly
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let mut presenter = EguiAuthoredChildPresenter {
+        ui,
+        parent_view,
+        parent_geometry_index,
+        view_origin,
+        skipped_slots,
+        scroll,
+        native_physical_operation,
+        output: EguiChildAssembly::default(),
+    };
+    widget.visit_egui_authored_children_in_paint_order(
+        external,
+        local,
+        parent_view,
+        &mut presenter,
+    );
+    presenter.output
+}
+
+fn present_egui_child<W>(
+    ui: &mut egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    placement: ChildPlacement,
+    slot: WidgetSlotAddress,
+    view_origin: egui::Pos2,
+    output: &mut EguiChildAssembly,
+    native_physical_operation: Option<&DebugPhysicalControl>,
+) where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let layout_input = child_layout_input(placement.bounds.into_rect());
+    let frame = egui_frame_identity(ui, &widget.id(), layout_input.viewport.into_rect());
+    let view = widget.visible_backend_view_definition(
+        external,
+        local,
+        ViewDefinitionInput {
+            frame,
+            layout_input,
+        },
+    );
+    let view = mount_presented_child_view_addresses(view, &slot);
+    let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+    let child_rect = egui_rect(view_origin, placement.bounds.into_rect());
+    let region_id =
+        PresentationRegionId::from(format!("egui-child-response:{}", widget_slot_key(&slot)));
+    let response = apply_region_cursor(
+        ui.interact(
+            child_rect,
+            egui_region_id(
+                EguiPresentedRegionKind::Hit,
+                &region_id,
+                &widget.id(),
+                Some(&slot),
+            ),
+            egui::Sense::click(),
+        ),
+        CursorCapability::Default,
+    );
+
+    let capabilities = widget.capabilities();
+    let admission =
+        egui_backend_admission().admit_view_definition_with_capabilities(&capabilities, &view);
+    if !admission.accepted {
+        output.refused_admissions.push(admission);
+        return;
+    }
+
+    output
+        .refused_admissions
+        .extend(font_policy_unavailable_admissions_for_view(&view));
+    output.presented_views.push(view.clone());
+    output.presented_slots.push(slot.clone());
+    output.regions.push(child_response_region(
+        widget.id(),
+        slot,
+        placement.bounds.into_rect(),
+        response.clone(),
+    ));
+
+    if ui.is_rect_visible(child_rect) {
+        let painter = ui.painter_at(child_rect);
+        for op in &view.paint {
+            paint_op(&painter, child_rect.min, op);
+        }
+    }
+
+    let child_slots = authored_child_slots(widget, external, local);
+    let mut nested_assembly = EguiChildAssembly::default();
+    let nested_regions = allocate_presentation_regions_without_font_policy(
+        ui,
+        widget,
+        external,
+        local,
+        child_rect.min,
+        &view,
+        &geometry_index,
+        &child_slots,
+        &mut nested_assembly,
+        native_physical_operation,
+    );
+    output.regions.extend(nested_regions);
+    let skipped_slots = nested_assembly.presented_slots.clone();
+    nested_assembly.extend(present_authored_children(
+        ui,
+        widget,
+        external,
+        local,
+        &view,
+        &geometry_index,
+        child_rect.min,
+        &skipped_slots,
+        None,
+        native_physical_operation,
+    ));
+    output.extend(nested_assembly);
+}
+
+fn present_egui_native_child<N>(
+    ui: &mut egui::Ui,
+    widget: &N,
+    external: &N::ExternalState,
+    local: &N::LocalState,
+    placement: ChildPlacement,
+    slot: WidgetSlotAddress,
+    view_origin: egui::Pos2,
+    output: &mut EguiChildAssembly,
+) where
+    N: SlipwayEguiNativeChildWidget,
+{
+    let layout_input = child_layout_input(placement.bounds.into_rect());
+    let frame = egui_frame_identity(ui, &widget.id(), layout_input.viewport.into_rect());
+    let view = widget.visible_backend_view_definition(
+        external,
+        local,
+        ViewDefinitionInput {
+            frame: frame.clone(),
+            layout_input,
+        },
+    );
+    let view = mount_presented_child_view_addresses(view, &slot);
+    let child_rect = egui_rect(view_origin, placement.bounds.into_rect());
+
+    let capabilities = widget.capabilities();
+    let admission =
+        egui_backend_admission().admit_view_definition_with_capabilities(&capabilities, &view);
+    if !admission.accepted {
+        output.refused_admissions.push(admission);
+        return;
+    }
+
+    output.presented_views.push(view);
+    output.presented_slots.push(slot.clone());
+    let native_output = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .id_salt(("slipway-native-child", widget_slot_key(&slot)))
+                .max_rect(child_rect),
+            |ui| {
+                widget.egui_native_ui(
+                    ui,
+                    external,
+                    local,
+                    EguiNativeWidgetContext {
+                        slot: &slot,
+                        frame: &frame,
+                        placement,
+                        rect: child_rect,
+                    },
+                )
+            },
+        )
+        .inner;
+
+    if native_output.request_repaint {
+        ui.ctx().request_repaint();
+    }
+    output.input_events.extend(native_output.input_events);
+    output.state.extend(native_output.state);
+    output.diagnostics.extend(native_output.diagnostics);
+}
+
+fn allocate_presentation_regions<W>(
+    ui: &mut egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    view_origin: egui::Pos2,
+    view: &ViewDefinition,
+    geometry_index: &PresentationGeometryIndex,
+    child_slots: &[EguiAuthoredChildSlot],
+    child_assembly: &mut EguiChildAssembly,
+    native_physical_operation: Option<&DebugPhysicalControl>,
+) -> Vec<EguiPresentedRegion>
+where
+    W: SlipwayEguiBackendWidget,
+{
+    let mut regions = Vec::new();
+    for scroll in &view.scroll_regions {
+        if region_belongs_to_authored_child(&scroll.target, scroll.address.as_ref(), child_slots) {
+            continue;
+        }
+
+        let scroll_allocation = allocate_scroll_region_with_skips(
+            ui,
+            widget,
+            external,
+            local,
+            view_origin,
+            view,
+            geometry_index,
+            scroll,
+            &child_assembly.presented_slots,
+            native_physical_operation,
+        );
+        if let Some(region) = scroll_allocation.region {
+            regions.push(region);
+        }
+        child_assembly.extend(scroll_allocation.child_assembly);
+    }
+
+    for focus in &view.focus_regions {
+        if region_belongs_to_authored_child(&focus.target, focus.address.as_ref(), child_slots) {
+            continue;
+        }
+
+        if let Some(text_edit) = &focus.text_edit {
+            let (region, font_admissions) = allocate_text_edit_region(
+                ui,
+                widget,
+                external,
+                local,
+                view_origin,
+                view,
+                geometry_index,
+                focus,
+                text_edit,
+            );
+            child_assembly.refused_admissions.extend(font_admissions);
+            regions.push(region);
+        } else {
+            regions.push(allocate_focus_region(
+                ui,
+                view_origin,
+                view,
+                geometry_index,
+                focus,
+            ));
+        }
+    }
+
+    let mut hit_regions = view.hit_regions.iter().collect::<Vec<_>>();
+    hit_regions.sort_by_key(|region| {
+        (
+            region.order.z_index,
+            region.order.paint_order,
+            region.order.traversal_order,
+        )
+    });
+    for hit in hit_regions {
+        if region_belongs_to_authored_child(&hit.target, hit.address.as_ref(), child_slots) {
+            continue;
+        }
+
+        regions.push(allocate_hit_region(
+            ui,
+            view_origin,
+            view,
+            geometry_index,
+            hit,
+        ));
+    }
+
+    regions
+}
+
+fn allocate_presentation_regions_without_font_policy<W>(
+    ui: &mut egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    view_origin: egui::Pos2,
+    view: &ViewDefinition,
+    geometry_index: &PresentationGeometryIndex,
+    child_slots: &[EguiAuthoredChildSlot],
+    child_assembly: &mut EguiChildAssembly,
+    native_physical_operation: Option<&DebugPhysicalControl>,
+) -> Vec<EguiPresentedRegion>
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let mut regions = Vec::new();
+    for scroll in &view.scroll_regions {
+        if region_belongs_to_authored_child(&scroll.target, scroll.address.as_ref(), child_slots) {
+            continue;
+        }
+
+        let scroll_allocation = allocate_scroll_region_with_skips(
+            ui,
+            widget,
+            external,
+            local,
+            view_origin,
+            view,
+            geometry_index,
+            scroll,
+            &child_assembly.presented_slots,
+            native_physical_operation,
+        );
+        if let Some(region) = scroll_allocation.region {
+            regions.push(region);
+        }
+        child_assembly.extend(scroll_allocation.child_assembly);
+    }
+
+    for focus in &view.focus_regions {
+        if region_belongs_to_authored_child(&focus.target, focus.address.as_ref(), child_slots) {
+            continue;
+        }
+
+        if let Some(text_edit) = &focus.text_edit {
+            regions.push(allocate_text_edit_region_without_font_policy(
+                ui,
+                view_origin,
+                view,
+                geometry_index,
+                focus,
+                text_edit,
+            ));
+        } else {
+            regions.push(allocate_focus_region(
+                ui,
+                view_origin,
+                view,
+                geometry_index,
+                focus,
+            ));
+        }
+    }
+
+    let mut hit_regions = view.hit_regions.iter().collect::<Vec<_>>();
+    hit_regions.sort_by_key(|region| {
+        (
+            region.order.z_index,
+            region.order.paint_order,
+            region.order.traversal_order,
+        )
+    });
+    for hit in hit_regions {
+        if region_belongs_to_authored_child(&hit.target, hit.address.as_ref(), child_slots) {
+            continue;
+        }
+
+        regions.push(allocate_hit_region(
+            ui,
+            view_origin,
+            view,
+            geometry_index,
+            hit,
+        ));
+    }
+
+    regions
+}
+
+fn allocate_hit_region(
+    ui: &mut egui::Ui,
+    view_origin: egui::Pos2,
+    _view: &ViewDefinition,
+    geometry_index: &PresentationGeometryIndex,
+    hit: &HitRegionDeclaration,
+) -> EguiPresentedRegion {
+    let id = egui_region_id(
+        EguiPresentedRegionKind::Hit,
+        &hit.id,
+        &hit.target,
+        hit.address.as_ref(),
+    );
+    let target_rect = slipway_core::declared_target_rect_for_region_address_with_geometry_index(
+        geometry_index,
+        &hit.target,
+        hit.address.as_ref(),
+    );
+    let target_origin = egui_point(view_origin, target_rect.origin);
+    let target_bounds = target_local_bounds(target_rect);
+    let rect = egui_rect(target_origin, hit.bounds.into_rect());
+    let sense = if hit.enabled {
+        egui_sense_for_hit(hit)
+    } else {
+        egui::Sense::hover()
+    };
+    let response = apply_region_cursor(ui.interact(rect, id, sense), hit.cursor.clone());
+
+    EguiPresentedRegion {
+        kind: EguiPresentedRegionKind::Hit,
+        region_id: hit.id.clone(),
+        target: hit.target.clone(),
+        address: hit.address.clone(),
+        event_target: hit
+            .route
+            .path
+            .last()
+            .cloned()
+            .unwrap_or_else(|| hit.target.clone()),
+        event_target_slot: hit.route.address.clone().or_else(|| hit.address.clone()),
+        declared_bounds: hit.bounds.into_rect(),
+        target_origin,
+        target_bounds,
+        event_coordinate_space: hit.event_coordinate_space,
+        response,
+        cursor: hit.cursor.clone(),
+        enabled: hit.enabled,
+        text_edit_change: None,
+        scroll_state: None,
+    }
+}
+
+fn allocate_focus_region(
+    ui: &mut egui::Ui,
+    view_origin: egui::Pos2,
+    _view: &ViewDefinition,
+    geometry_index: &PresentationGeometryIndex,
+    focus: &FocusRegionDeclaration,
+) -> EguiPresentedRegion {
+    let id = egui_region_id(
+        EguiPresentedRegionKind::Focus,
+        &focus.id,
+        &focus.target,
+        focus.address.as_ref(),
+    );
+    let target_rect = slipway_core::declared_target_rect_for_region_address_with_geometry_index(
+        geometry_index,
+        &focus.target,
+        focus.address.as_ref(),
+    );
+    let target_origin = egui_point(view_origin, target_rect.origin);
+    let target_bounds = target_local_bounds(target_rect);
+    let rect = egui_rect(target_origin, focus.bounds.into_rect());
+    let sense = if focus.enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let response = apply_region_cursor(ui.interact(rect, id, sense), CursorCapability::Default);
+
+    EguiPresentedRegion {
+        kind: EguiPresentedRegionKind::Focus,
+        region_id: focus.id.clone(),
+        target: focus.target.clone(),
+        address: focus.address.clone(),
+        event_target: focus.target.clone(),
+        event_target_slot: focus.address.clone(),
+        declared_bounds: focus.bounds.into_rect(),
+        target_origin,
+        target_bounds,
+        event_coordinate_space: PointerEventCoordinateSpace::TargetLocal,
+        response,
+        cursor: CursorCapability::Default,
+        enabled: focus.enabled,
+        text_edit_change: None,
+        scroll_state: None,
+    }
+}
+
+fn allocate_text_edit_region<W>(
+    ui: &mut egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    view_origin: egui::Pos2,
+    view: &ViewDefinition,
+    geometry_index: &PresentationGeometryIndex,
+    focus: &FocusRegionDeclaration,
+    text_edit: &TextEditRegionDeclaration,
+) -> (EguiPresentedRegion, Vec<BackendParityAdmission>)
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let font_admissions = install_text_edit_font(ui, widget, external, local, focus, text_edit);
+    (
+        allocate_text_edit_region_without_font_policy(
+            ui,
+            view_origin,
+            view,
+            geometry_index,
+            focus,
+            text_edit,
+        ),
+        font_admissions,
+    )
+}
+
+fn allocate_text_edit_region_without_font_policy(
+    ui: &mut egui::Ui,
+    view_origin: egui::Pos2,
+    _view: &ViewDefinition,
+    geometry_index: &PresentationGeometryIndex,
+    focus: &FocusRegionDeclaration,
+    text_edit: &TextEditRegionDeclaration,
+) -> EguiPresentedRegion {
+    let id = egui_region_id(
+        EguiPresentedRegionKind::TextEdit,
+        &focus.id,
+        &focus.target,
+        focus.address.as_ref(),
+    );
+    let target_rect = slipway_core::declared_target_rect_for_region_address_with_geometry_index(
+        geometry_index,
+        &focus.target,
+        focus.address.as_ref(),
+    );
+    let target_origin = egui_point(view_origin, target_rect.origin);
+    let target_bounds = target_local_bounds(target_rect);
+    let rect = egui_rect(target_origin, focus.bounds.into_rect());
+    let editable = focus.enabled && text_edit.selection.editable;
+    let mut text = text_edit.buffer.text.clone();
+    let before = text.clone();
+    let text_widget = if matches!(text_edit.line_mode, slipway_core::TextLineMode::MultiLine) {
+        egui::TextEdit::multiline(&mut text)
+            .desired_width(rect.width())
+            .interactive(editable)
+    } else {
+        egui::TextEdit::singleline(&mut text)
+            .desired_width(rect.width())
+            .interactive(editable)
+    };
+    let response = apply_region_cursor(ui.put(rect, text_widget.id(id)), CursorCapability::Text);
+    let text_edit_change = if response.changed() && before != text {
+        Some(EguiTextEditChange {
+            before,
+            after: text,
+            selection_before: text_edit.selection.selection.clone(),
+            selection_after: None,
+        })
+    } else {
+        None
+    };
+
+    EguiPresentedRegion {
+        kind: EguiPresentedRegionKind::TextEdit,
+        region_id: focus.id.clone(),
+        target: focus.target.clone(),
+        address: focus.address.clone(),
+        event_target: focus.target.clone(),
+        event_target_slot: focus.address.clone(),
+        declared_bounds: focus.bounds.into_rect(),
+        target_origin,
+        target_bounds,
+        event_coordinate_space: PointerEventCoordinateSpace::TargetLocal,
+        response,
+        cursor: CursorCapability::Text,
+        enabled: focus.enabled,
+        text_edit_change,
+        scroll_state: None,
+    }
+}
+
+fn allocate_scroll_region_with_skips<W>(
+    ui: &mut egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    view_origin: egui::Pos2,
+    view: &ViewDefinition,
+    geometry_index: &PresentationGeometryIndex,
+    scroll: &ScrollRegionDeclaration,
+    skipped_slots: &[WidgetSlotAddress],
+    native_physical_operation: Option<&DebugPhysicalControl>,
+) -> EguiScrollAllocation
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    if !scroll.enabled {
+        return EguiScrollAllocation::default();
+    }
+
+    let id = egui_region_id(
+        EguiPresentedRegionKind::Scroll,
+        &scroll.id,
+        &scroll.target,
+        scroll.address.as_ref(),
+    );
+    let target_rect = slipway_core::declared_target_rect_for_region_address_with_geometry_index(
+        geometry_index,
+        &scroll.target,
+        scroll.address.as_ref(),
+    );
+    let target_origin = egui_point(view_origin, target_rect.origin);
+    let target_bounds = target_local_bounds(target_rect);
+    let viewport_rect = egui_rect(target_origin, scroll.viewport.into_rect());
+    let response = ui.interact(
+        viewport_rect,
+        id,
+        if scroll.consumption.drag {
+            egui::Sense::drag()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let native_scroll_offset =
+        egui_native_scroll_offset_for_operation(native_physical_operation, geometry_index, scroll);
+    let scroll_offset = native_scroll_offset.unwrap_or(scroll.offset);
+    let mut child_assembly = EguiChildAssembly::default();
+    let output = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .id_salt(("slipway-scroll-scope", scroll.id.as_str()))
+                .max_rect(viewport_rect),
+            |ui| {
+                egui::ScrollArea::new([scroll.axes.horizontal, scroll.axes.vertical])
+                    .id_salt(("slipway-scroll-area", scroll.id.as_str()))
+                    .scroll_offset(egui::vec2(scroll_offset.x, scroll_offset.y))
+                    .scroll_source(egui::containers::scroll_area::ScrollSource {
+                        scroll_bar: true,
+                        drag: if scroll.consumption.drag {
+                            egui::containers::scroll_area::DragScroll::Always
+                        } else {
+                            egui::containers::scroll_area::DragScroll::Never
+                        },
+                        mouse_wheel: scroll.consumption.wheel,
+                    })
+                    .show_viewport(ui, |content_ui, _viewport| {
+                        let content_origin =
+                            scroll_content_origin(content_ui, geometry_index, scroll);
+                        child_assembly.extend(present_authored_children(
+                            content_ui,
+                            widget,
+                            external,
+                            local,
+                            view,
+                            geometry_index,
+                            content_origin,
+                            skipped_slots,
+                            Some(scroll),
+                            native_physical_operation,
+                        ));
+                        if !child_assembly.presented_slots.is_empty() {
+                            content_ui.allocate_space(egui::vec2(
+                                scroll.content_bounds.size.width.max(0.0),
+                                scroll.content_bounds.size.height.max(0.0),
+                            ));
+                        }
+                    })
+            },
+        )
+        .inner;
+
+    if child_assembly.presented_slots.is_empty() {
+        child_assembly
+            .refused_admissions
+            .push(scroll_without_real_child_refusal(scroll));
+    }
+
+    EguiScrollAllocation {
+        region: Some(EguiPresentedRegion {
+            kind: EguiPresentedRegionKind::Scroll,
+            region_id: scroll.id.clone(),
+            target: scroll.target.clone(),
+            address: scroll.address.clone(),
+            event_target: scroll.target.clone(),
+            event_target_slot: scroll.address.clone(),
+            declared_bounds: scroll.viewport.into_rect(),
+            target_origin,
+            target_bounds,
+            event_coordinate_space: PointerEventCoordinateSpace::TargetLocal,
+            response,
+            cursor: CursorCapability::Default,
+            enabled: scroll.enabled,
+            text_edit_change: None,
+            scroll_state: Some(EguiScrollRegionState {
+                declared_offset: scroll.offset,
+                egui_offset: Point {
+                    x: output.state.offset.x,
+                    y: output.state.offset.y,
+                },
+                content_size: Size {
+                    width: output.content_size.x,
+                    height: output.content_size.y,
+                },
+                inner_rect: Rect {
+                    origin: egui_position(output.inner_rect.min, view_origin),
+                    size: Size {
+                        width: output.inner_rect.width(),
+                        height: output.inner_rect.height(),
+                    },
+                },
+            }),
+        }),
+        child_assembly,
+    }
+}
+
+fn child_layout_input(bounds: Rect) -> LayoutInput {
+    let viewport = Rect {
+        origin: Point { x: 0.0, y: 0.0 },
+        size: bounds.size,
+    };
+    LayoutInput {
+        viewport: TargetLocalRect::new(viewport),
+        constraints: LayoutConstraints {
+            min: Size {
+                width: 0.0,
+                height: 0.0,
+            },
+            max: viewport.size,
+        },
+    }
+}
+
+fn child_response_region(
+    target: WidgetId,
+    slot: WidgetSlotAddress,
+    bounds: Rect,
+    response: egui::Response,
+) -> EguiPresentedRegion {
+    EguiPresentedRegion {
+        kind: EguiPresentedRegionKind::Hit,
+        region_id: PresentationRegionId::from(format!(
+            "egui-child-response:{}",
+            widget_slot_key(&slot)
+        )),
+        target: target.clone(),
+        address: Some(slot.clone()),
+        event_target: target,
+        event_target_slot: Some(slot),
+        declared_bounds: bounds,
+        target_origin: response.interact_rect.min,
+        target_bounds: Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: bounds.size,
+        },
+        event_coordinate_space: PointerEventCoordinateSpace::TargetLocal,
+        response,
+        cursor: CursorCapability::Default,
+        enabled: true,
+        text_edit_change: None,
+        scroll_state: None,
+    }
+}
+
+fn mount_presented_child_view_addresses(
+    mut view: ViewDefinition,
+    child_slot: &WidgetSlotAddress,
+) -> ViewDefinition {
+    for region in &mut view.hit_regions {
+        region.address = Some(mount_presented_child_slot(
+            region.address.take(),
+            child_slot,
+        ));
+        region.route.address = Some(mount_presented_child_slot(
+            region.route.address.take(),
+            child_slot,
+        ));
+    }
+
+    for region in &mut view.focus_regions {
+        region.address = Some(mount_presented_child_slot(
+            region.address.take(),
+            child_slot,
+        ));
+    }
+
+    for region in &mut view.scroll_regions {
+        region.address = Some(mount_presented_child_slot(
+            region.address.take(),
+            child_slot,
+        ));
+    }
+
+    view
+}
+
+fn mount_presented_child_slot(
+    slot: Option<WidgetSlotAddress>,
+    child_slot: &WidgetSlotAddress,
+) -> WidgetSlotAddress {
+    let Some(slot) = slot else {
+        return child_slot.clone();
+    };
+
+    if slot.widget == child_slot.widget {
+        return child_slot.clone();
+    }
+
+    let mut path = child_slot.path.clone();
+    let mut suffix = slot.path;
+    if suffix.first() == Some(&child_slot.widget) {
+        suffix.remove(0);
+    }
+    path.extend(suffix);
+
+    WidgetSlotAddress {
+        widget: slot.widget,
+        path,
+        ordinal: slot.ordinal,
+    }
+}
+
+fn child_placement_matches_slot(
+    placement: &ChildPlacement,
+    child: &WidgetId,
+    child_slot: &WidgetSlotAddress,
+) -> bool {
+    if let Some(placement_slot) = &placement.local_state_slot {
+        placement_slot == child_slot
+    } else {
+        placement.child == *child
+    }
+}
+
+fn egui_child_paint_sort_key<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    parent_slot: &WidgetSlotAddress,
+    source_order: usize,
+    parent_view: &ViewDefinition,
+) -> (i32, usize, usize)
+where
+    W: SlipwayWidget + SlipwayViewDefinition,
+{
+    let child = widget.id();
+    let child_slot = parent_slot.child(child.clone(), source_order);
+    let Some(placement) = parent_view
+        .layout
+        .child_placements
+        .iter()
+        .find(|placement| child_placement_matches_slot(placement, &child, &child_slot))
+    else {
+        return (0, source_order, source_order);
+    };
+    let view = widget.visible_backend_view_definition(
+        external,
+        local,
+        ViewDefinitionInput {
+            frame: parent_view.frame.clone(),
+            layout_input: child_layout_input(placement.bounds.into_rect()),
+        },
+    );
+    paint_unit_sort_key(&PaintUnit::from_view(view, source_order))
+}
+
+fn region_belongs_to_authored_child(
+    target: &WidgetId,
+    address: Option<&WidgetSlotAddress>,
+    child_slots: &[EguiAuthoredChildSlot],
+) -> bool {
+    child_slots.iter().any(|child| {
+        address
+            .map(|address| slot_contains_address(&child.slot, address))
+            .unwrap_or(false)
+            || target == &child.child
+    })
+}
+
+fn slot_contains_address(parent: &WidgetSlotAddress, address: &WidgetSlotAddress) -> bool {
+    address.path.len() >= parent.path.len()
+        && address
+            .path
+            .iter()
+            .zip(parent.path.iter())
+            .all(|(address_part, parent_part)| address_part == parent_part)
+}
+
+fn scroll_contains_placement_with_geometry_index(
+    geometry_index: &PresentationGeometryIndex,
+    scroll: &ScrollRegionDeclaration,
+    placement: &ChildPlacement,
+) -> bool {
+    let content_bounds = slipway_core::declared_region_root_local_rect_with_geometry_index(
+        geometry_index,
+        &scroll.target,
+        scroll.address.as_ref(),
+        scroll.content_bounds.into_rect(),
+    );
+    let viewport = slipway_core::declared_region_root_local_rect_with_geometry_index(
+        geometry_index,
+        &scroll.target,
+        scroll.address.as_ref(),
+        scroll.viewport.into_rect(),
+    );
+    rects_intersect(content_bounds, placement.bounds.into_rect())
+        || rects_intersect(viewport, placement.bounds.into_rect())
+}
+
+fn rects_intersect(a: Rect, b: Rect) -> bool {
+    let a_min_x = a.origin.x;
+    let a_min_y = a.origin.y;
+    let a_max_x = a.origin.x + a.size.width.max(0.0);
+    let a_max_y = a.origin.y + a.size.height.max(0.0);
+    let b_min_x = b.origin.x;
+    let b_min_y = b.origin.y;
+    let b_max_x = b.origin.x + b.size.width.max(0.0);
+    let b_max_y = b.origin.y + b.size.height.max(0.0);
+
+    a_min_x < b_max_x && a_max_x > b_min_x && a_min_y < b_max_y && a_max_y > b_min_y
+}
+
+fn scroll_content_origin(
+    ui: &egui::Ui,
+    geometry_index: &PresentationGeometryIndex,
+    scroll: &ScrollRegionDeclaration,
+) -> egui::Pos2 {
+    let min = ui.max_rect().min;
+    let viewport = slipway_core::declared_region_root_local_rect_with_geometry_index(
+        geometry_index,
+        &scroll.target,
+        scroll.address.as_ref(),
+        scroll.viewport.into_rect(),
+    );
+    egui::pos2(min.x - viewport.origin.x, min.y - viewport.origin.y)
+}
+
+fn scroll_without_real_child_refusal(scroll: &ScrollRegionDeclaration) -> BackendParityAdmission {
+    let requirement_id = format!("view.scroll_regions.{}.real_child_ui", scroll.id.as_str());
+    let diagnostic = Diagnostic::unsupported(
+        Some(scroll.target.clone()),
+        "egui.scroll_region.no_real_child_ui",
+        "egui ScrollArea::show_viewport requires matching authored child UI; no child placement was available for this scroll region",
+    );
+
+    BackendParityAdmission {
+        backend_id: EGUI_BACKEND_ID.to_string(),
+        accepted: false,
+        required_profiles: Vec::new(),
+        visible_requirements: vec![BackendVisibleCapabilityRequirement {
+            requirement_id: requirement_id.clone(),
+            target: Some(scroll.target.clone()),
+            capability: BackendVisibleCapability::ScrollRegions,
+            required: true,
+        }],
+        unsupported: vec![UnsupportedCapabilityEvidence {
+            backend_id: EGUI_BACKEND_ID.to_string(),
+            target: Some(scroll.target.clone()),
+            capability: Capability::ScrollRegionPresentation,
+            visible_capability: Some(BackendVisibleCapability::ScrollRegions),
+            requirement_id: Some(requirement_id),
+            reason: "scroll region cannot be presented as real egui scroll content without a matching authored child placement".to_string(),
+            source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "scroll-region-assembly"),
+            diagnostics: vec![diagnostic.clone()],
+        }],
+        source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "scroll-region-assembly"),
+        diagnostics: vec![diagnostic],
+    }
+}
+
+fn child_without_placement_refusal(
+    child: WidgetId,
+    slot: &WidgetSlotAddress,
+    native: bool,
+) -> BackendParityAdmission {
+    let kind = if native { "native-child" } else { "child" };
+    let requirement_id = format!("view.child_placements.{}.{}", widget_slot_key(slot), kind);
+    let diagnostic = Diagnostic::unsupported(
+        Some(child.clone()),
+        "egui.child_placement.missing",
+        format!(
+            "egui backend visited {kind} `{}` but no matching ChildPlacement was produced",
+            child.as_str()
+        ),
+    );
+
+    BackendParityAdmission {
+        backend_id: EGUI_BACKEND_ID.to_string(),
+        accepted: false,
+        required_profiles: Vec::new(),
+        visible_requirements: vec![BackendVisibleCapabilityRequirement {
+            requirement_id: requirement_id.clone(),
+            target: Some(child.clone()),
+            capability: BackendVisibleCapability::Custom(
+                "egui.authored_child_placement".to_string(),
+            ),
+            required: true,
+        }],
+        unsupported: vec![UnsupportedCapabilityEvidence {
+            backend_id: EGUI_BACKEND_ID.to_string(),
+            target: Some(child),
+            capability: Capability::ChildTraversal,
+            visible_capability: Some(BackendVisibleCapability::Custom(
+                "egui.authored_child_placement".to_string(),
+            )),
+            requirement_id: Some(requirement_id),
+            reason: "visited authored child cannot be presented without a matching ChildPlacement"
+                .to_string(),
+            source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "child-assembly"),
+            diagnostics: vec![diagnostic.clone()],
+        }],
+        source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "child-assembly"),
+        diagnostics: vec![diagnostic],
+    }
+}
+
+fn widget_slot_key(slot: &WidgetSlotAddress) -> String {
+    let path = slot
+        .path
+        .iter()
+        .map(WidgetId::as_str)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{path}:{}", slot.ordinal)
+}
+
+fn egui_region_id(
+    kind: EguiPresentedRegionKind,
+    region_id: &PresentationRegionId,
+    target: &WidgetId,
+    address: Option<&WidgetSlotAddress>,
+) -> egui::Id {
+    let address_key = address.map(|address| {
+        (
+            address.widget.as_str().to_string(),
+            address
+                .path
+                .iter()
+                .map(|widget| widget.as_str().to_string())
+                .collect::<Vec<_>>(),
+            address.ordinal,
+        )
+    });
+    egui::Id::new((
+        "slipway-egui-region",
+        kind,
+        target.as_str().to_string(),
+        region_id.as_str().to_string(),
+        address_key,
+    ))
+}
+
+fn egui_sense_for_hit(hit: &HitRegionDeclaration) -> egui::Sense {
+    let drag = matches!(
+        hit.capture,
+        PointerCaptureIntent::DuringDrag | PointerCaptureIntent::Explicit
+    ) || matches!(
+        hit.cursor,
+        CursorCapability::Grab
+            | CursorCapability::Grabbing
+            | CursorCapability::Move
+            | CursorCapability::ResizeHorizontal
+            | CursorCapability::ResizeVertical
+            | CursorCapability::ResizeBoth
+    );
+    let click = !matches!(hit.cursor, CursorCapability::Inherited);
+
+    match (click, drag) {
+        (true, true) => egui::Sense::click() | egui::Sense::drag(),
+        (true, false) => egui::Sense::click(),
+        (false, true) => egui::Sense::drag(),
+        (false, false) => egui::Sense::hover(),
+    }
+}
+
+fn apply_region_cursor(response: egui::Response, cursor: CursorCapability) -> egui::Response {
+    match egui_cursor_icon(cursor) {
+        Some(cursor) => response.on_hover_and_drag_cursor(cursor),
+        None => response,
+    }
+}
+
+fn egui_cursor_icon(cursor: CursorCapability) -> Option<egui::CursorIcon> {
+    match cursor {
+        CursorCapability::Pointer => Some(egui::CursorIcon::PointingHand),
+        CursorCapability::Text => Some(egui::CursorIcon::Text),
+        CursorCapability::Grab => Some(egui::CursorIcon::Grab),
+        CursorCapability::Grabbing => Some(egui::CursorIcon::Grabbing),
+        CursorCapability::Move => Some(egui::CursorIcon::Move),
+        CursorCapability::Crosshair => Some(egui::CursorIcon::Crosshair),
+        CursorCapability::NotAllowed => Some(egui::CursorIcon::NotAllowed),
+        CursorCapability::ResizeHorizontal => Some(egui::CursorIcon::ResizeHorizontal),
+        CursorCapability::ResizeVertical => Some(egui::CursorIcon::ResizeVertical),
+        CursorCapability::ResizeBoth => Some(egui::CursorIcon::ResizeNwSe),
+        CursorCapability::Inherited | CursorCapability::Default | CursorCapability::Custom(_) => {
+            None
+        }
+    }
+}
+
+fn egui_region_at_position(
+    regions: &[EguiPresentedRegion],
+    position: egui::Pos2,
+) -> Option<&EguiPresentedRegion> {
+    egui_response_authority_region_at_position(regions, position)
+        .or_else(|| egui_geometry_region_at_position(regions, position))
+}
+
+fn egui_region_by_id<'a>(
+    regions: &'a [EguiPresentedRegion],
+    id: &PresentationRegionId,
+) -> Option<&'a EguiPresentedRegion> {
+    regions
+        .iter()
+        .find(|region| region.enabled && &region.region_id == id)
+}
+
+fn egui_region_anchor_position(
+    _context: &EguiInputContext<'_>,
+    region: &EguiPresentedRegion,
+) -> egui::Pos2 {
+    let x = region.declared_bounds.origin.x + region.declared_bounds.size.width.min(1.0) * 0.5;
+    let y = region.declared_bounds.origin.y + region.declared_bounds.size.height.min(1.0) * 0.5;
+    egui::pos2(region.target_origin.x + x, region.target_origin.y + y)
+}
+
+fn egui_response_authority_region_at_position(
+    regions: &[EguiPresentedRegion],
+    position: egui::Pos2,
+) -> Option<&EguiPresentedRegion> {
+    regions.iter().rev().find(|region| {
+        region.enabled
+            && region.response.interact_rect.contains(position)
+            && egui_region_has_response_authority(region)
+    })
+}
+
+fn egui_region_has_response_authority(region: &EguiPresentedRegion) -> bool {
+    region.response.clicked()
+        || region.response.hovered()
+        || region.response.contains_pointer()
+        || region.response.has_focus()
+        || region.response.gained_focus()
+        || region.response.lost_focus()
+        || region.text_edit_change.is_some()
+        || region
+            .scroll_state
+            .as_ref()
+            .is_some_and(egui_scroll_state_changed)
+}
+
+fn egui_region_can_request_focus(region: &EguiPresentedRegion) -> bool {
+    region.response.sense.is_focusable()
+        || matches!(
+            region.kind,
+            EguiPresentedRegionKind::Focus | EguiPresentedRegionKind::TextEdit
+        )
+}
+
+fn apply_egui_native_physical_region_effect(
+    operation: Option<&DebugPhysicalControl>,
+    regions: &[EguiPresentedRegion],
+) {
+    let Some(DebugPhysicalControl::Focus { selector, focused }) = operation else {
+        return;
+    };
+    let Some(region) = egui_focus_region_for_native_selector(regions, selector) else {
+        return;
+    };
+
+    if *focused {
+        region.response.request_focus();
+    } else {
+        region.response.surrender_focus();
+    }
+}
+
+fn egui_native_scroll_offset_for_operation(
+    operation: Option<&DebugPhysicalControl>,
+    geometry_index: &PresentationGeometryIndex,
+    scroll: &ScrollRegionDeclaration,
+) -> Option<Point> {
+    let Some(DebugPhysicalControl::Scroll {
+        selector,
+        offset_x,
+        offset_y,
+    }) = operation
+    else {
+        return None;
+    };
+    if !egui_scroll_selector_matches(selector, geometry_index, scroll) {
+        return None;
+    }
+    Some(Point {
+        x: *offset_x,
+        y: *offset_y,
+    })
+}
+
+fn egui_scroll_selector_matches(
+    selector: &slipway_debug_bridge::DebugPhysicalControlDeclarationSelector,
+    geometry_index: &PresentationGeometryIndex,
+    scroll: &ScrollRegionDeclaration,
+) -> bool {
+    match selector {
+        slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Target { target } => {
+            &scroll.target == target
+        }
+        slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Region { region } => {
+            &scroll.id == region
+        }
+        slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Position { position } => {
+            slipway_core::declared_region_contains_root_local_point_with_geometry_index(
+                geometry_index,
+                &scroll.target,
+                scroll.address.as_ref(),
+                scroll.viewport.into_rect(),
+                *position,
+            )
+        }
+    }
+}
+
+fn egui_focus_region_for_native_selector<'a>(
+    regions: &'a [EguiPresentedRegion],
+    selector: &slipway_debug_bridge::DebugPhysicalControlDeclarationSelector,
+) -> Option<&'a EguiPresentedRegion> {
+    match selector {
+        slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Target { target } => {
+            regions.iter().find(|region| {
+                region.enabled
+                    && egui_region_can_request_focus(region)
+                    && &region.event_target == target
+            })
+        }
+        slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Region { region } => {
+            regions.iter().find(|candidate| {
+                candidate.enabled
+                    && egui_region_can_request_focus(candidate)
+                    && &candidate.region_id == region
+            })
+        }
+        slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Position { position } => {
+            let position = egui::pos2(position.x, position.y);
+            regions.iter().rev().find(|region| {
+                region.enabled
+                    && egui_region_can_request_focus(region)
+                    && region.response.interact_rect.contains(position)
+            })
+        }
+    }
+}
+
+fn egui_scroll_state_changed(scroll: &EguiScrollRegionState) -> bool {
+    (scroll.egui_offset.x - scroll.declared_offset.x).abs() > f32::EPSILON
+        || (scroll.egui_offset.y - scroll.declared_offset.y).abs() > f32::EPSILON
+}
+
+fn egui_geometry_region_at_position(
+    regions: &[EguiPresentedRegion],
+    position: egui::Pos2,
+) -> Option<&EguiPresentedRegion> {
+    regions.iter().rev().find(|region| {
+        region.enabled
+            && region.response.interact_rect.contains(position)
+            && (region.response.sense.interactive()
+                || region.response.hovered()
+                || region.response.contains_pointer())
+    })
+}
+
+#[cfg(test)]
+fn egui_region_position(region: &EguiPresentedRegion, position: egui::Pos2) -> Point {
+    match region.event_coordinate_space {
+        PointerEventCoordinateSpace::TargetLocal => egui_position(position, region.target_origin),
+        PointerEventCoordinateSpace::RegionLocal => {
+            egui_position(position, region.response.interact_rect.min)
+        }
+    }
+}
+
+fn egui_backend_input_trace<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    input: BackendInputEvent,
+    outcome: &EventOutcome<W::AppMessage>,
+) -> BackendInputTrace
+where
+    W: SlipwayView + SlipwayWidgetTypes,
+{
+    BackendInputTrace {
+        input,
+        handled: outcome.handled,
+        revision_before: None,
+        revision_after: None,
+        emitted_messages: outcome
+            .emitted_messages
+            .iter()
+            .map(|message| EmittedMessageEvidence {
+                target: message.target.clone(),
+                name: message.name.clone(),
+            })
+            .collect(),
+        local_state: widget.observe_state(external, local),
+        changes: outcome.changes.clone(),
+        diagnostics: outcome.diagnostics.clone(),
+    }
+}
+
+fn egui_refused_backend_input_trace<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    input: BackendInputEvent,
+    diagnostics: Vec<Diagnostic>,
+) -> BackendInputTrace
+where
+    W: SlipwayView + SlipwayWidgetTypes,
+{
+    BackendInputTrace {
+        diagnostics,
+        input,
+        handled: false,
+        revision_before: None,
+        revision_after: None,
+        emitted_messages: Vec::new(),
+        local_state: widget.observe_state(external, local),
+        changes: Vec::new(),
+    }
+}
+
+fn egui_backend_pointer_input_event(
+    context: &EguiInputContext<'_>,
+    region: &EguiPresentedRegion,
+    position: egui::Pos2,
+    kind: PointerEventKind,
+    button: Option<PointerButton>,
+    details: PointerDetails,
+    pointer_is_pressed: bool,
+) -> Option<BackendInputEvent> {
+    let view_root_local_position = egui_position(position, context.rect.min);
+    let (dispatch, mut evidence) =
+        slipway_core::resolve_declared_pointer_dispatch_with_evidence_and_geometry_index(
+            EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
+            context.frame.clone(),
+            context.geometry_index,
+            context.hit_regions,
+            view_root_local_position,
+            kind,
+            button,
+            details.clone(),
+            pointer_is_pressed,
+        );
+
+    if evidence.selected_region.as_ref() != Some(&region.region_id) {
+        evidence.diagnostics.push(Diagnostic::warning(
+            Some(region.target.clone()),
+            "egui.backend_dispatch_region_mismatch",
+            format!(
+                "egui response selected region `{}` but declared resolver selected `{}`",
+                region.region_id.as_str(),
+                evidence
+                    .selected_region
+                    .as_ref()
+                    .map(|region| region.as_str())
+                    .unwrap_or("<none>")
+            ),
+        ));
+        return None;
+    }
+
+    dispatch.map(|dispatch| BackendInputEvent::declared(dispatch.input, evidence))
+}
+
+fn egui_backend_wheel_input_event(
+    context: &EguiInputContext<'_>,
+    position: egui::Pos2,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<BackendInputEvent> {
+    let view_root_local_position = egui_position(position, context.rect.min);
+    let (dispatch, evidence) =
+        slipway_core::resolve_declared_wheel_dispatch_with_evidence_and_geometry_index(
+            EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
+            context.frame.clone(),
+            context.geometry_index,
+            context.scroll_regions,
+            view_root_local_position,
+            delta_x,
+            delta_y,
+        );
+
+    dispatch.map(|dispatch| BackendInputEvent::declared(dispatch.input, evidence))
+}
+
+fn egui_focus_backend_input_event(
+    context: &EguiInputContext<'_>,
+    region: &EguiPresentedRegion,
+    kind: DeclaredEventDispatchKind,
+    event: InputEvent,
+) -> BackendInputEvent {
+    let selected_region = context
+        .focus_regions
+        .iter()
+        .find(|candidate| candidate.id == region.region_id);
+    let evidence = slipway_core::declared_focus_text_dispatch_evidence_with_geometry_index(
+        EvidenceSource::backend_presented(EGUI_BACKEND_ID, "focused-input"),
+        context.frame.clone(),
+        context.geometry_index,
+        context.focus_regions,
+        selected_region,
+        kind,
+        None,
+        event.clone(),
+    );
+    BackendInputEvent::declared(event, evidence)
+}
+
+fn egui_scroll_backend_input_event(
+    context: &EguiInputContext<'_>,
+    region: &EguiPresentedRegion,
+    mut event: InputEvent,
+) -> Option<BackendInputEvent> {
+    let selected_region = context
+        .scroll_regions
+        .iter()
+        .find(|candidate| candidate.id == region.region_id);
+    let selected_region = selected_region?;
+    if let InputEvent::Scroll(scroll) = &mut event {
+        scroll.target = selected_region.target.clone();
+        scroll.target_slot = selected_region.address.clone();
+        scroll.region_id = selected_region.id.clone();
+        scroll.viewport = selected_region.viewport;
+        scroll.content_bounds = selected_region.content_bounds;
+    }
+    let evidence = slipway_core::declared_scroll_dispatch_evidence(
+        EvidenceSource::backend_presented(EGUI_BACKEND_ID, "native-scroll"),
+        context.frame.clone(),
+        context.scroll_regions,
+        Some(selected_region),
+        event.clone(),
+    );
+    Some(BackendInputEvent::declared(event, evidence))
+}
+
+fn egui_focused_backend_input_event(
+    context: &EguiInputContext<'_>,
+    focused_target: Option<&WidgetId>,
+    kind: DeclaredEventDispatchKind,
+    event: InputEvent,
+) -> Option<BackendInputEvent> {
+    if let Some(region) = focused_region(context.regions, focused_target) {
+        Some(egui_focus_backend_input_event(context, region, kind, event))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn egui_region_target_bounds(region: &EguiPresentedRegion) -> Rect {
+    region.target_bounds
+}
+
+fn target_local_bounds(target_rect: Rect) -> Rect {
+    Rect {
+        origin: Point { x: 0.0, y: 0.0 },
+        size: target_rect.size,
+    }
+}
+
+fn focused_region<'a>(
+    regions: &'a [EguiPresentedRegion],
+    focused_target: Option<&WidgetId>,
+) -> Option<&'a EguiPresentedRegion> {
+    let focused_target = focused_target?;
+    regions.iter().find(|region| {
+        &region.target == focused_target
+            && (region.response.has_focus()
+                || matches!(
+                    region.kind,
+                    EguiPresentedRegionKind::Focus | EguiPresentedRegionKind::TextEdit
+                ))
+    })
+}
+
+fn focused_event_target(
+    regions: &[EguiPresentedRegion],
+    focused_target: Option<&WidgetId>,
+    root_target: &WidgetId,
+) -> (WidgetId, Option<WidgetSlotAddress>) {
+    focused_event_target_opt(regions, focused_target).unwrap_or_else(|| (root_target.clone(), None))
+}
+
+fn focused_event_target_opt(
+    regions: &[EguiPresentedRegion],
+    focused_target: Option<&WidgetId>,
+) -> Option<(WidgetId, Option<WidgetSlotAddress>)> {
+    if let Some(region) = focused_region(regions, focused_target) {
+        Some((region.target.clone(), region.address.clone()))
+    } else {
+        focused_target.map(|target| (target.clone(), None))
+    }
+}
+
+fn egui_composition_event(
+    target: Option<WidgetId>,
+    target_slot: Option<WidgetSlotAddress>,
+    ime: &egui::ImeEvent,
+) -> Option<TextCompositionEvent> {
+    let target = target?;
+    match ime {
+        #[allow(deprecated)]
+        egui::ImeEvent::Enabled => Some(TextCompositionEvent {
+            target,
+            target_slot,
+            phase: TextCompositionPhase::Start,
+            preedit_text: String::new(),
+            cursor_range: None,
+        }),
+        egui::ImeEvent::Preedit {
+            text,
+            active_range_chars,
+        } => Some(TextCompositionEvent {
+            target,
+            phase: if text.is_empty() {
+                TextCompositionPhase::Cancel
+            } else {
+                TextCompositionPhase::Update
+            },
+            target_slot,
+            preedit_text: text.clone(),
+            cursor_range: active_range_chars.as_ref().map(|range| TextSelectionRange {
+                anchor: range.start,
+                focus: range.end,
+            }),
+        }),
+        egui::ImeEvent::Commit(text) => Some(TextCompositionEvent {
+            target,
+            target_slot,
+            phase: TextCompositionPhase::Commit,
+            preedit_text: text.clone(),
+            cursor_range: None,
+        }),
+        #[allow(deprecated)]
+        egui::ImeEvent::Disabled => Some(TextCompositionEvent {
+            target,
+            target_slot,
+            phase: TextCompositionPhase::Cancel,
+            preedit_text: String::new(),
+            cursor_range: None,
+        }),
+    }
+}
+
+fn install_declared_fonts<W>(
+    ui: &egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    view: &ViewDefinition,
+) -> Vec<BackendParityAdmission>
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let mut diagnostics = Vec::new();
+
+    for (content, style) in text_paint_entries(&view.paint) {
+        collect_font_installation_diagnostics(
+            ui.ctx(),
+            widget,
+            external,
+            local,
+            &view.target,
+            content,
+            style,
+            &mut diagnostics,
+        );
+    }
+
+    font_installation_admissions(view.target.clone(), diagnostics)
+}
+
+fn install_text_edit_font<W>(
+    ui: &egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    focus: &FocusRegionDeclaration,
+    text_edit: &TextEditRegionDeclaration,
+) -> Vec<BackendParityAdmission>
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let mut diagnostics = Vec::new();
+    collect_font_installation_diagnostics(
+        ui.ctx(),
+        widget,
+        external,
+        local,
+        &focus.target,
+        &text_edit.buffer.text,
+        &TextStyle::default(),
+        &mut diagnostics,
+    );
+    font_installation_admissions(focus.target.clone(), diagnostics)
+}
+
+fn collect_font_installation_diagnostics<W>(
+    ctx: &egui::Context,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    target: &WidgetId,
+    content: &str,
+    style: &TextStyle,
+    diagnostics: &mut Vec<Diagnostic>,
+) where
+    W: SlipwayEguiBackendChildWidget,
+{
+    if source_text_validity(content) != SourceValidityKind::Valid {
+        return;
+    }
+    if !text_font_installation_required(content, style) {
+        return;
+    }
+
+    let request = FontResolutionRequest {
+        family: style.font_family.clone(),
+        fallback_families: egui_font_fallbacks(&style.font_family),
+        weight: style.font_weight,
+        style: style.font_style,
+        source: None,
+    };
+    let evidence = widget.resolve_font(external, local, request);
+    let mut results = Vec::new();
+    results.push(install_font_from_evidence(
+        ctx,
+        evidence.resolved_ref.as_deref(),
+        evidence.request.source.as_ref(),
+    ));
+    if let Some(installation) = &evidence.installation {
+        results.push(install_font_from_evidence(
+            ctx,
+            Some(&installation.resource_id),
+            installation.source.as_ref(),
+        ));
+    }
+
+    if results
+        .iter()
+        .any(EguiFontInstallResult::satisfies_requirement)
+    {
+        return;
+    }
+
+    diagnostics.push(font_installation_failure_diagnostic(
+        target, content, style, &evidence, &results,
+    ));
+}
+
+fn font_installation_admissions(
+    target: WidgetId,
+    diagnostics: Vec<Diagnostic>,
+) -> Vec<BackendParityAdmission> {
+    if diagnostics.is_empty() {
+        return Vec::new();
+    }
+
+    let requirement_id = "view.font_resource_installation".to_string();
+    vec![BackendParityAdmission {
+        backend_id: EGUI_BACKEND_ID.to_string(),
+        accepted: false,
+        required_profiles: Vec::new(),
+        visible_requirements: vec![BackendVisibleCapabilityRequirement {
+            requirement_id: requirement_id.clone(),
+            target: Some(target.clone()),
+            capability: BackendVisibleCapability::FontInstallation,
+            required: true,
+        }],
+        unsupported: vec![UnsupportedCapabilityEvidence {
+            backend_id: EGUI_BACKEND_ID.to_string(),
+            target: Some(target.clone()),
+            capability: Capability::FontResourceInstallation,
+            visible_capability: Some(BackendVisibleCapability::FontInstallation),
+            requirement_id: Some(requirement_id),
+            reason: "egui could not prove required font installation for visible text".to_string(),
+            source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "font-installation"),
+            diagnostics: diagnostics.clone(),
+        }],
+        source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "font-installation"),
+        diagnostics,
+    }]
+}
+
+fn font_policy_unavailable_admissions_for_view(
+    view: &ViewDefinition,
+) -> Vec<BackendParityAdmission> {
+    let mut diagnostics = Vec::new();
+    for (content, style) in text_paint_entries(&view.paint) {
+        collect_font_policy_unavailable_diagnostic(&view.target, content, style, &mut diagnostics);
+    }
+    for focus in &view.focus_regions {
+        if let Some(text_edit) = &focus.text_edit {
+            collect_font_policy_unavailable_diagnostic(
+                &focus.target,
+                &text_edit.buffer.text,
+                &TextStyle::default(),
+                &mut diagnostics,
+            );
+        }
+    }
+    font_installation_admissions(view.target.clone(), diagnostics)
+}
+
+fn collect_font_policy_unavailable_diagnostic(
+    target: &WidgetId,
+    content: &str,
+    style: &TextStyle,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if source_text_validity(content) != SourceValidityKind::Valid {
+        return;
+    }
+    if !text_font_installation_required(content, style) {
+        return;
+    }
+
+    let code = if text_requires_cjk_font_evidence(content) {
+        "egui.font.cjk_coverage_unproved"
+    } else {
+        "egui.font.installation_unproved"
+    };
+    diagnostics.push(Diagnostic::unsupported(
+        Some(target.clone()),
+        code,
+        "egui presented child text requires font installation evidence, but this child allocation boundary does not expose SlipwayFontResolutionPolicy",
+    ));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EguiFontInstallStatus {
+    Installed,
+    AlreadyInstalled,
+    MissingSource,
+    MissingAssetRef,
+    ReadFailed,
+    UnsupportedSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EguiFontInstallResult {
+    status: EguiFontInstallStatus,
+}
+
+impl EguiFontInstallResult {
+    fn satisfies_requirement(&self) -> bool {
+        matches!(
+            self.status,
+            EguiFontInstallStatus::Installed | EguiFontInstallStatus::AlreadyInstalled
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct EguiFontInstallCache {
+    records: Vec<EguiFontInstallRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EguiFontInstallRecord {
+    key: String,
+    status: EguiFontInstallStatus,
+}
+
+fn install_font_from_evidence(
+    ctx: &egui::Context,
+    resolved_ref: Option<&str>,
+    source: Option<&ResourceSourceDeclaration>,
+) -> EguiFontInstallResult {
+    let Some(source) = source else {
+        return EguiFontInstallResult {
+            status: EguiFontInstallStatus::MissingSource,
+        };
+    };
+    let key = egui_font_install_key(resolved_ref, source);
+    if let Some(cached) = cached_font_install_result(ctx, &key) {
+        return if cached.status == EguiFontInstallStatus::Installed {
+            EguiFontInstallResult {
+                status: EguiFontInstallStatus::AlreadyInstalled,
+            }
+        } else {
+            cached
+        };
+    };
+    let bytes = match declared_font_bytes(source) {
+        Ok(bytes) => bytes,
+        Err(status) => {
+            let result = EguiFontInstallResult { status };
+            store_font_install_result(ctx, key, &result);
+            return result;
+        }
+    };
+    let name = resolved_ref
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(source.source_id.as_str());
+    ctx.add_font(egui::epaint::text::FontInsert::new(
+        name,
+        egui::text::FontData::from_owned(bytes),
+        vec![
+            egui::epaint::text::InsertFontFamily {
+                family: egui::FontFamily::Proportional,
+                priority: egui::epaint::text::FontPriority::Highest,
+            },
+            egui::epaint::text::InsertFontFamily {
+                family: egui::FontFamily::Monospace,
+                priority: egui::epaint::text::FontPriority::Lowest,
+            },
+        ],
+    ));
+    let result = EguiFontInstallResult {
+        status: EguiFontInstallStatus::Installed,
+    };
+    store_font_install_result(ctx, key, &result);
+    result
+}
+
+fn cached_font_install_result(ctx: &egui::Context, key: &str) -> Option<EguiFontInstallResult> {
+    let cache = ctx.data_mut(|data| data.get_persisted::<EguiFontInstallCache>(font_cache_id()))?;
+    cache
+        .records
+        .iter()
+        .find(|record| record.key == key)
+        .map(|record| EguiFontInstallResult {
+            status: record.status,
+        })
+}
+
+fn store_font_install_result(ctx: &egui::Context, key: String, result: &EguiFontInstallResult) {
+    ctx.data_mut(|data| {
+        let mut cache = data
+            .get_persisted::<EguiFontInstallCache>(font_cache_id())
+            .unwrap_or_default();
+        if let Some(record) = cache.records.iter_mut().find(|record| record.key == key) {
+            record.status = result.status;
+        } else {
+            cache.records.push(EguiFontInstallRecord {
+                key,
+                status: result.status,
+            });
+        }
+        data.insert_persisted(font_cache_id(), cache);
+    });
+}
+
+fn font_cache_id() -> egui::Id {
+    egui::Id::new("slipway-egui-font-install-cache")
+}
+
+fn egui_font_install_key(resolved_ref: Option<&str>, source: &ResourceSourceDeclaration) -> String {
+    let name = resolved_ref
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(source.source_id.as_str());
+    let revision = source
+        .revision
+        .iter()
+        .map(|entry| format!("{}={}", entry.name, entry.value))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{name}|{}|{:?}|{}|{}|{revision}",
+        source.source_id,
+        source.kind,
+        source.family.as_deref().unwrap_or(""),
+        source.asset_ref.as_deref().unwrap_or("")
+    )
+}
+
+fn declared_font_bytes(
+    source: &ResourceSourceDeclaration,
+) -> Result<Vec<u8>, EguiFontInstallStatus> {
+    match source.kind {
+        ResourceSourceKind::Asset | ResourceSourceKind::Embedded => {
+            let asset_ref = source
+                .asset_ref
+                .as_deref()
+                .ok_or(EguiFontInstallStatus::MissingAssetRef)?;
+            fs::read(Path::new(asset_ref)).map_err(|_| EguiFontInstallStatus::ReadFailed)
+        }
+        ResourceSourceKind::BackendInstalled
+        | ResourceSourceKind::SystemFamily
+        | ResourceSourceKind::Custom(_) => Err(EguiFontInstallStatus::UnsupportedSource),
+    }
+}
+
+fn font_installation_failure_diagnostic(
+    target: &WidgetId,
+    content: &str,
+    style: &TextStyle,
+    evidence: &slipway_core::FontResolutionEvidence,
+    results: &[EguiFontInstallResult],
+) -> Diagnostic {
+    let statuses = results
+        .iter()
+        .map(|result| egui_font_install_status_label(result.status))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let code = if text_requires_cjk_font_evidence(content) {
+        "egui.font.cjk_coverage_unproved"
+    } else {
+        "egui.font.installation_unproved"
+    };
+    let family = if style.font_family.trim().is_empty() {
+        slipway_core::DEFAULT_TEXT_FONT_FAMILY
+    } else {
+        style.font_family.as_str()
+    };
+    let resolved = evidence
+        .resolved_ref
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("<none>");
+    Diagnostic::unsupported(
+        Some(target.clone()),
+        code,
+        format!(
+            "egui font installation for family '{family}' was not proven for visible text; resolved_ref={resolved}; install_status={statuses}"
+        ),
+    )
+}
+
+fn egui_font_install_status_label(status: EguiFontInstallStatus) -> &'static str {
+    match status {
+        EguiFontInstallStatus::Installed => "installed",
+        EguiFontInstallStatus::AlreadyInstalled => "already_installed",
+        EguiFontInstallStatus::MissingSource => "missing_source",
+        EguiFontInstallStatus::MissingAssetRef => "missing_asset_ref",
+        EguiFontInstallStatus::ReadFailed => "read_failed",
+        EguiFontInstallStatus::UnsupportedSource => "unsupported_source",
+    }
+}
+
+fn text_paint_entries(ops: &[PaintOp]) -> Vec<(&str, &TextStyle)> {
+    let mut entries = Vec::new();
+    collect_text_paint_entries(ops, &mut entries);
+    entries
+}
+
+fn collect_text_paint_entries<'a>(ops: &'a [PaintOp], entries: &mut Vec<(&'a str, &'a TextStyle)>) {
+    for op in ops {
+        match op {
+            PaintOp::Text { content, style, .. } => entries.push((content.as_str(), style)),
+            PaintOp::Group { ops, .. } => collect_text_paint_entries(ops, entries),
+            PaintOp::Fill { .. } | PaintOp::Stroke { .. } => {}
+        }
+    }
+}
+
+fn egui_font_fallbacks(family: &str) -> Vec<String> {
+    let mut fallbacks = vec!["system-ui".to_string(), "sans-serif".to_string()];
+    if !family.trim().is_empty() && !fallbacks.iter().any(|fallback| fallback == family) {
+        fallbacks.insert(0, family.to_string());
+    }
+    fallbacks
+}
+
+fn source_text_validity(content: &str) -> SourceValidityKind {
+    if content.contains('\u{FFFD}') {
+        return SourceValidityKind::InvalidUtf8;
+    }
+
+    let mojibake_markers = [
+        "\u{00c3}",
+        "\u{00c2}",
+        "\u{00e2}\u{20ac}\u{2122}",
+        "\u{00e2}\u{20ac}\u{0153}",
+        "\u{00e2}\u{20ac}",
+        "\u{00ec}",
+        "\u{00ed}",
+        "\u{00eb}",
+    ];
+    if mojibake_markers
+        .iter()
+        .any(|marker| content.contains(marker))
+    {
+        return SourceValidityKind::SuspectedMojibake;
+    }
+
+    SourceValidityKind::Valid
+}
+
+fn egui_pointer_button(button: egui::PointerButton) -> PointerButton {
+    match button {
+        egui::PointerButton::Primary => PointerButton::Primary,
+        egui::PointerButton::Secondary => PointerButton::Secondary,
+        egui::PointerButton::Middle | egui::PointerButton::Extra1 | egui::PointerButton::Extra2 => {
+            PointerButton::Auxiliary
+        }
+    }
+}
+
+fn egui_pointer_details(
+    modifiers: egui::Modifiers,
+    button: Option<egui::PointerButton>,
+) -> PointerDetails {
+    let mut buttons = PointerButtons::default();
+    match button {
+        Some(egui::PointerButton::Primary) => buttons.primary = true,
+        Some(egui::PointerButton::Secondary) => buttons.secondary = true,
+        Some(
+            egui::PointerButton::Middle | egui::PointerButton::Extra1 | egui::PointerButton::Extra2,
+        ) => buttons.auxiliary = true,
+        None => {}
+    }
+
+    PointerDetails {
+        pointer_id: None,
+        device: PointerDeviceKind::Mouse,
+        buttons,
+        modifiers: egui_modifiers(modifiers),
+        pressure: None,
+        tilt_x: None,
+        tilt_y: None,
+        twist: None,
+    }
+}
+
+fn egui_modifiers(modifiers: egui::Modifiers) -> Modifiers {
+    Modifiers {
+        shift: modifiers.shift,
+        control: modifiers.ctrl,
+        alt: modifiers.alt,
+        meta: modifiers.mac_cmd || modifiers.command,
+    }
+}
+
+fn paint_op(painter: &egui::Painter, origin: egui::Pos2, op: &PaintOp) {
+    match op {
+        PaintOp::Fill { shape, color } => paint_fill(painter, origin, shape, *color),
+        PaintOp::Stroke {
+            shape,
+            color,
+            width,
+        } => paint_stroke(painter, origin, shape, *color, *width),
+        PaintOp::Text {
+            bounds,
+            content,
+            color,
+            style,
+        } => paint_text(painter, origin, *bounds, content, *color, style),
+        PaintOp::Group { clip, ops, .. } => {
+            if let Some(clip) = clip {
+                let clipped = painter.with_clip_rect(egui_rect(origin, clip.bounds));
+                for op in ops {
+                    paint_op(&clipped, origin, op);
+                }
+            } else {
+                for op in ops {
+                    paint_op(painter, origin, op);
+                }
+            }
+        }
+    }
+}
+
+fn paint_fill(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    shape: &ShapeDeclaration,
+    color: slipway_core::Color,
+) {
+    match shape.kind {
+        ShapeKind::Rectangle => {
+            painter.rect_filled(egui_rect(origin, shape.bounds), 0.0, egui_color(color));
+        }
+        ShapeKind::RoundedRectangle => {
+            painter.rect_filled(egui_rect(origin, shape.bounds), 4.0, egui_color(color));
+        }
+        ShapeKind::Circle => {
+            let rect = egui_rect(origin, shape.bounds);
+            painter.circle_filled(
+                rect.center(),
+                rect.width().min(rect.height()) * 0.5,
+                egui_color(color),
+            );
+        }
+        ShapeKind::Line => paint_stroke(painter, origin, shape, color, 1.0),
+        ShapeKind::Path => {
+            if let Some((points, _closed)) = egui_path_points(origin, shape.path.as_ref()) {
+                painter.add(egui::epaint::PathShape::convex_polygon(
+                    points,
+                    egui_color(color),
+                    egui::Stroke::NONE,
+                ));
+            }
+        }
+        ShapeKind::Text => {}
+    }
+}
+
+fn paint_stroke(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    shape: &ShapeDeclaration,
+    color: slipway_core::Color,
+    width: f32,
+) {
+    let stroke = egui::Stroke::new(width.max(0.0), egui_color(color));
+    match shape.kind {
+        ShapeKind::Rectangle | ShapeKind::RoundedRectangle => {
+            painter.rect_stroke(
+                egui_rect(origin, shape.bounds),
+                if shape.kind == ShapeKind::RoundedRectangle {
+                    4.0
+                } else {
+                    0.0
+                },
+                stroke,
+                egui::StrokeKind::Middle,
+            );
+        }
+        ShapeKind::Circle => {
+            let rect = egui_rect(origin, shape.bounds);
+            painter.circle_stroke(rect.center(), rect.width().min(rect.height()) * 0.5, stroke);
+        }
+        ShapeKind::Line => {
+            let rect = egui_rect(origin, shape.bounds);
+            painter.line_segment([rect.left_top(), rect.right_bottom()], stroke);
+        }
+        ShapeKind::Path => {
+            if let Some((points, closed)) = egui_path_points(origin, shape.path.as_ref()) {
+                let path = if closed {
+                    egui::epaint::PathShape::closed_line(points, stroke)
+                } else {
+                    egui::epaint::PathShape::line(points, stroke)
+                };
+                painter.add(path);
+            }
+        }
+        ShapeKind::Text => {}
+    }
+}
+
+fn egui_path_points(
+    origin: egui::Pos2,
+    path: Option<&PathDeclaration>,
+) -> Option<(Vec<egui::Pos2>, bool)> {
+    let path = path?;
+    let mut points = Vec::new();
+    let mut closed = false;
+
+    for command in &path.commands {
+        match command {
+            PathCommand::MoveTo(point) | PathCommand::LineTo(point) => {
+                points.push(egui_point(origin, *point));
+            }
+            PathCommand::QuadraticTo { control, to } => {
+                points.push(egui_point(origin, *control));
+                points.push(egui_point(origin, *to));
+            }
+            PathCommand::CubicTo {
+                control_1,
+                control_2,
+                to,
+            } => {
+                points.push(egui_point(origin, *control_1));
+                points.push(egui_point(origin, *control_2));
+                points.push(egui_point(origin, *to));
+            }
+            PathCommand::Close => {
+                closed = true;
+            }
+        }
+    }
+
+    (points.len() >= 2).then_some((points, closed))
+}
+
+fn egui_point(origin: egui::Pos2, point: Point) -> egui::Pos2 {
+    egui::pos2(origin.x + point.x, origin.y + point.y)
+}
+
+fn egui_rect(origin: egui::Pos2, rect: Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(origin.x + rect.origin.x, origin.y + rect.origin.y),
+        egui::vec2(rect.size.width.max(0.0), rect.size.height.max(0.0)),
+    )
+}
+
+fn egui_color(color: slipway_core::Color) -> egui::Color32 {
+    egui::Rgba::from_rgba_unmultiplied(
+        color.red.clamp(0.0, 1.0),
+        color.green.clamp(0.0, 1.0),
+        color.blue.clamp(0.0, 1.0),
+        color.alpha.clamp(0.0, 1.0),
+    )
+    .into()
+}
+
+fn paint_text(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    bounds: Rect,
+    content: &str,
+    color: slipway_core::Color,
+    style: &TextStyle,
+) {
+    let rect = egui_rect(origin, bounds);
+    let clipped = painter.with_clip_rect(rect);
+    let text_color = egui_color(color);
+    let galley = clipped.layout_job(egui_text_layout_job(
+        content,
+        text_color,
+        style,
+        rect.width().max(0.0),
+    ));
+    let position = egui_text_position(rect, style);
+
+    clipped.galley(position, Arc::clone(&galley), text_color);
+}
+
+fn egui_text_layout_job(
+    content: &str,
+    color: egui::Color32,
+    style: &TextStyle,
+    wrap_width: f32,
+) -> egui::text::LayoutJob {
+    let mut job =
+        egui::text::LayoutJob::simple_format(content.to_string(), egui_text_format(color, style));
+    job.wrap.max_width = if wrap_width.is_finite() && wrap_width > 0.0 {
+        wrap_width
+    } else {
+        f32::INFINITY
+    };
+    job
+}
+
+fn egui_text_format(color: egui::Color32, style: &TextStyle) -> egui::text::TextFormat {
+    let font_id = egui::FontId::new(egui_text_font_size(style), egui_font_family(style));
+    let mut format = egui::text::TextFormat::simple(font_id, color);
+    format.italics = style.font_style == FontStyle::Italic;
+    format.underline = egui_decoration_stroke(style.decoration.underline, color);
+    format.strikethrough = egui_decoration_stroke(style.decoration.strikethrough, color);
+    format.valign = egui_text_valign(style.baseline);
+    format.line_height = Some(normalized_text_size(style) * 1.2);
+    format
+        .coords
+        .push("wght", egui_font_weight_value(style.font_weight));
+    format
+}
+
+fn egui_font_family(style: &TextStyle) -> egui::FontFamily {
+    let family = style.font_family.trim();
+    if family.eq_ignore_ascii_case("monospace")
+        || family.eq_ignore_ascii_case("ui-monospace")
+        || family.eq_ignore_ascii_case("monospaced")
+    {
+        egui::FontFamily::Monospace
+    } else if family.eq_ignore_ascii_case("system-ui")
+        || family.eq_ignore_ascii_case("sans")
+        || family.eq_ignore_ascii_case("sans-serif")
+        || family.eq_ignore_ascii_case("proportional")
+    {
+        egui::FontFamily::Proportional
+    } else {
+        egui::FontFamily::Proportional
+    }
+}
+
+fn egui_text_font_size(style: &TextStyle) -> f32 {
+    let size = normalized_text_size(style);
+    match style.baseline {
+        BaselineShift::Normal => size,
+        BaselineShift::Superscript | BaselineShift::Subscript => size * 0.75,
+    }
+}
+
+fn normalized_text_size(style: &TextStyle) -> f32 {
+    if style.font_size.is_finite() {
+        style.font_size.max(1.0)
+    } else {
+        slipway_core::DEFAULT_TEXT_FONT_SIZE
+    }
+}
+
+fn egui_font_weight_value(weight: FontWeight) -> f32 {
+    match weight {
+        FontWeight::Normal => 400.0,
+        FontWeight::Bold => 700.0,
+        FontWeight::Weight(value) => value.clamp(1, 1000) as f32,
+    }
+}
+
+fn egui_decoration_stroke(enabled: bool, color: egui::Color32) -> egui::Stroke {
+    if enabled {
+        egui::Stroke::new(1.0, color)
+    } else {
+        egui::Stroke::NONE
+    }
+}
+
+fn egui_text_valign(baseline: BaselineShift) -> egui::Align {
+    match baseline {
+        BaselineShift::Normal => egui::Align::BOTTOM,
+        BaselineShift::Superscript => egui::Align::TOP,
+        BaselineShift::Subscript => egui::Align::BOTTOM,
+    }
+}
+
+fn egui_text_position(rect: egui::Rect, style: &TextStyle) -> egui::Pos2 {
+    let y_offset = match style.baseline {
+        BaselineShift::Normal => 0.0,
+        BaselineShift::Superscript => -normalized_text_size(style) * 0.35,
+        BaselineShift::Subscript => normalized_text_size(style) * 0.2,
+    };
+    rect.left_top() + egui::vec2(0.0, y_offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::rc::Rc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use slipway_core::{
+        BaselineShift, CaretGeometryEvidence, CaretSet, CommandEvent, EventRoute, EventRoutePhase,
+        FontResolutionEvidence, FontStyle, FontWeight, FrameIdentity, HitRegionOrder,
+        ImeCompositionPolicyDeclaration, Point, Rect, ScrollAxes, ScrollConsumptionPolicy,
+        ScrollEvent, Size, SlipwayLogic, SlipwaySsot, SlipwayView, SlipwayWidgetListVisitor,
+        SlipwayWidgetTypes, TextBufferSnapshot, TextDecoration, TextSelectionPolicyDeclaration,
+        TextStyle, WheelRouting,
+    };
+    use slipway_debug_bridge::{
+        DebugCommand, DebugPhysicalControl, DebugReplyProduct, MessageDisposition,
+    };
+    use slipway_runtime::SlipwayRuntime;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ProbeWidget {
+        id: WidgetId,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct MoveProbeWidget {
+        id: WidgetId,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct HoverProbeWidget {
+        id: WidgetId,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct CancelProbeWidget {
+        id: WidgetId,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct FocusedProbeWidget {
+        id: WidgetId,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ScrollProbeWidget {
+        id: WidgetId,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum ProbeMessage {
+        Routed,
+    }
+
+    #[derive(Default)]
+    struct TwoCommandBridge {
+        emitted: bool,
+    }
+
+    #[derive(Default)]
+    struct FocusedKeyboardBridge {
+        emitted: bool,
+    }
+
+    #[derive(Default)]
+    struct FocusedCommandBridge {
+        emitted: bool,
+    }
+
+    #[derive(Default)]
+    struct FocusedTextEditBridge {
+        emitted: bool,
+    }
+
+    #[derive(Default)]
+    struct ScrollBridge {
+        emitted: bool,
+    }
+
+    #[derive(Default)]
+    struct DirectCommandBridge {
+        emitted: bool,
+    }
+
+    #[derive(Default)]
+    struct ForgedDeclaredBridge {
+        emitted: bool,
+    }
+
+    impl EguiSlipwayBridge<ProbeWidget> for TwoCommandBridge {
+        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                },
+            }
+        }
+
+        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
+            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+        }
+
+        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            [PointerEventKind::Press, PointerEventKind::Release]
+                .into_iter()
+                .map(|kind| declared_egui_probe_pointer_input(&context, kind))
+                .collect()
+        }
+
+        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
+
+        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
+            outcome
+                .emitted_messages
+                .into_iter()
+                .map(|message| message.message)
+                .collect()
+        }
+    }
+
+    impl EguiSlipwayBridge<FocusedProbeWidget> for FocusedKeyboardBridge {
+        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                },
+            }
+        }
+
+        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
+            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+        }
+
+        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            let Some(region) = context
+                .regions
+                .iter()
+                .find(|region| region.kind == EguiPresentedRegionKind::TextEdit)
+            else {
+                return Vec::new();
+            };
+            let event = InputEvent::Keyboard(KeyboardEvent {
+                target: region.event_target.clone(),
+                target_slot: region.event_target_slot.clone(),
+                key: "Enter".to_string(),
+                kind: KeyEventKind::Press,
+                modifiers: slipway_core::Modifiers::default(),
+                details: KeyboardDetails::default(),
+            });
+            vec![egui_focus_backend_input_event(
+                &context,
+                region,
+                DeclaredEventDispatchKind::Keyboard,
+                event,
+            )]
+        }
+
+        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
+
+        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
+            outcome
+                .emitted_messages
+                .into_iter()
+                .map(|message| message.message)
+                .collect()
+        }
+    }
+
+    impl EguiSlipwayBridge<FocusedProbeWidget> for FocusedCommandBridge {
+        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                },
+            }
+        }
+
+        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
+            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+        }
+
+        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            let Some(region) = context
+                .regions
+                .iter()
+                .find(|region| region.kind == EguiPresentedRegionKind::TextEdit)
+            else {
+                return Vec::new();
+            };
+            let event = InputEvent::Command(CommandEvent {
+                target: region.event_target.clone(),
+                target_slot: region.event_target_slot.clone(),
+                command: "submit".to_string(),
+                payload_ref: Some("payload-1".to_string()),
+                source: None,
+            });
+            vec![egui_focus_backend_input_event(
+                &context,
+                region,
+                DeclaredEventDispatchKind::Command,
+                event,
+            )]
+        }
+
+        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
+
+        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
+            outcome
+                .emitted_messages
+                .into_iter()
+                .map(|message| message.message)
+                .collect()
+        }
+    }
+
+    impl EguiSlipwayBridge<FocusedProbeWidget> for FocusedTextEditBridge {
+        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                },
+            }
+        }
+
+        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
+            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+        }
+
+        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            let Some(region) = context
+                .regions
+                .iter()
+                .find(|region| region.kind == EguiPresentedRegionKind::TextEdit)
+            else {
+                return Vec::new();
+            };
+            let event = InputEvent::TextEdit(TextEditEvent {
+                target: region.event_target.clone(),
+                target_slot: region.event_target_slot.clone(),
+                kind: TextEditKind::ReplaceBuffer,
+                text: Some("abc".to_string()),
+                selection_before: None,
+                selection_after: None,
+            });
+            vec![egui_focus_backend_input_event(
+                &context,
+                region,
+                DeclaredEventDispatchKind::Text,
+                event,
+            )]
+        }
+
+        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
+
+        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
+            outcome
+                .emitted_messages
+                .into_iter()
+                .map(|message| message.message)
+                .collect()
+        }
+    }
+
+    impl EguiSlipwayBridge<ScrollProbeWidget> for ScrollBridge {
+        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                },
+            }
+        }
+
+        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
+            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+        }
+
+        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            let Some(region) = context.scroll_regions.first() else {
+                return Vec::new();
+            };
+            let event = InputEvent::Scroll(ScrollEvent {
+                target: region.target.clone(),
+                target_slot: region.address.clone(),
+                region_id: region.id.clone(),
+                offset_x: 0.0,
+                offset_y: 24.0,
+                viewport: region.viewport,
+                content_bounds: region.content_bounds,
+            });
+            let evidence = slipway_core::declared_scroll_dispatch_evidence(
+                EvidenceSource::backend_presented(EGUI_BACKEND_ID, "native-scroll"),
+                context.frame.clone(),
+                context.scroll_regions,
+                Some(region),
+                event.clone(),
+            );
+            vec![BackendInputEvent::declared(event, evidence)]
+        }
+
+        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
+
+        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
+            outcome
+                .emitted_messages
+                .into_iter()
+                .map(|message| message.message)
+                .collect()
+        }
+    }
+
+    impl EguiSlipwayBridge<ProbeWidget> for DirectCommandBridge {
+        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                },
+            }
+        }
+
+        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
+            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+        }
+
+        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            vec![BackendInputEvent::direct(InputEvent::Command(
+                CommandEvent {
+                    target: context.widget_id.clone(),
+                    target_slot: None,
+                    command: "undeclared".to_string(),
+                    payload_ref: None,
+                    source: None,
+                },
+            ))]
+        }
+
+        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
+
+        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
+            outcome
+                .emitted_messages
+                .into_iter()
+                .map(|message| message.message)
+                .collect()
+        }
+    }
+
+    impl EguiSlipwayBridge<ProbeWidget> for ForgedDeclaredBridge {
+        fn layout_input(&mut self, context: EguiLayoutContext<'_>) -> LayoutInput {
+            TwoCommandBridge::default().layout_input(context)
+        }
+
+        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
+            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+        }
+
+        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
+            if self.emitted {
+                return Vec::new();
+            }
+            self.emitted = true;
+            let mut input = declared_egui_probe_pointer_input(&context, PointerEventKind::Press);
+            if let Some(evidence) = input.dispatch_evidence.as_mut() {
+                evidence.selected_region = Some(PresentationRegionId::from("forged-hit"));
+            }
+            vec![input]
+        }
+
+        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
+
+        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
+            outcome
+                .emitted_messages
+                .into_iter()
+                .map(|message| message.message)
+                .collect()
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct NativeEguiLabel;
+
+    impl SlipwayWidgetTypes for NativeEguiLabel {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwayEguiNativeWidgetSpec for NativeEguiLabel {
+        fn id(&self) -> WidgetId {
+            WidgetId::from("egui.native-label")
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn egui_native_ui(
+            &self,
+            ui: &mut egui::Ui,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _context: EguiNativeWidgetContext<'_>,
+        ) -> EguiNativeWidgetOutput {
+            ui.label("native");
+            EguiNativeWidgetOutput::default()
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct NativeEguiProviderSurface {
+        kind: ProviderSurfaceKind,
+    }
+
+    impl SlipwayWidgetTypes for NativeEguiProviderSurface {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwayEguiNativeWidgetSpec for NativeEguiProviderSurface {
+        fn id(&self) -> WidgetId {
+            match self.kind {
+                ProviderSurfaceKind::Canvas => WidgetId::from("egui.provider.canvas"),
+                ProviderSurfaceKind::Gpu => WidgetId::from("egui.provider.gpu"),
+                _ => WidgetId::from("egui.provider.other"),
+            }
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::RenderSurface, Capability::ProviderSurfacePolicy]
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn egui_native_ui(
+            &self,
+            ui: &mut egui::Ui,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _context: EguiNativeWidgetContext<'_>,
+        ) -> EguiNativeWidgetOutput {
+            ui.label("provider");
+            EguiNativeWidgetOutput::default()
+        }
+    }
+
+    impl SlipwayEguiProviderSurfaceSpec for NativeEguiProviderSurface {
+        fn provider_surface_request(&self) -> ProviderSurfaceRequest {
+            ProviderSurfaceRequest {
+                target: self.id(),
+                provider_id: match self.kind {
+                    ProviderSurfaceKind::Canvas => "egui.canvas.provider".to_string(),
+                    ProviderSurfaceKind::Gpu => "egui.gpu.provider".to_string(),
+                    _ => "egui.other.provider".to_string(),
+                },
+                kind: self.kind.clone(),
+                bounds: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 64.0,
+                        height: 32.0,
+                    },
+                },
+                payload_ref: Some("owned-renderer".to_string()),
+                dirty_regions: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayEguiSplitGpuProviderSurfaceSpec for NativeEguiProviderSurface {
+        type PreparedFrame = ();
+
+        fn prepare_egui_gpu_surface(
+            &mut self,
+            _context: EguiGpuSurfacePrepareContext<'_>,
+        ) -> Result<Self::PreparedFrame, Vec<Diagnostic>> {
+            Ok(())
+        }
+
+        fn paint_prepared_egui_gpu_surface(
+            &self,
+            _context: EguiGpuSurfacePaintContext<'_, '_, Self::PreparedFrame>,
+        ) -> Result<(), Vec<Diagnostic>> {
+            Ok(())
+        }
+    }
+
+    struct EguiNativeVisitCounter {
+        normal: usize,
+        native: usize,
+    }
+
+    impl SlipwayEguiWidgetListVisitor<(), ProbeMessage> for EguiNativeVisitCounter {
+        fn visit_egui_child<W>(
+            &mut self,
+            _widget: &W,
+            _external: &(),
+            _local: &W::LocalState,
+            _slot: WidgetSlotAddress,
+        ) where
+            W: SlipwayEguiBackendChildWidget<ExternalState = (), AppMessage = ProbeMessage>,
+        {
+            self.normal += 1;
+        }
+
+        fn visit_egui_native_child<N>(
+            &mut self,
+            _widget: &N,
+            _external: &(),
+            _local: &N::LocalState,
+            _slot: WidgetSlotAddress,
+        ) where
+            N: SlipwayEguiNativeChildWidget<ExternalState = (), AppMessage = ProbeMessage>,
+        {
+            self.native += 1;
+        }
+    }
+
+    macro_rules! impl_egui_test_leaf_children {
+        ($($type:ty),+ $(,)?) => {
+            $(
+                impl SlipwayEguiAuthoredChildren for $type {
+                    fn visit_egui_authored_children<V>(
+                        &self,
+                        _external: &Self::ExternalState,
+                        _local: &Self::LocalState,
+                        _visitor: &mut V,
+                    ) where
+                        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+                    {
+                    }
+                }
+            )+
+        };
+    }
+
+    macro_rules! impl_egui_test_event_policy {
+        ($($type:ty),+ $(,)?) => {
+            $(
+                impl slipway_core::SlipwayEventRoutingPolicy for $type {
+                    fn event_routing_policy(
+                        &self,
+                        _external: &Self::ExternalState,
+                        _local: &Self::LocalState,
+                        event: &slipway_core::InputEvent,
+                    ) -> slipway_core::EventRoutingPolicyDeclaration {
+                        let id = self.id();
+                        let address = event.target_slot().cloned();
+                        let path = address
+                            .as_ref()
+                            .map(|address| address.path.clone())
+                            .unwrap_or_else(|| vec![id.clone()]);
+                        slipway_core::EventRoutingPolicyDeclaration {
+                            target: id.clone(),
+                            event_target: event.target().clone(),
+                            route: slipway_core::EventRoute {
+                                route_id: None,
+                                address,
+                                path,
+                                phase: slipway_core::EventRoutePhase::Target,
+                            },
+                            capture: Vec::new(),
+                            diagnostics: Vec::new(),
+                        }
+                    }
+                }
+
+                impl slipway_core::SlipwayEventDispositionPolicy for $type {
+                    fn event_disposition(
+                        &self,
+                        _external: &Self::ExternalState,
+                        _local: &Self::LocalState,
+                        event: &slipway_core::InputEvent,
+                        _route: &slipway_core::EventRoute,
+                    ) -> slipway_core::EventPropagationEvidence {
+                        let id = self.id();
+                        let handled = event.target() == &id;
+                        let disposition = slipway_core::EventDisposition {
+                            handled,
+                            propagate: !handled,
+                            default_action_allowed: true,
+                        };
+                        slipway_core::EventPropagationEvidence {
+                            target: id.clone(),
+                            event: event.clone(),
+                            steps: vec![slipway_core::EventPropagationStep {
+                                stage: slipway_core::EventPropagationStage::Target,
+                                node: Some(id),
+                                disposition,
+                                emitted_messages: Vec::new(),
+                                changes: Vec::new(),
+                            }],
+                            final_disposition: disposition,
+                            diagnostics: Vec::new(),
+                        }
+                    }
+                }
+            )+
+        };
+    }
+
+    impl_egui_test_leaf_children!(
+        ProbeWidget,
+        MoveProbeWidget,
+        HoverProbeWidget,
+        CancelProbeWidget,
+        FocusedProbeWidget,
+        ScrollProbeWidget,
+        UnsupportedClipWidget,
+        CountingWidget,
+    );
+
+    impl_egui_test_event_policy!(
+        ProbeWidget,
+        FocusedProbeWidget,
+        ScrollProbeWidget,
+        ParentWithChildWidget,
+        ScrollableParentWidget,
+        UnsupportedClipWidget,
+        CountingWidget,
+    );
+
+    impl slipway_core::SlipwayTextBufferPolicy for FocusedProbeWidget {
+        fn text_buffer(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> TextBufferSnapshot {
+            TextBufferSnapshot {
+                target: self.id.clone(),
+                text: "editable".to_string(),
+                revision: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayTextSelectionPolicy for FocusedProbeWidget {
+        fn text_selection(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> TextSelectionPolicyDeclaration {
+            TextSelectionPolicyDeclaration {
+                target: self.id.clone(),
+                selection: None,
+                carets: CaretSet {
+                    carets: vec![0],
+                    primary: Some(0),
+                },
+                editable: true,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayImeCompositionPolicy for FocusedProbeWidget {
+        fn ime_composition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> ImeCompositionPolicyDeclaration {
+            ImeCompositionPolicyDeclaration {
+                target: self.id.clone(),
+                active: false,
+                preedit_text: None,
+                cursor_range: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayCaretGeometryPolicy for FocusedProbeWidget {
+        fn caret_geometry(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _measurement: Option<&slipway_core::TextMeasurementEvidence>,
+        ) -> CaretGeometryEvidence {
+            CaretGeometryEvidence {
+                target: self.id.clone(),
+                caret_bounds: Vec::new(),
+                selection_bounds: Vec::new(),
+                measurement_request_ids: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayTextEditCommandPolicy for FocusedProbeWidget {
+        fn text_edit_commands(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<slipway_core::TextEditCommandDeclaration> {
+            vec![
+                slipway_core::TextEditCommandDeclaration {
+                    command_id: "insert-text".to_string(),
+                    kind: TextEditKind::InsertText,
+                    enabled: true,
+                },
+                slipway_core::TextEditCommandDeclaration {
+                    command_id: "delete-backward".to_string(),
+                    kind: TextEditKind::DeleteBackward,
+                    enabled: true,
+                },
+            ]
+        }
+    }
+
+    impl slipway_core::SlipwayTextUndoRedoPolicy for FocusedProbeWidget {
+        fn text_undo_redo(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> slipway_core::TextUndoRedoEvidence {
+            slipway_core::TextUndoRedoEvidence {
+                target: self.id.clone(),
+                can_undo: false,
+                can_redo: false,
+                undo_depth: Some(0),
+                redo_depth: Some(0),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayTextFlowPolicy for FocusedProbeWidget {
+        fn text_flow_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _input: &LayoutInput,
+        ) -> slipway_core::TextFlowPolicy {
+            slipway_core::TextFlowPolicy {
+                target: self.id.clone(),
+                line_mode: slipway_core::TextLineMode::SingleLine,
+                wrap: slipway_core::TextWrapMode::NoWrap,
+                line_clamp: None,
+                allow_ellipsis: false,
+                baseline: None,
+                caret_bounds: Vec::new(),
+                viewport: None,
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayTextMeasurementPolicy for FocusedProbeWidget {
+        fn text_measurement_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _input: &LayoutInput,
+        ) -> slipway_core::TextMeasurementPolicyDeclaration {
+            slipway_core::TextMeasurementPolicyDeclaration {
+                target: self.id.clone(),
+                required: false,
+                purposes: Vec::new(),
+                requests: Vec::new(),
+                cache_policies: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn text_measurement_evidence<P>(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: &LayoutInput,
+            _provider: &mut P,
+        ) -> slipway_core::TextMeasurementEvidence
+        where
+            P: slipway_core::SlipwayTextMetricProvider,
+        {
+            slipway_core::TextMeasurementEvidence {
+                target: self.id.clone(),
+                policy: slipway_core::SlipwayTextMeasurementPolicy::text_measurement_policy(
+                    self, external, local, input,
+                ),
+                receipts: Vec::new(),
+                cache: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayTextMeasurementCachePolicy for FocusedProbeWidget {
+        fn text_measurement_cache_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _input: &LayoutInput,
+        ) -> Vec<slipway_core::TextMeasurementCachePolicyDeclaration> {
+            Vec::new()
+        }
+    }
+
+    impl slipway_core::SlipwayCachedTextMeasurementPolicy for FocusedProbeWidget {
+        fn cached_text_measurement_evidence<P, C>(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: &LayoutInput,
+            _provider: &mut P,
+            _cache: &mut C,
+        ) -> slipway_core::TextMeasurementEvidence
+        where
+            P: slipway_core::SlipwayTextMetricProvider,
+            C: slipway_core::SlipwayTextMeasurementCache,
+        {
+            slipway_core::TextMeasurementEvidence {
+                target: self.id.clone(),
+                policy: slipway_core::SlipwayTextMeasurementPolicy::text_measurement_policy(
+                    self, external, local, input,
+                ),
+                receipts: Vec::new(),
+                cache: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayFocusTraversal for FocusedProbeWidget {
+        fn focus_member(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Option<slipway_core::FocusTraversalMember> {
+            None
+        }
+
+        fn next_focus(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _input: slipway_core::FocusTraversalInput,
+        ) -> Option<WidgetId> {
+            None
+        }
+
+        fn previous_focus(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _input: slipway_core::FocusTraversalInput,
+        ) -> Option<WidgetId> {
+            None
+        }
+    }
+
+    impl slipway_core::SlipwaySemantics for FocusedProbeWidget {
+        fn semantics(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<slipway_core::SemanticNode> {
+            Vec::new()
+        }
+    }
+
+    impl slipway_core::SlipwayDebugEventTracePolicy for FocusedProbeWidget {
+        fn debug_event_trace_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> slipway_core::DebugEventTracePolicyDeclaration {
+            slipway_core::DebugEventTracePolicyDeclaration {
+                target: self.id.clone(),
+                request_only: true,
+                include_route: true,
+                include_messages: true,
+                include_state_changes: true,
+                include_repaint_request: false,
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayContainerLayoutPolicy for ScrollProbeWidget {
+        fn container_layout_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _input: &LayoutInput,
+        ) -> slipway_core::ContainerLayoutPolicyDeclaration {
+            slipway_core::ContainerLayoutPolicyDeclaration {
+                target: self.id.clone(),
+                kind: slipway_core::ContainerLayoutKind::Stack,
+                child_order: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayChildConstraintPolicy for ScrollProbeWidget {
+        fn child_constraints(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _input: &LayoutInput,
+        ) -> Vec<slipway_core::ChildConstraintPolicyDeclaration> {
+            Vec::new()
+        }
+    }
+
+    impl slipway_core::SlipwayLayoutInvalidationPolicy for ScrollProbeWidget {
+        fn layout_invalidation_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> slipway_core::LayoutInvalidationPolicyDeclaration {
+            slipway_core::LayoutInvalidationPolicyDeclaration {
+                target: self.id.clone(),
+                dependencies: Vec::new(),
+                revisions: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayLayoutEvidencePolicy for ScrollProbeWidget {
+        fn layout_evidence(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            output: &LayoutOutput,
+        ) -> slipway_core::LayoutEvidence {
+            slipway_core::LayoutEvidence {
+                target: self.id.clone(),
+                bounds: output.bounds,
+                child_placements: output.child_placements.clone(),
+                invalidated: false,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayScrollBehaviorPolicy for ScrollProbeWidget {
+        fn scroll_behavior_policy(
+            &self,
+            _external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: &LayoutInput,
+        ) -> slipway_core::ScrollBehaviorPolicyDeclaration {
+            let viewport = input.viewport;
+            slipway_core::ScrollBehaviorPolicyDeclaration {
+                target: self.id.clone(),
+                region_id: None,
+                address: None,
+                axes: ScrollAxes {
+                    horizontal: false,
+                    vertical: true,
+                },
+                extent: Size {
+                    width: viewport.size.width,
+                    height: viewport.size.height * 4.0,
+                },
+                viewport,
+                content_bounds: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: viewport.size.width,
+                        height: viewport.size.height * 4.0,
+                    },
+                }),
+                offset: Point {
+                    x: 0.0,
+                    y: *local as f32,
+                },
+                consumption: ScrollConsumptionPolicy {
+                    wheel: true,
+                    drag: true,
+                    keyboard: true,
+                    programmatic: true,
+                },
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayWheelRoutingPolicy for ScrollProbeWidget {
+        fn wheel_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _wheel: &slipway_core::WheelEvent,
+        ) -> slipway_core::WheelRoutingPolicyDeclaration {
+            slipway_core::WheelRoutingPolicyDeclaration {
+                target: self.id.clone(),
+                routing: WheelRouting::SelfFirst,
+                modifiers: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayViewportObservationPolicy for ScrollProbeWidget {
+        fn viewport_observation(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> slipway_core::ViewportObservationEvidence {
+            let viewport = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 40.0,
+                },
+            });
+            slipway_core::ViewportObservationEvidence {
+                target: self.id.clone(),
+                viewport,
+                visible_rect: viewport,
+                scroll: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayVirtualCollectionPolicy for ScrollProbeWidget {
+        fn virtual_collection_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> slipway_core::VirtualCollectionPolicyDeclaration {
+            slipway_core::VirtualCollectionPolicyDeclaration {
+                target: self.id.clone(),
+                item_count: 0,
+                visible_range: None,
+                realization_hint: slipway_core::VirtualizationHint::None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayHitTesting for ScrollProbeWidget {
+        fn hit_test(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: slipway_core::HitTestInput,
+        ) -> slipway_core::HitTestOutput {
+            slipway_core::HitTestOutput {
+                target: Some(input.target.clone()),
+                local_point: Some(input.point),
+                route: EventRoute {
+                    route_id: None,
+                    address: None,
+                    path: vec![input.target],
+                    phase: EventRoutePhase::Target,
+                },
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwaySemantics for ScrollProbeWidget {
+        fn semantics(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<slipway_core::SemanticNode> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayEguiAuthoredChildren for ParentWithChildWidget {
+        fn visit_egui_authored_children<V>(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            visitor: &mut V,
+        ) where
+            V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+            visitor.visit_egui_child(&self.child, external, &local.child, self.child_slot());
+        }
+    }
+
+    impl SlipwayEguiAuthoredChildren for ScrollableParentWidget {
+        fn visit_egui_authored_children<V>(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            visitor: &mut V,
+        ) where
+            V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+            visitor.visit_egui_child(&self.child, external, &local.child, self.child_slot());
+        }
+    }
+
+    impl ProbeWidget {
+        fn new(id: &str) -> Self {
+            Self {
+                id: WidgetId::from(id),
+            }
+        }
+    }
+
+    impl MoveProbeWidget {
+        fn new(id: &str) -> Self {
+            Self {
+                id: WidgetId::from(id),
+            }
+        }
+    }
+
+    impl HoverProbeWidget {
+        fn new(id: &str) -> Self {
+            Self {
+                id: WidgetId::from(id),
+            }
+        }
+    }
+
+    impl CancelProbeWidget {
+        fn new(id: &str) -> Self {
+            Self {
+                id: WidgetId::from(id),
+            }
+        }
+    }
+
+    impl FocusedProbeWidget {
+        fn new(id: &str) -> Self {
+            Self {
+                id: WidgetId::from(id),
+            }
+        }
+    }
+
+    impl ScrollProbeWidget {
+        fn new(id: &str) -> Self {
+            Self {
+                id: WidgetId::from(id),
+            }
+        }
+    }
+
+    fn control_message(id: &str, target: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.control","arguments":{{"trace":true,"event":{{"type":"command","target":"{}","command":"routed"}}}}}}}}"#,
+            id, target,
+        )
+    }
+
+    fn frame(index: u64) -> FrameIdentity {
+        FrameIdentity {
+            surface_id: "egui-test".to_string(),
+            surface_instance_id: "egui-test-instance".to_string(),
+            revision: index,
+            frame_index: index,
+            viewport: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 40.0,
+                },
+            },
+        }
+    }
+
+    fn frame_json(frame: &FrameIdentity) -> String {
+        format!(
+            r#"{{"surface_id":"{}","surface_instance_id":"{}","revision":{},"frame_index":{},"viewport":{{"origin":{{"x":{},"y":{}}},"size":{{"width":{},"height":{}}}}}}}"#,
+            frame.surface_id,
+            frame.surface_instance_id,
+            frame.revision,
+            frame.frame_index,
+            frame.viewport.origin.x,
+            frame.viewport.origin.y,
+            frame.viewport.size.width,
+            frame.viewport.size.height,
+        )
+    }
+
+    fn physical_pointer_message(id: &str, frame: &FrameIdentity, x: f32, y: f32) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"pointer","phase":"press","position":{{"x":{},"y":{}}},"button":"primary","device":"mouse"}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            x,
+            y,
+        )
+    }
+
+    fn physical_text_message(id: &str, frame: &FrameIdentity, target: &str, text: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"text","target":"{}","text":"{}"}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            target,
+            text,
+        )
+    }
+
+    fn physical_focus_message(
+        id: &str,
+        frame: &FrameIdentity,
+        target: &str,
+        focused: bool,
+    ) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"focus","target":"{}","focused":{}}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            target,
+            focused,
+        )
+    }
+
+    fn physical_pointer_phase_message(
+        id: &str,
+        frame: &FrameIdentity,
+        x: f32,
+        y: f32,
+        phase: &str,
+    ) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"pointer","phase":"{}","position":{{"x":{},"y":{}}},"device":"mouse"}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            phase,
+            x,
+            y,
+        )
+    }
+
+    fn physical_keyboard_message(
+        id: &str,
+        frame: &FrameIdentity,
+        target: &str,
+        key: &str,
+    ) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"keyboard","target":"{}","key":"{}","phase":"press"}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            target,
+            key,
+        )
+    }
+
+    fn physical_text_edit_message(
+        id: &str,
+        frame: &FrameIdentity,
+        target: &str,
+        edit_kind: &str,
+        text: &str,
+    ) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"text_edit","target":"{}","edit_kind":"{}","text":"{}"}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            target,
+            edit_kind,
+            text,
+        )
+    }
+
+    fn physical_command_message(
+        id: &str,
+        frame: &FrameIdentity,
+        target: &str,
+        command: &str,
+        payload_ref: &str,
+    ) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"command","target":"{}","command":"{}","payload_ref":"{}"}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            target,
+            command,
+            payload_ref,
+        )
+    }
+
+    fn physical_command_no_payload_message(
+        id: &str,
+        frame: &FrameIdentity,
+        target: &str,
+        command: &str,
+    ) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"command","target":"{}","command":"{}"}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            target,
+            command,
+        )
+    }
+
+    fn physical_scroll_message(
+        id: &str,
+        frame: &FrameIdentity,
+        target: &str,
+        offset_x: f32,
+        offset_y: f32,
+    ) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"scroll","target":"{}","offset_x":{},"offset_y":{}}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            target,
+            offset_x,
+            offset_y,
+        )
+    }
+
+    fn physical_wheel_message(
+        id: &str,
+        frame: &FrameIdentity,
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+    ) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"wheel","position":{{"x":{},"y":{}}},"delta_x":{},"delta_y":{}}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            x,
+            y,
+            delta_x,
+            delta_y,
+        )
+    }
+
+    fn probe_event_message(id: &str, frame: &FrameIdentity) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.probe","arguments":{{"frame":{},"kinds":["event"]}}}}}}"#,
+            id,
+            frame_json(frame),
+        )
+    }
+
+    fn test_hit_region(
+        id: &str,
+        target: WidgetId,
+        bounds: impl Into<Rect>,
+        traversal_order: usize,
+    ) -> HitRegionDeclaration {
+        let address = Some(WidgetSlotAddress::new(target.clone(), traversal_order));
+        slipway_core::hit_region_from_pointer_capability(
+            &ProbeWidget { id: target.clone() },
+            &(),
+            &7,
+            PresentationRegionId::from(id),
+            address.clone(),
+            TargetLocalRect::new(bounds.into()),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: traversal_order,
+                traversal_order,
+            },
+            Some(id.to_string()),
+            CursorCapability::Pointer,
+            true,
+            PointerCaptureIntent::None,
+        )
+    }
+
+    fn declared_egui_probe_pointer_input(
+        context: &EguiInputContext<'_>,
+        kind: PointerEventKind,
+    ) -> BackendInputEvent {
+        let (dispatch, evidence) = slipway_core::resolve_declared_pointer_dispatch_with_evidence(
+            EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
+            context.frame.clone(),
+            context.layout,
+            context.hit_regions,
+            Point { x: 1.0, y: 1.0 },
+            kind,
+            Some(PointerButton::Primary),
+            egui_pointer_details(
+                egui::Modifiers::default(),
+                Some(egui::PointerButton::Primary),
+            ),
+            matches!(kind, PointerEventKind::Press),
+        );
+        BackendInputEvent::declared(
+            dispatch
+                .expect("egui probe pointer resolves declared hit region")
+                .input,
+            evidence,
+        )
+    }
+
+    fn declared_egui_probe_pointer_input_for_runtime(
+        runtime: &SlipwayRuntime<ProbeWidget>,
+        frame: FrameIdentity,
+        kind: PointerEventKind,
+    ) -> BackendInputEvent {
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(frame.viewport),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: frame.viewport.size,
+            },
+        };
+        let view = runtime.widget().visible_backend_view_definition(
+            runtime.external(),
+            runtime.local_state(),
+            ViewDefinitionInput {
+                frame: frame.clone(),
+                layout_input,
+            },
+        );
+        let (dispatch, evidence) = slipway_core::resolve_declared_pointer_dispatch_with_evidence(
+            EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
+            frame,
+            &view.layout,
+            &view.hit_regions,
+            Point { x: 1.0, y: 1.0 },
+            kind,
+            Some(PointerButton::Primary),
+            egui_pointer_details(
+                egui::Modifiers::default(),
+                Some(egui::PointerButton::Primary),
+            ),
+            matches!(kind, PointerEventKind::Press),
+        );
+        BackendInputEvent::declared(
+            dispatch
+                .expect("egui runtime probe pointer resolves declared hit region")
+                .input,
+            evidence,
+        )
+    }
+
+    fn test_text_edit_region(target: WidgetId, bounds: impl Into<Rect>) -> FocusRegionDeclaration {
+        let bounds = TargetLocalRect::new(bounds.into());
+        slipway_core::text_edit_focus_region_from_capability(
+            &FocusedProbeWidget { id: target.clone() },
+            &(),
+            &0,
+            PresentationRegionId::from("text-focus"),
+            Some(WidgetSlotAddress::new(target.clone(), 0)),
+            bounds,
+            None,
+            true,
+            &LayoutInput {
+                viewport: bounds,
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: bounds.size,
+                },
+            },
+            None,
+        )
+    }
+
+    fn test_scroll_region(target: WidgetId, viewport: impl Into<Rect>) -> ScrollRegionDeclaration {
+        let viewport = viewport.into();
+        slipway_core::scroll_region_from_scrollable_capability(
+            &ScrollProbeWidget { id: target.clone() },
+            &(),
+            &12,
+            &LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            Some(PresentationRegionId::from("scroll-region")),
+            Some(WidgetSlotAddress::new(target, 0)),
+            true,
+        )
+    }
+
+    fn egui_test_rect(x: f32, y: f32, width: f32, height: f32) -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(width, height))
+    }
+
+    fn slipway_test_rect(rect: egui::Rect) -> Rect {
+        Rect {
+            origin: Point {
+                x: rect.min.x,
+                y: rect.min.y,
+            },
+            size: Size {
+                width: rect.width().max(0.0),
+                height: rect.height().max(0.0),
+            },
+        }
+    }
+
+    fn test_presented_region(
+        ui: &mut egui::Ui,
+        id: &str,
+        kind: EguiPresentedRegionKind,
+        rect: egui::Rect,
+        sense: egui::Sense,
+        cursor: CursorCapability,
+    ) -> EguiPresentedRegion {
+        let response =
+            apply_region_cursor(ui.interact(rect, egui::Id::new(id), sense), cursor.clone());
+        EguiPresentedRegion {
+            kind,
+            region_id: PresentationRegionId::from(id),
+            target: WidgetId::from(id),
+            address: None,
+            event_target: WidgetId::from(id),
+            event_target_slot: None,
+            declared_bounds: slipway_test_rect(rect),
+            target_origin: rect.min,
+            target_bounds: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: rect.width().max(0.0),
+                    height: rect.height().max(0.0),
+                },
+            },
+            event_coordinate_space: PointerEventCoordinateSpace::TargetLocal,
+            response,
+            cursor,
+            enabled: true,
+            text_edit_change: None,
+            scroll_state: None,
+        }
+    }
+
+    fn test_text_edit_change() -> EguiTextEditChange {
+        EguiTextEditChange {
+            before: "before".to_string(),
+            after: "after".to_string(),
+            selection_before: None,
+            selection_after: None,
+        }
+    }
+
+    #[test]
+    fn egui_region_anchor_position_includes_target_origin() {
+        egui::__run_test_ui(|ui| {
+            let frame = FrameIdentity {
+                surface_id: "egui-test".to_string(),
+                surface_instance_id: "anchor".to_string(),
+                revision: 1,
+                frame_index: 1,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 240.0,
+                        height: 120.0,
+                    },
+                },
+            };
+            let layout = LayoutOutput {
+                bounds: TargetLocalRect::new(frame.viewport),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+            let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+            let response = ui.interact(
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1.0, 1.0)),
+                egui::Id::new("anchor-response"),
+                egui::Sense::hover(),
+            );
+            let region = EguiPresentedRegion {
+                kind: EguiPresentedRegionKind::Hit,
+                region_id: PresentationRegionId::from("child-hit"),
+                target: WidgetId::from("child"),
+                address: None,
+                event_target: WidgetId::from("child"),
+                event_target_slot: None,
+                declared_bounds: Rect {
+                    origin: Point { x: 10.0, y: 6.0 },
+                    size: Size {
+                        width: 20.0,
+                        height: 12.0,
+                    },
+                },
+                target_origin: egui::pos2(80.0, 40.0),
+                target_bounds: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 60.0,
+                    },
+                },
+                event_coordinate_space: PointerEventCoordinateSpace::TargetLocal,
+                response,
+                cursor: CursorCapability::Default,
+                enabled: true,
+                text_edit_change: None,
+                scroll_state: None,
+            };
+            let regions = vec![region];
+            let context = EguiInputContext {
+                ui,
+                widget_id: WidgetId::from("root"),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &[],
+                focus_regions: &[],
+                scroll_regions: &[],
+                response: &regions[0].response,
+                regions: &regions,
+            };
+
+            let anchor = egui_region_anchor_position(&context, &regions[0]);
+
+            assert_eq!(anchor, egui::pos2(90.5, 46.5));
+        });
+    }
+
+    fn test_scroll_state() -> EguiScrollRegionState {
+        EguiScrollRegionState {
+            declared_offset: Point { x: 0.0, y: 0.0 },
+            egui_offset: Point { x: 0.0, y: 8.0 },
+            content_size: Size {
+                width: 100.0,
+                height: 200.0,
+            },
+            inner_rect: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 50.0,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn egui_native_wrapper_participates_in_child_list_entry_traversal() {
+        let children = (SlipwayEguiNativeWidget::new(NativeEguiLabel),);
+        let local = ((),);
+        let root_slot = WidgetSlotAddress::new(WidgetId::from("egui.native-root"), 0);
+        let mut counter = EguiNativeVisitCounter {
+            normal: 0,
+            native: 0,
+        };
+
+        children.visit_egui_children(&(), &local, &root_slot, &mut counter);
+
+        assert_eq!(counter.normal, 0);
+        assert_eq!(counter.native, 1);
+    }
+
+    #[test]
+    fn egui_provider_surface_wrapper_exposes_canvas_and_gpu_slots() {
+        fn assert_provider_surface<W: slipway_core::SlipwayProviderSurfaceCapability>(_widget: &W) {
+        }
+
+        let canvas = SlipwayEguiNativeWidget::new(NativeEguiProviderSurface {
+            kind: ProviderSurfaceKind::Canvas,
+        });
+        assert_provider_surface(&canvas);
+        assert_eq!(canvas.canvas_surfaces().len(), 1);
+        assert!(canvas.gpu_surfaces().is_empty());
+        assert!(canvas.media_surfaces().is_empty());
+        assert!(canvas.plot_surfaces().is_empty());
+        assert_eq!(
+            canvas.render_surfaces(&(), &())[0].capabilities,
+            vec!["canvas".to_string()]
+        );
+
+        let mut gpu = SlipwayEguiNativeWidget::new(NativeEguiProviderSurface {
+            kind: ProviderSurfaceKind::Gpu,
+        });
+        assert_provider_surface(&gpu);
+        assert!(gpu.canvas_surfaces().is_empty());
+        assert_eq!(gpu.gpu_surfaces().len(), 1);
+        assert_eq!(gpu.gpu_surfaces()[0].provider_id, "egui.gpu.provider");
+        assert_eq!(
+            gpu.render_surfaces(&(), &())[0].capabilities,
+            vec!["gpu".to_string()]
+        );
+
+        let hit = gpu.provider_hit_test(HitTestInput {
+            target: WidgetId::from("egui.provider.gpu"),
+            point: Point { x: 2.0, y: 3.0 },
+            pointer: slipway_core::PointerDetails::default(),
+        });
+        assert_eq!(hit.provider_id, "egui.gpu.provider");
+        assert_eq!(hit.hit, None);
+        assert!(hit.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "egui.provider_surface.hit_test_unsupported"
+                && diagnostic.severity == slipway_core::DiagnosticSeverity::Unsupported
+        }));
+
+        let snapshot = gpu.provider_snapshot(ProviderSnapshotRequest {
+            target: WidgetId::from("egui.provider.gpu"),
+            provider_id: "egui.gpu.provider".to_string(),
+            bounds: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 64.0,
+                    height: 32.0,
+                },
+            },
+            frame: frame(212),
+        });
+        assert_eq!(snapshot.provider_id, "egui.gpu.provider");
+        assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "egui.provider_surface.snapshot_unsupported"
+                && diagnostic.severity == slipway_core::DiagnosticSeverity::Unsupported
+        }));
+    }
+
+    #[test]
+    fn egui_split_gpu_provider_contract_is_backend_specific_and_mut_prepare_only() {
+        fn assert_split_gpu<W: SlipwayEguiSplitGpuSurfaceProvider<PreparedFrame = ()>>(
+            _widget: &W,
+        ) {
+        }
+
+        let mut gpu = SlipwayEguiNativeWidget::new(NativeEguiProviderSurface {
+            kind: ProviderSurfaceKind::Gpu,
+        });
+
+        assert_split_gpu(&gpu);
+        assert_eq!(gpu.gpu_surfaces().len(), 1);
+        assert_eq!(
+            gpu.native().provider_surface_request().kind,
+            ProviderSurfaceKind::Gpu
+        );
+
+        gpu.native_mut().kind = ProviderSurfaceKind::Canvas;
+        assert!(gpu.gpu_surfaces().is_empty());
+        assert_eq!(gpu.canvas_surfaces().len(), 1);
+    }
+
+    #[test]
+    fn egui_provider_surface_profile_is_admitted() {
+        let admission = egui_backend_admission()
+            .backend_parity_admission(&[CapabilityProfileKind::ProviderSurface]);
+
+        assert!(admission.accepted);
+        assert!(admission.visible_requirements.iter().any(|requirement| {
+            requirement.capability == egui_provider_surface_visible_capability()
+        }));
+    }
+
+    #[test]
+    fn egui_input_lock_collects_raw_input_only() {
+        let source = include_str!("lib.rs");
+        let snapshot_fn = source
+            .find("fn egui_raw_input_snapshot")
+            .expect("raw input snapshot helper is present");
+        let snapshot_end = source[snapshot_fn..]
+            .find("#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]")
+            .map(|offset| snapshot_fn + offset)
+            .expect("next item after raw input helper is present");
+        let snapshot_body = &source[snapshot_fn..snapshot_end];
+
+        assert!(snapshot_body.contains("ui.input(|input| EguiRawInputSnapshot"));
+        assert!(snapshot_body.contains("events: input.events.clone()"));
+        assert!(snapshot_body.contains("modifiers: input.modifiers"));
+        assert!(snapshot_body.contains("hover_pos: input.pointer.hover_pos()"));
+        for forbidden in [
+            "response.",
+            "egui_region_at_position",
+            "focused_target",
+            "request_focus",
+            "focused_event_target",
+            "focused_region_kind",
+        ] {
+            assert!(
+                !snapshot_body.contains(forbidden),
+                "Context::input closure must collect raw input only; found {forbidden}"
+            );
+        }
+
+        let input_events = source
+            .find(
+                "fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {",
+            )
+            .expect("input_events method is present");
+        let input_events_end = source[input_events..]
+            .find("fn paint(&mut self, context: EguiPaintContext<'_>, ops: &[PaintOp])")
+            .map(|offset| input_events + offset)
+            .expect("paint method follows input_events");
+        let input_events_body = &source[input_events..input_events_end];
+        let raw_snapshot = input_events_body
+            .find("let raw_input = egui_raw_input_snapshot(context.ui);")
+            .expect("input_events snapshots raw input");
+        let response_routing = input_events_body
+            .find("egui_region_at_position")
+            .expect("input_events routes with region responses after snapshot");
+
+        assert!(
+            raw_snapshot < response_routing,
+            "response routing must happen after raw input snapshot"
+        );
+        assert!(!input_events_body.contains("context.ui.input(|input|"));
+    }
+
+    #[test]
+    fn runtime_app_drain_uses_budgeted_live_debug_turn_api() {
+        let source = include_str!("lib.rs");
+        let drain_method = source
+            .find("pub fn drain_debug_pending(&mut self)")
+            .expect("runtime app drain method is present");
+        let drain_end = source[drain_method..]
+            .find("pub fn sense")
+            .map(|offset| drain_method + offset)
+            .expect("next method after drain is present");
+        let drain_body = &source[drain_method..drain_end];
+
+        assert!(drain_body.contains("drain_live_debug_turn_with_app_reducer"));
+        assert!(!drain_body.contains("drain_debug_pending_with_app_reducer"));
+        assert!(!drain_body.contains("drain_runtime_mcp_pending_with_app_reducer"));
+    }
+
+    #[test]
+    fn response_authoritative_region_wins_over_overlapping_geometric_region() {
+        egui::__run_test_ui(|ui| {
+            let rect = egui_test_rect(0.0, 0.0, 60.0, 40.0);
+            let mut response_region = test_presented_region(
+                ui,
+                "scroll-response",
+                EguiPresentedRegionKind::Scroll,
+                rect,
+                egui::Sense::click_and_drag(),
+                CursorCapability::Default,
+            );
+            response_region.scroll_state = Some(test_scroll_state());
+
+            let geometric_region = test_presented_region(
+                ui,
+                "geometry-hit",
+                EguiPresentedRegionKind::Hit,
+                rect,
+                egui::Sense::click(),
+                CursorCapability::Pointer,
+            );
+            let regions = vec![response_region, geometric_region];
+
+            let selected = egui_region_at_position(&regions, egui::pos2(20.0, 20.0))
+                .expect("overlapping point should select a region");
+
+            assert_eq!(selected.region_id.as_str(), "scroll-response");
+        });
+    }
+
+    #[test]
+    fn unchanged_scroll_background_is_not_response_authority() {
+        egui::__run_test_ui(|ui| {
+            let mut scroll_region = test_presented_region(
+                ui,
+                "scroll-background",
+                EguiPresentedRegionKind::Scroll,
+                egui_test_rect(0.0, 0.0, 60.0, 40.0),
+                egui::Sense::drag(),
+                CursorCapability::Default,
+            );
+            scroll_region.scroll_state = Some(EguiScrollRegionState {
+                declared_offset: Point { x: 4.0, y: 8.0 },
+                egui_offset: Point { x: 4.0, y: 8.0 },
+                ..test_scroll_state()
+            });
+
+            assert!(
+                !egui_region_has_response_authority(&scroll_region),
+                "unchanged scroll metadata must not outrank a child response"
+            );
+        });
+    }
+
+    #[test]
+    fn text_edit_response_wins_inside_broader_region() {
+        egui::__run_test_ui(|ui| {
+            let text_rect = egui_test_rect(10.0, 10.0, 40.0, 20.0);
+            let mut text_region = test_presented_region(
+                ui,
+                "text-edit",
+                EguiPresentedRegionKind::TextEdit,
+                text_rect,
+                egui::Sense::click(),
+                CursorCapability::Text,
+            );
+            text_region.text_edit_change = Some(test_text_edit_change());
+
+            let broad_region = test_presented_region(
+                ui,
+                "broad-hit",
+                EguiPresentedRegionKind::Hit,
+                egui_test_rect(0.0, 0.0, 100.0, 80.0),
+                egui::Sense::click(),
+                CursorCapability::Pointer,
+            );
+            let regions = vec![text_region, broad_region];
+
+            let selected = egui_region_at_position(&regions, egui::pos2(20.0, 15.0))
+                .expect("text edit point should select a region");
+
+            assert_eq!(selected.region_id.as_str(), "text-edit");
+            assert_eq!(selected.kind, EguiPresentedRegionKind::TextEdit);
+        });
+    }
+
+    #[test]
+    fn geometry_fallback_still_selects_region_without_response_authority() {
+        egui::__run_test_ui(|ui| {
+            let first_region = test_presented_region(
+                ui,
+                "first-hit",
+                EguiPresentedRegionKind::Hit,
+                egui_test_rect(0.0, 0.0, 40.0, 40.0),
+                egui::Sense::click(),
+                CursorCapability::Pointer,
+            );
+            let fallback_region = test_presented_region(
+                ui,
+                "fallback-hit",
+                EguiPresentedRegionKind::Hit,
+                egui_test_rect(10.0, 10.0, 40.0, 40.0),
+                egui::Sense::click(),
+                CursorCapability::Crosshair,
+            );
+            let regions = vec![first_region, fallback_region];
+
+            let selected = egui_region_at_position(&regions, egui::pos2(20.0, 20.0))
+                .expect("geometry fallback should select an overlapping region");
+
+            assert_eq!(selected.region_id.as_str(), "fallback-hit");
+        });
+    }
+
+    #[test]
+    fn cursor_selection_follows_chosen_response_region() {
+        egui::__run_test_ui(|ui| {
+            let mut text_region = test_presented_region(
+                ui,
+                "cursor-text",
+                EguiPresentedRegionKind::TextEdit,
+                egui_test_rect(5.0, 5.0, 50.0, 24.0),
+                egui::Sense::click(),
+                CursorCapability::Text,
+            );
+            text_region.text_edit_change = Some(test_text_edit_change());
+
+            let geometric_region = test_presented_region(
+                ui,
+                "cursor-geometry",
+                EguiPresentedRegionKind::Hit,
+                egui_test_rect(0.0, 0.0, 80.0, 60.0),
+                egui::Sense::click(),
+                CursorCapability::Pointer,
+            );
+            let regions = vec![text_region, geometric_region];
+
+            let selected = egui_region_at_position(&regions, egui::pos2(10.0, 10.0))
+                .expect("cursor point should select a region");
+
+            assert_eq!(selected.region_id.as_str(), "cursor-text");
+            assert_eq!(selected.cursor, CursorCapability::Text);
+        });
+    }
+
+    impl SlipwayWidgetTypes for ProbeWidget {
+        type ExternalState = ();
+        type LocalState = usize;
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwaySsot for ProbeWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id.clone())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for ProbeWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            *local += 1;
+            EventOutcome::message(self.id.clone(), "routed", ProbeMessage::Routed)
+        }
+    }
+
+    impl SlipwayView for ProbeWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            7
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            vec![PaintOp::Fill {
+                shape: ShapeDeclaration {
+                    id: Some("probe-fill".to_string()),
+                    kind: ShapeKind::Rectangle,
+                    bounds: layout.bounds.into_rect(),
+                    path: None,
+                    clip: None,
+                },
+                color: slipway_core::Color {
+                    red: 0.1,
+                    green: 0.2,
+                    blue: 0.3,
+                    alpha: 1.0,
+                },
+            }]
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            vec![StateObservation {
+                target: self.id.clone(),
+                slot: None,
+                name: "local".to_string(),
+                value: local.to_string(),
+            }]
+        }
+    }
+
+    impl SlipwayViewDefinition for ProbeWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            ViewDefinition {
+                target: self.id.clone(),
+                frame: input.frame,
+                paint: self.paint(external, local, &layout),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id.clone()),
+                hit_regions: vec![test_hit_region(
+                    "probe-hit",
+                    self.id.clone(),
+                    layout.bounds,
+                    0,
+                )],
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+                layout,
+            }
+        }
+    }
+
+    impl SlipwayWidgetTypes for MoveProbeWidget {
+        type ExternalState = ();
+        type LocalState = usize;
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwaySsot for MoveProbeWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id.clone())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for MoveProbeWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            match event {
+                InputEvent::Pointer(pointer)
+                    if pointer.target == self.id
+                        && pointer.kind == slipway_core::PointerEventKind::Move =>
+                {
+                    *local += 1;
+                    EventOutcome::message(self.id.clone(), "routed", ProbeMessage::Routed)
+                }
+                _ => EventOutcome::ignored(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayEventRoutingPolicy for MoveProbeWidget {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &slipway_core::InputEvent,
+        ) -> slipway_core::EventRoutingPolicyDeclaration {
+            let id = self.id();
+            let address = event.target_slot().cloned();
+            let path = address
+                .as_ref()
+                .map(|address| address.path.clone())
+                .unwrap_or_else(|| vec![id.clone()]);
+            slipway_core::EventRoutingPolicyDeclaration {
+                target: id.clone(),
+                event_target: event.target().clone(),
+                route: slipway_core::EventRoute {
+                    route_id: Some("egui.probe.move.route".to_string()),
+                    address,
+                    path,
+                    phase: slipway_core::EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayEventDispositionPolicy for MoveProbeWidget {
+        fn event_disposition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &slipway_core::InputEvent,
+            _route: &slipway_core::EventRoute,
+        ) -> slipway_core::EventPropagationEvidence {
+            let id = self.id();
+            let handled = matches!(
+                event,
+                slipway_core::InputEvent::Pointer(pointer)
+                    if pointer.target == id
+                        && pointer.kind == slipway_core::PointerEventKind::Move
+            );
+            let disposition = slipway_core::EventDisposition {
+                handled,
+                propagate: !handled,
+                default_action_allowed: true,
+            };
+            slipway_core::EventPropagationEvidence {
+                target: id.clone(),
+                event: event.clone(),
+                steps: vec![slipway_core::EventPropagationStep {
+                    stage: slipway_core::EventPropagationStage::Target,
+                    node: Some(id),
+                    disposition,
+                    emitted_messages: Vec::new(),
+                    changes: Vec::new(),
+                }],
+                final_disposition: disposition,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayView for MoveProbeWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            ProbeWidget::new(self.id.as_str()).initial_local_state()
+        }
+
+        fn layout(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            ProbeWidget::new(self.id.as_str()).layout(external, local, input)
+        }
+
+        fn paint(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            ProbeWidget::new(self.id.as_str()).paint(external, local, layout)
+        }
+
+        fn observe_state(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            ProbeWidget::new(self.id.as_str()).observe_state(external, local)
+        }
+    }
+
+    impl SlipwayViewDefinition for MoveProbeWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            ProbeWidget::new(self.id.as_str()).view_definition(external, local, input)
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for MoveProbeWidget {
+        fn resolve_font(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            ProbeWidget::new(self.id.as_str()).resolve_font(external, local, request)
+        }
+    }
+
+    impl SlipwayLayoutIntent for MoveProbeWidget {
+        fn layout_intent(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: &LayoutInput,
+        ) -> LayoutIntentProbe {
+            ProbeWidget::new(self.id.as_str()).layout_intent(external, local, input)
+        }
+    }
+
+    impl SlipwayWidgetTypes for HoverProbeWidget {
+        type ExternalState = ();
+        type LocalState = usize;
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwaySsot for HoverProbeWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id.clone())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for HoverProbeWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            match event {
+                InputEvent::Pointer(pointer)
+                    if pointer.target == self.id
+                        && matches!(
+                            pointer.kind,
+                            slipway_core::PointerEventKind::Enter
+                                | slipway_core::PointerEventKind::Leave
+                        ) =>
+                {
+                    *local += 1;
+                    EventOutcome::message(self.id.clone(), "hovered", ProbeMessage::Routed)
+                }
+                _ => EventOutcome::ignored(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayEventRoutingPolicy for HoverProbeWidget {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &slipway_core::InputEvent,
+        ) -> slipway_core::EventRoutingPolicyDeclaration {
+            let id = self.id();
+            let address = event.target_slot().cloned();
+            let path = address
+                .as_ref()
+                .map(|address| address.path.clone())
+                .unwrap_or_else(|| vec![id.clone()]);
+            slipway_core::EventRoutingPolicyDeclaration {
+                target: id.clone(),
+                event_target: event.target().clone(),
+                route: slipway_core::EventRoute {
+                    route_id: Some("egui.probe.hover.route".to_string()),
+                    address,
+                    path,
+                    phase: slipway_core::EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayEventDispositionPolicy for HoverProbeWidget {
+        fn event_disposition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &slipway_core::InputEvent,
+            _route: &slipway_core::EventRoute,
+        ) -> slipway_core::EventPropagationEvidence {
+            let id = self.id();
+            let handled = matches!(
+                event,
+                slipway_core::InputEvent::Pointer(pointer)
+                    if pointer.target == id
+                        && matches!(
+                            pointer.kind,
+                            slipway_core::PointerEventKind::Enter
+                                | slipway_core::PointerEventKind::Leave
+                        )
+            );
+            let disposition = slipway_core::EventDisposition {
+                handled,
+                propagate: !handled,
+                default_action_allowed: true,
+            };
+            slipway_core::EventPropagationEvidence {
+                target: id.clone(),
+                event: event.clone(),
+                steps: vec![slipway_core::EventPropagationStep {
+                    stage: slipway_core::EventPropagationStage::Target,
+                    node: Some(id),
+                    disposition,
+                    emitted_messages: Vec::new(),
+                    changes: Vec::new(),
+                }],
+                final_disposition: disposition,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayView for HoverProbeWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            ProbeWidget::new(self.id.as_str()).initial_local_state()
+        }
+
+        fn layout(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            ProbeWidget::new(self.id.as_str()).layout(external, local, input)
+        }
+
+        fn paint(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            ProbeWidget::new(self.id.as_str()).paint(external, local, layout)
+        }
+
+        fn observe_state(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            ProbeWidget::new(self.id.as_str()).observe_state(external, local)
+        }
+    }
+
+    impl SlipwayViewDefinition for HoverProbeWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            ProbeWidget::new(self.id.as_str()).view_definition(external, local, input)
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for HoverProbeWidget {
+        fn resolve_font(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            ProbeWidget::new(self.id.as_str()).resolve_font(external, local, request)
+        }
+    }
+
+    impl SlipwayLayoutIntent for HoverProbeWidget {
+        fn layout_intent(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: &LayoutInput,
+        ) -> LayoutIntentProbe {
+            ProbeWidget::new(self.id.as_str()).layout_intent(external, local, input)
+        }
+    }
+
+    impl SlipwayWidgetTypes for CancelProbeWidget {
+        type ExternalState = ();
+        type LocalState = usize;
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwaySsot for CancelProbeWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id.clone())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for CancelProbeWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            match event {
+                InputEvent::Pointer(pointer)
+                    if pointer.target == self.id
+                        && pointer.kind == slipway_core::PointerEventKind::Cancel =>
+                {
+                    *local += 1;
+                    EventOutcome::message(self.id.clone(), "cancelled", ProbeMessage::Routed)
+                }
+                _ => EventOutcome::ignored(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayEventRoutingPolicy for CancelProbeWidget {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &slipway_core::InputEvent,
+        ) -> slipway_core::EventRoutingPolicyDeclaration {
+            let id = self.id();
+            let address = event.target_slot().cloned();
+            let path = address
+                .as_ref()
+                .map(|address| address.path.clone())
+                .unwrap_or_else(|| vec![id.clone()]);
+            slipway_core::EventRoutingPolicyDeclaration {
+                target: id.clone(),
+                event_target: event.target().clone(),
+                route: slipway_core::EventRoute {
+                    route_id: Some("egui.probe.cancel.route".to_string()),
+                    address,
+                    path,
+                    phase: slipway_core::EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayEventDispositionPolicy for CancelProbeWidget {
+        fn event_disposition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &slipway_core::InputEvent,
+            _route: &slipway_core::EventRoute,
+        ) -> slipway_core::EventPropagationEvidence {
+            let id = self.id();
+            let handled = matches!(
+                event,
+                slipway_core::InputEvent::Pointer(pointer)
+                    if pointer.target == id
+                        && pointer.kind == slipway_core::PointerEventKind::Cancel
+            );
+            let disposition = slipway_core::EventDisposition {
+                handled,
+                propagate: !handled,
+                default_action_allowed: true,
+            };
+            slipway_core::EventPropagationEvidence {
+                target: id.clone(),
+                event: event.clone(),
+                steps: vec![slipway_core::EventPropagationStep {
+                    stage: slipway_core::EventPropagationStage::Target,
+                    node: Some(id),
+                    disposition,
+                    emitted_messages: Vec::new(),
+                    changes: Vec::new(),
+                }],
+                final_disposition: disposition,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayView for CancelProbeWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            ProbeWidget::new(self.id.as_str()).initial_local_state()
+        }
+
+        fn layout(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            ProbeWidget::new(self.id.as_str()).layout(external, local, input)
+        }
+
+        fn paint(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            ProbeWidget::new(self.id.as_str()).paint(external, local, layout)
+        }
+
+        fn observe_state(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            ProbeWidget::new(self.id.as_str()).observe_state(external, local)
+        }
+    }
+
+    impl SlipwayViewDefinition for CancelProbeWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            ProbeWidget::new(self.id.as_str()).view_definition(external, local, input)
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for CancelProbeWidget {
+        fn resolve_font(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            ProbeWidget::new(self.id.as_str()).resolve_font(external, local, request)
+        }
+    }
+
+    impl SlipwayLayoutIntent for CancelProbeWidget {
+        fn layout_intent(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: &LayoutInput,
+        ) -> LayoutIntentProbe {
+            ProbeWidget::new(self.id.as_str()).layout_intent(external, local, input)
+        }
+    }
+
+    impl SlipwayWidgetTypes for ScrollProbeWidget {
+        type ExternalState = ();
+        type LocalState = usize;
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwaySsot for ScrollProbeWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![
+                Capability::WheelInput,
+                Capability::ScrollRegionPresentation,
+                Capability::Paint,
+            ]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id.clone())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for ScrollProbeWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            match event {
+                InputEvent::Scroll(scroll)
+                    if scroll.target == self.id.clone()
+                        && scroll.region_id == PresentationRegionId::from("scroll-region") =>
+                {
+                    *local += 1;
+                    EventOutcome::message(self.id.clone(), "scrolled", ProbeMessage::Routed)
+                }
+                InputEvent::Wheel(wheel)
+                    if wheel.target == self.id.clone()
+                        && wheel.target_slot
+                            == Some(WidgetSlotAddress::new(self.id.clone(), 0))
+                        && wheel.delta_x == 0.0
+                        && wheel.delta_y == 7.0 =>
+                {
+                    *local += 1;
+                    EventOutcome::message(self.id.clone(), "wheeled", ProbeMessage::Routed)
+                }
+                _ => EventOutcome::ignored(),
+            }
+        }
+    }
+
+    impl SlipwayView for ScrollProbeWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            7
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            vec![PaintOp::Fill {
+                shape: ShapeDeclaration {
+                    id: Some("scroll-probe-fill".to_string()),
+                    kind: ShapeKind::Rectangle,
+                    bounds: layout.bounds.into_rect(),
+                    path: None,
+                    clip: None,
+                },
+                color: slipway_core::Color {
+                    red: 0.1,
+                    green: 0.3,
+                    blue: 0.4,
+                    alpha: 1.0,
+                },
+            }]
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            vec![StateObservation {
+                target: self.id.clone(),
+                slot: None,
+                name: "scrolls".to_string(),
+                value: local.to_string(),
+            }]
+        }
+    }
+
+    impl SlipwayViewDefinition for ScrollProbeWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            ViewDefinition {
+                target: self.id.clone(),
+                frame: input.frame,
+                paint: self.paint(external, local, &layout),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id.clone()),
+                hit_regions: Vec::new(),
+                focus_regions: Vec::new(),
+                scroll_regions: vec![test_scroll_region(
+                    self.id.clone(),
+                    layout.bounds.into_rect(),
+                )],
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+                layout,
+            }
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for ScrollProbeWidget {
+        fn resolve_font(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            FontResolutionEvidence {
+                request,
+                resolved_ref: None,
+                fallback_chain: Vec::new(),
+                installation: None,
+                refusal: None,
+                valid_source: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayLayoutIntent for ScrollProbeWidget {
+        fn layout_intent(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: &LayoutInput,
+        ) -> LayoutIntentProbe {
+            LayoutIntentProbe {
+                target: self.id.clone(),
+                intrinsic_size: None,
+                size_policy: Some(slipway_core::SizePolicyDeclaration {
+                    target: self.id.clone(),
+                    width: slipway_core::SizePolicy::Fill { weight: 1.0 },
+                    height: slipway_core::SizePolicy::FitContent,
+                }),
+                resize_policy: None,
+                overflow_policy: Some(slipway_core::OverflowPolicyDeclaration {
+                    target: self.id.clone(),
+                    x: slipway_core::OverflowBehavior::Clip,
+                    y: slipway_core::OverflowBehavior::Scroll,
+                }),
+                auto_layout: None,
+                responsive_variant: Some(slipway_core::ResponsiveVariant {
+                    target: self.id.clone(),
+                    key: if input.viewport.size.width < 400.0 {
+                        "compact".to_string()
+                    } else {
+                        "wide".to_string()
+                    },
+                    active_breakpoints: Vec::new(),
+                    reason: None,
+                }),
+                text_flow: None,
+                text_measurement_cache: Vec::new(),
+                text_measurement: None,
+                fit_overflow: Vec::new(),
+                layer: None,
+                scroll: None,
+                collection: None,
+                interaction_styles: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for ProbeWidget {
+        fn resolve_font(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            FontResolutionEvidence {
+                request,
+                resolved_ref: None,
+                fallback_chain: Vec::new(),
+                installation: None,
+                refusal: None,
+                valid_source: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayLayoutIntent for ProbeWidget {
+        fn layout_intent(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: &LayoutInput,
+        ) -> LayoutIntentProbe {
+            LayoutIntentProbe {
+                target: self.id.clone(),
+                intrinsic_size: None,
+                size_policy: Some(slipway_core::SizePolicyDeclaration {
+                    target: self.id.clone(),
+                    width: slipway_core::SizePolicy::Fill { weight: 1.0 },
+                    height: slipway_core::SizePolicy::FitContent,
+                }),
+                resize_policy: None,
+                overflow_policy: Some(slipway_core::OverflowPolicyDeclaration {
+                    target: self.id.clone(),
+                    x: slipway_core::OverflowBehavior::Clip,
+                    y: slipway_core::OverflowBehavior::Scroll,
+                }),
+                auto_layout: None,
+                responsive_variant: Some(slipway_core::ResponsiveVariant {
+                    target: self.id.clone(),
+                    key: if input.viewport.size.width < 400.0 {
+                        "compact".to_string()
+                    } else {
+                        "wide".to_string()
+                    },
+                    active_breakpoints: Vec::new(),
+                    reason: None,
+                }),
+                text_flow: None,
+                text_measurement_cache: Vec::new(),
+                text_measurement: None,
+                fit_overflow: Vec::new(),
+                layer: None,
+                scroll: None,
+                collection: None,
+                interaction_styles: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayWidgetTypes for FocusedProbeWidget {
+        type ExternalState = ();
+        type LocalState = usize;
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwaySsot for FocusedProbeWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![
+                Capability::KeyboardInput,
+                Capability::TextInput,
+                Capability::FocusInput,
+                Capability::FocusRegionPresentation,
+                Capability::TextEditRegionPresentation,
+                Capability::Paint,
+            ]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id.clone())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for FocusedProbeWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            if event.target() != &self.id {
+                return EventOutcome::ignored();
+            }
+            *local += 1;
+            EventOutcome::message(self.id.clone(), "focused", ProbeMessage::Routed)
+        }
+    }
+
+    impl SlipwayView for FocusedProbeWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            7
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            vec![PaintOp::Fill {
+                shape: ShapeDeclaration {
+                    id: Some("focused-probe-fill".to_string()),
+                    kind: ShapeKind::Rectangle,
+                    bounds: layout.bounds.into_rect(),
+                    path: None,
+                    clip: None,
+                },
+                color: slipway_core::Color {
+                    red: 0.1,
+                    green: 0.2,
+                    blue: 0.8,
+                    alpha: 1.0,
+                },
+            }]
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            vec![StateObservation {
+                target: self.id.clone(),
+                slot: None,
+                name: "local".to_string(),
+                value: local.to_string(),
+            }]
+        }
+    }
+
+    impl SlipwayViewDefinition for FocusedProbeWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            ViewDefinition {
+                target: self.id.clone(),
+                frame: input.frame,
+                paint: self.paint(external, local, &layout),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id.clone()),
+                hit_regions: Vec::new(),
+                focus_regions: vec![test_text_edit_region(
+                    self.id.clone(),
+                    layout.bounds.into_rect(),
+                )],
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+                layout,
+            }
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for FocusedProbeWidget {
+        fn resolve_font(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            FontResolutionEvidence {
+                request,
+                resolved_ref: None,
+                fallback_chain: Vec::new(),
+                installation: None,
+                refusal: None,
+                valid_source: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ParentWithChildWidget {
+        id: WidgetId,
+        child: ProbeWidget,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ScrollableParentWidget {
+        id: WidgetId,
+        child: ProbeWidget,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ParentWithChildLocal {
+        child: usize,
+    }
+
+    impl ParentWithChildWidget {
+        fn new() -> Self {
+            Self {
+                id: WidgetId::from("parent"),
+                child: ProbeWidget::new("child"),
+            }
+        }
+
+        fn child_slot(&self) -> WidgetSlotAddress {
+            WidgetSlotAddress::new(self.id.clone(), 0).child(self.child.id(), 0)
+        }
+
+        fn child_bounds(&self) -> Rect {
+            Rect {
+                origin: Point { x: 12.0, y: 10.0 },
+                size: Size {
+                    width: 48.0,
+                    height: 28.0,
+                },
+            }
+        }
+    }
+
+    impl ScrollableParentWidget {
+        fn new() -> Self {
+            Self {
+                id: WidgetId::from("egui.scroll.host"),
+                child: ProbeWidget::new("egui.scroll.child"),
+            }
+        }
+
+        fn child_slot(&self) -> WidgetSlotAddress {
+            WidgetSlotAddress::new(self.id.clone(), 0).child(self.child.id(), 0)
+        }
+
+        fn child_bounds(&self) -> Rect {
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 180.0,
+                },
+            }
+        }
+
+        fn scroll_region(&self) -> ScrollRegionDeclaration {
+            let viewport = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 40.0,
+                },
+            });
+            scroll_region_from_scrollable_capability(
+                &ScrollProbeWidget {
+                    id: self.id.clone(),
+                },
+                &(),
+                &0,
+                &LayoutInput {
+                    viewport,
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: viewport.size,
+                    },
+                },
+                Some(PresentationRegionId::from("scroll-region")),
+                Some(WidgetSlotAddress::new(self.id.clone(), 0)),
+                true,
+            )
+        }
+    }
+
+    impl SlipwayWidgetTypes for ParentWithChildWidget {
+        type ExternalState = ();
+        type LocalState = ParentWithChildLocal;
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwayWidgetTypes for ScrollableParentWidget {
+        type ExternalState = ();
+        type LocalState = ParentWithChildLocal;
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwaySsot for ParentWithChildWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode {
+                id: self.id.clone(),
+                children: vec![TopologyNode::leaf(self.child.id())],
+                local_state_slot: Some(WidgetSlotAddress::new(self.id.clone(), 0)),
+            }
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+
+        fn visit_authored_children<V>(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            visitor: &mut V,
+        ) where
+            V: SlipwayWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+            visitor.visit_child(&self.child, external, &local.child, self.child_slot());
+        }
+    }
+
+    impl SlipwaySsot for ScrollableParentWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![
+                Capability::WheelInput,
+                Capability::ScrollRegionPresentation,
+                Capability::Paint,
+            ]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode {
+                id: self.id.clone(),
+                children: vec![TopologyNode::leaf(self.child.id())],
+                local_state_slot: Some(WidgetSlotAddress::new(self.id.clone(), 0)),
+            }
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+
+        fn visit_authored_children<V>(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            visitor: &mut V,
+        ) where
+            V: SlipwayWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+            visitor.visit_child(&self.child, external, &local.child, self.child_slot());
+        }
+    }
+
+    impl SlipwayLogic for ParentWithChildWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            EventOutcome::ignored()
+        }
+    }
+
+    impl SlipwayLogic for ScrollableParentWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            match event {
+                InputEvent::Scroll(scroll)
+                    if scroll.target == self.id
+                        && scroll.region_id == PresentationRegionId::from("scroll-region") =>
+                {
+                    local.child += 1;
+                    EventOutcome::message(self.id.clone(), "scrolled", ProbeMessage::Routed)
+                }
+                _ => EventOutcome::ignored(),
+            }
+        }
+    }
+
+    impl SlipwayView for ParentWithChildWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            ParentWithChildLocal {
+                child: self.child.initial_local_state(),
+            }
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: vec![ChildPlacement {
+                    child: self.child.id(),
+                    bounds: slipway_core::ParentLocalRect::new(self.child_bounds()),
+                    local_state_slot: Some(self.child_slot()),
+                }],
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayView for ScrollableParentWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            ParentWithChildLocal {
+                child: self.child.initial_local_state(),
+            }
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: vec![ChildPlacement {
+                    child: self.child.id(),
+                    bounds: slipway_core::ParentLocalRect::new(self.child_bounds()),
+                    local_state_slot: Some(self.child_slot()),
+                }],
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            vec![StateObservation {
+                target: self.id.clone(),
+                slot: None,
+                name: "scrolls".to_string(),
+                value: local.child.to_string(),
+            }]
+        }
+    }
+
+    impl SlipwayViewDefinition for ParentWithChildWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                layout: layout.clone(),
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: vec![test_hit_region("parent-root", self.id(), layout.bounds, 0)],
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayViewDefinition for ScrollableParentWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                layout: layout.clone(),
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: Vec::new(),
+                focus_regions: Vec::new(),
+                scroll_regions: vec![self.scroll_region()],
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for ParentWithChildWidget {
+        fn resolve_font(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            FontResolutionEvidence {
+                request,
+                resolved_ref: None,
+                fallback_chain: Vec::new(),
+                installation: None,
+                refusal: None,
+                valid_source: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for ScrollableParentWidget {
+        fn resolve_font(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            FontResolutionEvidence {
+                request,
+                resolved_ref: None,
+                fallback_chain: Vec::new(),
+                installation: None,
+                refusal: None,
+                valid_source: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct UnsupportedClipWidget;
+
+    impl SlipwayWidgetTypes for UnsupportedClipWidget {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwaySsot for UnsupportedClipWidget {
+        fn id(&self) -> WidgetId {
+            WidgetId::from("egui.unsupported")
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for UnsupportedClipWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            EventOutcome::ignored()
+        }
+    }
+
+    impl SlipwayView for UnsupportedClipWidget {
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            vec![PaintOp::Group {
+                id: Some("path-clip-group".to_string()),
+                clip: Some(slipway_core::ClipDeclaration {
+                    id: Some("path-clip".to_string()),
+                    bounds: layout.bounds.into_rect(),
+                    path: Some(PathDeclaration {
+                        commands: vec![
+                            PathCommand::MoveTo(Point { x: 0.0, y: 0.0 }),
+                            PathCommand::LineTo(Point { x: 20.0, y: 0.0 }),
+                            PathCommand::LineTo(Point { x: 20.0, y: 20.0 }),
+                            PathCommand::Close,
+                        ],
+                    }),
+                }),
+                ops: Vec::new(),
+            }]
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayViewDefinition for UnsupportedClipWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            let paint = self.paint(external, local, &layout);
+
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                layout,
+                paint,
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: Vec::new(),
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for UnsupportedClipWidget {
+        fn resolve_font(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            FontResolutionEvidence {
+                request,
+                resolved_ref: None,
+                fallback_chain: Vec::new(),
+                installation: None,
+                refusal: None,
+                valid_source: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn app_preserves_multiple_authored_widget_slots() {
+        let app = SlipwayEguiApp::new(
+            (),
+            vec![ProbeWidget::new("one"), ProbeWidget::new("two")],
+            DefaultEguiBridge::new(),
+            |_, _| {},
+        );
+
+        assert_eq!(app.widget_count(), 2);
+        assert_eq!(app.slots[0].widget.id(), WidgetId::from("one"));
+        assert_eq!(app.slots[1].widget.id(), WidgetId::from("two"));
+        assert_eq!(app.slots[0].local_state, 7);
+        assert_eq!(app.slots[1].local_state, 7);
+    }
+
+    #[test]
+    fn default_bridge_translates_available_size_to_layout_input() {
+        let mut bridge = DefaultEguiBridge::new();
+
+        egui::__run_test_ui(|ui| {
+            let input = <DefaultEguiBridge as EguiSlipwayBridge<ProbeWidget>>::layout_input(
+                &mut bridge,
+                EguiLayoutContext {
+                    ui,
+                    available_size: egui::vec2(80.0, 40.0),
+                    pixels_per_point: 1.0,
+                },
+            );
+
+            assert_eq!(input.viewport.size.width, 80.0);
+            assert_eq!(input.viewport.size.height, 40.0);
+            assert_eq!(input.constraints.max.width, 80.0);
+            assert_eq!(input.constraints.max.height, 40.0);
+        });
+    }
+
+    #[test]
+    fn default_bridge_extracts_messages_without_widget_semantics() {
+        let mut bridge = DefaultEguiBridge::new();
+        let outcome = EventOutcome::message(WidgetId::from("one"), "routed", ProbeMessage::Routed);
+
+        let messages =
+            <DefaultEguiBridge as EguiSlipwayBridge<ProbeWidget>>::messages(&mut bridge, outcome);
+
+        assert_eq!(messages, vec![ProbeMessage::Routed]);
+        assert!(bridge.take_probe_products().is_empty());
+    }
+
+    #[test]
+    fn declared_hit_regions_allocate_distinct_egui_responses() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 80.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let view = ViewDefinition {
+            target: widget.id(),
+            frame: FrameIdentity {
+                surface_id: "test".to_string(),
+                surface_instance_id: "test".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: layout.bounds.into_rect(),
+            },
+            layout: layout.clone(),
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
+            hit_regions: vec![
+                test_hit_region(
+                    "left",
+                    WidgetId::from("left"),
+                    Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 40.0,
+                            height: 40.0,
+                        },
+                    },
+                    0,
+                ),
+                test_hit_region(
+                    "right",
+                    WidgetId::from("right"),
+                    Rect {
+                        origin: Point { x: 50.0, y: 0.0 },
+                        size: Size {
+                            width: 40.0,
+                            height: 40.0,
+                        },
+                    },
+                    1,
+                ),
+            ],
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        egui::__run_test_ui(|ui| {
+            let (surface_rect, root_response) =
+                ui.allocate_exact_size(egui::vec2(120.0, 80.0), egui::Sense::hover());
+            let child_slots = authored_child_slots(&widget, &(), &local);
+            let mut child_assembly = EguiChildAssembly::default();
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let regions = allocate_presentation_regions(
+                ui,
+                &widget,
+                &(),
+                &local,
+                surface_rect.min,
+                &view,
+                &geometry_index,
+                &child_slots,
+                &mut child_assembly,
+                None,
+            );
+
+            assert!(!root_response.sense.interactive());
+            assert_eq!(regions.len(), 2);
+            assert!(child_assembly.regions.is_empty());
+            assert_ne!(regions[0].response.id, regions[1].response.id);
+            assert_ne!(
+                regions[0].response.interact_rect,
+                regions[1].response.interact_rect
+            );
+            assert!(
+                regions
+                    .iter()
+                    .all(|region| region.response.sense.senses_click())
+            );
+        });
+    }
+
+    #[test]
+    fn declared_hit_region_allocation_preserves_route_event_target() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 80.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let route_target = WidgetId::from("route-target");
+        let route_slot = WidgetSlotAddress::new(route_target.clone(), 9);
+        let mut hit = test_hit_region(
+            "routed-hit",
+            WidgetId::from("visual-target"),
+            layout.bounds.into_rect(),
+            0,
+        );
+        hit.route.path = vec![WidgetId::from("root"), route_target.clone()];
+        hit.route.address = Some(route_slot.clone());
+
+        let view = ViewDefinition {
+            target: widget.id(),
+            frame: FrameIdentity {
+                surface_id: "test".to_string(),
+                surface_instance_id: "test".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: layout.bounds.into_rect(),
+            },
+            layout: layout.clone(),
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
+            hit_regions: vec![hit],
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        egui::__run_test_ui(|ui| {
+            let (surface_rect, _root_response) =
+                ui.allocate_exact_size(egui::vec2(120.0, 80.0), egui::Sense::hover());
+            let child_slots = authored_child_slots(&widget, &(), &local);
+            let mut child_assembly = EguiChildAssembly::default();
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let regions = allocate_presentation_regions(
+                ui,
+                &widget,
+                &(),
+                &local,
+                surface_rect.min,
+                &view,
+                &geometry_index,
+                &child_slots,
+                &mut child_assembly,
+                None,
+            );
+
+            assert_eq!(regions.len(), 1);
+            assert_eq!(regions[0].target, WidgetId::from("visual-target"));
+            assert_eq!(regions[0].event_target, route_target);
+            assert_eq!(regions[0].event_target_slot, Some(route_slot.clone()));
+
+            let position = surface_rect.min + egui::vec2(4.0, 4.0);
+            let target_local_position = Point { x: 4.0, y: 4.0 };
+            let (dispatch, evidence) =
+                slipway_core::resolve_declared_pointer_dispatch_with_evidence(
+                    EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
+                    view.frame.clone(),
+                    &view.layout,
+                    &view.hit_regions,
+                    target_local_position,
+                    PointerEventKind::Press,
+                    Some(slipway_core::PointerButton::Primary),
+                    slipway_core::PointerDetails::default(),
+                    true,
+                );
+            let dispatch = dispatch.expect("core resolver selects egui hit region");
+            let InputEvent::Pointer(pointer) = dispatch.input else {
+                panic!("expected pointer dispatch");
+            };
+
+            assert_eq!(evidence.source.backend_id.as_deref(), Some(EGUI_BACKEND_ID));
+            assert_eq!(
+                evidence.selected_region,
+                Some(slipway_core::PresentationRegionId::from("routed-hit"))
+            );
+            assert_eq!(pointer.target, regions[0].event_target);
+            assert_eq!(pointer.target_slot, regions[0].event_target_slot);
+            assert_eq!(
+                pointer.position,
+                egui_region_position(&regions[0], position)
+            );
+            assert_eq!(
+                pointer.target_bounds.map(TargetLocalRect::into_rect),
+                Some(egui_region_target_bounds(&regions[0]))
+            );
+        });
+    }
+
+    #[test]
+    fn empty_root_space_is_not_a_region_target() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 80.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let view = ViewDefinition {
+            target: widget.id(),
+            frame: FrameIdentity {
+                surface_id: "test".to_string(),
+                surface_instance_id: "test".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: layout.bounds.into_rect(),
+            },
+            layout: layout.clone(),
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
+            hit_regions: vec![test_hit_region(
+                "small",
+                WidgetId::from("small"),
+                Rect {
+                    origin: Point { x: 10.0, y: 10.0 },
+                    size: Size {
+                        width: 20.0,
+                        height: 20.0,
+                    },
+                },
+                0,
+            )],
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        egui::__run_test_ui(|ui| {
+            let (surface_rect, _root_response) =
+                ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover());
+            let child_slots = authored_child_slots(&widget, &(), &local);
+            let mut child_assembly = EguiChildAssembly::default();
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let regions = allocate_presentation_regions(
+                ui,
+                &widget,
+                &(),
+                &local,
+                surface_rect.min,
+                &view,
+                &geometry_index,
+                &child_slots,
+                &mut child_assembly,
+                None,
+            );
+            let empty_space = egui::pos2(surface_rect.min.x + 70.0, surface_rect.min.y + 70.0);
+
+            assert!(egui_region_at_position(&regions, empty_space).is_none());
+        });
+    }
+
+    #[test]
+    fn text_edit_allocates_invisible_input_region_and_scroll_refuses_fake_content() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 120.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let view = ViewDefinition {
+            target: widget.id(),
+            frame: FrameIdentity {
+                surface_id: "test".to_string(),
+                surface_instance_id: "test".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: layout.bounds.into_rect(),
+            },
+            layout: layout.clone(),
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
+            hit_regions: Vec::new(),
+            focus_regions: vec![test_text_edit_region(
+                WidgetId::from("text"),
+                Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 24.0,
+                    },
+                },
+            )],
+            scroll_regions: vec![test_scroll_region(
+                WidgetId::from("scroll"),
+                Rect {
+                    origin: Point { x: 0.0, y: 32.0 },
+                    size: Size {
+                        width: 160.0,
+                        height: 50.0,
+                    },
+                },
+            )],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        egui::__run_test_ui(|ui| {
+            let (surface_rect, _root_response) =
+                ui.allocate_exact_size(egui::vec2(200.0, 120.0), egui::Sense::hover());
+            let child_slots = authored_child_slots(&widget, &(), &local);
+            let mut child_assembly = EguiChildAssembly::default();
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let regions = allocate_presentation_regions(
+                ui,
+                &widget,
+                &(),
+                &local,
+                surface_rect.min,
+                &view,
+                &geometry_index,
+                &child_slots,
+                &mut child_assembly,
+                None,
+            );
+
+            let text = regions
+                .iter()
+                .find(|region| region.kind == EguiPresentedRegionKind::TextEdit)
+                .expect("text edit region allocated");
+            assert_eq!(text.cursor, CursorCapability::Text);
+            assert!(text.response.sense.is_focusable());
+
+            let scroll = regions
+                .iter()
+                .find(|region| region.kind == EguiPresentedRegionKind::Scroll)
+                .expect("scroll region allocated");
+            assert!(scroll.scroll_state.is_some());
+            assert!(scroll.response.sense.senses_drag());
+            assert_eq!(child_assembly.refused_admissions.len(), 1);
+            assert_eq!(
+                child_assembly.refused_admissions[0]
+                    .source
+                    .pass_id
+                    .as_deref(),
+                Some("scroll-region-assembly")
+            );
+        });
+    }
+
+    #[test]
+    fn focused_input_without_presented_region_returns_refusal_dispatch_evidence() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 48.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let view = ViewDefinition {
+            target: widget.id(),
+            frame: FrameIdentity {
+                surface_id: "test".to_string(),
+                surface_instance_id: "test".to_string(),
+                revision: 0,
+                frame_index: 7,
+                viewport: layout.bounds.into_rect(),
+            },
+            layout: layout.clone(),
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
+            hit_regions: Vec::new(),
+            focus_regions: vec![test_text_edit_region(
+                WidgetId::from("candidate"),
+                Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 24.0,
+                    },
+                },
+            )],
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        egui::__run_test_ui(|ui| {
+            let (surface_rect, root_response) =
+                ui.allocate_exact_size(egui::vec2(120.0, 48.0), egui::Sense::hover());
+            let child_slots = authored_child_slots(&widget, &(), &local);
+            let mut child_assembly = EguiChildAssembly::default();
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let regions = allocate_presentation_regions(
+                ui,
+                &widget,
+                &(),
+                &local,
+                surface_rect.min,
+                &view,
+                &geometry_index,
+                &child_slots,
+                &mut child_assembly,
+                None,
+            );
+            let focused_target = WidgetId::from("missing-focused-target");
+            let event = InputEvent::Text(TextInputEvent {
+                target: focused_target.clone(),
+                target_slot: None,
+                text: "x".to_string(),
+            });
+            let context = EguiInputContext {
+                ui,
+                widget_id: widget.id(),
+                frame: &view.frame,
+                rect: surface_rect,
+                layout: &view.layout,
+                geometry_index: &geometry_index,
+                hit_regions: &view.hit_regions,
+                focus_regions: &view.focus_regions,
+                scroll_regions: &view.scroll_regions,
+                response: &root_response,
+                regions: &regions,
+            };
+
+            let backend_input = egui_focused_backend_input_event(
+                &context,
+                Some(&focused_target),
+                DeclaredEventDispatchKind::Text,
+                event.clone(),
+            );
+
+            assert!(
+                backend_input.is_none(),
+                "stale focused backend input must not create a mutating declared event"
+            );
+        });
+    }
+
+    #[test]
+    fn authored_child_response_wins_over_root_synthetic_hit_region() {
+        let widget = ParentWithChildWidget::new();
+        let local = widget.initial_local_state();
+        let view = widget.view_definition(
+            &(),
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test".to_string(),
+                    surface_instance_id: "test".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    }),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+            },
+        );
+
+        egui::__run_test_ui(|ui| {
+            let (surface_rect, _root_response) =
+                ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover());
+            let child_slots = authored_child_slots(&widget, &(), &local);
+            let mut child_assembly = EguiChildAssembly::default();
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let mut regions = allocate_presentation_regions(
+                ui,
+                &widget,
+                &(),
+                &local,
+                surface_rect.min,
+                &view,
+                &geometry_index,
+                &child_slots,
+                &mut child_assembly,
+                None,
+            );
+            let skipped_slots = child_assembly.presented_slots.clone();
+            child_assembly.extend(present_authored_children(
+                ui,
+                &widget,
+                &(),
+                &local,
+                &view,
+                &geometry_index,
+                surface_rect.min,
+                &skipped_slots,
+                None,
+                None,
+            ));
+            regions.extend(child_assembly.regions);
+
+            let child_point = egui::pos2(surface_rect.min.x + 20.0, surface_rect.min.y + 20.0);
+            let target_region = egui_region_at_position(&regions, child_point)
+                .expect("child point should target a region");
+
+            assert_eq!(target_region.target, widget.child.id());
+            assert_eq!(target_region.address, Some(widget.child_slot()));
+            assert!(
+                target_region
+                    .region_id
+                    .as_str()
+                    .starts_with("egui-child-response:")
+                    || target_region.region_id.as_str() == "probe-hit"
+            );
+            assert_eq!(
+                target_region.response.interact_rect.min,
+                egui::pos2(surface_rect.min.x + 12.0, surface_rect.min.y + 10.0)
+            );
+        });
+    }
+
+    #[test]
+    fn visited_child_without_matching_child_placement_emits_refusal() {
+        let widget = ParentWithChildWidget::new();
+        let local = widget.initial_local_state();
+        let mut view = widget.view_definition(
+            &(),
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test".to_string(),
+                    surface_instance_id: "test".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    }),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+            },
+        );
+        view.layout.child_placements.clear();
+
+        egui::__run_test_ui(|ui| {
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let output = present_authored_children(
+                ui,
+                &widget,
+                &(),
+                &local,
+                &view,
+                &geometry_index,
+                egui::pos2(0.0, 0.0),
+                &[],
+                None,
+                None,
+            );
+
+            assert!(output.regions.is_empty());
+            assert_eq!(output.refused_admissions.len(), 1);
+            let admission = &output.refused_admissions[0];
+            assert!(!admission.accepted);
+            assert_eq!(admission.source.pass_id.as_deref(), Some("child-assembly"));
+            assert!(admission.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "egui.child_placement.missing"
+                    && diagnostic.severity == slipway_core::DiagnosticSeverity::Unsupported
+            }));
+            assert!(admission.unsupported.iter().any(|unsupported| {
+                unsupported.capability == Capability::ChildTraversal
+                    && unsupported.target == Some(widget.child.id())
+            }));
+        });
+    }
+
+    #[test]
+    fn visited_native_child_without_matching_child_placement_emits_refusal() {
+        let root = ProbeWidget::new("native-parent");
+        let local = root.initial_local_state();
+        let view = root.view_definition(
+            &(),
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test".to_string(),
+                    surface_instance_id: "test".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    }),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+            },
+        );
+        let native = SlipwayEguiNativeWidget::new(NativeEguiLabel);
+        let slot = WidgetSlotAddress::new(root.id(), 0).child(native.id(), 0);
+
+        egui::__run_test_ui(|ui| {
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let mut presenter = EguiAuthoredChildPresenter {
+                ui,
+                parent_view: &view,
+                view_origin: egui::pos2(0.0, 0.0),
+                skipped_slots: &[],
+                parent_geometry_index: &geometry_index,
+                scroll: None,
+                native_physical_operation: None,
+                output: EguiChildAssembly::default(),
+            };
+
+            presenter.visit_egui_native_child(&native, &(), &(), slot.clone());
+            let output = presenter.output;
+
+            assert!(output.regions.is_empty());
+            assert_eq!(output.refused_admissions.len(), 1);
+            let admission = &output.refused_admissions[0];
+            assert!(!admission.accepted);
+            assert_eq!(admission.source.pass_id.as_deref(), Some("child-assembly"));
+            assert!(admission.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "egui.child_placement.missing"
+                    && diagnostic.severity == slipway_core::DiagnosticSeverity::Unsupported
+            }));
+            assert!(admission.unsupported.iter().any(|unsupported| {
+                unsupported.capability == Capability::ChildTraversal
+                    && unsupported.target == Some(native.id())
+            }));
+        });
+    }
+
+    #[test]
+    fn scroll_area_show_viewport_renders_matching_authored_child() {
+        let widget = ParentWithChildWidget::new();
+        let local = widget.initial_local_state();
+        let mut view = widget.view_definition(
+            &(),
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test".to_string(),
+                    surface_instance_id: "test".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    }),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+            },
+        );
+        view.scroll_regions = vec![test_scroll_region(
+            widget.id(),
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 80.0,
+                    height: 42.0,
+                },
+            },
+        )];
+
+        egui::__run_test_ui(|ui| {
+            let (surface_rect, _root_response) =
+                ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover());
+            let child_slots = authored_child_slots(&widget, &(), &local);
+            let mut child_assembly = EguiChildAssembly::default();
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let regions = allocate_presentation_regions(
+                ui,
+                &widget,
+                &(),
+                &local,
+                surface_rect.min,
+                &view,
+                &geometry_index,
+                &child_slots,
+                &mut child_assembly,
+                None,
+            );
+
+            assert!(
+                regions
+                    .iter()
+                    .any(|region| region.kind == EguiPresentedRegionKind::Scroll)
+            );
+            assert!(
+                child_assembly
+                    .presented_slots
+                    .iter()
+                    .any(|slot| slot == &widget.child_slot())
+            );
+            assert!(child_assembly.refused_admissions.is_empty());
+            assert!(
+                child_assembly
+                    .regions
+                    .iter()
+                    .any(|region| region.target == widget.child.id())
+            );
+            let forbidden_fake_content_call = ["set", "_min", "_size"].concat();
+            assert!(!include_str!("lib.rs").contains(&forbidden_fake_content_call));
+        });
+    }
+
+    #[test]
+    fn scroll_background_response_does_not_cover_hosted_child_response() {
+        let widget = ParentWithChildWidget::new();
+        let local = widget.initial_local_state();
+        let mut view = widget.view_definition(
+            &(),
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test".to_string(),
+                    surface_instance_id: "test".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    }),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+            },
+        );
+        view.scroll_regions = vec![test_scroll_region(
+            widget.id(),
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 80.0,
+                    height: 42.0,
+                },
+            },
+        )];
+
+        let build_regions = |ui: &mut egui::Ui| {
+            let (surface_rect, _root_response) =
+                ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover());
+            let child_slots = authored_child_slots(&widget, &(), &local);
+            let mut child_assembly = EguiChildAssembly::default();
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let mut regions = allocate_presentation_regions(
+                ui,
+                &widget,
+                &(),
+                &local,
+                surface_rect.min,
+                &view,
+                &geometry_index,
+                &child_slots,
+                &mut child_assembly,
+                None,
+            );
+            let skipped_slots = child_assembly.presented_slots.clone();
+            child_assembly.extend(present_authored_children(
+                ui,
+                &widget,
+                &(),
+                &local,
+                &view,
+                &geometry_index,
+                surface_rect.min,
+                &skipped_slots,
+                None,
+                None,
+            ));
+            regions.extend(child_assembly.regions);
+
+            let child_point = egui::pos2(surface_rect.min.x + 20.0, surface_rect.min.y + 20.0);
+            (regions, child_point)
+        };
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::empty());
+
+        let mut child_point = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (_regions, point) = build_regions(ui);
+            child_point = Some(point);
+        });
+        let child_point = child_point.expect("first pass should record child point");
+
+        let mut selected = None;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(child_point)],
+                ..Default::default()
+            },
+            |ui| {
+                let (regions, _point) = build_regions(ui);
+                let selected_region = egui_region_at_position(&regions, child_point)
+                    .expect("pointer over child should select a region");
+                let child_has_pointer_authority = regions.iter().any(|region| {
+                    region.target == widget.child.id()
+                        && (region.response.hovered() || region.response.contains_pointer())
+                });
+                selected = Some((
+                    selected_region.target.clone(),
+                    selected_region.region_id.clone(),
+                    child_has_pointer_authority,
+                ));
+            },
+        );
+
+        let (target, region_id, child_has_pointer_authority) =
+            selected.expect("second pass should select region");
+        assert_eq!(
+            target,
+            widget.child.id(),
+            "scroll background response must not cover hosted child response; selected {region_id:?}"
+        );
+        assert!(child_has_pointer_authority);
+    }
+
+    #[test]
+    fn scroll_background_response_is_registered_before_scroll_content() {
+        let source = include_str!("lib.rs");
+        let scroll_fn = source
+            .find("fn allocate_scroll_region_with_skips")
+            .expect("scroll allocation function is present");
+        let scroll_body = &source[scroll_fn..];
+        let response_interact = scroll_body
+            .find("let response = ui.interact(")
+            .expect("scroll response interact is present");
+        let show_viewport = scroll_body
+            .find(".show_viewport(ui, |content_ui, _viewport| {")
+            .expect("scroll content show_viewport is present");
+
+        assert!(
+            response_interact < show_viewport,
+            "egui scroll background interaction must be registered before show_viewport content"
+        );
+    }
+
+    #[test]
+    fn egui_backend_widget_trait_captures_visible_runtime_requirements() {
+        fn assert_backend_widget<W: SlipwayEguiBackendWidget>() {}
+        fn assert_layout_intent_widget<W: SlipwayEguiLayoutIntentBackendWidget>() {}
+        fn assert_child_widget<W: SlipwayEguiBackendChildWidget>() {}
+
+        assert_backend_widget::<ProbeWidget>();
+        assert_layout_intent_widget::<ProbeWidget>();
+        assert_child_widget::<ProbeWidget>();
+    }
+
+    #[test]
+    fn egui_backend_admission_accepts_supported_path_and_regions() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let input = ViewDefinitionInput {
+            frame: FrameIdentity {
+                surface_id: "egui-admission".to_string(),
+                surface_instance_id: "test-instance".to_string(),
+                revision: 1,
+                frame_index: 1,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                },
+            },
+            layout_input: LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                },
+            },
+        };
+        let mut view = widget.view_definition(&(), &local, input);
+        view.paint = vec![PaintOp::Stroke {
+            shape: ShapeDeclaration {
+                id: Some("supported-path".to_string()),
+                kind: ShapeKind::Path,
+                bounds: view.layout.bounds.into_rect(),
+                path: Some(PathDeclaration {
+                    commands: vec![
+                        PathCommand::MoveTo(Point { x: 0.0, y: 0.0 }),
+                        PathCommand::LineTo(Point { x: 20.0, y: 20.0 }),
+                    ],
+                }),
+                clip: None,
+            },
+            color: slipway_core::Color {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            },
+            width: 1.0,
+        }];
+        view.focus_regions = vec![test_text_edit_region(
+            WidgetId::from("text"),
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 80.0,
+                    height: 24.0,
+                },
+            },
+        )];
+        view.scroll_regions = vec![test_scroll_region(
+            WidgetId::from("scroll"),
+            Rect {
+                origin: Point { x: 0.0, y: 30.0 },
+                size: Size {
+                    width: 80.0,
+                    height: 40.0,
+                },
+            },
+        )];
+
+        let admission = egui_backend_admission().admit_view_definition(&view);
+
+        assert!(admission.accepted);
+        assert!(admission.unsupported.is_empty());
+        assert_eq!(admission.source.label(), "backend_presented");
+        assert_eq!(
+            admission.source.backend_id.as_deref(),
+            Some(EGUI_BACKEND_ID)
+        );
+        assert!(admission.visible_requirements.iter().any(|requirement| {
+            requirement.capability == BackendVisibleCapability::TextEditRegions
+        }));
+        assert!(
+            admission.visible_requirements.iter().any(
+                |requirement| requirement.capability == BackendVisibleCapability::ScrollRegions
+            )
+        );
+        assert!(admission.visible_requirements.iter().any(|requirement| {
+            requirement.capability == BackendVisibleCapability::ShapePathClip
+        }));
+    }
+
+    #[test]
+    fn egui_backend_admission_refuses_blocking_view_contract_errors() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let input = ViewDefinitionInput {
+            frame: FrameIdentity {
+                surface_id: "egui-admission".to_string(),
+                surface_instance_id: "contract-test".to_string(),
+                revision: 1,
+                frame_index: 2,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                },
+            },
+            layout_input: LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                },
+            },
+        };
+        let mut view = widget.view_definition(&(), &local, input);
+        view.hit_regions[0].route.path.clear();
+
+        let admission = egui_backend_admission().admit_view_definition(&view);
+
+        assert!(!admission.accepted);
+        let unsupported = admission
+            .unsupported
+            .iter()
+            .find(|entry| entry.requirement_id.as_deref() == Some("view.contract"))
+            .expect("blocking contract diagnostics must refuse visible launch");
+        assert!(
+            unsupported
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "view_contract.hit_route_empty")
+        );
+        assert!(
+            admission
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "view_contract.hit_route_empty")
+        );
+    }
+
+    #[test]
+    fn egui_backend_admission_refuses_text_input_without_text_edit_focus_region() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let input = ViewDefinitionInput {
+            frame: FrameIdentity {
+                surface_id: "egui-admission".to_string(),
+                surface_instance_id: "text-contract-test".to_string(),
+                revision: 1,
+                frame_index: 3,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                },
+            },
+            layout_input: LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                },
+            },
+        };
+        let mut view = widget.view_definition(&(), &local, input);
+        view.focus_regions.clear();
+
+        let admission = egui_backend_admission()
+            .admit_view_definition_with_capabilities(&[Capability::TextInput], &view);
+
+        assert!(!admission.accepted);
+        let unsupported = admission
+            .unsupported
+            .iter()
+            .find(|entry| entry.requirement_id.as_deref() == Some("view.contract"))
+            .expect("missing text edit focus region must refuse visible launch");
+        assert!(unsupported.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "view_contract.text_input_missing_text_edit_focus_region"
+        }));
+    }
+
+    #[test]
+    fn egui_backend_admission_refuses_unsupported_path_clip() {
+        let widget = ProbeWidget::new("root");
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 80.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let view = ViewDefinition {
+            target: widget.id(),
+            frame: FrameIdentity {
+                surface_id: "egui-admission".to_string(),
+                surface_instance_id: "test-instance".to_string(),
+                revision: 1,
+                frame_index: 2,
+                viewport: layout.bounds.into_rect(),
+            },
+            layout: layout.clone(),
+            paint: vec![PaintOp::Group {
+                id: Some("unsupported-clip".to_string()),
+                clip: Some(slipway_core::ClipDeclaration {
+                    id: Some("clip-path".to_string()),
+                    bounds: layout.bounds.into_rect(),
+                    path: Some(PathDeclaration {
+                        commands: vec![
+                            PathCommand::MoveTo(Point { x: 0.0, y: 0.0 }),
+                            PathCommand::LineTo(Point { x: 20.0, y: 0.0 }),
+                            PathCommand::LineTo(Point { x: 20.0, y: 20.0 }),
+                            PathCommand::Close,
+                        ],
+                    }),
+                }),
+                ops: Vec::new(),
+            }],
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
+            hit_regions: vec![test_hit_region("hit", widget.id(), layout.bounds, 0)],
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let admission = egui_backend_admission().admit_view_definition(&view);
+
+        assert!(!admission.accepted);
+        let unsupported = admission
+            .unsupported
+            .iter()
+            .find(|entry| entry.visible_capability == Some(BackendVisibleCapability::ShapePathClip))
+            .expect("path clip must be refused before visible launch");
+        assert_eq!(unsupported.source.label(), "backend_presented");
+        assert_eq!(
+            unsupported.source.backend_id.as_deref(),
+            Some(EGUI_BACKEND_ID)
+        );
+        assert!(
+            unsupported
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == "egui.visible_paint.unsupported_group_clip_path")
+        );
+    }
+
+    #[test]
+    fn egui_visible_widget_refuses_unsupported_clip_before_paint_path() {
+        let widget = UnsupportedClipWidget;
+        let mut local = widget.initial_local_state();
+        let mut bridge = DefaultEguiBridge::new();
+        let mut messages = Vec::new();
+
+        egui::__run_test_ui(|ui| {
+            ui.add(SlipwayEguiWidget::new(
+                &widget,
+                &(),
+                &mut local,
+                &mut bridge,
+                &mut messages,
+            ));
+        });
+
+        assert!(messages.is_empty());
+        let refusals = bridge.take_refused_admissions();
+        assert_eq!(refusals.len(), 1);
+        let refusal = &refusals[0];
+        assert!(!refusal.accepted);
+        assert_eq!(refusal.source.label(), "backend_presented");
+        assert_eq!(refusal.source.backend_id.as_deref(), Some(EGUI_BACKEND_ID));
+        assert!(refusal.unsupported.iter().any(|entry| {
+            entry.visible_capability == Some(BackendVisibleCapability::ShapePathClip)
+        }));
+    }
+
+    #[test]
+    fn egui_text_format_maps_declared_style() {
+        let style = TextStyle {
+            font_family: "monospace".to_string(),
+            font_size: 24.0,
+            font_weight: FontWeight::Bold,
+            font_style: FontStyle::Italic,
+            decoration: TextDecoration {
+                underline: true,
+                strikethrough: true,
+            },
+            baseline: BaselineShift::Superscript,
+        };
+        let format = egui_text_format(egui::Color32::WHITE, &style);
+
+        assert_eq!(format.font_id.family, egui::FontFamily::Monospace);
+        assert_eq!(format.font_id.size, 18.0);
+        assert_eq!(format.coords.as_ref().len(), 1);
+        assert_eq!(format.coords.as_ref()[0].1, 700.0);
+        assert!(format.italics);
+        assert_eq!(format.underline.color, egui::Color32::WHITE);
+        assert_eq!(format.underline.width, 1.0);
+        assert_eq!(format.strikethrough.color, egui::Color32::WHITE);
+        assert_eq!(format.strikethrough.width, 1.0);
+        assert_eq!(format.valign, egui::Align::TOP);
+
+        let custom = TextStyle {
+            font_family: "Inter".to_string(),
+            ..TextStyle::default()
+        };
+        assert_eq!(egui_font_family(&custom), egui::FontFamily::Proportional);
+    }
+
+    #[test]
+    fn egui_default_text_style_stays_plain() {
+        let style = TextStyle::default();
+        let format = egui_text_format(egui::Color32::BLACK, &style);
+        let job = egui_text_layout_job("plain", egui::Color32::BLACK, &style, 42.0);
+
+        assert_eq!(format.font_id.family, egui::FontFamily::Proportional);
+        assert_eq!(format.font_id.size, slipway_core::DEFAULT_TEXT_FONT_SIZE);
+        assert_eq!(format.coords.as_ref()[0].1, 400.0);
+        assert!(!format.italics);
+        assert_eq!(format.underline, egui::Stroke::NONE);
+        assert_eq!(format.strikethrough, egui::Stroke::NONE);
+        assert_eq!(format.valign, egui::Align::BOTTOM);
+        assert_eq!(job.text, "plain");
+        assert_eq!(job.wrap.max_width, 42.0);
+    }
+
+    #[test]
+    fn cjk_paint_without_installable_font_reports_backend_evidence() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 40.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let view = ViewDefinition {
+            target: widget.id(),
+            frame: FrameIdentity {
+                surface_id: "egui-font".to_string(),
+                surface_instance_id: "font-test".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: layout.bounds.into_rect(),
+            },
+            layout: layout.clone(),
+            paint: vec![PaintOp::Text {
+                bounds: layout.bounds.into_rect(),
+                content: "\u{d55c}\u{ae00}".to_string(),
+                color: slipway_core::Color {
+                    red: 0.0,
+                    green: 0.0,
+                    blue: 0.0,
+                    alpha: 1.0,
+                },
+                style: TextStyle::default(),
+            }],
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let admission = egui_backend_admission().admit_view_definition(&view);
+        assert!(admission.visible_requirements.iter().any(|requirement| {
+            requirement.capability == BackendVisibleCapability::FontInstallation
+        }));
+
+        egui::__run_test_ui(|ui| {
+            let refusals = install_declared_fonts(ui, &widget, &(), &local, &view);
+
+            assert_eq!(refusals.len(), 1);
+            assert!(!refusals[0].accepted);
+            assert_eq!(refusals[0].source.label(), "backend_presented");
+            assert_eq!(
+                refusals[0].source.pass_id.as_deref(),
+                Some("font-installation")
+            );
+            assert!(refusals[0].diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "egui.font.cjk_coverage_unproved"
+                    && diagnostic.message.contains("missing_source")
+            }));
+        });
+    }
+
+    #[test]
+    fn cjk_text_edit_stays_native_and_reports_font_evidence() {
+        let widget = ProbeWidget::new("root");
+        let local = widget.initial_local_state();
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 160.0,
+                    height: 48.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut focus = test_text_edit_region(
+            WidgetId::from("text"),
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 24.0,
+                },
+            },
+        );
+        focus
+            .text_edit
+            .as_mut()
+            .expect("test focus has a text edit")
+            .buffer
+            .text = "\u{d55c}\u{ae00}".to_string();
+        let view = ViewDefinition {
+            target: widget.id(),
+            frame: FrameIdentity {
+                surface_id: "egui-font".to_string(),
+                surface_instance_id: "text-edit-font-test".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: layout.bounds.into_rect(),
+            },
+            layout: layout.clone(),
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
+            hit_regions: Vec::new(),
+            focus_regions: vec![focus],
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        egui::__run_test_ui(|ui| {
+            let (surface_rect, _root_response) =
+                ui.allocate_exact_size(egui::vec2(160.0, 48.0), egui::Sense::hover());
+            let child_slots = authored_child_slots(&widget, &(), &local);
+            let mut child_assembly = EguiChildAssembly::default();
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let regions = allocate_presentation_regions(
+                ui,
+                &widget,
+                &(),
+                &local,
+                surface_rect.min,
+                &view,
+                &geometry_index,
+                &child_slots,
+                &mut child_assembly,
+                None,
+            );
+
+            assert!(
+                regions
+                    .iter()
+                    .any(|region| region.kind == EguiPresentedRegionKind::TextEdit)
+            );
+            assert!(child_assembly.refused_admissions.iter().any(|admission| {
+                admission.source.pass_id.as_deref() == Some("font-installation")
+                    && admission
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code == "egui.font.cjk_coverage_unproved")
+            }));
+        });
+    }
+
+    #[test]
+    fn font_install_cache_prevents_repeated_asset_reads() {
+        let ctx = egui::Context::default();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "slipway-egui-font-cache-{}-{unique}.font",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"cached-font-bytes").expect("write temp font bytes");
+        let source = ResourceSourceDeclaration {
+            source_id: "cache-font".to_string(),
+            kind: ResourceSourceKind::Asset,
+            family: None,
+            asset_ref: Some(path.to_string_lossy().into_owned()),
+            revision: Vec::new(),
+        };
+
+        let first = install_font_from_evidence(&ctx, Some("cache-font"), Some(&source));
+        std::fs::remove_file(&path).expect("remove temp font bytes after first install");
+        let second = install_font_from_evidence(&ctx, Some("cache-font"), Some(&source));
+
+        assert_eq!(first.status, EguiFontInstallStatus::Installed);
+        assert_eq!(second.status, EguiFontInstallStatus::AlreadyInstalled);
+    }
+
+    #[test]
+    fn runtime_app_debug_drain_uses_message_reducer_for_traced_control() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+        let frame = FrameIdentity {
+            surface_id: "egui-runtime-shell".to_string(),
+            surface_instance_id: "test-instance".to_string(),
+            revision: 1,
+            frame_index: 7,
+            viewport: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 40.0,
+                },
+            },
+        };
+        let handle = app
+            .runtime()
+            .bridge_client()
+            .submit(DebugCommand::control_with_trace(
+                "egui-trace",
+                frame,
+                InputEvent::Command(CommandEvent {
+                    target: WidgetId::from("one"),
+                    target_slot: None,
+                    command: "routed".to_string(),
+                    payload_ref: None,
+                    source: None,
+                }),
+            ))
+            .expect("submit traced control");
+
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        assert_eq!(applied.get(), 1);
+
+        let reply = handle
+            .try_recv()
+            .expect("reply channel ok")
+            .expect("reply produced");
+        let DebugReplyProduct::ControlTrace(trace) = reply.product else {
+            panic!("expected control trace product");
+        };
+        assert_eq!(trace.messages.len(), 1);
+        assert_eq!(trace.messages[0].disposition, MessageDisposition::Consumed);
+    }
+
+    #[test]
+    fn runtime_app_accepts_backend_presented_physical_control_from_native_runner() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+        let frame = app.runtime().last_frame_identity();
+        let backend_input = declared_egui_probe_pointer_input_for_runtime(
+            app.runtime(),
+            frame.clone(),
+            PointerEventKind::Press,
+        );
+
+        let product = app.handle_backend_presented_physical_control(
+            DebugCommand::physical_control_with_trace(
+                "egui-native-runner-press",
+                frame,
+                DebugPhysicalControl::Pointer {
+                    position: Point { x: 1.0, y: 1.0 },
+                    kind: PointerEventKind::Press,
+                    button: Some(PointerButton::Primary),
+                    details: egui_pointer_details(
+                        egui::Modifiers::default(),
+                        Some(egui::PointerButton::Primary),
+                    ),
+                    pointer_is_pressed: true,
+                },
+            ),
+            backend_input,
+        );
+
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+        let DebugReplyProduct::ControlTrace(trace) = product else {
+            panic!("native runner ingress must return physical control trace");
+        };
+        assert_eq!(
+            trace.mode,
+            slipway_debug_bridge::DebugControlMode::PhysicalEquivalent
+        );
+        assert!(trace.handled);
+        let evidence = trace
+            .dispatch_evidence
+            .as_ref()
+            .expect("trace carries backend dispatch evidence");
+        assert_eq!(
+            evidence.source,
+            EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input")
+        );
+    }
+
+    #[test]
+    fn runtime_app_raw_input_hook_injects_physical_mcp_before_ui() {
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, _messages: Vec<ProbeMessage>| {},
+        );
+        let frame = app.runtime().last_frame_identity();
+        let handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_pointer_message(
+                "egui-native-pending",
+                &frame,
+                1.0,
+                1.0,
+            ))
+            .expect("runtime MCP physical request queued");
+        let mut raw_input = egui::RawInput::default();
+
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut raw_input);
+
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        assert!(matches!(
+            raw_input.events.as_slice(),
+            [
+                egui::Event::PointerMoved(_),
+                egui::Event::PointerButton { pressed: true, .. }
+            ]
+        ));
+        assert!(
+            handle.try_recv().expect("response channel ok").is_none(),
+            "native-aware drain must not complete MCP before backend-presented input is observed"
+        );
+    }
+
+    #[test]
+    fn egui_native_physical_converter_supports_text_keyboard_and_native_commands() {
+        let selector = slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Target {
+            target: WidgetId::from("text-probe"),
+        };
+        let raw_input = egui::RawInput::default();
+
+        let text_events = native_runner::egui_events_for_native_physical_operation(
+            &DebugPhysicalControl::Text {
+                selector: selector.clone(),
+                text: "abc".to_string(),
+            },
+            &raw_input,
+        )
+        .expect("text input maps to egui text event");
+        assert!(matches!(
+            text_events,
+            native_runner::NativePhysicalControlPlan::RawInputEvents(ref events)
+                if events == &vec![egui::Event::Text("abc".to_string())]
+        ));
+
+        let keyboard_events = native_runner::egui_events_for_native_physical_operation(
+            &DebugPhysicalControl::Keyboard {
+                selector: selector.clone(),
+                key: "Enter".to_string(),
+                kind: KeyEventKind::Press,
+                modifiers: Modifiers {
+                    shift: true,
+                    control: true,
+                    alt: false,
+                    meta: false,
+                },
+                details: KeyboardDetails {
+                    repeat: true,
+                    ..KeyboardDetails::default()
+                },
+            },
+            &raw_input,
+        )
+        .expect("supported key maps to egui key event");
+        let native_runner::NativePhysicalControlPlan::RawInputEvents(keyboard_events) =
+            keyboard_events
+        else {
+            panic!("keyboard maps to raw input events");
+        };
+        assert!(matches!(
+            keyboard_events.as_slice(),
+            [egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: true,
+                repeat: true,
+                modifiers,
+                ..
+            }] if modifiers.shift && modifiers.ctrl && modifiers.command
+        ));
+
+        let copy_events = native_runner::egui_events_for_native_physical_operation(
+            &DebugPhysicalControl::Command {
+                selector: selector.clone(),
+                command: "copy".to_string(),
+                payload_ref: None,
+            },
+            &raw_input,
+        )
+        .expect("copy maps to egui copy event");
+        assert!(matches!(
+            copy_events,
+            native_runner::NativePhysicalControlPlan::RawInputEvents(ref events)
+                if events == &vec![egui::Event::Copy]
+        ));
+
+        let cut_events = native_runner::egui_events_for_native_physical_operation(
+            &DebugPhysicalControl::Command {
+                selector,
+                command: "cut".to_string(),
+                payload_ref: None,
+            },
+            &raw_input,
+        )
+        .expect("cut maps to egui cut event");
+        assert!(matches!(
+            cut_events,
+            native_runner::NativePhysicalControlPlan::RawInputEvents(ref events)
+                if events == &vec![egui::Event::Cut]
+        ));
+    }
+
+    #[test]
+    fn egui_native_physical_converter_refuses_non_raw_input_variants() {
+        let selector = slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Target {
+            target: WidgetId::from("text-probe"),
+        };
+        let raw_input = egui::RawInput::default();
+
+        let text_edit_error = native_runner::egui_events_for_native_physical_operation(
+            &DebugPhysicalControl::TextEdit {
+                selector: selector.clone(),
+                kind: TextEditKind::ReplaceBuffer,
+                text: Some("abc".to_string()),
+                selection_before: None,
+                selection_after: None,
+            },
+            &raw_input,
+        )
+        .expect_err("text-edit is not a raw input event");
+        assert_eq!(
+            text_edit_error.code,
+            "native-physical-control-text-edit-unsupported"
+        );
+
+        let focus_plan = native_runner::egui_events_for_native_physical_operation(
+            &DebugPhysicalControl::Focus {
+                selector: selector.clone(),
+                focused: true,
+            },
+            &raw_input,
+        )
+        .expect("focus maps to backend-native mutation plan");
+        assert!(
+            matches!(
+                focus_plan,
+                native_runner::NativePhysicalControlPlan::BackendNativeMutation
+            ),
+            "focus must not pretend to be RawInput"
+        );
+
+        let command_error = native_runner::egui_events_for_native_physical_operation(
+            &DebugPhysicalControl::Command {
+                selector: selector.clone(),
+                command: "submit".to_string(),
+                payload_ref: Some("payload".to_string()),
+            },
+            &raw_input,
+        )
+        .expect_err("arbitrary command payloads are not egui raw input");
+        assert_eq!(
+            command_error.code,
+            "native-physical-control-command-payload-unsupported"
+        );
+
+        let scroll_plan = native_runner::egui_events_for_native_physical_operation(
+            &DebugPhysicalControl::Scroll {
+                selector,
+                offset_x: 0.0,
+                offset_y: 24.0,
+            },
+            &raw_input,
+        )
+        .expect("scroll maps to backend-native mutation plan");
+        assert!(
+            matches!(
+                scroll_plan,
+                native_runner::NativePhysicalControlPlan::BackendNativeMutation
+            ),
+            "scroll must not pretend to be RawInput"
+        );
+    }
+
+    #[test]
+    fn runtime_app_returns_error_when_injected_physical_has_no_backend_trace() {
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, _messages: Vec<ProbeMessage>| {},
+        );
+        let frame = app.runtime().last_frame_identity();
+        let handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_text_message(
+                "egui-native-no-trace",
+                &frame,
+                "text-probe",
+                "abc",
+            ))
+            .expect("runtime MCP physical text request queued");
+        let mut raw_input = egui::RawInput::default();
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut raw_input);
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        assert_eq!(raw_input.events, vec![egui::Event::Text("abc".to_string())]);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui);
+        });
+
+        let response = handle
+            .recv()
+            .expect("response channel ok")
+            .expect("native no-trace response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(payload.contains(r#""product_kind":"error""#), "{payload}");
+        assert!(
+            payload.contains("native-physical-control-no-backend-trace"),
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn runtime_app_native_focus_completes_from_backend_presented_trace() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(FocusedProbeWidget::new("egui.focused"), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.render_ui(ui);
+        });
+        let frame = app.runtime().last_frame_identity();
+        let handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_focus_message(
+                "egui-native-focus",
+                &frame,
+                "egui.focused",
+                true,
+            ))
+            .expect("runtime MCP physical focus request queued");
+        let mut raw_input = egui::RawInput::default();
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut raw_input);
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        assert!(
+            raw_input.events.is_empty(),
+            "focus must use egui backend-native focus request, not fabricated RawInput"
+        );
+
+        let _ = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui);
+        });
+
+        let response = handle
+            .recv()
+            .expect("response channel ok")
+            .expect("native focus response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            payload.contains(r#""product_kind":"control_trace""#),
+            "{payload}"
+        );
+        assert!(
+            payload.contains(r#""physical_equivalent":true"#),
+            "{payload}"
+        );
+        assert!(
+            payload.contains(r#""label":"backend_presented""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""kind":"focus""#), "{payload}");
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+    }
+
+    #[test]
+    fn runtime_app_native_text_and_keyboard_complete_after_focus() {
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(FocusedProbeWidget::new("egui.focused"), ()),
+            DefaultEguiBridge::new(),
+            move |_, _messages: Vec<ProbeMessage>| {},
+        );
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.render_ui(ui);
+        });
+
+        let focus_handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_focus_message(
+                "egui-native-focus-for-text",
+                &app.runtime().last_frame_identity(),
+                "egui.focused",
+                true,
+            ))
+            .expect("runtime MCP physical focus request queued");
+        let mut raw_input = egui::RawInput::default();
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut raw_input);
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let _ = ctx.run_ui(raw_input, |ui| app.render_ui(ui));
+        focus_handle
+            .recv()
+            .expect("focus response channel ok")
+            .expect("focus response sent");
+
+        let text_handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_text_message(
+                "egui-native-text-after-focus",
+                &app.runtime().last_frame_identity(),
+                "egui.focused",
+                "abc",
+            ))
+            .expect("runtime MCP physical text request queued");
+        let mut raw_input = egui::RawInput::default();
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut raw_input);
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        assert!(matches!(
+            raw_input.events.as_slice(),
+            [egui::Event::Text(text)] if text == "abc"
+        ));
+        let _ = ctx.run_ui(raw_input, |ui| app.render_ui(ui));
+        let response = text_handle
+            .recv()
+            .expect("text response channel ok")
+            .expect("text response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            payload.contains(r#""product_kind":"control_trace""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""kind":"text""#), "{payload}");
+        assert!(
+            payload.contains(r#""label":"backend_presented""#),
+            "{payload}"
+        );
+
+        let focus_handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_focus_message(
+                "egui-native-refocus-for-keyboard",
+                &app.runtime().last_frame_identity(),
+                "egui.focused",
+                true,
+            ))
+            .expect("runtime MCP physical refocus request queued");
+        let mut raw_input = egui::RawInput::default();
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut raw_input);
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let _ = ctx.run_ui(raw_input, |ui| app.render_ui(ui));
+        focus_handle
+            .recv()
+            .expect("refocus response channel ok")
+            .expect("refocus response sent");
+
+        let keyboard_handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_keyboard_message(
+                "egui-native-keyboard-after-focus",
+                &app.runtime().last_frame_identity(),
+                "egui.focused",
+                "A",
+            ))
+            .expect("runtime MCP physical keyboard request queued");
+        let mut raw_input = egui::RawInput::default();
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut raw_input);
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        assert!(matches!(
+            raw_input.events.as_slice(),
+            [egui::Event::Key {
+                key: egui::Key::A,
+                pressed: true,
+                ..
+            }]
+        ));
+        let _ = ctx.run_ui(raw_input, |ui| app.render_ui(ui));
+        let response = keyboard_handle
+            .recv()
+            .expect("keyboard response channel ok")
+            .expect("keyboard response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            payload.contains(r#""product_kind":"control_trace""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""kind":"keyboard""#), "{payload}");
+        assert!(
+            payload.contains(r#""label":"backend_presented""#),
+            "{payload}"
+        );
+
+        let command_handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_command_no_payload_message(
+                "egui-native-command-after-focus",
+                &app.runtime().last_frame_identity(),
+                "egui.focused",
+                "copy",
+            ))
+            .expect("runtime MCP physical command request queued");
+        let mut raw_input = egui::RawInput::default();
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut raw_input);
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        assert_eq!(raw_input.events, vec![egui::Event::Copy]);
+        let _ = ctx.run_ui(raw_input, |ui| app.render_ui(ui));
+        let response = command_handle
+            .recv()
+            .expect("command response channel ok")
+            .expect("command response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            payload.contains(r#""product_kind":"control_trace""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""kind":"command""#), "{payload}");
+        assert!(payload.contains(r#""command":"copy""#), "{payload}");
+        assert!(
+            payload.contains(r#""label":"backend_presented""#),
+            "{payload}"
+        );
+    }
+
+    #[test]
+    fn runtime_app_native_scroll_completes_from_backend_scrollarea_trace() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ScrollableParentWidget::new(), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.render_ui(ui);
+        });
+
+        let handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_scroll_message(
+                "egui-native-scroll",
+                &app.runtime().last_frame_identity(),
+                "egui.scroll.host",
+                0.0,
+                24.0,
+            ))
+            .expect("runtime MCP physical scroll request queued");
+        let mut raw_input = egui::RawInput::default();
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut raw_input);
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        assert!(
+            raw_input.events.is_empty(),
+            "absolute scroll must use egui ScrollArea state, not fabricated RawInput"
+        );
+
+        let _ = ctx.run_ui(raw_input, |ui| app.render_ui(ui));
+
+        let response = handle
+            .recv()
+            .expect("scroll response channel ok")
+            .expect("scroll response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert!(
+            payload.contains(r#""product_kind":"control_trace""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""kind":"scroll""#), "{payload}");
+        assert!(
+            payload.contains(r#""label":"backend_presented""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""native-scroll""#), "{payload}");
+        assert_eq!(app.runtime().local_state().child, 8);
+        assert_eq!(applied.get(), 1);
+    }
+
+    #[test]
+    fn runtime_app_records_every_backend_trace_from_frame() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            TwoCommandBridge::default(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        egui::__run_test_ui(|ui| {
+            app.render_ui(ui);
+        });
+
+        let traces = app.runtime().backend_input_traces().collect::<Vec<_>>();
+        assert_eq!(traces.len(), 2);
+        let pointer_kinds = traces
+            .iter()
+            .map(|trace| match &trace.input.event {
+                InputEvent::Pointer(pointer) => pointer.kind,
+                _ => panic!("expected pointer event"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pointer_kinds,
+            vec![PointerEventKind::Press, PointerEventKind::Release]
+        );
+        for trace in traces {
+            let evidence = trace
+                .input
+                .dispatch_evidence
+                .as_ref()
+                .expect("egui backend shell input carries declaration evidence");
+            assert_eq!(
+                evidence.source,
+                EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input")
+            );
+            assert_eq!(
+                evidence.selected_region,
+                Some(PresentationRegionId::from("probe-hit"))
+            );
+        }
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+    }
+
+    #[test]
+    fn runtime_app_refuses_bridge_input_without_dispatch_evidence() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            DirectCommandBridge::default(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        egui::__run_test_ui(|ui| {
+            app.render_ui(ui);
+        });
+
+        assert_eq!(
+            *app.runtime().local_state(),
+            7,
+            "undeclared bridge input must not reach widget logic"
+        );
+        assert_eq!(applied.get(), 0);
+        let traces = app.runtime().backend_input_traces().collect::<Vec<_>>();
+        assert_eq!(traces.len(), 1);
+        assert!(!traces[0].handled);
+        assert!(traces[0].input.dispatch_evidence.is_none());
+        assert!(traces[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_MISSING
+        }));
+    }
+
+    #[test]
+    fn runtime_app_refuses_forged_declared_backend_input() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            ForgedDeclaredBridge::default(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        egui::__run_test_ui(|ui| {
+            app.render_ui(ui);
+        });
+
+        assert_eq!(
+            *app.runtime().local_state(),
+            7,
+            "forged declared backend input must not reach widget logic"
+        );
+        assert_eq!(applied.get(), 0);
+        let traces = app.runtime().backend_input_traces().collect::<Vec<_>>();
+        assert_eq!(traces.len(), 1);
+        assert!(!traces[0].handled);
+        assert!(traces[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_REGION_MISMATCH
+        }));
+    }
+
+    #[test]
+    fn egui_backend_focus_input_event_evidence_matches_runtime_contract() {
+        egui::__run_test_ui(|ui| {
+            let target = WidgetId::from("egui.focused");
+            let other_target = WidgetId::from("egui.other");
+            let frame = FrameIdentity {
+                surface_id: "egui-focused-input".to_string(),
+                surface_instance_id: "test-instance".to_string(),
+                revision: 1,
+                frame_index: 81,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                },
+            };
+            let layout = LayoutOutput {
+                bounds: TargetLocalRect::new(frame.viewport),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+            let mut selected_focus = test_text_edit_region(target.clone(), frame.viewport);
+            selected_focus.id = PresentationRegionId::from("egui-selected-focus");
+            selected_focus.address = None;
+            let mut other_focus = test_text_edit_region(
+                other_target,
+                Rect {
+                    origin: Point { x: 0.0, y: 44.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 40.0,
+                    },
+                },
+            );
+            other_focus.id = PresentationRegionId::from("egui-other-focus");
+            let focus_regions = vec![other_focus, selected_focus.clone()];
+            let view = ViewDefinition {
+                target: target.clone(),
+                frame: frame.clone(),
+                layout: layout.clone(),
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(target.clone()),
+                hit_regions: Vec::new(),
+                focus_regions: focus_regions.clone(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+            let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+            let presented = allocate_focus_region(
+                ui,
+                egui::pos2(0.0, 0.0),
+                &view,
+                &geometry_index,
+                &selected_focus,
+            );
+            let regions = vec![presented];
+            let context = EguiInputContext {
+                ui,
+                widget_id: target.clone(),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &[],
+                focus_regions: &focus_regions,
+                scroll_regions: &[],
+                response: &regions[0].response,
+                regions: &regions,
+            };
+            let event = InputEvent::Keyboard(KeyboardEvent {
+                target: target.clone(),
+                target_slot: None,
+                key: "Enter".to_string(),
+                kind: KeyEventKind::Press,
+                modifiers: slipway_core::Modifiers::default(),
+                details: KeyboardDetails::default(),
+            });
+
+            let input = egui_focus_backend_input_event(
+                &context,
+                &regions[0],
+                DeclaredEventDispatchKind::Keyboard,
+                event,
+            );
+            let diagnostics = slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+                &view,
+                &input,
+                Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+                Some(EGUI_BACKEND_ID),
+            );
+
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            let evidence = input
+                .dispatch_evidence
+                .as_ref()
+                .expect("focused backend input carries evidence");
+            assert_eq!(
+                evidence.candidate_regions,
+                vec![PresentationRegionId::from("egui-selected-focus")]
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_keyboard_input_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(FocusedProbeWidget::new("egui.focused"), ()),
+            FocusedKeyboardBridge::default(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        egui::__run_test_ui(|ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records focused keyboard frame");
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_keyboard_message(
+                "egui-shell-keyboard",
+                &backend_frame,
+                "egui.focused",
+                "Enter",
+            ))
+            .expect("runtime MCP physical keyboard request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical keyboard response sent");
+
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+
+        let probe_handle = client
+            .submit(probe_event_message(
+                "egui-shell-keyboard-events",
+                &backend_frame,
+            ))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+
+        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert_eq!(
+            payload.matches(r#""selected_region":"text-focus""#).count(),
+            4
+        );
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend keyboard input share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_text_edit_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(FocusedProbeWidget::new("egui.focused"), ()),
+            FocusedTextEditBridge::default(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        egui::__run_test_ui(|ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records focused text-edit frame");
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_text_edit_message(
+                "egui-shell-text-edit",
+                &backend_frame,
+                "egui.focused",
+                "replace_buffer",
+                "abc",
+            ))
+            .expect("runtime MCP physical text-edit request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical text-edit response sent");
+
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+
+        let probe_handle = client
+            .submit(probe_event_message(
+                "egui-shell-text-edit-events",
+                &backend_frame,
+            ))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+
+        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert_eq!(
+            payload.matches(r#""selected_region":"text-focus""#).count(),
+            4
+        );
+        assert!(
+            payload.contains(r#""summary":"text_edit:ReplaceBuffer""#),
+            "probe must preserve egui text-edit shape: {payload}"
+        );
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend text-edit input share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_pointer_move_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(MoveProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records pointer move frame");
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_pointer_phase_message(
+                "egui-shell-move",
+                &backend_frame,
+                1.0,
+                1.0,
+                "move",
+            ))
+            .expect("runtime MCP physical pointer move request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical pointer move response sent");
+
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+
+        let probe_handle = client
+            .submit(probe_event_message(
+                "egui-shell-move-events",
+                &backend_frame,
+            ))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+
+        assert!(payload.matches(r#""kind":"event""#).count() >= 2);
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert!(payload.matches(r#""selected_region":"probe-hit""#).count() >= 4);
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend pointer move share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_pointer_enter_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(HoverProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records pointer enter frame");
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_pointer_phase_message(
+                "egui-shell-enter",
+                &backend_frame,
+                1.0,
+                1.0,
+                "enter",
+            ))
+            .expect("runtime MCP physical pointer enter request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical pointer enter response sent");
+
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+
+        let probe_handle = client
+            .submit(probe_event_message(
+                "egui-shell-enter-events",
+                &backend_frame,
+            ))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+
+        assert!(payload.matches(r#""kind":"event""#).count() >= 2);
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend pointer enter share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_pointer_leave_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(HoverProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui);
+        });
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+
+        let raw_input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(egui::pos2(-10.0, -10.0))],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records pointer leave frame");
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_pointer_phase_message(
+                "egui-shell-leave",
+                &backend_frame,
+                0.5,
+                0.5,
+                "leave",
+            ))
+            .expect("runtime MCP physical pointer leave request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical pointer leave response sent");
+
+        assert_eq!(*app.runtime().local_state(), 10);
+        assert_eq!(applied.get(), 3);
+
+        let probe_handle = client
+            .submit(probe_event_message(
+                "egui-shell-leave-events",
+                &backend_frame,
+            ))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+
+        assert!(payload.matches(r#""kind":"event""#).count() >= 2);
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend pointer leave share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_pointer_cancel_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(CancelProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui);
+        });
+        assert_eq!(*app.runtime().local_state(), 7);
+        assert_eq!(applied.get(), 0);
+
+        let raw_input = egui::RawInput {
+            events: vec![egui::Event::PointerGone],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records pointer cancel frame");
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_pointer_phase_message(
+                "egui-shell-cancel",
+                &backend_frame,
+                0.5,
+                0.5,
+                "cancel",
+            ))
+            .expect("runtime MCP physical pointer cancel request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical pointer cancel response sent");
+
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+
+        let probe_handle = client
+            .submit(probe_event_message(
+                "egui-shell-cancel-events",
+                &backend_frame,
+            ))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+
+        assert!(payload.matches(r#""kind":"event""#).count() >= 2);
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert!(
+            payload.contains(r#""summary":"pointer:Cancel""#),
+            "event probe must expose pointer cancel generated events: {payload}"
+        );
+        assert!(
+            payload.contains(r#""kind":"Cancel""#),
+            "event probe must expose pointer cancel kind: {payload}"
+        );
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend pointer cancel share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_wheel_input_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ScrollProbeWidget::new("egui.scroll"), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        let ctx = egui::Context::default();
+        let raw_input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(1.0, 1.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 7.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..egui::RawInput::default()
+        };
+        let _ = ctx.run_ui(raw_input, |ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records wheel frame");
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_wheel_message(
+                "egui-shell-wheel",
+                &backend_frame,
+                1.0,
+                1.0,
+                0.0,
+                7.0,
+            ))
+            .expect("runtime MCP physical wheel request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical wheel response sent");
+
+        assert_eq!(*app.runtime().local_state(), 10);
+        assert_eq!(applied.get(), 3);
+
+        let probe_handle = client
+            .submit(probe_event_message(
+                "egui-shell-wheel-events",
+                &backend_frame,
+            ))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+
+        assert_eq!(payload.matches(r#""kind":"wheel""#).count(), 4, "{payload}");
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert!(
+            payload.contains(r#""selected_region":"scroll-region""#),
+            "{payload}"
+        );
+        assert!(
+            !payload.contains("backend_input.dispatch_evidence_event_mismatch"),
+            "native scroll side effect must stay declaration-consistent: {payload}"
+        );
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend wheel input share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_scroll_input_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ScrollProbeWidget::new("egui.scroll"), ()),
+            ScrollBridge::default(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        egui::__run_test_ui(|ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records scroll frame");
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_scroll_message(
+                "egui-shell-scroll",
+                &backend_frame,
+                "egui.scroll",
+                0.0,
+                24.0,
+            ))
+            .expect("runtime MCP physical scroll request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical scroll response sent");
+
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+
+        let probe_handle = client
+            .submit(probe_event_message(
+                "egui-shell-scroll-events",
+                &backend_frame,
+            ))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+
+        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert_eq!(
+            payload
+                .matches(r#""selected_region":"scroll-region""#)
+                .count(),
+            4
+        );
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend scroll input share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_command_input_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(FocusedProbeWidget::new("egui.focused"), ()),
+            FocusedCommandBridge::default(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        egui::__run_test_ui(|ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records focused command frame");
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_command_message(
+                "egui-shell-command",
+                &backend_frame,
+                "egui.focused",
+                "submit",
+                "payload-1",
+            ))
+            .expect("runtime MCP physical command request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical command response sent");
+
+        assert_eq!(*app.runtime().local_state(), 9);
+        assert_eq!(applied.get(), 2);
+
+        let probe_handle = client
+            .submit(probe_event_message(
+                "egui-shell-command-events",
+                &backend_frame,
+            ))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+
+        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert_eq!(
+            payload.matches(r#""selected_region":"text-focus""#).count(),
+            4
+        );
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend command input share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
+    fn runtime_app_mcp_physical_and_backend_input_share_event_probe_surface() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            TwoCommandBridge::default(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        );
+
+        egui::__run_test_ui(|ui| {
+            app.render_ui(ui);
+        });
+
+        let backend_frame = app
+            .runtime()
+            .last_backend_input_trace()
+            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
+            .map(|evidence| evidence.frame.clone())
+            .expect("backend render pass records a declared frame");
+        let client = app.runtime().runtime_mcp_client_clone();
+        let physical_handle = client
+            .submit(physical_pointer_message(
+                "egui-shell-physical",
+                &backend_frame,
+                1.0,
+                1.0,
+            ))
+            .expect("runtime MCP physical request queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        physical_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("physical control response sent");
+
+        assert_eq!(*app.runtime().local_state(), 10);
+        assert_eq!(applied.get(), 3);
+
+        let probe_handle = client
+            .submit(probe_event_message("egui-shell-events", &backend_frame))
+            .expect("runtime MCP event probe queued");
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        let response = probe_handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("event probe response sent");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("tool result text");
+        assert_eq!(payload.matches(r#""kind":"event""#).count(), 3);
+        assert!(payload.contains(r#""label":"debug_mcp""#));
+        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert_eq!(payload.matches(r#""dispatch_identity""#).count(), 3);
+        assert_eq!(payload.matches(r#""result_identity""#).count(), 3);
+        assert_eq!(
+            payload.matches(r#""selected_region":"probe-hit""#).count(),
+            6
+        );
+        assert_eq!(payload.matches(r#""handled":true"#).count(), 6);
+        assert!(
+            payload.contains(r#""code":"event_equivalence.identity_match""#),
+            "event probe must prove MCP and backend physical input share dispatch/result identity: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
+            "happy path must not report dispatch mismatch: {payload}"
+        );
+        assert!(
+            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
+            "happy path must not report result mismatch: {payload}"
+        );
+    }
+
+    #[test]
+    fn runtime_app_transport_wake_drains_same_runtime_without_window() {
+        let applied = Rc::new(Cell::new(0usize));
+        let applied_for_reducer = Rc::clone(&applied);
+        let runtime = SlipwayRuntime::new(ProbeWidget::new("one"), ());
+        let transport = runtime
+            .start_debug_mcp_transport()
+            .expect("runtime MCP transport starts");
+        let addr = transport.local_addr();
+        let mut app = SlipwayEguiRuntimeApp::new(
+            runtime,
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+            },
+        )
+        .with_debug_mcp_transport(transport);
+        assert_eq!(app.debug_mcp_transport_addr(), Some(addr));
+        let ctx = egui::Context::default();
+        app.ensure_mcp_wake_forwarder(&ctx);
+
+        let mut stream = TcpStream::connect(addr).expect("connect to runtime MCP transport");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        writeln!(stream, "{}", control_message("egui-tcp-control", "one"))
+            .expect("write JSON-RPC line");
+        stream.flush().expect("flush JSON-RPC line");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.drain_egui_mcp_wakes() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "transport wake should reach egui app"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let (drained, error) = app.drain_debug_pending();
+        assert_eq!(drained, 1);
+        assert_eq!(error, None);
+        assert_eq!(*app.runtime().local_state(), 8);
+        assert_eq!(applied.get(), 1);
+
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .expect("read JSON-RPC response line");
+        assert!(response_line.contains(r#""id":"egui-tcp-control""#));
+        assert!(response_line.contains("control_trace"));
+        assert!(response_line.contains("Consumed"));
+    }
+
+    #[test]
+    fn observations_are_explicit_and_moved_out_with_take() {
+        let mut bridge = DefaultEguiBridge::new();
+
+        assert!(
+            !<DefaultEguiBridge as EguiSlipwayBridge<ProbeWidget>>::wants_observation(&mut bridge)
+        );
+
+        bridge.request_observation();
+        assert!(
+            <DefaultEguiBridge as EguiSlipwayBridge<ProbeWidget>>::wants_observation(&mut bridge)
+        );
+        assert!(
+            !<DefaultEguiBridge as EguiSlipwayBridge<ProbeWidget>>::wants_observation(&mut bridge)
+        );
+
+        <DefaultEguiBridge as EguiSlipwayBridge<ProbeWidget>>::observe(
+            &mut bridge,
+            EguiObservationContext {
+                widget_id: WidgetId::from("one"),
+                capabilities: Vec::new(),
+                topology: TopologyNode::leaf(WidgetId::from("one")),
+                unsupported: Vec::new(),
+                state: vec![StateObservation {
+                    target: WidgetId::from("one"),
+                    slot: None,
+                    name: "local".to_string(),
+                    value: "7".to_string(),
+                }],
+                layout_intent: None,
+            },
+        );
+
+        assert_eq!(bridge.take_probe_products().len(), 2);
+        assert!(bridge.take_probe_products().is_empty());
+    }
+
+    #[test]
+    fn ordinary_widget_path_does_not_emit_layout_intent_even_if_available() {
+        let widget = ProbeWidget::new("one");
+        let mut local = widget.initial_local_state();
+        let mut bridge = DefaultEguiBridge::new();
+        let mut messages = Vec::new();
+
+        bridge.request_observation();
+        egui::__run_test_ui(|ui| {
+            ui.add(SlipwayEguiWidget::new(
+                &widget,
+                &(),
+                &mut local,
+                &mut bridge,
+                &mut messages,
+            ));
+        });
+
+        let products = bridge.take_probe_products();
+        assert_eq!(products.len(), 2);
+        assert!(
+            !products
+                .iter()
+                .any(|product| matches!(product, ProbeProduct::LayoutIntent(_)))
+        );
+    }
+
+    #[test]
+    fn layout_intent_widget_path_emits_layout_intent_only_when_requested() {
+        let widget = ProbeWidget::new("one");
+        let mut local = widget.initial_local_state();
+        let mut bridge = DefaultEguiBridge::new();
+        let mut messages = Vec::new();
+
+        egui::__run_test_ui(|ui| {
+            ui.add(SlipwayEguiLayoutIntentWidget::new(
+                &widget,
+                &(),
+                &mut local,
+                &mut bridge,
+                &mut messages,
+            ));
+        });
+
+        assert!(bridge.take_probe_products().is_empty());
+
+        bridge.request_observation();
+        egui::__run_test_ui(|ui| {
+            ui.add(SlipwayEguiLayoutIntentWidget::new(
+                &widget,
+                &(),
+                &mut local,
+                &mut bridge,
+                &mut messages,
+            ));
+        });
+
+        let products = bridge.take_probe_products();
+        assert_eq!(products.len(), 3);
+        let layout_intent = products
+            .iter()
+            .find_map(|product| match product {
+                ProbeProduct::LayoutIntent(layout_intent) => Some(layout_intent),
+                _ => None,
+            })
+            .expect("layout intent probe");
+
+        assert_eq!(layout_intent.target, WidgetId::from("one"));
+        assert!(layout_intent.responsive_variant.is_some());
+        assert!(layout_intent.size_policy.is_some());
+        assert!(layout_intent.overflow_policy.is_some());
+    }
+
+    #[derive(Debug, Default)]
+    struct CallCounts {
+        capabilities: Cell<u32>,
+        topology: Cell<u32>,
+        unsupported: Cell<u32>,
+        observe_state: Cell<u32>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct CountingWidget {
+        calls: Rc<CallCounts>,
+    }
+
+    impl PartialEq for CountingWidget {
+        fn eq(&self, other: &Self) -> bool {
+            Rc::ptr_eq(&self.calls, &other.calls)
+        }
+    }
+
+    impl SlipwayWidgetTypes for CountingWidget {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = ProbeMessage;
+    }
+
+    impl SlipwaySsot for CountingWidget {
+        fn id(&self) -> WidgetId {
+            WidgetId::from("counting")
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            self.calls
+                .capabilities
+                .set(self.calls.capabilities.get() + 1);
+            vec![Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            self.calls.topology.set(self.calls.topology.get() + 1);
+            TopologyNode::leaf(self.id())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            self.calls.unsupported.set(self.calls.unsupported.get() + 1);
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for CountingWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            EventOutcome::ignored()
+        }
+    }
+
+    impl SlipwayView for CountingWidget {
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 10.0,
+                        height: 10.0,
+                    },
+                }),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            self.calls
+                .observe_state
+                .set(self.calls.observe_state.get() + 1);
+            Vec::new()
+        }
+    }
+
+    impl SlipwayViewDefinition for CountingWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                layout: layout.clone(),
+                paint: self.paint(external, local, &layout),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: Vec::new(),
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for CountingWidget {
+        fn resolve_font(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            FontResolutionEvidence {
+                request,
+                resolved_ref: None,
+                fallback_chain: Vec::new(),
+                installation: None,
+                refusal: None,
+                valid_source: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn observation_only_computes_non_admission_authority_products_when_requested() {
+        let calls = Rc::new(CallCounts::default());
+        let widget = CountingWidget {
+            calls: Rc::clone(&calls),
+        };
+        let mut bridge = DefaultEguiBridge::new();
+        let mut local = widget.initial_local_state();
+        let mut messages = Vec::new();
+
+        egui::__run_test_ui(|ui| {
+            ui.add(SlipwayEguiWidget::new(
+                &widget,
+                &(),
+                &mut local,
+                &mut bridge,
+                &mut messages,
+            ));
+        });
+
+        assert_eq!(calls.capabilities.get(), 1);
+        assert_eq!(calls.topology.get(), 0);
+        assert_eq!(calls.unsupported.get(), 0);
+        assert_eq!(calls.observe_state.get(), 0);
+
+        bridge.request_observation();
+        egui::__run_test_ui(|ui| {
+            ui.add(SlipwayEguiWidget::new(
+                &widget,
+                &(),
+                &mut local,
+                &mut bridge,
+                &mut messages,
+            ));
+        });
+
+        assert_eq!(calls.capabilities.get(), 3);
+        assert_eq!(calls.topology.get(), 1);
+        assert_eq!(calls.unsupported.get(), 1);
+        assert_eq!(calls.observe_state.get(), 1);
+        assert_eq!(bridge.take_probe_products().len(), 2);
+        assert!(bridge.take_probe_products().is_empty());
+    }
+}

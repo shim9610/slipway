@@ -1,0 +1,62 @@
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2026-0192: ttf-parser 0.25.1 is pulled transitively by iced's
+    # accepted font stack (iced -> cosmic-text -> fontdb -> ttf-parser), not by
+    # Slipway directly. Keep this narrow and revisit when iced/fontdb updates.
+    "RUSTSEC-2026-0192",
+    # RUSTSEC-2024-0436: paste 1.0.15 is pulled transitively by iced's accepted
+    # wgpu stack through wgpu-hal -> metal. Slipway does not depend on paste
+    # directly. Keep this narrow and revisit when wgpu/metal updates.
+    "RUSTSEC-2024-0436",
+    # RUSTSEC-2026-0194: quick-xml 0.39.4 is pulled transitively by eframe's
+    # non-wasm native stack through egui-winit -> smithay-clipboard ->
+    # wayland-scanner. This path is a build-time Wayland protocol XML scanner,
+    # not a Slipway runtime parser for untrusted XML. `cargo update -p
+    # quick-xml` and `cargo update -p wayland-scanner` cannot currently raise
+    # the version because wayland-scanner 0.31.10 is the latest published
+    # compatible release. Keep this narrow and remove it when wayland-scanner
+    # publishes a quick-xml >= 0.41.0 update. Linux native egui runner usage is
+    # discouraged while this exception remains active. Recheck the dependency
+    # migration and audit policy before changing this ignore.
+    "RUSTSEC-2026-0194",
+    # RUSTSEC-2026-0195: same quick-xml 0.39.4 transitively accepted through
+    # eframe's native Wayland build stack. The affected NsReader namespace
+    # allocation path is not a Slipway runtime parser for untrusted XML here;
+    # wayland-scanner uses quick-xml for Wayland protocol XML generation. `cargo
+    # update -p quick-xml` still cannot raise the version under current
+    # wayland-scanner constraints. Keep this narrow and remove it with the
+    # RUSTSEC-2026-0194 ignore when wayland-scanner moves to quick-xml >= 0.41.0.
+    # Linux native egui runner usage is discouraged while this exception remains
+    # active. Recheck the dependency migration and audit policy before changing
+    # this ignore.
+    "RUSTSEC-2026-0195",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "MPL-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

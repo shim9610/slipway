@@ -1,0 +1,14 @@
+[package]
+name = "slipway-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossbeam-channel = "0.5.15"
+serde_json = "1.0.150"
+slipway-core = { version = "0.1.0", path = "../slipway-core" }
+slipway-debug-bridge = { version = "0.1.0", path = "../slipway-debug-bridge" }
+slipway-debug-mcp = { version = "0.1.0", path = "../slipway-debug-mcp" }
+slipway-debug-renderer = { version = "0.1.0", path = "../slipway-debug-renderer" }

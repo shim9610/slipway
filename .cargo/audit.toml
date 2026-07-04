@@ -1,0 +1,22 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0194: quick-xml 0.39.4 is pulled through the Linux Wayland
+    # scanner path:
+    # slipway-backend-egui -> eframe -> egui-winit -> smithay-clipboard ->
+    # smithay-client-toolkit/wayland-client -> wayland-scanner -> quick-xml.
+    # This is not a Slipway runtime XML parser for untrusted documents.
+    #
+    # Mandatory review before removing/changing this ignore:
+    # docs/agents/security-audit-policy.md
+    # docs/agents/version-migration-checklist.md
+    "RUSTSEC-2026-0194",
+
+    # RUSTSEC-2026-0195: same quick-xml Wayland scanner path. Linux native
+    # egui usage is discouraged until the upstream wayland-scanner path can use
+    # quick-xml >= 0.41.0 or the dependency is removed from default builds.
+    #
+    # Mandatory review before removing/changing this ignore:
+    # docs/agents/security-audit-policy.md
+    # docs/agents/version-migration-checklist.md
+    "RUSTSEC-2026-0195",
+]

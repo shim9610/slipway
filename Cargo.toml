@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/slipway-core",
+    "crates/slipway-backend-egui",
+    "crates/slipway-backend-iced",
+    "crates/slipway-example-admission",
+    "crates/slipway-debug-bridge",
+    "crates/slipway-debug-mcp",
+    "crates/slipway-debug-renderer",
+    "crates/slipway-runtime",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/shim9610/slipway"
