@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/slipway",
     "crates/slipway-core",
     "crates/slipway-backend-egui",
     "crates/slipway-backend-iced",

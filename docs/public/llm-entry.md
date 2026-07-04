@@ -5,6 +5,16 @@ First map the source UI into explicit files and widget identities.
 
 ## Required First Pass
 
+Depend on the public facade crate, not on individual internal crates:
+
+```toml
+[dependencies]
+slipway = { git = "https://github.com/shim9610/slipway.git", features = ["iced"] }
+```
+
+Use `features = ["egui"]` for egui, or `features = ["all-backends"]` only when
+the task genuinely needs both backend adapters.
+
 Before editing code, read:
 
 1. [Authoring layout](authoring-layout.md)

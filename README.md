@@ -25,6 +25,8 @@ MVP, needs to be re-authored as a desktop UI while keeping the work inspectable:
 
 ## Repository Shape
 
+- `crates/slipway` - public facade crate. Most users should depend on this
+  package and select a backend with Cargo features.
 - `crates/slipway-core` - backend-neutral traits, geometry, declarations, and
   evidence types.
 - `crates/slipway-runtime` - runtime assembly, event application, debug bridge
@@ -36,6 +38,27 @@ MVP, needs to be re-authored as a desktop UI while keeping the work inspectable:
 - `crates/slipway-example-admission` - small admission/example app.
 
 Evaluation crates are disposable and are not part of the public API.
+
+## Install From Git
+
+Use the facade crate and choose the backend with features:
+
+```toml
+[dependencies]
+slipway = { git = "https://github.com/shim9610/slipway.git", features = ["iced"] }
+```
+
+For egui:
+
+```toml
+slipway = { git = "https://github.com/shim9610/slipway.git", features = ["egui"] }
+```
+
+For both backend adapters:
+
+```toml
+slipway = { git = "https://github.com/shim9610/slipway.git", features = ["all-backends"] }
+```
 
 ## Start Here
 

@@ -3,6 +3,18 @@
 Slipway backends mechanically lift authored widgets into the selected host
 framework. They do not own the UI body.
 
+Select backends through the facade crate:
+
+```toml
+slipway = { git = "https://github.com/shim9610/slipway.git", features = ["iced"] }
+```
+
+or:
+
+```toml
+slipway = { git = "https://github.com/shim9610/slipway.git", features = ["egui"] }
+```
+
 ## Backend-Neutral Rule
 
 Core authoring code should not contain iced or egui types. Backend-specific

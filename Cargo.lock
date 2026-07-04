@@ -2815,6 +2815,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "slipway"
+version = "0.1.0"
+dependencies = [
+ "slipway-backend-egui",
+ "slipway-backend-iced",
+ "slipway-core",
+ "slipway-debug-bridge",
+ "slipway-debug-mcp",
+ "slipway-debug-renderer",
+ "slipway-runtime",
+]
+
+[[package]]
 name = "slipway-backend-egui"
 version = "0.1.0"
 dependencies = [

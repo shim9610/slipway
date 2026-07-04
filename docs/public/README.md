@@ -8,6 +8,13 @@ and should not need internal project records to author an app.
 
 ## Reading Paths
 
+Install the public facade crate with the backend feature you need:
+
+```toml
+[dependencies]
+slipway = { git = "https://github.com/shim9610/slipway.git", features = ["iced"] }
+```
+
 For a human overview:
 
 1. [Project overview](../../README.md)

@@ -3,6 +3,16 @@
 The API guide is split by responsibility so an LLM worker can read only the
 part needed for the current task.
 
+Most users depend on the facade crate:
+
+```toml
+slipway = { git = "https://github.com/shim9610/slipway.git", features = ["iced"] }
+```
+
+Backend choice is the feature split. Do not add separate `slipway-core`,
+`slipway-runtime`, or backend crate dependencies unless you are deliberately
+working on the Slipway crates themselves.
+
 ## Files
 
 - [Core API](core.md) - backend-neutral identity, state, logic, view,

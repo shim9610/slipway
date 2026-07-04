@@ -5,6 +5,12 @@ This page names the main backend-neutral concepts in `slipway-core`.
 It is a map, not a complete Rustdoc replacement. Use it to decide which API
 area to inspect next.
 
+User apps should normally import these through the public facade crate:
+
+```rust
+use slipway::prelude::*;
+```
+
 ## State And Identity
 
 Important concepts:
