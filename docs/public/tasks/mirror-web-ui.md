@@ -3,6 +3,11 @@
 This guide is for an LLM worker asked to mirror a web UI, such as a Svelte app,
 with Slipway.
 
+Before reading source code, read [Quickstart for app authors](../quickstart-authoring.md).
+The mirroring worker should not need to inspect Slipway internals. If a required
+operation is missing from public docs, report `PUBLIC_DOC_GAP` and name the
+missing operation.
+
 ## Goal
 
 The goal is not automatic conversion. The worker reads the source UI, then
@@ -29,8 +34,9 @@ and backend evidence.
 6. Implement widget-local interaction in the internal logic file.
 7. Implement layout, paint, hit, focus, scroll, text, and paint-order
    declarations in the view file.
-8. Run the selected backend.
-9. Use MCP/debug tools to inspect status, view/probe evidence, screenshot or
+8. Run the selected backend through the public facade/backend feature.
+9. Use MCP/debug tools from the running backend window to inspect status,
+   view/probe evidence, screenshot or
    render evidence, physical-control behavior, resize, and scroll.
 10. Fix authoring gaps and repeat.
 

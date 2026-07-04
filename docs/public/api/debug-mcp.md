@@ -32,6 +32,47 @@ The default debug MCP surface exposes tools with names like:
 
 Tool availability may depend on debug configuration and backend support.
 
+## Finding The MCP Endpoint
+
+The standard debug backend path starts a loopback MCP endpoint and includes the
+address in the running window title:
+
+```text
+Slipway Backend Iced - Iced MCP: 127.0.0.1:52883
+```
+
+Connect to that TCP address and send one JSON-RPC request per line. The MCP
+surface uses `tools/call`:
+
+```json
+{"jsonrpc":"2.0","id":"status-1","method":"tools/call","params":{"name":"slipway.debug.status","arguments":{"frame":"current"}}}
+```
+
+Use `tools/list` to discover the currently admitted tool list:
+
+```json
+{"jsonrpc":"2.0","id":"tools-1","method":"tools/list","params":{}}
+```
+
+Screenshot/render requests should use the current visible frame unless the
+task intentionally compares a saved frame identity:
+
+```json
+{"jsonrpc":"2.0","id":"shot-1","method":"tools/call","params":{"name":"slipway.debug.screenshot","arguments":{"frame":"current"}}}
+```
+
+Pointer physical control example:
+
+```json
+{"jsonrpc":"2.0","id":"click-1","method":"tools/call","params":{"name":"slipway.debug.physical_control","arguments":{"frame":"current","operation":{"type":"pointer","phase":"press","position":{"x":120.0,"y":80.0},"button":"primary","device":"mouse"}}}}
+```
+
+Resize example:
+
+```json
+{"jsonrpc":"2.0","id":"resize-1","method":"tools/call","params":{"name":"slipway.debug.resize","arguments":{"frame":"current"}}}
+```
+
 ## Physical Control Meaning
 
 `slipway.debug.physical_control` is stricter than "mutate app state."

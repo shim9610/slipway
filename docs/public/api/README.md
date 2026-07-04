@@ -5,8 +5,8 @@ part needed for the current task.
 
 Most users depend on the facade crate:
 
-```toml
-slipway = { git = "https://github.com/shim9610/slipway.git", features = ["iced"] }
+```powershell
+cargo add slipway --git https://github.com/shim9610/slipway.git --features iced
 ```
 
 Backend choice is the feature split. Do not add separate `slipway-core`,

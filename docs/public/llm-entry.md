@@ -3,32 +3,38 @@
 You are authoring a Slipway app. Do not start by writing one large root widget.
 First map the source UI into explicit files and widget identities.
 
+This is a user-authoring document. You should not need to inspect Slipway's
+private architecture notes, old evaluation crates, git history, or backend
+adapter internals before beginning an app. If the public docs do not explain an
+operation, report `PUBLIC_DOC_GAP` with the missing operation.
+
 ## Required First Pass
 
-Depend on the public facade crate, not on individual internal crates:
+Start with the quickstart:
 
-```toml
-[dependencies]
-slipway = { git = "https://github.com/shim9610/slipway.git", features = ["iced"] }
+1. [Quickstart for app authors](quickstart-authoring.md)
+2. [Authoring layout](authoring-layout.md)
+3. [Core API map](api/core.md)
+4. [Backend API map](api/backends.md)
+5. [Debug MCP](api/debug-mcp.md)
+
+Depend on the public facade crate, not on individual internal crates. Prefer
+`cargo add`:
+
+```powershell
+cargo add slipway --git https://github.com/shim9610/slipway.git --features iced
 ```
 
 Use `features = ["egui"]` for egui, or `features = ["all-backends"]` only when
 the task genuinely needs both backend adapters.
 
-Before editing code, read:
-
-1. [Authoring layout](authoring-layout.md)
-2. [Core API map](api/core.md)
-3. [Backend API map](api/backends.md)
-4. [Debug MCP](api/debug-mcp.md)
-
 If the task is to mirror a web UI, also read:
 
-5. [Web UI mirroring task guide](tasks/mirror-web-ui.md)
+6. [Web UI mirroring task guide](tasks/mirror-web-ui.md)
 
 If the task uses canvas, plots, media, or an existing renderer, also read:
 
-6. [Provider surfaces](api/provider-surfaces.md)
+7. [Provider surfaces](api/provider-surfaces.md)
 
 ## Required Output Shape
 

@@ -62,6 +62,7 @@ slipway = { git = "https://github.com/shim9610/slipway.git", features = ["all-ba
 
 ## Start Here
 
+- App author quickstart: [docs/public/quickstart-authoring.md](docs/public/quickstart-authoring.md)
 - Public documentation index: [docs/public/README.md](docs/public/README.md)
 - LLM authoring entry point: [docs/public/llm-entry.md](docs/public/llm-entry.md)
 - Required file split: [docs/public/authoring-layout.md](docs/public/authoring-layout.md)
@@ -72,3 +73,8 @@ slipway = { git = "https://github.com/shim9610/slipway.git", features = ["all-ba
 Project-maintenance notes are maintained separately from this public manual.
 They are not the user manual and should not be treated as public API
 documentation.
+
+If an app-authoring task requires reading internal architecture notes or old
+evaluation history before code can be written, treat that as a public
+documentation gap. App authors should be able to start from the quickstart and
+the linked public API pages.
