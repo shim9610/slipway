@@ -145,12 +145,16 @@ where
     let event_loop = EventLoop::<eframe::UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
+    let mut app = app;
+    app.mark_native_create_started();
     let eframe_app = eframe::create_native(
         title,
         eframe::NativeOptions::default(),
         Box::new(move |creation_context| {
             let mut app = app;
+            app.record_native_create_phase();
             app.ensure_mcp_wake_forwarder(&creation_context.egui_ctx);
+            app.prewarm_native_visible_cache(&creation_context.egui_ctx);
             Ok(Box::new(app))
         }),
         &event_loop,

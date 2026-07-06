@@ -26,17 +26,20 @@ For a human overview:
 3. [Authoring layout](authoring-layout.md)
 4. [Core API map](api/core.md)
 5. [Backend API map](api/backends.md)
-6. [Debug MCP](api/debug-mcp.md)
+6. [IME and Korean text input](api/ime.md)
+7. [Debug MCP](api/debug-mcp.md)
 
 For an LLM worker that must author or mirror a UI:
 
 1. [Quickstart for app authors](quickstart-authoring.md)
 2. [LLM entry point](llm-entry.md)
-3. [Authoring layout](authoring-layout.md)
-4. [Core API map](api/core.md)
-5. [Backend API map](api/backends.md)
-6. [Web UI mirroring task guide](tasks/mirror-web-ui.md)
-7. [Debug MCP](api/debug-mcp.md)
+3. [LLM contract checklist](llm-contract-checklist.md)
+4. [Authoring layout](authoring-layout.md)
+5. [Core API map](api/core.md)
+6. [Backend API map](api/backends.md)
+7. [IME and Korean text input](api/ime.md)
+8. [Web UI mirroring task guide](tasks/mirror-web-ui.md)
+9. [Debug MCP](api/debug-mcp.md)
 
 For custom rendering or already-owned renderer integration:
 

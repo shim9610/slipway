@@ -16,3 +16,6 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/shim9610/slipway"
+
+[profile.dev]
+opt-level = 1

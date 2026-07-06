@@ -24,6 +24,10 @@ Switching backend is not an automatic translation promise. It is a typed repair
 workflow: missing backend-specific contracts should produce compile errors or
 unsupported diagnostics.
 
+For LLM workers: a compile error caused by a missing backend contract is not a
+reason to import internals or bypass the backend. Either implement the required
+backend-specific wrapper contract or report the missing public API/backend gap.
+
 ## iced Backend
 
 Main crate:
@@ -74,9 +78,21 @@ Visible backends must:
 - keep authored children as separate backend child widgets where possible;
 - call `visible_backend_view_definition` for visible presentation boundaries;
 - validate view and dispatch evidence before mutating widget state;
-- preserve `BackendInputEvent` evidence for physical input;
+- preserve `BackendInputEvent` evidence for physical input and validate that
+  the evidence backend id matches the selected backend;
+- preserve the same `FrameIdentity` between MCP/debug physical-control
+  commands and backend-presented evidence. Matching viewport alone is not
+  enough evidence;
 - refuse blocking contract diagnostics instead of silently applying behavior;
 - keep canonical/offscreen rendering out of the visible hot path.
+
+Backend-presented physical evidence is backend-specific. An iced visible
+runtime must reject egui/test backend provenance, and an egui visible runtime
+must reject iced/test backend provenance.
+
+Visible backend success must be proven through the same backend path the user
+will exercise. Semantic runtime control or fabricated JSON evidence is not a
+substitute for backend-presented input traces.
 
 ## Backend-Native Escape Hatch
 
@@ -84,3 +100,14 @@ If you already own an iced or egui widget, wrap it through that backend's native
 wrapper path. The wrapper is still a Slipway child and must expose enough
 identity, layout, event, and debug evidence for Slipway to inspect where it
 sits in the app.
+
+This is an explicit backend-specific escape hatch. It is not a cross-backend
+visual parity guarantee and it is not a way to smuggle undeclared behavior into
+the neutral authoring API. If a task requires Slipway parity evidence, the
+wrapper must expose the relevant bounds, event regions, state, snapshots, or
+unsupported diagnostics through its backend-specific contract.
+
+Scroll repair is also backend-owned defense, not an authoring shortcut. If a
+visible backend crops or disables invalid scroll geometry, that keeps the
+window stable but should be treated as diagnostic evidence that the authored
+scroll declaration needs repair.

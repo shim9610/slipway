@@ -1590,7 +1590,7 @@ impl AdmissionWidget {
             },
             content: "drag overlay".to_string(),
             color: rgb(76, 29, 149),
-            style: TextStyle::default().with_font_size(12.0),
+            style: TextStyle::plain().with_font_size(12.0),
         });
         let graph = Rect {
             origin: Point {
@@ -1743,7 +1743,7 @@ impl AdmissionWidget {
             bounds: Self::overlay_stack_help_text_rect(bounds),
             content: "front buttons; drag title bars".to_string(),
             color: rgb(71, 85, 105),
-            style: TextStyle::default().with_font_size(12.0),
+            style: TextStyle::plain().with_font_size(12.0),
         });
 
         for index in 0..4 {
@@ -1778,7 +1778,7 @@ impl AdmissionWidget {
                 } else {
                     rgb(76, 29, 149)
                 },
-                style: TextStyle::default().with_font_size(12.0),
+                style: TextStyle::plain().with_font_size(12.0),
             });
         }
 
@@ -1854,7 +1854,7 @@ impl AdmissionWidget {
             },
             content: format!("{} layer {rank}", overlay_stack_label(index)),
             color: palette.1,
-            style: TextStyle::default().with_font_size(12.0),
+            style: TextStyle::plain().with_font_size(12.0),
         });
 
         let graph = Rect {
@@ -1974,7 +1974,7 @@ impl AdmissionWidget {
                     },
                     content: format!("inner {} row {}", index + 1, row + inner_rows[index] + 1),
                     color: rgb(51, 65, 85),
-                    style: TextStyle::default().with_font_size(12.0),
+                    style: TextStyle::plain().with_font_size(12.0),
                 });
             }
             content_ops.push(PaintOp::Group {
@@ -2001,7 +2001,7 @@ impl AdmissionWidget {
             content: "Wheel over outer or each inner panel; MCP should report distinct region ids."
                 .to_string(),
             color: rgb(100, 116, 139),
-            style: TextStyle::default().with_font_size(12.0),
+            style: TextStyle::plain().with_font_size(12.0),
         });
         ops.push(PaintOp::Group {
             id: Some("nested-scroll-content".to_string()),
@@ -2868,6 +2868,7 @@ impl SlipwayLogic for AdmissionWidget {
             (Self::Action(_), InputEvent::Pointer(pointer))
                 if pointer.kind == slipway_core::PointerEventKind::Release =>
             {
+                *local = AdmissionLocal::Action { pressed: false };
                 handled_no_change_outcome(self.id())
             }
             (Self::Segment(_), InputEvent::Pointer(pointer))
@@ -3681,7 +3682,7 @@ impl SlipwayView for AdmissionWidget {
                 bounds: self.card_header_text_rect(bounds),
                 content: format!("{} | {}", self.role(), title),
                 color: rgb(15, 23, 42),
-                style: TextStyle::default(),
+                style: TextStyle::plain(),
             },
         ];
 
@@ -3799,7 +3800,7 @@ impl SlipwayView for AdmissionWidget {
                     } else {
                         rgb(51, 65, 85)
                     },
-                    style: TextStyle::default(),
+                    style: TextStyle::plain(),
                 });
             }
         }
@@ -3929,7 +3930,7 @@ fn intensity_from_pointer(x: f32) -> f32 {
 }
 
 fn admission_text_input_style_token() -> TextStyle {
-    TextStyle::default()
+    TextStyle::plain()
         .with_font_family("system-ui")
         .with_font_size(14.0)
 }
@@ -4164,7 +4165,7 @@ mod tests {
         input: slipway_core::BackendInputEvent,
     ) -> slipway_runtime::SlipwayBackendInputApplyReport {
         let mut reducer = apply_messages;
-        runtime.apply_backend_input_event_with_app_reducer(input, &mut reducer)
+        runtime.apply_backend_input_event_for_backend_with_app_reducer(input, "iced", &mut reducer)
     }
 
     fn clipped_group_count(ops: &[PaintOp], prefix: &str) -> usize {
@@ -4392,6 +4393,49 @@ mod tests {
         );
         assert!(slider_outcome.handled);
         assert_eq!(slider_outcome.emitted_messages.len(), 1);
+    }
+
+    #[test]
+    fn action_release_clears_pressed_local_state_after_click() {
+        let state = AdmissionState::default();
+        let action = AdmissionWidget::Action(ActionWidget);
+        let mut local = action.initial_local_state();
+
+        let press = action.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: action.id(),
+                target_slot: None,
+                position: Point { x: 4.0, y: 4.0 },
+                target_bounds: None,
+                kind: slipway_core::PointerEventKind::Press,
+                button: None,
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+
+        assert!(press.handled);
+        assert_eq!(press.emitted_messages.len(), 1);
+        assert_eq!(local, AdmissionLocal::Action { pressed: true });
+
+        let release = action.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: action.id(),
+                target_slot: None,
+                position: Point { x: 4.0, y: 4.0 },
+                target_bounds: None,
+                kind: slipway_core::PointerEventKind::Release,
+                button: None,
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+
+        assert!(release.handled);
+        assert!(release.emitted_messages.is_empty());
+        assert_eq!(local, AdmissionLocal::Action { pressed: false });
     }
 
     #[test]
@@ -4961,7 +5005,7 @@ mod tests {
                 },
                 content: "lower-key sibling".to_string(),
                 color: rgb(0, 0, 0),
-                style: TextStyle::default(),
+                style: TextStyle::plain(),
             }],
         };
 
@@ -5843,7 +5887,8 @@ mod tests {
             }),
             AdmissionState::default(),
         );
-        let frame = admission_test_frame(640.0, 700.0);
+        runtime.record_presented_viewport(admission_test_frame(640.0, 700.0).viewport);
+        let frame = runtime.last_frame_identity();
         let view = admission_view(&runtime, frame);
 
         let backend_input = pointer_backend_input_for_view(&view, Point { x: 24.0, y: 24.0 });
@@ -5867,8 +5912,9 @@ mod tests {
             }),
             AdmissionState::default(),
         );
-        let frame = admission_test_frame(640.0, 700.0);
+        runtime.record_presented_viewport(admission_test_frame(640.0, 700.0).viewport);
 
+        let frame = runtime.last_frame_identity();
         let view = admission_view(&runtime, frame.clone());
         let report = apply_test_backend_input(
             &mut runtime,
@@ -5877,6 +5923,7 @@ mod tests {
         assert!(report.handled, "{:?}", report.diagnostics);
         assert_eq!(runtime.external().segment, Segment::Week);
 
+        let frame = runtime.last_frame_identity();
         let view = admission_view(&runtime, frame.clone());
         let report = apply_test_backend_input(
             &mut runtime,
@@ -5885,6 +5932,7 @@ mod tests {
         assert!(report.handled, "{:?}", report.diagnostics);
         assert_eq!(runtime.external().draft, "edited through backend");
 
+        let frame = runtime.last_frame_identity();
         let view = admission_view(&runtime, frame.clone());
         let report = apply_test_backend_input(
             &mut runtime,
@@ -5893,6 +5941,7 @@ mod tests {
         assert!(report.handled, "{:?}", report.diagnostics);
         assert!(!runtime.external().enabled);
 
+        let frame = runtime.last_frame_identity();
         let view = admission_view(&runtime, frame.clone());
         let report = apply_test_backend_input(
             &mut runtime,
@@ -5901,6 +5950,7 @@ mod tests {
         assert!(report.handled, "{:?}", report.diagnostics);
         assert!(runtime.external().intensity > 0.9);
 
+        let frame = runtime.last_frame_identity();
         let view = admission_view(&runtime, frame.clone());
         let report = apply_test_backend_input(
             &mut runtime,
@@ -5909,6 +5959,7 @@ mod tests {
         assert!(report.handled, "{:?}", report.diagnostics);
         assert_eq!(runtime.external().selected_item, 0);
 
+        let frame = runtime.last_frame_identity();
         let view = admission_view(&runtime, frame);
         let report = apply_test_backend_input(
             &mut runtime,

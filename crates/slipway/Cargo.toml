@@ -1,18 +1,18 @@
 [package]
 name = "slipway"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-slipway-backend-egui = { version = "0.1.0", path = "../slipway-backend-egui", optional = true }
-slipway-backend-iced = { version = "0.1.0", path = "../slipway-backend-iced", optional = true }
-slipway-core = { version = "0.1.0", path = "../slipway-core" }
-slipway-debug-bridge = { version = "0.1.0", path = "../slipway-debug-bridge" }
-slipway-debug-mcp = { version = "0.1.0", path = "../slipway-debug-mcp" }
-slipway-debug-renderer = { version = "0.1.0", path = "../slipway-debug-renderer" }
-slipway-runtime = { version = "0.1.0", path = "../slipway-runtime" }
+slipway-backend-egui = { version = "0.1.1", path = "../slipway-backend-egui", optional = true }
+slipway-backend-iced = { version = "0.1.1", path = "../slipway-backend-iced", optional = true }
+slipway-core = { version = "0.1.1", path = "../slipway-core" }
+slipway-debug-bridge = { version = "0.1.1", path = "../slipway-debug-bridge" }
+slipway-debug-mcp = { version = "0.1.1", path = "../slipway-debug-mcp" }
+slipway-debug-renderer = { version = "0.1.1", path = "../slipway-debug-renderer" }
+slipway-runtime = { version = "0.1.1", path = "../slipway-runtime" }
 
 [features]
 default = []

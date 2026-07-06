@@ -64,14 +64,21 @@ For iced:
 use slipway::prelude::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run_slipway_iced_runtime_app(
+    let config = SlipwayRuntimeConfig::admitted_debug()
+        .with_platform_ime_always_allowed();
+
+    run_slipway_iced_runtime_app_with_config(
         SlipwayAppWidget::new(MyApp::new()),
         MyExternalState::default(),
         apply_messages,
+        config,
     )?;
     Ok(())
 }
 ```
+
+Use `with_platform_ime_always_allowed()` for Korean/Hangul text input on iced.
+See [IME and Korean text input](api/ime.md).
 
 For egui:
 

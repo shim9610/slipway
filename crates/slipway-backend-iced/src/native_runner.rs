@@ -10,12 +10,14 @@ use iced::theme::Base as _;
 use iced_core::input_method;
 use iced_winit::runtime::user_interface::{self, UserInterface};
 use iced_winit::winit;
-use slipway_core::PointerButton as DebugPointerButton;
-use slipway_debug_bridge::DebugPhysicalControl;
+use slipway_core::{PointerButton as DebugPointerButton, Size};
+use slipway_debug_bridge::{
+    DebugPhysicalControl, VISIBLE_FRAME_BUDGET_NS, VisibleFrameTimingRecorder,
+};
 use slipway_runtime::{SlipwayImePolicy, SlipwayRuntimePendingNativeMcpCall};
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{
@@ -31,6 +33,10 @@ use winit::window::{ImePurpose, Window, WindowId};
 enum NativeRunnerEvent {
     McpWake,
 }
+
+const RESIZE_CONFIGURE_QUIET_FRAMES: u64 = 12;
+const RESIZE_CONFIGURE_QUIET: Duration =
+    Duration::from_nanos((VISIBLE_FRAME_BUDGET_NS as u64) * RESIZE_CONFIGURE_QUIET_FRAMES);
 
 pub fn run_slipway_iced_runtime_app_native<W, F>(
     widget: W,
@@ -84,13 +90,20 @@ where
     window: Option<NativeIcedWindow>,
     pending_mcp: Option<SlipwayRuntimePendingNativeMcpCall>,
     pending_iced_events: Vec<iced::Event>,
-    pending_resize: Option<PhysicalSize<u32>>,
+    pending_resize: Option<PendingResize>,
+    frame_timing: VisibleFrameTimingRecorder,
+}
+
+struct PendingResize {
+    physical_size: PhysicalSize<u32>,
+    queued_at: Instant,
 }
 
 struct NativeIcedWindow {
     raw: Arc<Window>,
     compositor: iced_renderer::Compositor,
     surface: <iced_renderer::Compositor as iced::advanced::graphics::Compositor>::Surface,
+    surface_physical_size: PhysicalSize<u32>,
     renderer: iced::Renderer,
     cache: user_interface::Cache,
     clipboard: iced_winit::Clipboard,
@@ -108,6 +121,7 @@ struct NativeIcedWindow {
     ime_policy: SlipwayImePolicy,
     ime_trace: bool,
     redraw_at: Option<Instant>,
+    presented_frames: u64,
     theme: iced::Theme,
     style: renderer::Style,
 }
@@ -246,6 +260,7 @@ where
             pending_mcp: None,
             pending_iced_events: Vec::new(),
             pending_resize: None,
+            frame_timing: VisibleFrameTimingRecorder::from_env("iced"),
         }
     }
 
@@ -271,10 +286,12 @@ where
             return Ok(());
         }
 
+        let create_window_start = Instant::now();
         let mut window_settings = iced::window::Settings::default();
         window_settings.size = iced::Size::new(1024.0, 768.0);
         let scale_factor = 1.0;
         let title = self.app.title();
+        let window_start = Instant::now();
         let window = Arc::new(
             event_loop
                 .create_window(iced_winit::conversion::window_attributes(
@@ -286,6 +303,8 @@ where
                 ))
                 .map_err(|error| iced::Error::WindowCreationFailed(Box::new(error)))?,
         );
+        self.frame_timing
+            .record("iced.create_window.window", window_start.elapsed(), 1, None);
         window.set_title(&title);
         let ime_allowed = self.ime_policy.keeps_platform_ime_allowed();
         if ime_allowed {
@@ -298,10 +317,19 @@ where
             );
         }
 
+        let executor_start = Instant::now();
         let executor = <iced::executor::Default as iced::Executor>::new()
             .map_err(iced::Error::ExecutorCreationFailed)?;
-        let graphics_settings: iced::advanced::graphics::Settings =
+        self.frame_timing.record(
+            "iced.create_window.executor",
+            executor_start.elapsed(),
+            1,
+            None,
+        );
+        let mut graphics_settings: iced::advanced::graphics::Settings =
             iced::Settings::default().into();
+        graphics_settings.vsync = false;
+        let compositor_start = Instant::now();
         let mut compositor = executor
             .block_on(
                 <iced_renderer::Compositor as iced::advanced::graphics::Compositor>::new(
@@ -312,22 +340,62 @@ where
                 ),
             )
             .map_err(iced::Error::GraphicsCreationFailed)?;
-        load_platform_text_fonts(&mut compositor, self.ime_trace);
+        self.frame_timing.record(
+            "iced.create_window.compositor",
+            compositor_start.elapsed(),
+            1,
+            None,
+        );
+        let font_start = Instant::now();
+        let loaded_platform_fonts =
+            load_platform_text_fonts(&mut compositor, self.ime_trace, &mut self.frame_timing);
+        self.frame_timing.record(
+            "iced.create_window.font",
+            font_start.elapsed(),
+            loaded_platform_fonts,
+            None,
+        );
         let physical_size = non_zero_physical_size(window.inner_size());
-        let mut surface =
+        let timing_physical_size = Some(Size {
+            width: physical_size.width as f32,
+            height: physical_size.height as f32,
+        });
+        let surface_start = Instant::now();
+        let surface =
             compositor.create_surface(window.clone(), physical_size.width, physical_size.height);
-        compositor.configure_surface(&mut surface, physical_size.width, physical_size.height);
+        self.frame_timing.record(
+            "iced.create_window.surface",
+            surface_start.elapsed(),
+            1,
+            timing_physical_size,
+        );
+        let renderer_start = Instant::now();
         let renderer = compositor.create_renderer();
+        self.frame_timing.record(
+            "iced.create_window.renderer",
+            renderer_start.elapsed(),
+            1,
+            timing_physical_size,
+        );
         let theme = iced::Theme::default(iced::theme::Mode::Light);
         let base = theme.base();
+        let clipboard_start = Instant::now();
+        let clipboard = iced_winit::Clipboard::connect(window.clone());
+        self.frame_timing.record(
+            "iced.create_window.clipboard",
+            clipboard_start.elapsed(),
+            1,
+            timing_physical_size,
+        );
 
         self.window = Some(NativeIcedWindow {
             raw: window.clone(),
             compositor,
             surface,
+            surface_physical_size: physical_size,
             renderer,
             cache: user_interface::Cache::new(),
-            clipboard: iced_winit::Clipboard::connect(window),
+            clipboard,
             viewport: viewport_from_window(&physical_size, scale_factor),
             cursor_position: None,
             modifiers: ModifiersState::default(),
@@ -342,6 +410,7 @@ where
             ime_policy: self.ime_policy,
             ime_trace: self.ime_trace,
             redraw_at: None,
+            presented_frames: 0,
             theme,
             style: renderer::Style {
                 text_color: base.text_color,
@@ -352,6 +421,13 @@ where
         if let Some(window) = self.window.as_ref() {
             window.raw.request_redraw();
         }
+        let timing_viewport = self.window.as_ref().map(iced_timing_viewport);
+        self.frame_timing.record(
+            "iced.create_window",
+            create_window_start.elapsed(),
+            1,
+            timing_viewport,
+        );
 
         Ok(())
     }
@@ -384,10 +460,9 @@ where
             .unwrap_or(mouse::Cursor::Unavailable)
     }
 
-    fn dispatch_iced_events(
-        &mut self,
-        events: &[iced::Event],
-    ) -> Vec<SlipwayIcedRuntimeMessage<W::AppMessage>> {
+    fn dispatch_iced_events(&mut self, events: &[iced::Event]) -> Vec<SlipwayIcedRuntimeMessage> {
+        let timing_start = Instant::now();
+        let timing_viewport = self.window.as_ref().map(iced_timing_viewport);
         let cursor = self.cursor();
         let Some(window) = self.window.as_mut() else {
             return Vec::new();
@@ -439,10 +514,17 @@ where
         if let Some(mouse_interaction) = mouse_interaction {
             self.update_mouse_interaction(mouse_interaction);
         }
+        self.record_iced_update_message_counts(&messages, timing_viewport);
+        self.frame_timing.record(
+            "iced.update",
+            timing_start.elapsed(),
+            events.len(),
+            timing_viewport,
+        );
         messages
     }
 
-    fn process_messages(&mut self, messages: Vec<SlipwayIcedRuntimeMessage<W::AppMessage>>) {
+    fn process_messages(&mut self, messages: Vec<SlipwayIcedRuntimeMessage>) {
         let mut should_redraw = false;
         for message in messages {
             if let SlipwayIcedRuntimeMessage::PreeditStyle(style) = message {
@@ -462,10 +544,7 @@ where
         }
     }
 
-    fn apply_preedit_style_messages(
-        &mut self,
-        messages: &[SlipwayIcedRuntimeMessage<W::AppMessage>],
-    ) {
+    fn apply_preedit_style_messages(&mut self, messages: &[SlipwayIcedRuntimeMessage]) {
         for message in messages {
             if let SlipwayIcedRuntimeMessage::PreeditStyle(style) = message {
                 self.apply_preedit_style(style.clone());
@@ -499,27 +578,95 @@ where
     }
 
     fn redraw(&mut self) {
+        let timing_start = Instant::now();
+        let timing_viewport = self.window.as_ref().map(iced_timing_viewport);
         let cursor = self.cursor();
         let Some(window) = self.window.as_mut() else {
             return;
         };
+        let presented_frame_before = window.presented_frames;
         let cache = std::mem::replace(&mut window.cache, user_interface::Cache::new());
+        let view_start = Instant::now();
+        let element = self.app.view::<iced::Theme, iced::Renderer>();
+        let view_elapsed = view_start.elapsed();
+        let build_start = Instant::now();
         let mut user_interface = UserInterface::build(
-            self.app.view::<iced::Theme, iced::Renderer>(),
+            element,
             window.viewport.logical_size(),
             cache,
             &mut window.renderer,
         );
+        let build_elapsed = build_start.elapsed();
+        let draw_start = Instant::now();
         user_interface.draw(&mut window.renderer, &window.theme, &window.style, cursor);
+        let draw_elapsed = draw_start.elapsed();
         window.cache = user_interface.into_cache();
+        let has_preedit = window.preedit.is_some();
+        let preedit_start = Instant::now();
         draw_window_preedit(window);
+        let preedit_elapsed = preedit_start.elapsed();
         let base = window.theme.base();
-        let _ = window.compositor.present(
+        let present_start = Instant::now();
+        let present_result = window.compositor.present(
             &mut window.renderer,
             &mut window.surface,
             &window.viewport,
             base.background_color,
             || {},
+        );
+        let present_elapsed = present_start.elapsed();
+        if present_result.is_ok() {
+            window.presented_frames += 1;
+        }
+        let presented_frame_after = window.presented_frames;
+        let _ = window;
+        self.frame_timing.record(
+            "iced.redraw.frame_index",
+            Duration::ZERO,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.draw",
+            draw_elapsed,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.preedit_draw",
+            preedit_elapsed,
+            usize::from(has_preedit),
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.present",
+            present_elapsed,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.view",
+            view_elapsed,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.build",
+            build_elapsed,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.presented_frame_count",
+            Duration::ZERO,
+            presented_frame_after as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.draw_present",
+            timing_start.elapsed(),
+            presented_frame_before as usize,
+            timing_viewport,
         );
     }
 
@@ -535,6 +682,7 @@ where
         if id != window_id {
             return;
         }
+        self.record_window_event_kind_for_timing(&event);
 
         match &event {
             WindowEvent::CloseRequested => {
@@ -543,17 +691,11 @@ where
             }
             WindowEvent::Resized(size) => {
                 self.queue_resize(*size);
+                return;
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let Some(window) = self.window.as_mut() {
-                    let physical_size = non_zero_physical_size(window.raw.inner_size());
-                    window.viewport = Viewport::with_physical_size(
-                        iced::Size::new(physical_size.width, physical_size.height),
-                        *scale_factor as f32,
-                    );
-                    self.pending_resize = Some(physical_size);
-                }
-                self.sync_presented_viewport_from_window();
+                self.queue_scale_factor_resize(*scale_factor as f32);
+                return;
             }
             WindowEvent::Focused(true) => {
                 if let Some(window) = self.window.as_mut() {
@@ -609,7 +751,24 @@ where
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.apply_pending_resize();
+                let timing_start = Instant::now();
+                let pending_event_count = self.pending_iced_events.len();
+                let should_defer_resize = self.pending_resize.is_some()
+                    && self
+                        .window
+                        .as_ref()
+                        .is_some_and(|window| window.presented_frames > 0);
+                if should_defer_resize {
+                    let timing_viewport = self.window.as_ref().map(iced_timing_viewport);
+                    self.frame_timing.record(
+                        "iced.resize_deferred_redraw",
+                        timing_start.elapsed(),
+                        pending_event_count,
+                        timing_viewport,
+                    );
+                    return;
+                }
+                self.apply_pending_resize(false);
                 self.dispatch_pending_iced_events();
                 if self
                     .window
@@ -622,6 +781,13 @@ where
                     self.process_messages(messages);
                 }
                 self.redraw();
+                let timing_viewport = self.window.as_ref().map(iced_timing_viewport);
+                self.frame_timing.record(
+                    "iced.redraw_requested",
+                    timing_start.elapsed(),
+                    pending_event_count,
+                    timing_viewport,
+                );
                 return;
             }
             _ => {}
@@ -636,7 +802,71 @@ where
             window.modifiers,
         ) {
             self.pending_iced_events.push(event);
+            if self.pending_resize.is_none() {
+                self.dispatch_pending_iced_events();
+                if let Some(window) = self.window.as_ref() {
+                    window.raw.request_redraw();
+                }
+            } else if self
+                .window
+                .as_ref()
+                .is_some_and(|window| window.presented_frames == 0)
+            {
+                window.raw.request_redraw();
+            }
         }
+    }
+
+    fn record_window_event_kind_for_timing(&mut self, event: &WindowEvent) {
+        let kind = match event {
+            WindowEvent::CursorMoved { .. } => "iced.raw.cursor_moved",
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                ..
+            } => "iced.raw.mouse_pressed",
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                ..
+            } => "iced.raw.mouse_released",
+            WindowEvent::MouseWheel { .. } => "iced.raw.mouse_wheel",
+            WindowEvent::RedrawRequested => "iced.raw.redraw_requested",
+            WindowEvent::Resized(_) => "iced.raw.resized",
+            WindowEvent::ScaleFactorChanged { .. } => "iced.raw.scale_factor_changed",
+            WindowEvent::Focused(true) => "iced.raw.focused",
+            WindowEvent::Focused(false) => "iced.raw.unfocused",
+            WindowEvent::KeyboardInput { .. } => "iced.raw.keyboard_input",
+            WindowEvent::Ime(_) => "iced.raw.ime",
+            _ => return,
+        };
+        let viewport = self.window.as_ref().map(iced_timing_viewport);
+        self.frame_timing.record(kind, Duration::ZERO, 0, viewport);
+    }
+
+    fn record_iced_update_message_counts(
+        &mut self,
+        messages: &[SlipwayIcedRuntimeMessage],
+        viewport: Option<Size>,
+    ) {
+        let backend_inputs = messages
+            .iter()
+            .filter(|message| matches!(message, SlipwayIcedRuntimeMessage::BackendInput(_)))
+            .count();
+        let preedit_messages = messages
+            .iter()
+            .filter(|message| matches!(message, SlipwayIcedRuntimeMessage::PreeditStyle(_)))
+            .count();
+        self.frame_timing.record(
+            "iced.update.backend_input_messages",
+            Duration::ZERO,
+            backend_inputs,
+            viewport,
+        );
+        self.frame_timing.record(
+            "iced.update.preedit_messages",
+            Duration::ZERO,
+            preedit_messages,
+            viewport,
+        );
     }
 
     fn queue_resize(&mut self, size: PhysicalSize<u32>) {
@@ -644,18 +874,59 @@ where
             return;
         };
         let physical_size = non_zero_physical_size(size);
+        let request_initial_redraw = window.presented_frames == 0;
         window.viewport = Viewport::with_physical_size(
             iced::Size::new(physical_size.width, physical_size.height),
             window.raw.scale_factor() as f32,
         );
-        self.pending_resize = Some(physical_size);
+        let raw = window.raw.clone();
+        let unchanged_surface = window.surface_physical_size == physical_size;
+        self.pending_resize = (!unchanged_surface).then_some(PendingResize {
+            physical_size,
+            queued_at: Instant::now(),
+        });
+        let _ = window;
         self.sync_presented_viewport_from_window();
+        if request_initial_redraw || unchanged_surface {
+            raw.request_redraw();
+        }
     }
 
-    fn apply_pending_resize(&mut self) {
-        let Some(physical_size) = self.pending_resize.take() else {
+    fn queue_scale_factor_resize(&mut self, scale_factor: f32) {
+        let Some(window) = self.window.as_mut() else {
             return;
         };
+        let physical_size = non_zero_physical_size(window.raw.inner_size());
+        let request_initial_redraw = window.presented_frames == 0;
+        window.viewport = Viewport::with_physical_size(
+            iced::Size::new(physical_size.width, physical_size.height),
+            scale_factor,
+        );
+        let raw = window.raw.clone();
+        let unchanged_surface = window.surface_physical_size == physical_size;
+        self.pending_resize = (!unchanged_surface).then_some(PendingResize {
+            physical_size,
+            queued_at: Instant::now(),
+        });
+        let _ = window;
+        self.sync_presented_viewport_from_window();
+        if request_initial_redraw || unchanged_surface {
+            raw.request_redraw();
+        }
+    }
+
+    fn pending_resize_due_at(&self) -> Option<Instant> {
+        self.pending_resize
+            .as_ref()
+            .map(|pending| pending.queued_at + RESIZE_CONFIGURE_QUIET)
+    }
+
+    fn apply_pending_resize(&mut self, request_redraw_after_configure: bool) {
+        let Some(pending) = self.pending_resize.take() else {
+            return;
+        };
+        let physical_size = pending.physical_size;
+        let timing_start = Instant::now();
         let Some(window) = self.window.as_mut() else {
             return;
         };
@@ -664,10 +935,32 @@ where
             physical_size.width,
             physical_size.height,
         );
+        window.surface_physical_size = physical_size;
         let raw = window.raw.clone();
         let _ = window;
         self.sync_presented_viewport_from_window();
-        raw.request_redraw();
+        if request_redraw_after_configure {
+            raw.request_redraw();
+        }
+        let timing_viewport = self.window.as_ref().map(iced_timing_viewport);
+        self.queue_latest_iced_resize_event();
+        self.frame_timing.record(
+            "iced.resize_configure",
+            timing_start.elapsed(),
+            0,
+            timing_viewport,
+        );
+    }
+
+    fn queue_latest_iced_resize_event(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let logical = window.viewport.logical_size();
+        self.pending_iced_events
+            .push(iced::Event::Window(iced::window::Event::Resized(
+                iced::Size::new(logical.width, logical.height),
+            )));
     }
 
     fn dispatch_pending_iced_events(&mut self) {
@@ -1499,17 +1792,28 @@ where
                 self.pump_mcp();
             }
         }
-        self.apply_pending_resize();
+        let now = Instant::now();
+        if let Some(due_at) = self.pending_resize_due_at() {
+            if due_at > now {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due_at));
+                return;
+            }
+        }
+        self.apply_pending_resize(true);
         self.dispatch_pending_iced_events();
         let Some(window) = self.window.as_mut() else {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
+        if window.presented_frames == 0 {
+            window.raw.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         let Some(redraw_at) = window.redraw_at else {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
-        let now = Instant::now();
         if redraw_at <= now {
             window.redraw_at = None;
             window.raw.request_redraw();
@@ -1524,7 +1828,11 @@ fn non_zero_physical_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
     PhysicalSize::new(size.width.max(1), size.height.max(1))
 }
 
-fn load_platform_text_fonts(compositor: &mut iced_renderer::Compositor, ime_trace: bool) {
+fn load_platform_text_fonts(
+    compositor: &mut iced_renderer::Compositor,
+    ime_trace: bool,
+    frame_timing: &mut VisibleFrameTimingRecorder,
+) -> usize {
     #[cfg(target_os = "windows")]
     {
         const CANDIDATES: &[&str] = &[
@@ -1534,24 +1842,48 @@ fn load_platform_text_fonts(compositor: &mut iced_renderer::Compositor, ime_trac
         ];
 
         for path in CANDIDATES {
-            let Ok(bytes) = std::fs::read(path) else {
-                continue;
+            let read_start = Instant::now();
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => {
+                    frame_timing.record(
+                        "iced.platform_font.read",
+                        read_start.elapsed(),
+                        bytes.len(),
+                        None,
+                    );
+                    bytes
+                }
+                Err(_) => {
+                    frame_timing.record("iced.platform_font.read", read_start.elapsed(), 0, None);
+                    continue;
+                }
             };
+            let byte_count = bytes.len();
+            let load_start = Instant::now();
             compositor.load_font(Cow::Owned(bytes));
+            frame_timing.record(
+                "iced.platform_font.load",
+                load_start.elapsed(),
+                byte_count,
+                None,
+            );
             trace_ime(ime_trace, format_args!("loaded platform text font {path}"));
-            return;
+            return 1;
         }
 
         trace_ime(
             ime_trace,
             "no Windows Korean platform font candidate was available",
         );
+        0
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         let _ = compositor;
         let _ = ime_trace;
+        let _ = frame_timing;
+        0
     }
 }
 
@@ -1561,6 +1893,14 @@ fn viewport_from_window(size: &PhysicalSize<u32>, scale_factor: f32) -> Viewport
         iced::Size::new(physical_size.width, physical_size.height),
         scale_factor,
     )
+}
+
+fn iced_timing_viewport(window: &NativeIcedWindow) -> Size {
+    let logical = window.viewport.logical_size();
+    Size {
+        width: logical.width,
+        height: logical.height,
+    }
 }
 
 fn ensure_window_ime_policy(window: &mut NativeIcedWindow, reason: &'static str) {

@@ -11,6 +11,14 @@ User apps should normally import these through the public facade crate:
 use slipway::prelude::*;
 ```
 
+Do not use `use slipway::*` as the ordinary authoring surface. The facade root
+also re-exports low-level extension APIs for backend authors and provider
+wrappers. If app code needs a type that is not available from the prelude,
+confirm that the task is actually backend-extension work before importing it.
+If that decision is unclear, read
+[LLM contract checklist](../llm-contract-checklist.md) and report
+`PUBLIC_DOC_GAP` or `API_GAP` rather than importing internals.
+
 ## State And Identity
 
 Important concepts:
@@ -56,6 +64,11 @@ Important concepts:
 Authoring rule: child view/layout inputs are target-local. Parent placement is
 represented only by `ParentLocalRect`.
 
+Scroll declarations are created after layout. Use the scroll-region capability
+helper with the final `LayoutOutput`, not the incoming `LayoutInput`, so the
+scroll viewport is derived from the widget bounds that will actually be
+presented.
+
 ## Interaction Declarations
 
 Important concepts:
@@ -74,6 +87,13 @@ Important concepts:
 Authoring rule: a visual region that should react must have the matching
 declaration. Painting something clickable is not enough.
 
+LLM rule: if a click, wheel, focus, text input, or command works only because
+you directly changed state, the app has not satisfied the interaction contract.
+
+Address rule: child widgets may describe their own local slot identity, but the
+app/backend mounting pass owns the final parent-mounted `WidgetSlotAddress`.
+Do not manually construct a parent path inside a child view.
+
 ## App Composition
 
 Important concepts:
@@ -86,6 +106,33 @@ Important concepts:
 
 Authoring rule: an app with N widgets should expose N authored child widgets.
 Do not fake child widgets by painting all children inside one root view.
+
+LLM rule: when the source UI has meaningful components, preserve those
+boundaries as widgets or explicit container children. A single root surface is
+only acceptable for a genuinely single-widget UI.
+
+Tuple child lists are supported as a fixed-arity convenience for authored apps
+and containers. The public facade currently supports tuple child lists up to 16
+children across core, iced, and egui. This is not meant to be the only
+composition pattern: for larger or dynamic sets, use a dedicated container or
+collection widget that declares its own child/region contract instead of
+collapsing the whole UI into one painted surface.
+
+Layering rule: overlays and popups need explicit `PaintOrderDeclaration`,
+declared overflow bounds, and matching hit regions. The backend preserves the
+declared order. It does not guess z-order from paint order after the fact.
+
+Scroll clipping rule: a scrollable region owns a viewport and content bounds.
+If a widget declares nested scroll regions, each inner scroll viewport should
+also produce paint clipped to that viewport. Backend renderers must honor the
+clip; authors must expose the viewport/content relationship instead of relying
+on invisible overflow.
+
+Visible backends may defensively crop or disable invalid scroll geometry to keep
+the window from presenting impossible rectangles. That repair is diagnostic
+evidence, not authoring authority. Treat a scroll-normalization diagnostic as a
+bug in the widget declaration unless the task explicitly accepts degraded
+scroll behavior.
 
 ## Backend Input Evidence
 
@@ -101,3 +148,51 @@ Important concepts:
 
 Authoring rule: physical-equivalent input is not just an event. It needs
 dispatch evidence and a handled result trace.
+
+`BackendInputEvent::direct(...)` is not a visible backend physical-input API.
+Runtime and backend adapters must refuse it before authored handlers run. It is
+only useful as a negative test or for purely semantic/debug paths that do not
+claim backend-presented physical equivalence.
+
+`BackendInputEvent` is intentionally not part of `slipway::prelude::*`.
+Ordinary app authoring should not import or construct it. Backend adapters and
+explicit backend-extension code may use it, but visible backend ingress must use
+declared dispatch evidence.
+
+There is no implicit `InputEvent -> BackendInputEvent` conversion. If a backend
+is presenting physical input, it must attach declared dispatch evidence. If a
+tool only needs semantic state mutation, use semantic/debug control APIs and do
+not report the result as backend-presented physical equivalence.
+
+Declared backend input is also checked against the current visible
+`ViewDefinition`. The evidence source, backend id, frame identity, selected
+region, candidate regions, generated event, and event route must match the
+current declarations. Forged, stale, wrong-backend, or unresolved evidence is a
+contract error and must not mutate widget state.
+
+For backend-presented physical proof, the `FrameIdentity` in the MCP/debug
+command and the `FrameIdentity` in backend dispatch evidence must be identical.
+Sharing only viewport or bounds is not enough, because stale or different
+backend frames can otherwise fabricate parity.
+
+`SlipwayRuntime::apply_input_event(...)` is a semantic direct event path. It is
+not backend-presented physical evidence and should not be used to prove that a
+visible backend click, wheel, focus, or text operation works.
+
+## Text And Paint Style
+
+Important concepts:
+
+- `TextStyle` - explicit font family, size, weight, style, decoration, and
+  baseline.
+- `TextStyle::plain()` - an explicit Slipway baseline style for tests or simple
+  examples.
+- `PaintOp::styled_text(...)` - the only text paint constructor.
+
+Authoring rule: text paint must carry an explicit `TextStyle`. Slipway does not
+read backend theme defaults as style authority, and `TextStyle` intentionally
+does not implement `Default`.
+
+Production apps should normally put reusable design tokens in their own style
+module and pass those tokens into view code. Override only the fields that need
+to differ for a specific widget state.

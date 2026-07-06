@@ -386,13 +386,19 @@ pub struct IcedNativeWidgetContext<'a> {
     pub placement: Option<Rect>,
 }
 
+/// Backend-specific escape hatch for an already-owned iced element.
+///
+/// This is not a backend-neutral parity guarantee. Implementors must still
+/// expose Slipway layout/view/debug evidence through the surrounding
+/// `SlipwayViewDefinition` contract, and any behavior that cannot be expressed
+/// there should be reported as an unsupported backend-specific gap.
 pub trait SlipwayIcedNativeChildWidget: SlipwayWidget + SlipwayViewDefinition {
     fn iced_native_element<'a, Theme, Renderer>(
         &'a self,
         external: &'a Self::ExternalState,
         local: &'a Self::LocalState,
         context: IcedNativeWidgetContext<'a>,
-    ) -> iced::Element<'a, SlipwayIcedRuntimeMessage<Self::AppMessage>, Theme, Renderer>
+    ) -> iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
     where
         Self::AppMessage: Clone + 'a,
         Theme: SlipwayIcedThemeContract + 'a,
@@ -401,6 +407,10 @@ pub trait SlipwayIcedNativeChildWidget: SlipwayWidget + SlipwayViewDefinition {
             + 'a + 'static;
 }
 
+/// Contract for a backend-specific iced native wrapper.
+///
+/// This wrapper may mount native iced UI, but Slipway will not infer its
+/// internal drawing, hit testing, or cross-backend parity automatically.
 pub trait SlipwayIcedNativeWidgetSpec: SlipwayWidgetTypes {
     fn id(&self) -> WidgetId;
 
@@ -449,7 +459,7 @@ pub trait SlipwayIcedNativeWidgetSpec: SlipwayWidgetTypes {
         external: &'a Self::ExternalState,
         local: &'a Self::LocalState,
         context: IcedNativeWidgetContext<'a>,
-    ) -> iced::Element<'a, SlipwayIcedRuntimeMessage<Self::AppMessage>, Theme, Renderer>
+    ) -> iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
     where
         Self::AppMessage: Clone + 'a,
         Theme: SlipwayIcedThemeContract + 'a,
@@ -713,7 +723,7 @@ where
         external: &'a Self::ExternalState,
         local: &'a Self::LocalState,
         context: IcedNativeWidgetContext<'a>,
-    ) -> iced::Element<'a, SlipwayIcedRuntimeMessage<Self::AppMessage>, Theme, Renderer>
+    ) -> iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
     where
         Self::AppMessage: Clone + 'a,
         Theme: SlipwayIcedThemeContract + 'a,
@@ -1294,10 +1304,6 @@ impl DefaultIcedBridge {
         Self::default()
     }
 
-    pub fn queue_event(&mut self, event: InputEvent) {
-        self.events.push(BackendInputEvent::direct(event));
-    }
-
     pub fn queue_backend_input_event(&mut self, event: BackendInputEvent) {
         self.events.push(event);
     }
@@ -1412,8 +1418,8 @@ impl<W: SlipwayAuthoredWidget> IcedWidgetAdapter<W> {
         &mut self,
         external: &W::ExternalState,
         bridge: &mut B,
-        _context: IcedLayoutContext,
-        _frame: FrameIdentity,
+        context: IcedLayoutContext,
+        frame: FrameIdentity,
     ) -> Vec<IcedEventReceipt<W::AppMessage>>
     where
         W: slipway_core::SlipwayEventRoutingPolicy
@@ -1421,8 +1427,26 @@ impl<W: SlipwayAuthoredWidget> IcedWidgetAdapter<W> {
             + SlipwayViewDefinition,
     {
         let widget_id = self.widget_id();
+        let layout_input = bridge.layout_input(context);
+        let view = self.slot.widget.visible_backend_view_definition(
+            external,
+            &self.slot.local_state,
+            ViewDefinitionInput {
+                frame,
+                layout_input,
+            },
+        );
         let mut receipts = Vec::new();
         for backend_event in bridge.input_events(widget_id.clone()) {
+            if let Some(outcome) =
+                iced_backend_input_contract_refusal::<W::AppMessage>(&view, &backend_event)
+            {
+                receipts.push(IcedEventReceipt {
+                    widget_id: widget_id.clone(),
+                    outcome,
+                });
+                continue;
+            }
             let event = backend_event.event.clone();
             let declaration = slipway_core::declared_event_handling(
                 &self.slot.widget,
@@ -1470,6 +1494,25 @@ impl<W: SlipwayAuthoredWidget> IcedWidgetAdapter<W> {
             });
         }
     }
+}
+
+fn iced_backend_input_contract_refusal<M>(
+    view: &ViewDefinition,
+    input: &BackendInputEvent,
+) -> Option<EventOutcome<M>> {
+    let diagnostics = slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+        view,
+        input,
+        Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+        Some(ICED_BACKEND_ID),
+    );
+    if !view_definition_has_blocking_contract_diagnostic(&diagnostics) {
+        return None;
+    }
+
+    let mut outcome = EventOutcome::ignored();
+    outcome.diagnostics = diagnostics;
+    Some(outcome)
 }
 
 impl<W> IcedWidgetAdapter<W>
@@ -1595,10 +1638,9 @@ pub struct IcedPreeditOverlayStyle {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum SlipwayIcedRuntimeMessage<M> {
+pub enum SlipwayIcedRuntimeMessage {
     BackendInput(BackendInputEvent),
     PreeditStyle(IcedPreeditOverlayStyle),
-    App(M),
     DrainDebug,
     Noop,
 }
@@ -1609,9 +1651,6 @@ pub enum SlipwayIcedRuntimeUpdate {
         handled: bool,
         applied_messages: usize,
         diagnostics: Vec<Diagnostic>,
-    },
-    AppMessages {
-        applied_messages: usize,
     },
     DrainDebug,
     Noop,
@@ -1697,10 +1736,7 @@ where
         &self.assembled.debug_mcp
     }
 
-    pub fn update(
-        &mut self,
-        message: SlipwayIcedRuntimeMessage<W::AppMessage>,
-    ) -> SlipwayIcedRuntimeAppUpdate {
+    pub fn update(&mut self, message: SlipwayIcedRuntimeMessage) -> SlipwayIcedRuntimeAppUpdate {
         self.sync_presented_viewport();
         let (runtime_update, debug_replies_drained, debug_error) = match message {
             SlipwayIcedRuntimeMessage::DrainDebug => {
@@ -1728,7 +1764,7 @@ where
 
     pub fn update_without_debug_drain(
         &mut self,
-        message: SlipwayIcedRuntimeMessage<W::AppMessage>,
+        message: SlipwayIcedRuntimeMessage,
     ) -> SlipwayIcedRuntimeAppUpdate {
         self.sync_presented_viewport();
         let runtime_update = match message {
@@ -1775,9 +1811,10 @@ where
         self.sync_presented_viewport();
         self.assembled
             .runtime
-            .handle_backend_presented_physical_control_with_app_reducer(
+            .handle_backend_presented_physical_control_for_backend_with_app_reducer(
                 command,
                 backend_input,
+                ICED_BACKEND_ID,
                 &mut self.apply_app_messages,
             )
     }
@@ -1790,7 +1827,7 @@ where
 
     pub fn view<'a, Theme, Renderer>(
         &'a self,
-    ) -> iced::Element<'a, SlipwayIcedRuntimeMessage<W::AppMessage>, Theme, Renderer>
+    ) -> iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
     where
         W: SlipwayViewDefinition + 'a,
         W::ExternalState: 'a,
@@ -1806,7 +1843,7 @@ where
             .into()
     }
 
-    pub fn subscription(&self) -> iced::Subscription<SlipwayIcedRuntimeMessage<W::AppMessage>>
+    pub fn subscription(&self) -> iced::Subscription<SlipwayIcedRuntimeMessage>
     where
         W::AppMessage: 'static,
     {
@@ -3117,12 +3154,7 @@ where
             self.dirty_scopes,
         );
         self.trees.push(iced::advanced::widget::Tree::new(
-            &child
-                as &dyn iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<AppMessage>,
-                    Theme,
-                    Renderer,
-                >,
+            &child as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
         ));
     }
 
@@ -3229,21 +3261,11 @@ where
         );
         if let Some(tree) = self.trees.get_mut(self.next_index) {
             tree.diff(
-                &child
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                &child as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             );
         } else {
             self.trees.push(iced::advanced::widget::Tree::new(
-                &child
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                &child as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             ));
         }
         self.next_index += 1;
@@ -3391,7 +3413,7 @@ fn iced_text_input_style_from_decl(
 fn iced_text_input_widget_for_region<'a, AppMessage, Theme, Renderer>(
     presentation: &'a IcedPresentationState,
     region: &'a FocusRegionDeclaration,
-) -> iced::widget::TextInput<'a, SlipwayIcedRuntimeMessage<AppMessage>, Theme, Renderer>
+) -> iced::widget::TextInput<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
 where
     AppMessage: Clone + 'a,
     Theme: SlipwayIcedThemeContract + 'a,
@@ -3411,7 +3433,7 @@ where
     let focus_regions = presentation.focus_regions.clone();
     let selected_region = region.clone();
     let visual_style = text_edit.visual_style.clone();
-    let input = iced::widget::text_input::<SlipwayIcedRuntimeMessage<AppMessage>, Theme, Renderer>(
+    let input = iced::widget::text_input::<SlipwayIcedRuntimeMessage, Theme, Renderer>(
         "",
         &text_edit.buffer.text,
     )
@@ -3468,21 +3490,11 @@ fn reconcile_iced_text_input_trees<AppMessage, Theme, Renderer>(
             iced_text_input_widget_for_region::<AppMessage, Theme, Renderer>(presentation, region);
         if let Some(tree) = trees.get_mut(index) {
             tree.diff(
-                &input
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                &input as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             );
         } else {
             trees.push(iced::advanced::widget::Tree::new(
-                &input
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                &input as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             ));
         }
     }
@@ -3517,10 +3529,10 @@ where
         let limits = iced::advanced::layout::Limits::new(size, size);
         let node = <iced::widget::TextInput<
             '_,
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
-        > as iced::advanced::Widget<SlipwayIcedRuntimeMessage<AppMessage>, Theme, Renderer>>::layout(
+        > as iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>>::layout(
             &mut input,
             tree,
             renderer,
@@ -3611,12 +3623,7 @@ where
         );
         if tree_index >= self.tree_children.len() {
             self.tree_children.push(iced::advanced::widget::Tree::new(
-                &child
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                &child as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             ));
         }
 
@@ -3628,7 +3635,7 @@ where
         let mut child = child;
         let limits = iced_child_layout_limits(placement);
         let node = <SlipwayIcedRuntimeWidget<'_, W> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::layout(
@@ -4068,7 +4075,7 @@ where
             self.dirty_scopes,
         );
         <SlipwayIcedRuntimeWidget<'_, W> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::operate(
@@ -4237,7 +4244,7 @@ where
             self.dirty_scopes,
         );
         self.interaction = <SlipwayIcedRuntimeWidget<'_, W> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::mouse_interaction(
@@ -4348,14 +4355,14 @@ where
     visitor.interaction
 }
 
-struct IcedRuntimeChildUpdateVisitor<'a, 'b, 'c, Theme, Renderer, AppMessage> {
+struct IcedRuntimeChildUpdateVisitor<'a, 'b, 'c, Theme, Renderer> {
     tree_children: &'a mut [iced::advanced::widget::Tree],
     event: &'a iced::Event,
     layout: iced::advanced::Layout<'b>,
     cursor: iced::advanced::mouse::Cursor,
     renderer: &'a Renderer,
     clipboard: &'a mut dyn iced::advanced::Clipboard,
-    shell: &'a mut iced::advanced::Shell<'c, SlipwayIcedRuntimeMessage<AppMessage>>,
+    shell: &'a mut iced::advanced::Shell<'c, SlipwayIcedRuntimeMessage>,
     viewport: &'a iced::Rectangle,
     placements: &'a [slipway_core::ChildPlacement],
     next_tree_index: usize,
@@ -4368,7 +4375,7 @@ struct IcedRuntimeChildUpdateVisitor<'a, 'b, 'c, Theme, Renderer, AppMessage> {
 
 impl<ExternalState, AppMessage, Theme, Renderer>
     SlipwayIcedWidgetListVisitor<ExternalState, AppMessage>
-    for IcedRuntimeChildUpdateVisitor<'_, '_, '_, Theme, Renderer, AppMessage>
+    for IcedRuntimeChildUpdateVisitor<'_, '_, '_, Theme, Renderer>
 where
     AppMessage: Clone,
     Theme: SlipwayIcedThemeContract,
@@ -4419,7 +4426,7 @@ where
             self.dirty_scopes,
         );
         <SlipwayIcedRuntimeWidget<'_, W> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::update(
@@ -4499,7 +4506,7 @@ fn update_iced_runtime_children<W, Theme, Renderer>(
     cursor: iced::advanced::mouse::Cursor,
     renderer: &Renderer,
     clipboard: &mut dyn iced::advanced::Clipboard,
-    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage<W::AppMessage>>,
+    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
     viewport: &iced::Rectangle,
     placements: &[slipway_core::ChildPlacement],
     frame: &FrameIdentity,
@@ -4513,7 +4520,7 @@ fn update_iced_runtime_children<W, Theme, Renderer>(
         + iced::advanced::graphics::geometry::Renderer
         + 'static,
 {
-    let mut visitor = IcedRuntimeChildUpdateVisitor::<Theme, Renderer, W::AppMessage> {
+    let mut visitor = IcedRuntimeChildUpdateVisitor::<Theme, Renderer> {
         tree_children,
         event,
         layout,
@@ -4573,11 +4580,11 @@ fn operate_iced_text_input_regions<AppMessage, Theme, Renderer>(
             iced_text_input_widget_for_region::<AppMessage, Theme, Renderer>(presentation, region);
         <iced::widget::TextInput<
             '_,
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         > as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::operate(&mut input, tree, layout.child(start + index), renderer, operation);
@@ -4594,7 +4601,7 @@ fn update_iced_text_input_regions<AppMessage, Theme, Renderer>(
     cursor: iced::advanced::mouse::Cursor,
     renderer: &Renderer,
     clipboard: &mut dyn iced::advanced::Clipboard,
-    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage<AppMessage>>,
+    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
     viewport: &iced::Rectangle,
 ) where
     AppMessage: Clone,
@@ -4626,11 +4633,11 @@ fn update_iced_text_input_regions<AppMessage, Theme, Renderer>(
         let input_method_before = shell.input_method().clone();
         <iced::widget::TextInput<
             '_,
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         > as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::update(
@@ -4737,11 +4744,11 @@ fn draw_iced_text_input_regions<AppMessage, Theme, Renderer>(
             iced_text_input_widget_for_region::<AppMessage, Theme, Renderer>(presentation, region);
         <iced::widget::TextInput<
             '_,
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         > as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::draw(
@@ -4784,11 +4791,11 @@ where
             iced_text_input_widget_for_region::<AppMessage, Theme, Renderer>(presentation, region);
         let interaction = <iced::widget::TextInput<
             '_,
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         > as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::mouse_interaction(
@@ -4857,7 +4864,7 @@ fn iced_text_editor_widget_for_region<'a, AppMessage, Theme, Renderer, F>(
 ) -> iced::widget::TextEditor<
     'a,
     iced::advanced::text::highlighter::PlainText,
-    SlipwayIcedRuntimeMessage<AppMessage>,
+    SlipwayIcedRuntimeMessage,
     Theme,
     Renderer,
 >
@@ -4867,7 +4874,7 @@ where
     Renderer: iced::advanced::text::Renderer<Font = iced::Font>
         + iced::advanced::graphics::geometry::Renderer
         + 'a + 'static,
-    F: Fn(iced::advanced::text::editor::Action) -> SlipwayIcedRuntimeMessage<AppMessage> + 'a,
+    F: Fn(iced::advanced::text::editor::Action) -> SlipwayIcedRuntimeMessage + 'a,
 {
     let size = region.bounds.size;
     let text_style = region
@@ -4877,7 +4884,7 @@ where
         .unwrap_or_else(|| panic!("text editor widget requires text edit typography declaration"));
     iced::widget::TextEditor::<
         iced::advanced::text::highlighter::PlainText,
-        SlipwayIcedRuntimeMessage<AppMessage>,
+        SlipwayIcedRuntimeMessage,
         Theme,
         Renderer,
     >::new(content)
@@ -4905,8 +4912,7 @@ fn sync_iced_text_editor_region_state<Renderer>(
     }
 }
 
-impl<AppMessage, Theme, Renderer>
-    iced::advanced::Widget<SlipwayIcedRuntimeMessage<AppMessage>, Theme, Renderer>
+impl<AppMessage, Theme, Renderer> iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>
     for IcedTextEditorRegionWidget<'_, AppMessage>
 where
     AppMessage: Clone,
@@ -4929,12 +4935,7 @@ where
                 |_| SlipwayIcedRuntimeMessage::Noop,
             );
             iced::advanced::widget::Tree::new(
-                &editor
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                &editor as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             )
         };
         iced::advanced::widget::tree::State::new(IcedTextEditorRegionState::<Renderer> {
@@ -4956,12 +4957,7 @@ where
             |_| SlipwayIcedRuntimeMessage::Noop,
         );
         state.native_tree.diff(
-            &editor
-                as &dyn iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<AppMessage>,
-                    Theme,
-                    Renderer,
-                >,
+            &editor as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
         );
     }
 
@@ -4995,22 +4991,24 @@ where
         <iced::widget::TextEditor<
             '_,
             iced::advanced::text::highlighter::PlainText,
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
-        > as iced::advanced::Widget<SlipwayIcedRuntimeMessage<AppMessage>, Theme, Renderer>>::layout(
+        > as iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>>::layout(
             &mut editor,
             &mut state.native_tree,
             renderer,
             &limits,
         )
-        .move_to(iced_point(region_root_local_rect(
-            self.presentation,
-            &self.region.target,
-            self.region.address.as_ref(),
-            self.region.bounds.into_rect(),
-        )
-        .origin))
+        .move_to(iced_point(
+            region_root_local_rect(
+                self.presentation,
+                &self.region.target,
+                self.region.address.as_ref(),
+                self.region.bounds.into_rect(),
+            )
+            .origin,
+        ))
     }
 
     fn update(
@@ -5021,7 +5019,7 @@ where
         cursor: iced::advanced::mouse::Cursor,
         renderer: &Renderer,
         clipboard: &mut dyn iced::advanced::Clipboard,
-        shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage<AppMessage>>,
+        shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
         viewport: &iced::Rectangle,
     ) {
         let state = tree
@@ -5049,14 +5047,10 @@ where
             <iced::widget::TextEditor<
                 '_,
                 iced::advanced::text::highlighter::PlainText,
-                SlipwayIcedRuntimeMessage<AppMessage>,
+                SlipwayIcedRuntimeMessage,
                 Theme,
                 Renderer,
-            > as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<AppMessage>,
-                Theme,
-                Renderer,
-            >>::update(
+            > as iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>>::update(
                 &mut editor,
                 &mut state.native_tree,
                 event,
@@ -5115,14 +5109,10 @@ where
         <iced::widget::TextEditor<
             '_,
             iced::advanced::text::highlighter::PlainText,
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
-        > as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
-            Theme,
-            Renderer,
-        >>::operate(
+        > as iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>>::operate(
             &mut editor,
             &mut state.native_tree,
             layout,
@@ -5152,10 +5142,10 @@ where
         <iced::widget::TextEditor<
             '_,
             iced::advanced::text::highlighter::PlainText,
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
-        > as iced::advanced::Widget<SlipwayIcedRuntimeMessage<AppMessage>, Theme, Renderer>>::draw(
+        > as iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>>::draw(
             &editor,
             &state.native_tree,
             renderer,
@@ -5186,10 +5176,10 @@ where
         <iced::widget::TextEditor<
             '_,
             iced::advanced::text::highlighter::PlainText,
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
-        > as iced::advanced::Widget<SlipwayIcedRuntimeMessage<AppMessage>, Theme, Renderer>>::mouse_interaction(
+        > as iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>>::mouse_interaction(
             &editor,
             &state.native_tree,
             layout,
@@ -5215,21 +5205,11 @@ fn reconcile_iced_text_editor_trees<AppMessage, Theme, Renderer>(
         let widget = IcedTextEditorRegionWidget::<AppMessage>::new(presentation, region);
         if let Some(tree) = trees.get_mut(index) {
             tree.diff(
-                &widget
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                &widget as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             );
         } else {
             trees.push(iced::advanced::widget::Tree::new(
-                &widget
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                &widget as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             ));
         }
     }
@@ -5263,7 +5243,7 @@ where
         let limits = iced::advanced::layout::Limits::new(size, size);
         nodes.push(
             <IcedTextEditorRegionWidget<'_, AppMessage> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<AppMessage>,
+                SlipwayIcedRuntimeMessage,
                 Theme,
                 Renderer,
             >>::layout(&mut widget, tree, renderer, &limits),
@@ -5307,7 +5287,7 @@ fn operate_iced_text_editor_regions<AppMessage, Theme, Renderer>(
         };
         let mut widget = IcedTextEditorRegionWidget::<AppMessage>::new(presentation, region);
         <IcedTextEditorRegionWidget<'_, AppMessage> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::operate(
@@ -5330,7 +5310,7 @@ fn update_iced_text_editor_regions<AppMessage, Theme, Renderer>(
     cursor: iced::advanced::mouse::Cursor,
     renderer: &Renderer,
     clipboard: &mut dyn iced::advanced::Clipboard,
-    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage<AppMessage>>,
+    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
     viewport: &iced::Rectangle,
 ) where
     AppMessage: Clone,
@@ -5352,7 +5332,7 @@ fn update_iced_text_editor_regions<AppMessage, Theme, Renderer>(
         let mut widget = IcedTextEditorRegionWidget::<AppMessage>::new(presentation, region);
         let input_method_before = shell.input_method().clone();
         <IcedTextEditorRegionWidget<'_, AppMessage> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::update(
@@ -5402,7 +5382,7 @@ fn draw_iced_text_editor_regions<AppMessage, Theme, Renderer>(
         };
         let widget = IcedTextEditorRegionWidget::<AppMessage>::new(presentation, region);
         <IcedTextEditorRegionWidget<'_, AppMessage> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::draw(
@@ -5444,7 +5424,7 @@ where
         };
         let widget = IcedTextEditorRegionWidget::<AppMessage>::new(presentation, region);
         let interaction = <IcedTextEditorRegionWidget<'_, AppMessage> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::mouse_interaction(
@@ -5481,7 +5461,7 @@ where
 }
 
 impl<'a, W, Theme, Renderer> From<IcedScrollContentWidget<'a, W>>
-    for iced::Element<'a, SlipwayIcedRuntimeMessage<W::AppMessage>, Theme, Renderer>
+    for iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
 where
     W: SlipwayIcedBackendChildWidget + 'a,
     W::ExternalState: 'a,
@@ -5497,8 +5477,7 @@ where
     }
 }
 
-impl<W, Theme, Renderer>
-    iced::advanced::Widget<SlipwayIcedRuntimeMessage<W::AppMessage>, Theme, Renderer>
+impl<W, Theme, Renderer> iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>
     for IcedScrollContentWidget<'_, W>
 where
     W: SlipwayIcedBackendChildWidget,
@@ -5620,7 +5599,7 @@ where
         cursor: iced::advanced::mouse::Cursor,
         renderer: &Renderer,
         clipboard: &mut dyn iced::advanced::Clipboard,
-        shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage<W::AppMessage>>,
+        shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
         viewport: &iced::Rectangle,
     ) {
         let placements = adjusted_scroll_child_placements(self.presentation, self.scroll);
@@ -5799,7 +5778,7 @@ fn iced_scrollable_widget_for_region<'a, W, Theme, Renderer>(
     region: &'a ScrollRegionDeclaration,
     frame_seed: Option<&'a FrameIdentity>,
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
-) -> iced::widget::Scrollable<'a, SlipwayIcedRuntimeMessage<W::AppMessage>, Theme, Renderer>
+) -> iced::widget::Scrollable<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
 where
     W: SlipwayIcedBackendChildWidget + 'a,
     W::ExternalState: 'a,
@@ -5828,7 +5807,7 @@ where
         dirty_scopes,
     };
 
-    iced::widget::scrollable::<SlipwayIcedRuntimeMessage<W::AppMessage>, Theme, Renderer>(content)
+    iced::widget::scrollable::<SlipwayIcedRuntimeMessage, Theme, Renderer>(content)
         .id(iced_scrollable_id(region))
         .width(iced::Length::Fixed(region.viewport.size.width.max(0.0)))
         .height(iced::Length::Fixed(region.viewport.size.height.max(0.0)))
@@ -5883,20 +5862,12 @@ fn reconcile_iced_scroll_region_trees<W, Theme, Renderer>(
         if let Some(tree) = trees.get_mut(index) {
             tree.diff(
                 &scrollable
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<W::AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                    as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             );
         } else {
             trees.push(iced::advanced::widget::Tree::new(
                 &scrollable
-                    as &dyn iced::advanced::Widget<
-                        SlipwayIcedRuntimeMessage<W::AppMessage>,
-                        Theme,
-                        Renderer,
-                    >,
+                    as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
             ));
         }
     }
@@ -5954,11 +5925,11 @@ where
             Some(
                 <iced::widget::Scrollable<
                     '_,
-                    SlipwayIcedRuntimeMessage<W::AppMessage>,
+                    SlipwayIcedRuntimeMessage,
                     Theme,
                     Renderer,
                 > as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<W::AppMessage>,
+                    SlipwayIcedRuntimeMessage,
                     Theme,
                     Renderer,
                 >>::layout(&mut scrollable, tree, renderer, &limits)
@@ -6026,11 +5997,11 @@ fn operate_iced_scroll_regions<W, Theme, Renderer>(
         );
         <iced::widget::Scrollable<
             '_,
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         > as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::operate(
@@ -6055,7 +6026,7 @@ fn update_iced_scroll_regions<W, Theme, Renderer>(
     cursor: iced::advanced::mouse::Cursor,
     renderer: &Renderer,
     clipboard: &mut dyn iced::advanced::Clipboard,
-    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage<W::AppMessage>>,
+    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
     viewport: &iced::Rectangle,
     text_count: usize,
     frame_seed: Option<&FrameIdentity>,
@@ -6090,11 +6061,11 @@ fn update_iced_scroll_regions<W, Theme, Renderer>(
         );
         <iced::widget::Scrollable<
             '_,
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         > as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::update(
@@ -6154,11 +6125,11 @@ fn draw_iced_scroll_regions<W, Theme, Renderer>(
         );
         <iced::widget::Scrollable<
             '_,
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         > as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::draw(
@@ -6215,11 +6186,11 @@ where
         );
         let interaction = <iced::widget::Scrollable<
             '_,
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         > as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
+            SlipwayIcedRuntimeMessage,
             Theme,
             Renderer,
         >>::mouse_interaction(
@@ -6268,7 +6239,7 @@ where
 
 pub fn apply_iced_runtime_message<W, F>(
     runtime: &mut SlipwayRuntime<W>,
-    message: SlipwayIcedRuntimeMessage<W::AppMessage>,
+    message: SlipwayIcedRuntimeMessage,
     apply_app_messages: &mut F,
 ) -> SlipwayIcedRuntimeUpdate
 where
@@ -6280,8 +6251,11 @@ where
 {
     match message {
         SlipwayIcedRuntimeMessage::BackendInput(event) => {
-            let report =
-                runtime.apply_backend_input_event_with_app_reducer(event, apply_app_messages);
+            let report = runtime.apply_backend_input_event_for_backend_with_app_reducer(
+                event,
+                ICED_BACKEND_ID,
+                apply_app_messages,
+            );
 
             SlipwayIcedRuntimeUpdate::Input {
                 handled: report.handled,
@@ -6290,12 +6264,6 @@ where
             }
         }
         SlipwayIcedRuntimeMessage::PreeditStyle(_) => SlipwayIcedRuntimeUpdate::Noop,
-        SlipwayIcedRuntimeMessage::App(message) => {
-            runtime.apply_app_messages(vec![message], apply_app_messages);
-            SlipwayIcedRuntimeUpdate::AppMessages {
-                applied_messages: 1,
-            }
-        }
         SlipwayIcedRuntimeMessage::DrainDebug => SlipwayIcedRuntimeUpdate::DrainDebug,
         SlipwayIcedRuntimeMessage::Noop => SlipwayIcedRuntimeUpdate::Noop,
     }
@@ -6413,7 +6381,7 @@ impl<'a, W: SlipwayIcedBackendChildWidget> SlipwayIcedRuntimeWidget<'a, W> {
         _event: &iced::Event,
         _bounds: iced::Rectangle,
         _cursor: iced::advanced::mouse::Cursor,
-    ) -> Option<SlipwayIcedRuntimeMessage<W::AppMessage>> {
+    ) -> Option<SlipwayIcedRuntimeMessage> {
         None
     }
 }
@@ -6465,7 +6433,7 @@ where
         _event: &iced::Event,
         _bounds: iced::Rectangle,
         _cursor: iced::advanced::mouse::Cursor,
-    ) -> Option<SlipwayIcedRuntimeMessage<W::AppMessage>> {
+    ) -> Option<SlipwayIcedRuntimeMessage> {
         None
     }
 
@@ -6536,7 +6504,7 @@ where
 }
 
 impl<'a, W, Theme, Renderer> From<SlipwayIcedRuntimeWidget<'a, W>>
-    for iced::Element<'a, SlipwayIcedRuntimeMessage<W::AppMessage>, Theme, Renderer>
+    for iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
 where
     W: SlipwayIcedBackendChildWidget + 'a,
     W::ExternalState: 'a,
@@ -6553,7 +6521,7 @@ where
 }
 
 impl<'a, W, Theme, Renderer> From<SlipwayIcedRuntimeLayoutIntentWidget<'a, W>>
-    for iced::Element<'a, SlipwayIcedRuntimeMessage<W::AppMessage>, Theme, Renderer>
+    for iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
 where
     W: SlipwayIcedLayoutIntentBackendChildWidget + 'a,
     W::ExternalState: 'a,
@@ -6569,8 +6537,7 @@ where
     }
 }
 
-impl<W, Theme, Renderer>
-    iced::advanced::Widget<SlipwayIcedRuntimeMessage<W::AppMessage>, Theme, Renderer>
+impl<W, Theme, Renderer> iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>
     for SlipwayIcedRuntimeWidget<'_, W>
 where
     W: SlipwayIcedBackendChildWidget,
@@ -6872,7 +6839,7 @@ where
         cursor: iced::advanced::mouse::Cursor,
         renderer: &Renderer,
         clipboard: &mut dyn iced::advanced::Clipboard,
-        shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage<W::AppMessage>>,
+        shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
         viewport: &iced::Rectangle,
     ) {
         if shell.is_event_captured() {
@@ -7154,14 +7121,8 @@ where
         _renderer: &Renderer,
         _viewport: &iced::Rectangle,
         _translation: iced::Vector,
-    ) -> Option<
-        iced::advanced::overlay::Element<
-            'b,
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
-            Theme,
-            Renderer,
-        >,
-    > {
+    ) -> Option<iced::advanced::overlay::Element<'b, SlipwayIcedRuntimeMessage, Theme, Renderer>>
+    {
         // Current core overlay declarations are metadata-only: they do not expose stable authored
         // overlay child/surface content, tree identity, layout, event routing, or an iced-safe
         // lifetime path. Returning an overlay here would fake official iced overlay forwarding.
@@ -7169,8 +7130,7 @@ where
     }
 }
 
-impl<W, Theme, Renderer>
-    iced::advanced::Widget<SlipwayIcedRuntimeMessage<W::AppMessage>, Theme, Renderer>
+impl<W, Theme, Renderer> iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>
     for SlipwayIcedRuntimeLayoutIntentWidget<'_, W>
 where
     W: SlipwayIcedLayoutIntentBackendChildWidget,
@@ -7462,7 +7422,7 @@ where
         cursor: iced::advanced::mouse::Cursor,
         renderer: &Renderer,
         clipboard: &mut dyn iced::advanced::Clipboard,
-        shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage<W::AppMessage>>,
+        shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
         viewport: &iced::Rectangle,
     ) {
         if shell.is_event_captured() {
@@ -7762,14 +7722,8 @@ where
         _renderer: &Renderer,
         _viewport: &iced::Rectangle,
         _translation: iced::Vector,
-    ) -> Option<
-        iced::advanced::overlay::Element<
-            'b,
-            SlipwayIcedRuntimeMessage<W::AppMessage>,
-            Theme,
-            Renderer,
-        >,
-    > {
+    ) -> Option<iced::advanced::overlay::Element<'b, SlipwayIcedRuntimeMessage, Theme, Renderer>>
+    {
         // See SlipwayIcedRuntimeWidget::overlay for the current lifecycle gate.
         None
     }
@@ -10429,7 +10383,7 @@ mod tests {
             _external: &'a Self::ExternalState,
             _local: &'a Self::LocalState,
             _context: IcedNativeWidgetContext<'a>,
-        ) -> iced::Element<'a, SlipwayIcedRuntimeMessage<Self::AppMessage>, Theme, Renderer>
+        ) -> iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
         where
             Self::AppMessage: Clone + 'a,
             Theme: iced::widget::text::Catalog
@@ -10476,7 +10430,7 @@ mod tests {
             _external: &'a Self::ExternalState,
             _local: &'a Self::LocalState,
             _context: IcedNativeWidgetContext<'a>,
-        ) -> iced::Element<'a, SlipwayIcedRuntimeMessage<Self::AppMessage>, Theme, Renderer>
+        ) -> iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
         where
             Self::AppMessage: Clone + 'a,
             Theme: iced::widget::text::Catalog
@@ -10968,7 +10922,7 @@ mod tests {
         ) -> slipway_core::TextInputTypographyDeclaration {
             slipway_core::TextInputTypographyDeclaration::explicit(
                 self.id.clone(),
-                TextStyle::default().with_font_family("system-ui"),
+                TextStyle::plain().with_font_family("system-ui"),
             )
         }
     }
@@ -12770,7 +12724,7 @@ mod tests {
             layout: &LayoutOutput,
         ) -> Vec<PaintOp> {
             let text = |label: String| {
-                PaintOp::text(
+                PaintOp::styled_text(
                     layout.bounds.into_rect(),
                     label,
                     Color {
@@ -12779,6 +12733,7 @@ mod tests {
                         blue: 0.0,
                         alpha: 1.0,
                     },
+                    TextStyle::plain(),
                 )
             };
             let mut paint = Vec::new();
@@ -13114,17 +13069,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <LayeredRuntimeWidget<'_> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::tag(&widget),
             state: <LayeredRuntimeWidget<'_> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::state(&widget),
             children: <LayeredRuntimeWidget<'_> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::children(&widget),
@@ -13135,7 +13090,7 @@ mod tests {
             iced::Size::new(100.0, 100.0),
         );
         let node = <LayeredRuntimeWidget<'_> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -13149,7 +13104,7 @@ mod tests {
             height: 100.0,
         };
         <LayeredRuntimeWidget<'_> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::draw(
@@ -13186,17 +13141,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <ScrollLayerRuntimeWidget<'_> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::tag(&widget),
             state: <ScrollLayerRuntimeWidget<'_> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::state(&widget),
             children: <ScrollLayerRuntimeWidget<'_> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::children(&widget),
@@ -13207,7 +13162,7 @@ mod tests {
             iced::Size::new(100.0, 100.0),
         );
         let node = <ScrollLayerRuntimeWidget<'_> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -13222,7 +13177,7 @@ mod tests {
         let mut messages = Vec::new();
         let mut shell = iced::advanced::Shell::new(&mut messages);
         <ScrollLayerRuntimeWidget<'_> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::update(
@@ -13243,7 +13198,7 @@ mod tests {
             text_color: iced::Color::BLACK,
         };
         <ScrollLayerRuntimeWidget<'_> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::draw(
@@ -13368,17 +13323,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <LayeredRuntimeWidget<'_> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <LayeredRuntimeWidget<'_> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
             children: <LayeredRuntimeWidget<'_> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::children(&widget),
@@ -13390,7 +13345,7 @@ mod tests {
         );
 
         let node = <LayeredRuntimeWidget<'_> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -15379,11 +15334,14 @@ mod tests {
             details: slipway_core::PointerDetails::default(),
         });
 
-        bridge.queue_event(direct_event);
+        bridge.queue_backend_input_event(BackendInputEvent::direct(direct_event));
         let receipts = adapter.route_events(&(), &mut bridge, context(), frame.clone());
         assert_eq!(receipts.len(), 1);
-        assert_eq!(adapter.local_state().clicks, 1);
-        assert!(receipts[0].outcome.handled);
+        assert_eq!(adapter.local_state().clicks, 0);
+        assert!(!receipts[0].outcome.handled);
+        assert!(receipts[0].outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_MISSING
+        }));
 
         let mut layout_bridge = DefaultIcedBridge::new();
         let layout_input = <DefaultIcedBridge as IcedSlipwayBridge<TestWidget>>::layout_input(
@@ -15413,7 +15371,8 @@ mod tests {
         bridge.queue_backend_input_event(BackendInputEvent::declared(dispatch.input, evidence));
         let receipts = adapter.route_events(&(), &mut bridge, context(), frame);
         assert_eq!(receipts.len(), 1);
-        assert_eq!(adapter.local_state().clicks, 2);
+        assert_eq!(adapter.local_state().clicks, 1);
+        assert!(receipts[0].outcome.handled);
     }
 
     #[test]
@@ -15453,7 +15412,7 @@ mod tests {
 
     #[test]
     fn iced_default_text_style_maps_to_plain_text() {
-        let style = TextStyle::default();
+        let style = TextStyle::plain();
         let font = iced_font(&style);
 
         assert_eq!(font.family, iced::font::Family::SansSerif);
@@ -15469,7 +15428,7 @@ mod tests {
     #[test]
     fn iced_preedit_overlay_uses_text_input_typography() {
         let target = WidgetId::from("text");
-        let style = TextStyle::default()
+        let style = TextStyle::plain()
             .with_font_family("serif")
             .with_font_size(22.0)
             .with_font_weight(FontWeight::Bold);
@@ -15622,7 +15581,7 @@ mod tests {
                     },
                     content: "leaky row".to_string(),
                     color: test_rgb(0, 0, 0),
-                    style: TextStyle::default(),
+                    style: TextStyle::plain(),
                 }],
             }],
         };
@@ -15676,7 +15635,7 @@ mod tests {
                     },
                     content: "visible row".to_string(),
                     color: test_rgb(0, 0, 0),
-                    style: TextStyle::default(),
+                    style: TextStyle::plain(),
                 }],
             }],
         };
@@ -15716,7 +15675,7 @@ mod tests {
             },
         };
         let text = |label: &str| {
-            PaintOp::text(
+            PaintOp::styled_text(
                 bounds.into_rect(),
                 label,
                 Color {
@@ -15725,6 +15684,7 @@ mod tests {
                     blue: 0.0,
                     alpha: 1.0,
                 },
+                TextStyle::plain(),
             )
         };
         let view = ViewDefinition {
@@ -16049,7 +16009,7 @@ mod tests {
 
         let _scrollable: iced::widget::Scrollable<
             '_,
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         > = iced_scrollable_widget_for_region::<TestWidget, iced::Theme, RecordingRenderer>(
@@ -16426,12 +16386,12 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, UnsupportedPaintWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, UnsupportedPaintWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::state(&widget),
@@ -16443,7 +16403,7 @@ mod tests {
             iced::Size::new(100.0, 40.0),
         );
         let node = <SlipwayIcedRuntimeWidget<'_, UnsupportedPaintWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -16470,7 +16430,7 @@ mod tests {
             text_color: iced::Color::BLACK,
         };
         <SlipwayIcedRuntimeWidget<'_, UnsupportedPaintWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::draw(
@@ -16496,12 +16456,12 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::state(&widget),
@@ -16513,7 +16473,7 @@ mod tests {
             iced::Size::new(100.0, 40.0),
         );
         let node = <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -16548,7 +16508,7 @@ mod tests {
             text_color: iced::Color::BLACK,
         };
         <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::draw(
@@ -16571,12 +16531,12 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::state(&widget),
@@ -16588,7 +16548,7 @@ mod tests {
             iced::Size::new(100.0, 40.0),
         );
         let node = <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -16607,7 +16567,7 @@ mod tests {
                 iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left));
             let mut shell = iced::advanced::Shell::new(&mut messages);
             <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::update(
@@ -16626,7 +16586,7 @@ mod tests {
         let mut redraw_messages = Vec::new();
         let mut redraw_shell = iced::advanced::Shell::new(&mut redraw_messages);
         <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::update(
@@ -16658,17 +16618,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, ParentWithTextChildWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, ParentWithTextChildWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::state(&widget),
             children: <SlipwayIcedRuntimeWidget<'_, ParentWithTextChildWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::children(&widget),
@@ -16679,7 +16639,7 @@ mod tests {
             iced::Size::new(100.0, 40.0),
         );
         let node = <SlipwayIcedRuntimeWidget<'_, ParentWithTextChildWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -16698,7 +16658,7 @@ mod tests {
                 iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left));
             let mut shell = iced::advanced::Shell::new(&mut messages);
             <SlipwayIcedRuntimeWidget<'_, ParentWithTextChildWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::update(
@@ -16717,7 +16677,7 @@ mod tests {
         let mut redraw_messages = Vec::new();
         let mut redraw_shell = iced::advanced::Shell::new(&mut redraw_messages);
         <SlipwayIcedRuntimeWidget<'_, ParentWithTextChildWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::update(
@@ -16761,7 +16721,7 @@ mod tests {
         {
             let mut messages = Vec::new();
             let mut ui = iced_winit::runtime::user_interface::UserInterface::<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >::build(
@@ -16784,7 +16744,7 @@ mod tests {
 
         let mut messages = Vec::new();
         let mut ui = iced_winit::runtime::user_interface::UserInterface::<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >::build(
@@ -16842,17 +16802,17 @@ mod tests {
         let widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
             children: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::children(&widget),
@@ -16869,7 +16829,7 @@ mod tests {
         assert_eq!(second.id, WidgetId::from("iced.child"));
 
         <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::diff(&widget, &mut tree);
@@ -16891,17 +16851,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
             children: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::children(&widget),
@@ -16913,7 +16873,7 @@ mod tests {
         );
 
         let node = <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -16932,17 +16892,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, PartiallyPlacedChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, PartiallyPlacedChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
             children: <SlipwayIcedRuntimeWidget<'_, PartiallyPlacedChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::children(&widget),
@@ -16954,7 +16914,7 @@ mod tests {
         );
 
         let node = <SlipwayIcedRuntimeWidget<'_, PartiallyPlacedChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -16987,17 +16947,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::state(&widget),
             children: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::children(&widget),
@@ -17009,7 +16969,7 @@ mod tests {
         );
 
         let node = <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -17040,7 +17000,7 @@ mod tests {
         };
 
         <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::draw(
@@ -17064,19 +17024,19 @@ mod tests {
         let mut tree = iced::advanced::widget::Tree {
             tag:
                 <SlipwayIcedRuntimeWidget<'_, UnsupportedPaintParentWithChildWidget> as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<Message>,
+                    SlipwayIcedRuntimeMessage,
                     iced::Theme,
                     RecordingRenderer,
                 >>::tag(&widget),
             state:
                 <SlipwayIcedRuntimeWidget<'_, UnsupportedPaintParentWithChildWidget> as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<Message>,
+                    SlipwayIcedRuntimeMessage,
                     iced::Theme,
                     RecordingRenderer,
                 >>::state(&widget),
             children:
                 <SlipwayIcedRuntimeWidget<'_, UnsupportedPaintParentWithChildWidget> as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<Message>,
+                    SlipwayIcedRuntimeMessage,
                     iced::Theme,
                     RecordingRenderer,
                 >>::children(&widget),
@@ -17089,7 +17049,7 @@ mod tests {
 
         let node =
             <SlipwayIcedRuntimeWidget<'_, UnsupportedPaintParentWithChildWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -17120,7 +17080,7 @@ mod tests {
         };
 
         <SlipwayIcedRuntimeWidget<'_, UnsupportedPaintParentWithChildWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::draw(
@@ -17144,18 +17104,18 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, LifecycleProbeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, LifecycleProbeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::state(&widget),
             children:
                 <SlipwayIcedRuntimeWidget<'_, LifecycleProbeWidget> as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<Message>,
+                    SlipwayIcedRuntimeMessage,
                     iced::Theme,
                     RecordingRenderer,
                 >>::children(&widget),
@@ -17166,7 +17126,7 @@ mod tests {
             iced::Size::new(100.0, 40.0),
         );
         let node = <SlipwayIcedRuntimeWidget<'_, LifecycleProbeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -17183,7 +17143,7 @@ mod tests {
 
         let mut operation = RecordingOperation::default();
         <SlipwayIcedRuntimeWidget<'_, LifecycleProbeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::operate(
@@ -17205,7 +17165,7 @@ mod tests {
             height: 40.0,
         };
         <SlipwayIcedRuntimeWidget<'_, LifecycleProbeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::draw(
@@ -17221,7 +17181,7 @@ mod tests {
         assert_eq!(lifecycle_counts(runtime.external()), after_layout);
 
         let interaction = <SlipwayIcedRuntimeWidget<'_, LifecycleProbeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             RecordingRenderer,
         >>::mouse_interaction(
@@ -17242,7 +17202,7 @@ mod tests {
         {
             let mut shell = iced::advanced::Shell::new(&mut messages);
             <SlipwayIcedRuntimeWidget<'_, LifecycleProbeWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 RecordingRenderer,
             >>::update(
@@ -17296,17 +17256,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
             children: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::children(&widget),
@@ -17317,7 +17277,7 @@ mod tests {
             iced::Size::new(100.0, 40.0),
         );
         let node = <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -17329,7 +17289,7 @@ mod tests {
         };
 
         let overlay = <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::overlay(
@@ -17362,17 +17322,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
             children: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::children(&widget),
@@ -17383,7 +17343,7 @@ mod tests {
             iced::Size::new(100.0, 40.0),
         );
         let node = <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -17391,7 +17351,7 @@ mod tests {
 
         let mut operation = RecordingOperation::default();
         <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::operate(&mut widget, &mut tree, layout, &renderer, &mut operation);
@@ -17411,7 +17371,7 @@ mod tests {
         );
 
         let interaction = <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::mouse_interaction(
@@ -17437,17 +17397,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
             children: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::children(&widget),
@@ -17458,7 +17418,7 @@ mod tests {
             iced::Size::new(100.0, 40.0),
         );
         let node = <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -17478,7 +17438,7 @@ mod tests {
         {
             let mut shell = iced::advanced::Shell::new(&mut messages);
             <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::update(
@@ -17538,17 +17498,17 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
             children: <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::children(&widget),
@@ -17559,7 +17519,7 @@ mod tests {
             iced::Size::new(100.0, 40.0),
         );
         let node = <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -17580,7 +17540,7 @@ mod tests {
         {
             let mut shell = iced::advanced::Shell::new(&mut messages);
             <SlipwayIcedRuntimeWidget<'_, ChildTreeWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::update(
@@ -17615,30 +17575,30 @@ mod tests {
         let mut runtime_widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut runtime_tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&runtime_widget),
             state: <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&runtime_widget),
             children: <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::children(&runtime_widget),
         };
         let runtime_node =
             <SlipwayIcedRuntimeWidget<'_, TestWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::layout(&mut runtime_widget, &mut runtime_tree, &renderer, &limits);
         let mut runtime_operation = RecordingOperation::default();
         <SlipwayIcedRuntimeWidget<'_, TestWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::operate(
@@ -17653,32 +17613,32 @@ mod tests {
         let mut intent_widget = SlipwayIcedRuntimeLayoutIntentWidget::from_runtime(&runtime);
         let mut intent_tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeLayoutIntentWidget<'_, TestWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&intent_widget),
             state:
                 <SlipwayIcedRuntimeLayoutIntentWidget<'_, TestWidget> as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<Message>,
+                    SlipwayIcedRuntimeMessage,
                     iced::Theme,
                     (),
                 >>::state(&intent_widget),
             children:
                 <SlipwayIcedRuntimeLayoutIntentWidget<'_, TestWidget> as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<Message>,
+                    SlipwayIcedRuntimeMessage,
                     iced::Theme,
                     (),
                 >>::children(&intent_widget),
         };
         let intent_node =
             <SlipwayIcedRuntimeLayoutIntentWidget<'_, TestWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::layout(&mut intent_widget, &mut intent_tree, &renderer, &limits);
         let mut intent_operation = RecordingOperation::default();
         <SlipwayIcedRuntimeLayoutIntentWidget<'_, TestWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::operate(
@@ -17847,12 +17807,12 @@ mod tests {
             let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
             let mut tree = iced::advanced::widget::Tree {
                 tag: <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<Message>,
+                    SlipwayIcedRuntimeMessage,
                     iced::Theme,
                     (),
                 >>::tag(&widget),
                 state: <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage<Message>,
+                    SlipwayIcedRuntimeMessage,
                     iced::Theme,
                     (),
                 >>::state(&widget),
@@ -17864,7 +17824,7 @@ mod tests {
                 iced::Size::new(100.0, 40.0),
             );
             let node = <SlipwayIcedRuntimeWidget<'_, TestWidget> as Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -17884,7 +17844,7 @@ mod tests {
             {
                 let mut shell = iced::advanced::Shell::new(&mut messages);
                 <SlipwayIcedRuntimeWidget<'_, TestWidget> as Widget<
-                    SlipwayIcedRuntimeMessage<Message>,
+                    SlipwayIcedRuntimeMessage,
                     iced::Theme,
                     (),
                 >>::update(
@@ -19137,12 +19097,12 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
@@ -19155,12 +19115,12 @@ mod tests {
         );
 
         let _ = <SlipwayIcedRuntimeWidget<'_, TestWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
         let _ = <SlipwayIcedRuntimeWidget<'_, TestWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -19250,12 +19210,12 @@ mod tests {
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
         let mut tree = iced::advanced::widget::Tree {
             tag: <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::tag(&widget),
             state: <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-                SlipwayIcedRuntimeMessage<Message>,
+                SlipwayIcedRuntimeMessage,
                 iced::Theme,
                 (),
             >>::state(&widget),
@@ -19268,7 +19228,7 @@ mod tests {
         );
 
         let _ = <SlipwayIcedRuntimeWidget<'_, TestWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -19290,7 +19250,7 @@ mod tests {
         }]));
 
         let _ = <SlipwayIcedRuntimeWidget<'_, TestWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -19311,7 +19271,7 @@ mod tests {
         }]));
 
         let _ = <SlipwayIcedRuntimeWidget<'_, TestWidget> as Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::layout(&mut widget, &mut tree, &renderer, &limits);
@@ -19326,7 +19286,7 @@ mod tests {
         let widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
 
         let runtime_tag = <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::tag(&widget);
@@ -19340,7 +19300,7 @@ mod tests {
         );
 
         let tree_state = <SlipwayIcedRuntimeWidget<'_, TestWidget> as iced::advanced::Widget<
-            SlipwayIcedRuntimeMessage<Message>,
+            SlipwayIcedRuntimeMessage,
             iced::Theme,
             (),
         >>::state(&widget);
@@ -20369,7 +20329,7 @@ mod tests {
     }
 
     #[test]
-    fn app_shell_delivers_forged_declared_backend_input_without_runtime_evidence_gate() {
+    fn app_shell_refuses_forged_declared_backend_input_before_runtime_mutation() {
         let mut shell = SlipwayIcedRuntimeApp::from_parts(TestWidget, (), |_, _| {});
         let frame = shell.runtime().last_frame_identity();
         let mut input =
@@ -20380,24 +20340,27 @@ mod tests {
 
         let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(input));
 
-        assert_eq!(shell.runtime().local_state().clicks, 1);
+        assert_eq!(shell.runtime().local_state().clicks, 0);
         let trace = shell
             .runtime()
             .last_backend_input_trace()
             .expect("visible backend input is recorded as a backend input trace");
-        assert!(trace.handled);
+        assert!(!trace.handled);
+        assert!(trace.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_REGION_MISMATCH
+        }));
         assert_eq!(
             update.runtime_update,
             Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
+                handled: false,
+                applied_messages: 0,
                 diagnostics: trace.diagnostics.clone(),
             })
         );
     }
 
     #[test]
-    fn app_shell_delivers_stale_declared_backend_input_without_runtime_evidence_gate() {
+    fn app_shell_refuses_stale_declared_backend_input_before_runtime_mutation() {
         let mut shell = SlipwayIcedRuntimeApp::from_parts(TestWidget, (), |_, _| {});
         let stale_frame = frame(777);
         let input =
@@ -20405,17 +20368,20 @@ mod tests {
 
         let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(input));
 
-        assert_eq!(shell.runtime().local_state().clicks, 1);
+        assert_eq!(shell.runtime().local_state().clicks, 0);
         let trace = shell
             .runtime()
             .last_backend_input_trace()
             .expect("stale backend input is recorded");
-        assert!(trace.handled);
+        assert!(!trace.handled);
+        assert!(trace.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_FRAME_MISMATCH
+        }));
         assert_eq!(
             update.runtime_update,
             Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
+                handled: false,
+                applied_messages: 0,
                 diagnostics: trace.diagnostics.clone(),
             })
         );

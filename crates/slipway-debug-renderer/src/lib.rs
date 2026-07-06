@@ -1,4 +1,4 @@
-use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
+﻿use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
 use slipway_core::{
     BaselineShift, Color, Diagnostic, DiagnosticSeverity, EvidenceSource, FontStyle, FontWeight,
     FrameIdentity, PaintOp, PathCommand, PathDeclaration, Rect, RenderEvidence, RenderPacket,
@@ -364,7 +364,7 @@ fn fill_shape(
                 shape.bounds,
                 shape.id.as_deref().unwrap_or("text"),
                 color,
-                &TextStyle::default(),
+                &TextStyle::plain(),
                 viewport,
                 target,
                 diagnostics,
@@ -407,7 +407,7 @@ fn stroke_shape(
                 shape.bounds,
                 shape.id.as_deref().unwrap_or("text"),
                 color,
-                &TextStyle::default(),
+                &TextStyle::plain(),
                 viewport,
                 target,
                 diagnostics,
@@ -1554,7 +1554,7 @@ mod tests {
                     },
                     content: "debug".to_string(),
                     color: color(0.1, 0.1, 0.1, 1.0),
-                    style: TextStyle::default(),
+                    style: TextStyle::plain(),
                 },
             ],
         }];
@@ -1576,7 +1576,7 @@ mod tests {
 
     #[test]
     fn text_style_changes_deterministic_pixel_hash() {
-        let base = TextStyle::default();
+        let base = TextStyle::plain();
         let base_hash = text_pixel_hash(base.clone());
         let variants = [
             TextStyle {
@@ -1702,7 +1702,7 @@ mod tests {
                             strikethrough: true,
                         },
                         baseline: BaselineShift::Superscript,
-                        ..TextStyle::default()
+                        ..TextStyle::plain()
                     },
                 }],
             ))

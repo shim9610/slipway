@@ -68,6 +68,7 @@ slipway = { git = "https://github.com/shim9610/slipway.git", features = ["all-ba
 - Required file split: [docs/public/authoring-layout.md](docs/public/authoring-layout.md)
 - Core API map: [docs/public/api/core.md](docs/public/api/core.md)
 - Backend API map: [docs/public/api/backends.md](docs/public/api/backends.md)
+- IME and Korean text input: [docs/public/api/ime.md](docs/public/api/ime.md)
 - Debug MCP: [docs/public/api/debug-mcp.md](docs/public/api/debug-mcp.md)
 
 Project-maintenance notes are maintained separately from this public manual.

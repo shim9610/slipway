@@ -13,17 +13,17 @@ use slipway_core::{
     PresentationGeometryIndex, PresentationRegionId, ProbeCollector, ProbeProduct,
     ProviderHitTestEvidence, ProviderSnapshotEvidence, ProviderSnapshotRequest,
     ProviderSurfaceKind, ProviderSurfaceRequest, Rect, RenderSurfaceDeclaration,
-    ResourceSourceDeclaration, ResourceSourceKind, ScrollEvent, ScrollRegionDeclaration,
-    ShapeDeclaration, ShapeKind, Size, SlipwayAuthoredWidget, SlipwayBackendCapabilityProbe,
-    SlipwayBackendParityAdmission, SlipwayCanvasProvider, SlipwayEventDispositionPolicy,
-    SlipwayEventRoutingPolicy, SlipwayFontResolutionPolicy, SlipwayGpuSurfaceProvider,
-    SlipwayLayoutIntent, SlipwayLogic, SlipwayMediaProvider, SlipwayPlotProvider,
-    SlipwayProviderHitTestPolicy, SlipwayProviderSnapshotPolicy, SlipwayRenderSurfaces,
-    SlipwayScrollableContainerCapability, SlipwaySsot, SlipwayTextInputCapability,
-    SlipwayUnsupportedCapabilityEvidence, SlipwayView, SlipwayViewDefinition, SlipwayWidget,
-    SlipwayWidgetTypes, SourceValidityKind, StateObservation, StateProbe, TargetLocalRect,
-    TextCompositionEvent, TextCompositionPhase, TextEditEvent, TextEditKind,
-    TextEditRegionDeclaration, TextInputEvent, TextInputVisualStyleDeclaration,
+    ResourceSourceDeclaration, ResourceSourceKind, ScrollAxes, ScrollEvent,
+    ScrollRegionDeclaration, ShapeDeclaration, ShapeKind, Size, SlipwayAuthoredWidget,
+    SlipwayBackendCapabilityProbe, SlipwayBackendParityAdmission, SlipwayCanvasProvider,
+    SlipwayEventDispositionPolicy, SlipwayEventRoutingPolicy, SlipwayFontResolutionPolicy,
+    SlipwayGpuSurfaceProvider, SlipwayLayoutIntent, SlipwayLogic, SlipwayMediaProvider,
+    SlipwayPlotProvider, SlipwayProviderHitTestPolicy, SlipwayProviderSnapshotPolicy,
+    SlipwayRenderSurfaces, SlipwayScrollableContainerCapability, SlipwaySsot,
+    SlipwayTextInputCapability, SlipwayUnsupportedCapabilityEvidence, SlipwayView,
+    SlipwayViewDefinition, SlipwayWidget, SlipwayWidgetTypes, SourceValidityKind, StateObservation,
+    StateProbe, TargetLocalRect, TextCompositionEvent, TextCompositionPhase, TextEditEvent,
+    TextEditKind, TextEditRegionDeclaration, TextInputEvent, TextInputVisualStyleDeclaration,
     TextMeasurementEvidence, TextSelectionRange, TextStyle, TopologyNode, TopologyProbe,
     UnsupportedCapabilityEvidence, ViewDefinition, ViewDefinitionInput, WidgetId, WidgetSlot,
     WidgetSlotAddress, expand_paint_unit_layers, paint_unit_sort_key,
@@ -33,6 +33,7 @@ use slipway_core::{
 };
 use slipway_debug_bridge::{
     DebugCommand, DebugCommandKind, DebugFailure, DebugPhysicalControl, DebugReplyProduct,
+    VisibleFrameTimingRecorder,
 };
 use slipway_runtime::{
     SlipwayRuntime, SlipwayRuntimeDrainBudget, SlipwayRuntimeMcpTransport,
@@ -43,6 +44,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 mod native_runner;
 
@@ -324,6 +326,12 @@ pub struct EguiNativeWidgetOutput {
     pub request_repaint: bool,
 }
 
+/// Backend-specific escape hatch for an already-owned egui UI fragment.
+///
+/// This is not a backend-neutral parity guarantee. Implementors must still
+/// expose Slipway layout/view/debug evidence through the surrounding
+/// `SlipwayViewDefinition` contract, and any behavior that cannot be expressed
+/// there should be reported as an unsupported backend-specific gap.
 pub trait SlipwayEguiNativeChildWidget: SlipwayWidget + SlipwayViewDefinition {
     fn egui_native_ui(
         &self,
@@ -334,6 +342,10 @@ pub trait SlipwayEguiNativeChildWidget: SlipwayWidget + SlipwayViewDefinition {
     ) -> EguiNativeWidgetOutput;
 }
 
+/// Contract for a backend-specific egui native wrapper.
+///
+/// This wrapper may mount native egui UI, but Slipway will not infer its
+/// internal drawing, hit testing, or cross-backend parity automatically.
 pub trait SlipwayEguiNativeWidgetSpec: SlipwayWidgetTypes {
     fn id(&self) -> WidgetId;
 
@@ -1880,8 +1892,18 @@ where
     backend_traces: Option<&'a mut Vec<BackendInputTrace>>,
     sense: egui::Sense,
     presented_viewport: Option<&'a mut Option<Rect>>,
+    presented_content_size: Option<&'a mut Option<Size>>,
     native_physical_operation: Option<&'a DebugPhysicalControl>,
+    frame_seed: Option<FrameIdentity>,
     layout_input_override: Option<LayoutInput>,
+    allocated_size_override: Option<egui::Vec2>,
+    timing_samples: Option<&'a mut Vec<EguiFrameTimingSample>>,
+}
+
+struct EguiFrameTimingSample {
+    kind: &'static str,
+    duration: Duration,
+    event_count: usize,
 }
 
 impl<'a, W, B> SlipwayEguiWidget<'a, W, B>
@@ -1905,8 +1927,12 @@ where
             backend_traces: None,
             sense: egui::Sense::hover(),
             presented_viewport: None,
+            presented_content_size: None,
             native_physical_operation: None,
+            frame_seed: None,
             layout_input_override: None,
+            allocated_size_override: None,
+            timing_samples: None,
         }
     }
 
@@ -1920,6 +1946,11 @@ where
         self
     }
 
+    pub fn record_presented_content_size(mut self, content_size: &'a mut Option<Size>) -> Self {
+        self.presented_content_size = Some(content_size);
+        self
+    }
+
     pub fn record_backend_traces(mut self, backend_traces: &'a mut Vec<BackendInputTrace>) -> Self {
         self.backend_traces = Some(backend_traces);
         self
@@ -1930,11 +1961,62 @@ where
         self
     }
 
+    fn frame_seed(mut self, frame: FrameIdentity) -> Self {
+        self.frame_seed = Some(frame);
+        self
+    }
+
     fn layout_input_override(mut self, layout_input: LayoutInput) -> Self {
         self.layout_input_override = Some(layout_input);
         self
     }
+
+    fn allocated_size_override(mut self, allocated_size: egui::Vec2) -> Self {
+        self.allocated_size_override = Some(allocated_size);
+        self
+    }
+
+    fn record_frame_timing(mut self, timing_samples: &'a mut Vec<EguiFrameTimingSample>) -> Self {
+        self.timing_samples = Some(timing_samples);
+        self
+    }
 }
+
+fn push_egui_frame_timing(
+    timing_samples: &mut Option<&mut Vec<EguiFrameTimingSample>>,
+    kind: &'static str,
+    duration: Duration,
+    event_count: usize,
+) {
+    if let Some(samples) = timing_samples.as_deref_mut() {
+        samples.push(EguiFrameTimingSample {
+            kind,
+            duration,
+            event_count,
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EguiPresentationRegionTimingLabels {
+    scroll: &'static str,
+    focus: &'static str,
+    hit: &'static str,
+}
+
+const EGUI_WIDGET_PRESENTATION_REGION_TIMING_LABELS: EguiPresentationRegionTimingLabels =
+    EguiPresentationRegionTimingLabels {
+        scroll: "egui.widget.presentation_regions.scroll",
+        focus: "egui.widget.presentation_regions.focus",
+        hit: "egui.widget.presentation_regions.hit",
+    };
+
+const EGUI_CHILD_PRESENTATION_REGION_TIMING_LABELS: EguiPresentationRegionTimingLabels =
+    EguiPresentationRegionTimingLabels {
+        scroll: "egui.child.presentation_regions.scroll",
+        focus: "egui.child.presentation_regions.focus",
+        hit: "egui.child.presentation_regions.hit",
+    };
 
 impl<W, B> egui::Widget for SlipwayEguiWidget<'_, W, B>
 where
@@ -1942,6 +2024,8 @@ where
     B: EguiSlipwayBridge<W>,
 {
     fn ui(mut self, ui: &mut egui::Ui) -> egui::Response {
+        let mut timing_samples = self.timing_samples.take();
+        let view_definition_start = Instant::now();
         let layout_input = self.layout_input_override.unwrap_or_else(|| {
             self.bridge.layout_input(EguiLayoutContext {
                 ui,
@@ -1952,7 +2036,9 @@ where
         if let Some(presented_viewport) = self.presented_viewport {
             *presented_viewport = Some(layout_input.viewport.into_rect());
         }
-        let frame = egui_frame_identity(ui, &self.widget.id(), layout_input.viewport.into_rect());
+        let frame = self.frame_seed.take().unwrap_or_else(|| {
+            egui_frame_identity(ui, &self.widget.id(), layout_input.viewport.into_rect())
+        });
         let mut view = self.widget.visible_backend_view_definition(
             self.external,
             self.local,
@@ -1961,42 +2047,145 @@ where
                 layout_input,
             },
         );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.view_definition",
+            view_definition_start.elapsed(),
+            1,
+        );
+        let admission_geometry_start = Instant::now();
         let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
         normalize_egui_visible_scroll_regions(&mut view, &geometry_index);
         let capabilities = self.widget.capabilities();
         let admission =
             egui_backend_admission().admit_view_definition_with_capabilities(&capabilities, &view);
         let desired_size = self.bridge.desired_size(&view.layout);
-        let (rect, response) = ui.allocate_exact_size(desired_size, self.sense);
+        if let Some(presented_content_size) = self.presented_content_size {
+            *presented_content_size = Some(view.layout.bounds.size);
+        }
+        let allocated_size = self.allocated_size_override.unwrap_or(desired_size);
+        let (rect, response) = ui.allocate_exact_size(allocated_size, self.sense);
         if !admission.accepted {
+            push_egui_frame_timing(
+                &mut timing_samples,
+                "egui.widget.admission_geometry",
+                admission_geometry_start.elapsed(),
+                0,
+            );
             paint_visible_admission_refusal(ui, rect, &admission);
             self.bridge.visible_admission_refused(admission);
             return response;
         }
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.admission_geometry",
+            admission_geometry_start.elapsed(),
+            1,
+        );
 
-        for admission in install_declared_fonts(ui, self.widget, self.external, self.local, &view) {
+        let font_install_start = Instant::now();
+        let (font_admissions, font_metrics) =
+            install_declared_fonts_with_metrics(ui, self.widget, self.external, self.local, &view);
+        let font_refusal_count = font_admissions.len();
+        for admission in font_admissions {
             self.bridge.visible_admission_refused(admission);
         }
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.font_install",
+            font_install_start.elapsed(),
+            font_metrics.total(),
+        );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.font_install.queued",
+            Duration::ZERO,
+            font_metrics.queued,
+        );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.font_install.installed",
+            Duration::ZERO,
+            font_metrics.installed,
+        );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.font_install.already_installed",
+            Duration::ZERO,
+            font_metrics.already_installed,
+        );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.font_install.missing_source",
+            Duration::ZERO,
+            font_metrics.missing_source,
+        );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.font_install.missing_asset_ref",
+            Duration::ZERO,
+            font_metrics.missing_asset_ref,
+        );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.font_install.read_failed",
+            Duration::ZERO,
+            font_metrics.read_failed,
+        );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.font_install.unsupported_source",
+            Duration::ZERO,
+            font_metrics.unsupported_source,
+        );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.font_install.refused",
+            Duration::ZERO,
+            font_refusal_count,
+        );
+        let paint_region_start = Instant::now();
+        let child_slot_start = Instant::now();
         let child_slots = authored_child_slots(self.widget, self.external, self.local);
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.authored_child_slots",
+            child_slot_start.elapsed(),
+            child_slots.len(),
+        );
         let mut child_assembly = EguiChildAssembly::default();
         if ui.is_rect_visible(rect) {
             let paint_clip = egui_view_paint_clip_rect(rect.min, rect, &view);
             let first_job = child_assembly.paint_jobs.len();
-            paint_egui_default_jobs_and_push_explicit_layer_jobs(
+            let paint_local_start = Instant::now();
+            let paint_records = paint_egui_default_jobs_and_push_explicit_layer_jobs(
                 ui,
                 &mut child_assembly.paint_jobs,
                 PaintUnit::from_view_ref(&view, 0),
                 rect.min,
                 paint_clip,
             );
-            child_assembly
-                .regions
-                .extend(allocate_paint_occlusion_regions(
-                    ui,
-                    &child_assembly.paint_jobs[first_job..],
-                ));
+            let queued_explicit_jobs = child_assembly.paint_jobs.len().saturating_sub(first_job);
+            push_egui_frame_timing(
+                &mut timing_samples,
+                "egui.widget.paint_local_jobs",
+                paint_local_start.elapsed(),
+                paint_records.len() + queued_explicit_jobs,
+            );
+            let occlusion_start = Instant::now();
+            let occlusion_regions =
+                allocate_paint_occlusion_regions(ui, &child_assembly.paint_jobs[first_job..]);
+            let occlusion_region_count = occlusion_regions.len();
+            child_assembly.regions.extend(occlusion_regions);
+            push_egui_frame_timing(
+                &mut timing_samples,
+                "egui.widget.paint_occlusion_regions",
+                occlusion_start.elapsed(),
+                occlusion_region_count,
+            );
         }
-        let mut regions = allocate_presentation_regions(
+        let presentation_region_start = Instant::now();
+        let mut regions = allocate_presentation_regions_with_timing(
             ui,
             self.widget,
             self.external,
@@ -2007,7 +2196,22 @@ where
             &child_slots,
             &mut child_assembly,
             self.native_physical_operation,
+            timing_samples.as_deref_mut(),
+            Some(EGUI_WIDGET_PRESENTATION_REGION_TIMING_LABELS),
         );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.presentation_regions",
+            presentation_region_start.elapsed(),
+            regions.len(),
+        );
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.paint_region_construction",
+            paint_region_start.elapsed(),
+            regions.len(),
+        );
+        let child_presentation_start = Instant::now();
         let authored_children = present_authored_children(
             ui,
             self.widget,
@@ -2016,9 +2220,10 @@ where
             &view,
             &geometry_index,
             rect.min,
-            &child_assembly.presented_slots,
+            &child_assembly.claimed_slots,
             None,
             self.native_physical_operation,
+            timing_samples.as_deref_mut(),
         );
         child_assembly.extend(authored_children);
         paint_egui_jobs(ui, &mut child_assembly.paint_jobs);
@@ -2028,6 +2233,13 @@ where
         }
         regions.extend(child_assembly.regions);
         apply_egui_native_physical_region_effect(self.native_physical_operation, &regions);
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.child_presentation",
+            child_presentation_start.elapsed(),
+            child_assembly.presented_slots.len(),
+        );
+        let input_bridge_start = Instant::now();
         let mut input_events = child_assembly.input_events;
         input_events.extend(self.bridge.input_events(EguiInputContext {
             ui,
@@ -2043,7 +2255,22 @@ where
             regions: &regions,
             native_physical_operation: self.native_physical_operation,
         }));
+        let input_event_count = input_events.len();
         for event in input_events {
+            if let Some(outcome) =
+                egui_backend_input_contract_refusal::<W::AppMessage>(&view, &event)
+            {
+                if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                    backend_traces.push(egui_backend_input_trace(
+                        self.widget,
+                        self.external,
+                        self.local,
+                        event,
+                        &outcome,
+                    ));
+                }
+                continue;
+            }
             let input = event.event.clone();
             let declaration = slipway_core::declared_event_handling(
                 self.widget,
@@ -2083,6 +2310,12 @@ where
             }
             self.messages.extend(self.bridge.messages(outcome));
         }
+        push_egui_frame_timing(
+            &mut timing_samples,
+            "egui.widget.input_bridge",
+            input_bridge_start.elapsed(),
+            input_event_count,
+        );
 
         if self.bridge.wants_observation() {
             self.bridge.observe(EguiObservationContext {
@@ -2227,7 +2460,8 @@ where
             &view,
             &geometry_index,
             rect.min,
-            &child_assembly.presented_slots,
+            &child_assembly.claimed_slots,
+            None,
             None,
             None,
         );
@@ -2254,6 +2488,20 @@ where
             native_physical_operation: None,
         }));
         for event in input_events {
+            if let Some(outcome) =
+                egui_backend_input_contract_refusal::<W::AppMessage>(&view, &event)
+            {
+                if let Some(backend_traces) = self.backend_traces.as_deref_mut() {
+                    backend_traces.push(egui_backend_input_trace(
+                        self.widget,
+                        self.external,
+                        self.local,
+                        event,
+                        &outcome,
+                    ));
+                }
+                continue;
+            }
             let input = event.event.clone();
             let declaration = slipway_core::declared_event_handling(
                 self.widget,
@@ -2470,6 +2718,8 @@ where
     egui_mcp_wake_rx: Option<mpsc::Receiver<()>>,
     pending_native_physical: Option<PendingEguiNativePhysicalControl>,
     root_scroll_offset: egui::Vec2,
+    frame_timing: VisibleFrameTimingRecorder,
+    native_create_started_at: Option<Instant>,
 }
 
 enum PendingEguiNativePhysicalControl {
@@ -2497,6 +2747,8 @@ where
             egui_mcp_wake_rx: None,
             pending_native_physical: None,
             root_scroll_offset: egui::Vec2::ZERO,
+            frame_timing: VisibleFrameTimingRecorder::from_env("egui"),
+            native_create_started_at: None,
         }
     }
 
@@ -2517,6 +2769,34 @@ where
         self.debug_mcp_transport
             .as_ref()
             .map(SlipwayRuntimeMcpTransport::local_addr)
+    }
+
+    fn mark_native_create_started(&mut self) {
+        self.native_create_started_at = Some(Instant::now());
+    }
+
+    fn record_native_create_phase(&mut self) {
+        let Some(started_at) = self.native_create_started_at.take() else {
+            return;
+        };
+        self.frame_timing
+            .record("egui.native.create_native", started_at.elapsed(), 0, None);
+    }
+
+    fn prewarm_native_visible_cache(&mut self, ctx: &egui::Context) {
+        let mut visible_frame_timing = VisibleFrameTimingRecorder::disabled("egui");
+        std::mem::swap(&mut self.frame_timing, &mut visible_frame_timing);
+        for _ in 0..3 {
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(raw_input, |ui| self.render_ui(ui));
+        }
+        std::mem::swap(&mut self.frame_timing, &mut visible_frame_timing);
     }
 
     pub fn drain_debug_pending(&mut self) -> (usize, Option<String>) {
@@ -2648,9 +2928,10 @@ where
         backend_input: BackendInputEvent,
     ) -> DebugReplyProduct {
         self.runtime
-            .handle_backend_presented_physical_control_with_app_reducer(
+            .handle_backend_presented_physical_control_for_backend_with_app_reducer(
                 command,
                 backend_input,
+                EGUI_BACKEND_ID,
                 &mut self.on_messages,
             )
     }
@@ -2661,15 +2942,23 @@ where
     }
 
     fn render_ui(&mut self, ui: &mut egui::Ui) {
+        let timing_start = Instant::now();
+        let background_layout_start = Instant::now();
         fill_egui_host_background(ui);
         let mut messages = Vec::new();
         let mut backend_traces = Vec::new();
+        let mut widget_timing_samples = self.frame_timing.is_enabled().then(Vec::new);
         let mut presented_viewport = None;
+        let mut presented_content_size = None;
         let sense = self.sense;
         let revision_before = self.runtime.last_frame_identity().revision;
         let native_physical_operation = self.pending_native_physical_operation().cloned();
 
         let available_size = ui.available_size();
+        let timing_viewport = Some(Size {
+            width: available_size.x.max(0.0),
+            height: available_size.y.max(0.0),
+        });
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(Rect {
                 origin: Point {
@@ -2693,65 +2982,120 @@ where
             },
         };
         let root_wheel_delta = egui_root_wheel_delta(ui, available_size);
-        let root_output = egui::ScrollArea::both()
-            .id_salt("slipway-root-scroll")
-            .auto_shrink([false, false])
-            .max_width(available_size.x.max(0.0))
-            .max_height(available_size.y.max(0.0))
-            .scroll_offset(self.root_scroll_offset)
-            .scroll_source(egui::containers::scroll_area::ScrollSource {
-                scroll_bar: true,
-                drag: egui::containers::scroll_area::DragScroll::Never,
-                mouse_wheel: false,
-            })
-            .show(ui, |ui| {
-                self.runtime
-                    .with_widget_state_mut(|widget, external, local| {
-                        ui.add(
-                            SlipwayEguiWidget::new(
-                                widget,
-                                external,
-                                local,
-                                &mut self.bridge,
-                                &mut messages,
-                            )
-                            .sense(sense)
-                            .record_backend_traces(&mut backend_traces)
-                            .record_presented_viewport(&mut presented_viewport)
-                            .native_physical_operation(native_physical_operation.as_ref())
-                            .layout_input_override(layout_input.clone()),
-                        );
-                    });
+        self.frame_timing.record(
+            "egui.render_ui.background_layout_setup",
+            background_layout_start.elapsed(),
+            0,
+            timing_viewport,
+        );
+        let frame_seed = self
+            .runtime
+            .frame_identity(layout_input.viewport.into_rect());
+        let root_scroll_show_start = Instant::now();
+        let mut ui_add_elapsed = Duration::ZERO;
+        let ui_add_start = Instant::now();
+        self.runtime
+            .with_widget_state_mut(|widget, external, local| {
+                let widget = SlipwayEguiWidget::new(
+                    widget,
+                    external,
+                    local,
+                    &mut self.bridge,
+                    &mut messages,
+                )
+                .sense(sense)
+                .record_backend_traces(&mut backend_traces)
+                .record_presented_viewport(&mut presented_viewport)
+                .record_presented_content_size(&mut presented_content_size)
+                .native_physical_operation(native_physical_operation.as_ref())
+                .frame_seed(frame_seed.clone())
+                .layout_input_override(layout_input.clone())
+                .allocated_size_override(available_size);
+                let widget = if let Some(samples) = widget_timing_samples.as_mut() {
+                    widget.record_frame_timing(samples)
+                } else {
+                    widget
+                };
+                ui.add(widget);
             });
+        ui_add_elapsed += ui_add_start.elapsed();
+        self.frame_timing.record(
+            "egui.render_ui.root_scroll_show",
+            root_scroll_show_start.elapsed(),
+            backend_traces.len(),
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "egui.render_ui.ui_add",
+            ui_add_elapsed,
+            backend_traces.len(),
+            timing_viewport,
+        );
+        if let Some(samples) = widget_timing_samples {
+            for sample in samples {
+                self.frame_timing.record(
+                    sample.kind,
+                    sample.duration,
+                    sample.event_count,
+                    timing_viewport,
+                );
+            }
+        }
+        let root_content_size = presented_content_size
+            .map(|size| egui::vec2(size.width.max(0.0), size.height.max(0.0)))
+            .unwrap_or(available_size);
         self.root_scroll_offset = clamp_egui_root_scroll_offset(
-            root_output.state.offset,
-            root_output.content_size,
+            self.root_scroll_offset,
+            root_content_size,
             available_size,
         );
         if let Some(viewport) = presented_viewport {
             self.runtime.record_presented_viewport(viewport);
         }
 
+        let app_message_apply_start = Instant::now();
+        let app_message_count = messages.len();
         self.runtime
             .apply_app_messages(messages, &mut self.on_messages);
+        self.frame_timing.record(
+            "egui.render_ui.app_message_apply",
+            app_message_apply_start.elapsed(),
+            app_message_count,
+            timing_viewport,
+        );
         let revision_after = self.runtime.last_frame_identity().revision;
         let handled_wheel = backend_traces_handled_wheel(&backend_traces);
+        let backend_trace_count = backend_traces.len();
 
+        let trace_recording_start = Instant::now();
         for mut trace in backend_traces {
             trace.revision_before = trace.revision_before.or(Some(revision_before));
             trace.revision_after = trace.revision_after.or(Some(revision_after));
             self.try_complete_pending_native_physical(&trace);
-            self.runtime.record_backend_input_trace(trace);
+            self.runtime
+                .record_backend_input_trace_for_backend(trace, EGUI_BACKEND_ID);
         }
+        self.frame_timing.record(
+            "egui.render_ui.trace_recording",
+            trace_recording_start.elapsed(),
+            backend_trace_count,
+            timing_viewport,
+        );
         if root_wheel_delta != egui::Vec2::ZERO && !handled_wheel {
             self.root_scroll_offset = clamp_egui_root_scroll_offset(
                 self.root_scroll_offset - root_wheel_delta,
-                root_output.content_size,
+                root_content_size,
                 available_size,
             );
             ui.ctx().request_repaint();
         }
         self.fail_unmatched_pending_native_physical();
+        self.frame_timing.record(
+            "egui.render_ui",
+            timing_start.elapsed(),
+            backend_trace_count,
+            timing_viewport,
+        );
     }
 
     fn ensure_mcp_wake_forwarder(&mut self, ctx: &egui::Context) {
@@ -2805,7 +3149,11 @@ where
 
         let product = self
             .runtime
-            .backend_presented_physical_control_product_from_trace(lease.command().clone(), trace);
+            .backend_presented_physical_control_product_from_trace_for_backend(
+                lease.command().clone(),
+                trace,
+                EGUI_BACKEND_ID,
+            );
         if matches!(product, DebugReplyProduct::Error(_)) {
             self.pending_native_physical =
                 Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace { pending, lease });
@@ -2859,6 +3207,7 @@ where
     F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>) + 'static,
 {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let timing_start = Instant::now();
         self.ensure_mcp_wake_forwarder(ctx);
         let woke = self.drain_egui_mcp_wakes();
         let (drained, error) = if woke > 0 {
@@ -2869,13 +3218,23 @@ where
         if woke > 0 || drained > 0 || error.is_some() {
             ctx.request_repaint();
         }
+        self.frame_timing
+            .record("egui.logic", timing_start.elapsed(), woke + drained, None);
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let timing_start = Instant::now();
+        let event_count = raw_input.events.len();
         let (drained, error) = self.inject_pending_native_physical_into_raw_input(raw_input);
         if drained > 0 || error.is_some() {
             ctx.request_repaint();
         }
+        self.frame_timing.record(
+            "egui.raw_input_hook",
+            timing_start.elapsed(),
+            event_count,
+            None,
+        );
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3425,6 +3784,7 @@ struct EguiAuthoredChildSlot {
 struct EguiChildAssembly {
     regions: Vec<EguiPresentedRegion>,
     refused_admissions: Vec<BackendParityAdmission>,
+    claimed_slots: Vec<WidgetSlotAddress>,
     presented_slots: Vec<WidgetSlotAddress>,
     paint_jobs: Vec<EguiPaintJob>,
     scroll_indicators: Vec<EguiScrollIndicatorPaint>,
@@ -3437,6 +3797,7 @@ impl EguiChildAssembly {
     fn extend(&mut self, other: EguiChildAssembly) {
         self.regions.extend(other.regions);
         self.refused_admissions.extend(other.refused_admissions);
+        self.claimed_slots.extend(other.claimed_slots);
         self.presented_slots.extend(other.presented_slots);
         self.paint_jobs.extend(other.paint_jobs);
         self.scroll_indicators.extend(other.scroll_indicators);
@@ -3534,6 +3895,7 @@ struct EguiAuthoredChildPresenter<'a> {
     parent_geometry_index: &'a PresentationGeometryIndex,
     scroll: Option<&'a ScrollRegionDeclaration>,
     native_physical_operation: Option<&'a DebugPhysicalControl>,
+    timing_samples: Option<&'a mut Vec<EguiFrameTimingSample>>,
     output: EguiChildAssembly,
 }
 
@@ -3567,11 +3929,19 @@ impl<ExternalState, AppMessage> SlipwayEguiWidgetListVisitor<ExternalState, AppM
         };
 
         if let Some(scroll) = self.scroll {
+            if !scroll_owns_placement_with_geometry_index(
+                self.parent_geometry_index,
+                scroll,
+                placement,
+            ) {
+                return;
+            }
             if !scroll_contains_placement_with_geometry_index(
                 self.parent_geometry_index,
                 scroll,
                 placement,
             ) {
+                self.output.claimed_slots.push(slot);
                 return;
             }
         }
@@ -3586,6 +3956,7 @@ impl<ExternalState, AppMessage> SlipwayEguiWidgetListVisitor<ExternalState, AppM
             self.view_origin,
             &mut self.output,
             self.native_physical_operation,
+            self.timing_samples.as_deref_mut(),
         );
     }
 
@@ -3616,11 +3987,19 @@ impl<ExternalState, AppMessage> SlipwayEguiWidgetListVisitor<ExternalState, AppM
         };
 
         if let Some(scroll) = self.scroll {
+            if !scroll_owns_placement_with_geometry_index(
+                self.parent_geometry_index,
+                scroll,
+                placement,
+            ) {
+                return;
+            }
             if !scroll_contains_placement_with_geometry_index(
                 self.parent_geometry_index,
                 scroll,
                 placement,
             ) {
+                self.output.claimed_slots.push(slot);
                 return;
             }
         }
@@ -3634,6 +4013,7 @@ impl<ExternalState, AppMessage> SlipwayEguiWidgetListVisitor<ExternalState, AppM
             slot,
             self.view_origin,
             &mut self.output,
+            self.timing_samples.as_deref_mut(),
         );
     }
 }
@@ -3649,6 +4029,7 @@ fn collect_authored_children<W>(
     skipped_slots: &[WidgetSlotAddress],
     scroll: Option<&ScrollRegionDeclaration>,
     native_physical_operation: Option<&DebugPhysicalControl>,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
 ) -> EguiChildAssembly
 where
     W: SlipwayEguiBackendChildWidget,
@@ -3661,6 +4042,7 @@ where
         skipped_slots,
         scroll,
         native_physical_operation,
+        timing_samples,
         output: EguiChildAssembly::default(),
     };
     widget.visit_egui_authored_children_in_paint_order(
@@ -3683,10 +4065,12 @@ fn present_authored_children<W>(
     skipped_slots: &[WidgetSlotAddress],
     scroll: Option<&ScrollRegionDeclaration>,
     native_physical_operation: Option<&DebugPhysicalControl>,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
 ) -> EguiChildAssembly
 where
     W: SlipwayEguiBackendChildWidget,
 {
+    let mut timing_samples = timing_samples;
     let mut output = collect_authored_children(
         ui,
         widget,
@@ -3698,9 +4082,24 @@ where
         skipped_slots,
         scroll,
         native_physical_operation,
+        timing_samples.as_deref_mut(),
     );
-    paint_local_egui_jobs(ui, &mut output.paint_jobs);
+    let paint_local_start = Instant::now();
+    let paint_records = paint_local_egui_jobs(ui, &mut output.paint_jobs);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.paint_local_jobs",
+        paint_local_start.elapsed(),
+        paint_records.len(),
+    );
+    let indicator_start = Instant::now();
     paint_declared_scroll_indicators(ui, &mut output.scroll_indicators);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.paint_scroll_indicators",
+        indicator_start.elapsed(),
+        output.scroll_indicators.len(),
+    );
     output
 }
 
@@ -3868,9 +4267,12 @@ fn present_egui_child<W>(
     view_origin: egui::Pos2,
     output: &mut EguiChildAssembly,
     native_physical_operation: Option<&DebugPhysicalControl>,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
 ) where
     W: SlipwayEguiBackendChildWidget,
 {
+    let mut timing_samples = timing_samples;
+    let view_definition_start = Instant::now();
     let layout_input = child_layout_input(placement.bounds.into_rect());
     let frame = egui_frame_identity(ui, &widget.id(), layout_input.viewport.into_rect());
     let view = widget.visible_backend_view_definition(
@@ -3885,7 +4287,14 @@ fn present_egui_child<W>(
     let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
     let mut view = view;
     normalize_egui_visible_scroll_regions(&mut view, &geometry_index);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.view_definition",
+        view_definition_start.elapsed(),
+        1,
+    );
     let child_rect = egui_rect(view_origin, placement.bounds.into_rect());
+    let response_start = Instant::now();
     let region_id =
         PresentationRegionId::from(format!("egui-child-response:{}", widget_slot_key(&slot)));
     let response = apply_region_cursor(
@@ -3901,25 +4310,53 @@ fn present_egui_child<W>(
         ),
         CursorCapability::Default,
     );
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.response_region",
+        response_start.elapsed(),
+        1,
+    );
 
+    let admission_start = Instant::now();
     let capabilities = widget.capabilities();
     let admission =
         egui_backend_admission().admit_view_definition_with_capabilities(&capabilities, &view);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.admission",
+        admission_start.elapsed(),
+        if admission.accepted { 1 } else { 0 },
+    );
     if !admission.accepted {
         paint_visible_admission_refusal(ui, child_rect, &admission);
         output.refused_admissions.push(admission);
         return;
     }
 
-    output
-        .refused_admissions
-        .extend(install_declared_fonts(ui, widget, external, local, &view));
+    let font_install_start = Instant::now();
+    let font_admissions = install_declared_fonts(ui, widget, external, local, &view);
+    let font_refusal_count = font_admissions.len();
+    output.refused_admissions.extend(font_admissions);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.font_install",
+        font_install_start.elapsed(),
+        font_refusal_count,
+    );
+    output.claimed_slots.push(slot.clone());
     output.presented_slots.push(slot.clone());
     let paint_clip = egui_view_paint_clip_rect(child_rect.min, child_rect, &view);
     let mut unit = PaintUnit::from_view_ref(&view, slot.ordinal);
     unit.address = Some(slot.clone());
     let child_response_sort_key = paint_unit_sort_key(&unit);
+    let collect_slots_start = Instant::now();
     let child_slots = authored_child_slots(widget, external, local);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.collect_nested_children",
+        collect_slots_start.elapsed(),
+        child_slots.len(),
+    );
     output.regions.push(child_response_region(
         widget.id(),
         slot.clone(),
@@ -3929,20 +4366,35 @@ fn present_egui_child<W>(
     ));
 
     let first_job = output.paint_jobs.len();
-    paint_egui_default_jobs_and_push_explicit_layer_jobs(
+    let paint_start = Instant::now();
+    let paint_records = paint_egui_default_jobs_and_push_explicit_layer_jobs(
         ui,
         &mut output.paint_jobs,
         unit,
         child_rect.min,
         paint_clip,
     );
-    output.regions.extend(allocate_paint_occlusion_regions(
-        ui,
-        &output.paint_jobs[first_job..],
-    ));
+    let queued_explicit_jobs = output.paint_jobs.len().saturating_sub(first_job);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.paint_local_jobs",
+        paint_start.elapsed(),
+        paint_records.len() + queued_explicit_jobs,
+    );
+    let occlusion_start = Instant::now();
+    let occlusion_regions = allocate_paint_occlusion_regions(ui, &output.paint_jobs[first_job..]);
+    let occlusion_region_count = occlusion_regions.len();
+    output.regions.extend(occlusion_regions);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.paint_occlusion_regions",
+        occlusion_start.elapsed(),
+        occlusion_region_count,
+    );
 
     let mut nested_assembly = EguiChildAssembly::default();
-    let nested_regions = allocate_presentation_regions(
+    let nested_regions_start = Instant::now();
+    let nested_regions = allocate_presentation_regions_with_timing(
         ui,
         widget,
         external,
@@ -3953,8 +4405,17 @@ fn present_egui_child<W>(
         &child_slots,
         &mut nested_assembly,
         native_physical_operation,
+        timing_samples.as_deref_mut(),
+        Some(EGUI_CHILD_PRESENTATION_REGION_TIMING_LABELS),
+    );
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.presentation_regions",
+        nested_regions_start.elapsed(),
+        nested_regions.len(),
     );
     output.regions.extend(nested_regions);
+    let nested_collect_start = Instant::now();
     let nested_authored = collect_authored_children(
         ui,
         widget,
@@ -3963,9 +4424,16 @@ fn present_egui_child<W>(
         &view,
         &geometry_index,
         child_rect.min,
-        &nested_assembly.presented_slots,
+        &nested_assembly.claimed_slots,
         None,
         native_physical_operation,
+        timing_samples.as_deref_mut(),
+    );
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.collect_nested_children",
+        nested_collect_start.elapsed(),
+        nested_authored.presented_slots.len(),
     );
     nested_assembly.extend(nested_authored);
     output.extend(nested_assembly);
@@ -3980,9 +4448,12 @@ fn present_egui_native_child<N>(
     slot: WidgetSlotAddress,
     view_origin: egui::Pos2,
     output: &mut EguiChildAssembly,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
 ) where
     N: SlipwayEguiNativeChildWidget,
 {
+    let mut timing_samples = timing_samples;
+    let view_definition_start = Instant::now();
     let layout_input = child_layout_input(placement.bounds.into_rect());
     let frame = egui_frame_identity(ui, &widget.id(), layout_input.viewport.into_rect());
     let view = widget.visible_backend_view_definition(
@@ -3997,18 +4468,33 @@ fn present_egui_native_child<N>(
     let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
     let mut view = view;
     normalize_egui_visible_scroll_regions(&mut view, &geometry_index);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.view_definition",
+        view_definition_start.elapsed(),
+        1,
+    );
     let child_rect = egui_rect(view_origin, placement.bounds.into_rect());
 
+    let admission_start = Instant::now();
     let capabilities = widget.capabilities();
     let admission =
         egui_backend_admission().admit_view_definition_with_capabilities(&capabilities, &view);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.admission",
+        admission_start.elapsed(),
+        if admission.accepted { 1 } else { 0 },
+    );
     if !admission.accepted {
         paint_visible_admission_refusal(ui, child_rect, &admission);
         output.refused_admissions.push(admission);
         return;
     }
 
+    output.claimed_slots.push(slot.clone());
     output.presented_slots.push(slot.clone());
+    let native_ui_start = Instant::now();
     let native_output = ui
         .scope_builder(
             egui::UiBuilder::new()
@@ -4029,6 +4515,12 @@ fn present_egui_native_child<N>(
             },
         )
         .inner;
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.native_ui",
+        native_ui_start.elapsed(),
+        1,
+    );
 
     if native_output.request_repaint {
         ui.ctx().request_repaint();
@@ -4053,7 +4545,43 @@ fn allocate_presentation_regions<W>(
 where
     W: SlipwayEguiBackendChildWidget,
 {
+    allocate_presentation_regions_with_timing(
+        ui,
+        widget,
+        external,
+        local,
+        view_origin,
+        view,
+        geometry_index,
+        child_slots,
+        child_assembly,
+        native_physical_operation,
+        None,
+        None,
+    )
+}
+
+fn allocate_presentation_regions_with_timing<W>(
+    ui: &mut egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    view_origin: egui::Pos2,
+    view: &ViewDefinition,
+    geometry_index: &PresentationGeometryIndex,
+    child_slots: &[EguiAuthoredChildSlot],
+    child_assembly: &mut EguiChildAssembly,
+    native_physical_operation: Option<&DebugPhysicalControl>,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
+    timing_labels: Option<EguiPresentationRegionTimingLabels>,
+) -> Vec<EguiPresentedRegion>
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let mut timing_samples = timing_samples;
     let mut regions = Vec::new();
+    let scroll_start = Instant::now();
+    let mut scroll_region_count = 0;
     for scroll in &view.scroll_regions {
         if region_belongs_to_authored_child(&scroll.target, scroll.address.as_ref(), child_slots) {
             continue;
@@ -4068,15 +4596,27 @@ where
             view,
             geometry_index,
             scroll,
-            &child_assembly.presented_slots,
+            &child_assembly.claimed_slots,
             native_physical_operation,
+            timing_samples.as_deref_mut(),
         );
         if let Some(region) = scroll_allocation.region {
             regions.push(region);
+            scroll_region_count += 1;
         }
         child_assembly.extend(scroll_allocation.child_assembly);
     }
+    if let Some(labels) = timing_labels {
+        push_egui_frame_timing(
+            &mut timing_samples,
+            labels.scroll,
+            scroll_start.elapsed(),
+            scroll_region_count,
+        );
+    }
 
+    let focus_start = Instant::now();
+    let mut focus_region_count = 0;
     for focus in &view.focus_regions {
         if region_belongs_to_authored_child(&focus.target, focus.address.as_ref(), child_slots) {
             continue;
@@ -4093,9 +4633,11 @@ where
                 geometry_index,
                 focus,
                 text_edit,
+                timing_samples.as_deref_mut(),
             );
             child_assembly.refused_admissions.extend(font_admissions);
             regions.push(region);
+            focus_region_count += 1;
         } else {
             regions.push(allocate_focus_region(
                 ui,
@@ -4104,9 +4646,19 @@ where
                 geometry_index,
                 focus,
             ));
+            focus_region_count += 1;
         }
     }
+    if let Some(labels) = timing_labels {
+        push_egui_frame_timing(
+            &mut timing_samples,
+            labels.focus,
+            focus_start.elapsed(),
+            focus_region_count,
+        );
+    }
 
+    let hit_start = Instant::now();
     let mut hit_regions = view.hit_regions.iter().collect::<Vec<_>>();
     hit_regions.sort_by_key(|region| {
         (
@@ -4127,6 +4679,17 @@ where
             geometry_index,
             hit,
         ));
+    }
+    if let Some(labels) = timing_labels {
+        push_egui_frame_timing(
+            &mut timing_samples,
+            labels.hit,
+            hit_start.elapsed(),
+            regions
+                .iter()
+                .filter(|region| region.kind == EguiPresentedRegionKind::Hit)
+                .count(),
+        );
     }
 
     regions
@@ -4247,11 +4810,21 @@ fn allocate_text_edit_region<W>(
     geometry_index: &PresentationGeometryIndex,
     focus: &FocusRegionDeclaration,
     text_edit: &TextEditRegionDeclaration,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
 ) -> (EguiPresentedRegion, Vec<BackendParityAdmission>)
 where
     W: SlipwayEguiBackendChildWidget,
 {
+    let mut timing_samples = timing_samples;
+    let id = egui_text_edit_id(focus);
+    let font_install_start = Instant::now();
     let font_admissions = install_text_edit_font(ui, widget, external, local, focus, text_edit);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.text_edit.font_install",
+        font_install_start.elapsed(),
+        font_admissions.len(),
+    );
     (
         allocate_text_edit_region_without_font_policy(
             ui,
@@ -4260,8 +4833,19 @@ where
             geometry_index,
             focus,
             text_edit,
+            id,
+            timing_samples.as_deref_mut(),
         ),
         font_admissions,
+    )
+}
+
+fn egui_text_edit_id(focus: &FocusRegionDeclaration) -> egui::Id {
+    egui_region_id(
+        EguiPresentedRegionKind::TextEdit,
+        &focus.id,
+        &focus.target,
+        focus.address.as_ref(),
     )
 }
 
@@ -4272,13 +4856,11 @@ fn allocate_text_edit_region_without_font_policy(
     geometry_index: &PresentationGeometryIndex,
     focus: &FocusRegionDeclaration,
     text_edit: &TextEditRegionDeclaration,
+    id: egui::Id,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
 ) -> EguiPresentedRegion {
-    let id = egui_region_id(
-        EguiPresentedRegionKind::TextEdit,
-        &focus.id,
-        &focus.target,
-        focus.address.as_ref(),
-    );
+    let mut timing_samples = timing_samples;
+    let geometry_start = Instant::now();
     let target_rect = slipway_core::declared_target_rect_for_region_address_with_geometry_index(
         geometry_index,
         &focus.target,
@@ -4290,6 +4872,13 @@ fn allocate_text_edit_region_without_font_policy(
     let editable = focus.enabled && text_edit.selection.editable;
     let mut text = text_edit.buffer.text.clone();
     let before = text.clone();
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.text_edit.geometry",
+        geometry_start.elapsed(),
+        1,
+    );
+    let style_start = Instant::now();
     let value_color = egui_color(text_edit.visual_style.value_color);
     let background_color = egui_color(text_edit.visual_style.background_color);
     let border_color = egui_color(text_edit.visual_style.border_color);
@@ -4304,6 +4893,13 @@ fn allocate_text_edit_region_without_font_policy(
         egui_text_font_size(&text_edit.typography.style),
         egui_text_input_font_family(ui.ctx(), text_edit),
     );
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.text_edit.style",
+        style_start.elapsed(),
+        1,
+    );
+    let widget_build_start = Instant::now();
     let text_widget = if matches!(text_edit.line_mode, slipway_core::TextLineMode::MultiLine) {
         egui::TextEdit::multiline(&mut text)
             .desired_width(rect.width())
@@ -4321,12 +4917,26 @@ fn allocate_text_edit_region_without_font_policy(
             .frame(frame)
             .interactive(editable)
     };
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.text_edit.widget_build",
+        widget_build_start.elapsed(),
+        1,
+    );
+    let ui_put_start = Instant::now();
     let response = ui
         .scope(|ui| {
             apply_text_input_visuals_to_egui_scope(ui, &text_edit.visual_style);
             apply_region_cursor(ui.put(rect, text_widget.id(id)), CursorCapability::Text)
         })
         .inner;
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.text_edit.ui_put",
+        ui_put_start.elapsed(),
+        1,
+    );
+    let change_start = Instant::now();
     let text_edit_change = if response.changed() && before != text {
         Some(EguiTextEditChange {
             before,
@@ -4337,6 +4947,12 @@ fn allocate_text_edit_region_without_font_policy(
     } else {
         None
     };
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.child.text_edit.change",
+        change_start.elapsed(),
+        if text_edit_change.is_some() { 1 } else { 0 },
+    );
 
     EguiPresentedRegion {
         kind: EguiPresentedRegionKind::TextEdit,
@@ -4369,10 +4985,12 @@ fn allocate_scroll_region_with_skips<W>(
     scroll: &ScrollRegionDeclaration,
     skipped_slots: &[WidgetSlotAddress],
     native_physical_operation: Option<&DebugPhysicalControl>,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
 ) -> EguiScrollAllocation
 where
     W: SlipwayEguiBackendChildWidget,
 {
+    let mut timing_samples = timing_samples;
     if !scroll.enabled {
         return EguiScrollAllocation::default();
     }
@@ -4391,6 +5009,7 @@ where
     let target_origin = egui_point(view_origin, target_rect.origin);
     let target_bounds = target_local_bounds(target_rect);
     let viewport_rect = egui_rect(target_origin, scroll.viewport.into_rect());
+    let interact_start = Instant::now();
     let response = ui.interact(
         viewport_rect,
         id,
@@ -4400,51 +5019,86 @@ where
             egui::Sense::hover()
         },
     );
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.widget.presentation_regions.scroll.interact",
+        interact_start.elapsed(),
+        1,
+    );
+    let offset_start = Instant::now();
     let native_scroll_offset =
         egui_native_scroll_offset_for_operation(native_physical_operation, geometry_index, scroll);
-    let scroll_offset = native_scroll_offset.unwrap_or(scroll.offset);
+    let scroll_offset = clamp_declared_scroll_offset(
+        native_scroll_offset.unwrap_or(scroll.offset),
+        scroll.axes,
+        scroll.viewport.into_rect(),
+        scroll.content_bounds.into_rect(),
+    );
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.widget.presentation_regions.scroll.offset",
+        offset_start.elapsed(),
+        1,
+    );
     let mut child_assembly = EguiChildAssembly::default();
-    let output = ui
-        .scope_builder(
-            egui::UiBuilder::new()
-                .id_salt(("slipway-scroll-scope", scroll.id.as_str()))
-                .max_rect(viewport_rect),
-            |ui| {
-                egui::ScrollArea::new([scroll.axes.horizontal, scroll.axes.vertical])
-                    .id_salt(("slipway-scroll-area", scroll.id.as_str()))
-                    .scroll_offset(egui::vec2(scroll_offset.x, scroll_offset.y))
-                    .scroll_source(egui::containers::scroll_area::ScrollSource {
-                        scroll_bar: true,
-                        drag: if scroll.consumption.drag {
-                            egui::containers::scroll_area::DragScroll::Always
-                        } else {
-                            egui::containers::scroll_area::DragScroll::Never
-                        },
-                        mouse_wheel: false,
-                    })
-                    .show_viewport(ui, |content_ui, _viewport| {
-                        let content_origin =
-                            scroll_content_origin(content_ui, geometry_index, scroll);
-                        child_assembly.extend(present_authored_children(
-                            content_ui,
-                            widget,
-                            external,
-                            local,
-                            view,
-                            geometry_index,
-                            content_origin,
-                            skipped_slots,
-                            Some(scroll),
-                            native_physical_operation,
-                        ));
-                        content_ui.allocate_space(egui::vec2(
-                            scroll.content_bounds.size.width.max(0.0),
-                            scroll.content_bounds.size.height.max(0.0),
-                        ));
-                    })
-            },
-        )
-        .inner;
+    let content_origin =
+        declared_scroll_content_origin(view_origin, target_rect, scroll, scroll_offset);
+    let content_rect = declared_scroll_content_rect(content_origin, scroll);
+    let mut effective_scroll = scroll.clone();
+    effective_scroll.offset = scroll_offset;
+    let child_assembly_output = &mut child_assembly;
+    let child_scope_start = Instant::now();
+    let mut child_present_elapsed = Duration::ZERO;
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .id_salt(("slipway-scroll-scope", scroll.id.as_str()))
+            .max_rect(content_rect),
+        |content_ui| {
+            let child_present_start = Instant::now();
+            child_assembly_output.extend(present_authored_children(
+                content_ui,
+                widget,
+                external,
+                local,
+                view,
+                geometry_index,
+                content_origin,
+                skipped_slots,
+                Some(&effective_scroll),
+                native_physical_operation,
+                timing_samples.as_deref_mut(),
+            ));
+            child_present_elapsed = child_present_start.elapsed();
+            content_ui.allocate_space(content_rect.size());
+        },
+    );
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.widget.presentation_regions.scroll.children",
+        child_present_elapsed,
+        child_assembly.presented_slots.len(),
+    );
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.widget.presentation_regions.scroll.claimed_children",
+        Duration::ZERO,
+        child_assembly.claimed_slots.len(),
+    );
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.widget.presentation_regions.scroll.scope",
+        child_scope_start.elapsed(),
+        child_assembly.presented_slots.len(),
+    );
+    let clip_start = Instant::now();
+    clip_declared_scroll_child_assembly(viewport_rect, &mut child_assembly);
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.widget.presentation_regions.scroll.clip",
+        clip_start.elapsed(),
+        child_assembly.regions.len(),
+    );
+    let indicator_start = Instant::now();
     child_assembly
         .scroll_indicators
         .push(EguiScrollIndicatorPaint {
@@ -4452,7 +5106,29 @@ where
             scroll: scroll.clone(),
             offset: scroll_offset,
         });
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.widget.presentation_regions.scroll.indicator",
+        indicator_start.elapsed(),
+        1,
+    );
 
+    let state_start = Instant::now();
+    let scroll_state = EguiScrollRegionState {
+        declared_offset: scroll.offset,
+        egui_offset: scroll_offset,
+        content_size: scroll.content_bounds.size,
+        inner_rect: Rect {
+            origin: egui_position(viewport_rect.min, view_origin),
+            size: scroll.viewport.size,
+        },
+    };
+    push_egui_frame_timing(
+        &mut timing_samples,
+        "egui.widget.presentation_regions.scroll.state",
+        state_start.elapsed(),
+        1,
+    );
     EguiScrollAllocation {
         region: Some(EguiPresentedRegion {
             kind: EguiPresentedRegionKind::Scroll,
@@ -4474,27 +5150,79 @@ where
             cursor: CursorCapability::Default,
             enabled: scroll.enabled,
             text_edit_change: None,
-            scroll_state: Some(EguiScrollRegionState {
-                declared_offset: scroll.offset,
-                egui_offset: Point {
-                    x: output.state.offset.x,
-                    y: output.state.offset.y,
-                },
-                content_size: Size {
-                    width: output.content_size.x,
-                    height: output.content_size.y,
-                },
-                inner_rect: Rect {
-                    origin: egui_position(output.inner_rect.min, view_origin),
-                    size: Size {
-                        width: output.inner_rect.width(),
-                        height: output.inner_rect.height(),
-                    },
-                },
-            }),
+            scroll_state: Some(scroll_state),
         }),
         child_assembly,
     }
+}
+
+fn clip_declared_scroll_child_assembly(
+    viewport_rect: egui::Rect,
+    child_assembly: &mut EguiChildAssembly,
+) {
+    for job in &mut child_assembly.paint_jobs {
+        if job.unit.order.overflow_bounds.is_none() {
+            job.clip_rect = job.clip_rect.intersect(viewport_rect);
+        }
+    }
+    for region in &mut child_assembly.regions {
+        if region.paint_sort_key.0 <= 0 {
+            region.response.interact_rect = region.response.interact_rect.intersect(viewport_rect);
+        }
+    }
+}
+
+fn clamp_declared_scroll_offset(
+    offset: Point,
+    axes: ScrollAxes,
+    viewport: Rect,
+    content_bounds: Rect,
+) -> Point {
+    let max_x = (content_bounds.size.width - viewport.size.width).max(0.0);
+    let max_y = (content_bounds.size.height - viewport.size.height).max(0.0);
+    Point {
+        x: if axes.horizontal {
+            offset.x.clamp(0.0, max_x)
+        } else {
+            0.0
+        },
+        y: if axes.vertical {
+            offset.y.clamp(0.0, max_y)
+        } else {
+            0.0
+        },
+    }
+}
+
+fn declared_scroll_content_origin(
+    view_origin: egui::Pos2,
+    target_rect: Rect,
+    scroll: &ScrollRegionDeclaration,
+    scroll_offset: Point,
+) -> egui::Pos2 {
+    let viewport = scroll.viewport.into_rect();
+    let content_bounds = scroll.content_bounds.into_rect();
+    egui::pos2(
+        view_origin.x + target_rect.origin.x + viewport.origin.x
+            - content_bounds.origin.x
+            - scroll_offset.x,
+        view_origin.y + target_rect.origin.y + viewport.origin.y
+            - content_bounds.origin.y
+            - scroll_offset.y,
+    )
+}
+
+fn declared_scroll_content_rect(
+    content_origin: egui::Pos2,
+    scroll: &ScrollRegionDeclaration,
+) -> egui::Rect {
+    egui::Rect::from_min_size(
+        content_origin,
+        egui::vec2(
+            scroll.content_bounds.size.width.max(0.0),
+            scroll.content_bounds.size.height.max(0.0),
+        ),
+    )
 }
 
 fn child_layout_input(bounds: Rect) -> LayoutInput {
@@ -4864,6 +5592,39 @@ fn scroll_contains_placement_with_geometry_index(
         scroll.address.as_ref(),
         scroll.viewport.into_rect(),
     );
+    let offset = clamp_declared_scroll_offset(
+        scroll.offset,
+        scroll.axes,
+        scroll.viewport.into_rect(),
+        scroll.content_bounds.into_rect(),
+    );
+    let visible_content = Rect {
+        origin: Point {
+            x: content_bounds.origin.x + offset.x,
+            y: content_bounds.origin.y + offset.y,
+        },
+        size: viewport.size,
+    };
+    rects_intersect(visible_content, placement.bounds.into_rect())
+}
+
+fn scroll_owns_placement_with_geometry_index(
+    geometry_index: &PresentationGeometryIndex,
+    scroll: &ScrollRegionDeclaration,
+    placement: &ChildPlacement,
+) -> bool {
+    let content_bounds = slipway_core::declared_region_root_local_rect_with_geometry_index(
+        geometry_index,
+        &scroll.target,
+        scroll.address.as_ref(),
+        scroll.content_bounds.into_rect(),
+    );
+    let viewport = slipway_core::declared_region_root_local_rect_with_geometry_index(
+        geometry_index,
+        &scroll.target,
+        scroll.address.as_ref(),
+        scroll.viewport.into_rect(),
+    );
     rects_intersect(content_bounds, placement.bounds.into_rect())
         || rects_intersect(viewport, placement.bounds.into_rect())
 }
@@ -4879,21 +5640,6 @@ fn rects_intersect(a: Rect, b: Rect) -> bool {
     let b_max_y = b.origin.y + b.size.height.max(0.0);
 
     a_min_x < b_max_x && a_max_x > b_min_x && a_min_y < b_max_y && a_max_y > b_min_y
-}
-
-fn scroll_content_origin(
-    ui: &egui::Ui,
-    geometry_index: &PresentationGeometryIndex,
-    scroll: &ScrollRegionDeclaration,
-) -> egui::Pos2 {
-    let min = ui.max_rect().min;
-    let viewport = slipway_core::declared_region_root_local_rect_with_geometry_index(
-        geometry_index,
-        &scroll.target,
-        scroll.address.as_ref(),
-        scroll.viewport.into_rect(),
-    );
-    egui::pos2(min.x - viewport.origin.x, min.y - viewport.origin.y)
 }
 
 fn paint_declared_scroll_indicator(
@@ -5415,6 +6161,25 @@ where
     }
 }
 
+fn egui_backend_input_contract_refusal<M>(
+    view: &ViewDefinition,
+    input: &BackendInputEvent,
+) -> Option<EventOutcome<M>> {
+    let diagnostics = slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+        view,
+        input,
+        Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+        Some(EGUI_BACKEND_ID),
+    );
+    if !view_definition_has_blocking_contract_diagnostic(&diagnostics) {
+        return None;
+    }
+
+    let mut outcome = EventOutcome::ignored();
+    outcome.diagnostics = diagnostics;
+    Some(outcome)
+}
+
 fn compact_egui_backend_trace_changes(changes: &[ChangeEvidence]) -> Vec<ChangeEvidence> {
     changes
         .iter()
@@ -5810,7 +6575,21 @@ fn install_declared_fonts<W>(
 where
     W: SlipwayEguiBackendChildWidget,
 {
+    install_declared_fonts_with_metrics(ui, widget, external, local, view).0
+}
+
+fn install_declared_fonts_with_metrics<W>(
+    ui: &egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    view: &ViewDefinition,
+) -> (Vec<BackendParityAdmission>, EguiFontInstallMetrics)
+where
+    W: SlipwayEguiBackendChildWidget,
+{
     let mut diagnostics = Vec::new();
+    let mut metrics = EguiFontInstallMetrics::default();
 
     visit_text_paint_entries(&view.paint, &mut |content, style| {
         collect_font_installation_diagnostics(
@@ -5823,10 +6602,14 @@ where
             style,
             None,
             &mut diagnostics,
+            &mut metrics,
         );
     });
 
-    font_installation_admissions(view.target.clone(), diagnostics)
+    (
+        font_installation_admissions(view.target.clone(), diagnostics),
+        metrics,
+    )
 }
 
 fn install_text_edit_font<W>(
@@ -5841,6 +6624,7 @@ where
     W: SlipwayEguiBackendChildWidget,
 {
     let mut diagnostics = Vec::new();
+    let mut metrics = EguiFontInstallMetrics::default();
     collect_font_installation_diagnostics(
         ui.ctx(),
         widget,
@@ -5851,6 +6635,7 @@ where
         &text_edit.typography.style,
         text_edit.typography.source.as_ref(),
         &mut diagnostics,
+        &mut metrics,
     );
     font_installation_admissions(focus.target.clone(), diagnostics)
 }
@@ -5865,6 +6650,7 @@ fn collect_font_installation_diagnostics<W>(
     style: &TextStyle,
     source: Option<&ResourceSourceDeclaration>,
     diagnostics: &mut Vec<Diagnostic>,
+    metrics: &mut EguiFontInstallMetrics,
 ) where
     W: SlipwayEguiBackendChildWidget,
 {
@@ -5891,22 +6677,26 @@ fn collect_font_installation_diagnostics<W>(
             source,
         ));
     }
-    results.push(install_font_from_evidence(
+    let result = install_font_from_evidence(
         ctx,
         evidence.resolved_ref.as_deref(),
         evidence.request.source.as_ref(),
-    ));
+    );
+    metrics.record(result.status);
+    results.push(result);
     if let Some(installation) = &evidence.installation {
         let duplicate = installation.source.as_ref().is_some_and(|source| {
             let key = egui_font_install_key(Some(&installation.resource_id), source);
             installed_keys.iter().any(|installed| installed == &key)
         });
         if !duplicate {
-            results.push(install_font_from_evidence(
+            let result = install_font_from_evidence(
                 ctx,
                 Some(&installation.resource_id),
                 installation.source.as_ref(),
-            ));
+            );
+            metrics.record(result.status);
+            results.push(result);
         }
     }
 
@@ -5965,6 +6755,41 @@ enum EguiFontInstallStatus {
     MissingAssetRef,
     ReadFailed,
     UnsupportedSource,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct EguiFontInstallMetrics {
+    queued: usize,
+    installed: usize,
+    already_installed: usize,
+    missing_source: usize,
+    missing_asset_ref: usize,
+    read_failed: usize,
+    unsupported_source: usize,
+}
+
+impl EguiFontInstallMetrics {
+    fn record(&mut self, status: EguiFontInstallStatus) {
+        match status {
+            EguiFontInstallStatus::Queued => self.queued += 1,
+            EguiFontInstallStatus::Installed => self.installed += 1,
+            EguiFontInstallStatus::AlreadyInstalled => self.already_installed += 1,
+            EguiFontInstallStatus::MissingSource => self.missing_source += 1,
+            EguiFontInstallStatus::MissingAssetRef => self.missing_asset_ref += 1,
+            EguiFontInstallStatus::ReadFailed => self.read_failed += 1,
+            EguiFontInstallStatus::UnsupportedSource => self.unsupported_source += 1,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.queued
+            + self.installed
+            + self.already_installed
+            + self.missing_source
+            + self.missing_asset_ref
+            + self.read_failed
+            + self.unsupported_source
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7753,7 +8578,7 @@ mod tests {
         ) -> slipway_core::TextInputTypographyDeclaration {
             slipway_core::TextInputTypographyDeclaration::explicit(
                 self.id.clone(),
-                TextStyle::default().with_font_family("system-ui"),
+                TextStyle::plain().with_font_family("system-ui"),
             )
         }
     }
@@ -12448,7 +13273,7 @@ mod tests {
                 &mut child_assembly,
                 None,
             );
-            let skipped_slots = child_assembly.presented_slots.clone();
+            let skipped_slots = child_assembly.claimed_slots.clone();
             child_assembly.extend(present_authored_children(
                 ui,
                 &widget,
@@ -12458,6 +13283,7 @@ mod tests {
                 &geometry_index,
                 surface_rect.min,
                 &skipped_slots,
+                None,
                 None,
                 None,
             ));
@@ -12540,6 +13366,7 @@ mod tests {
                 &[],
                 None,
                 None,
+                None,
             );
 
             assert!(output.regions.is_empty());
@@ -12613,6 +13440,7 @@ mod tests {
                 parent_geometry_index: &geometry_index,
                 scroll: None,
                 native_physical_operation: None,
+                timing_samples: None,
                 output: EguiChildAssembly::default(),
             };
 
@@ -12909,7 +13737,7 @@ mod tests {
                 allocated_scroll_region = regions
                     .iter()
                     .any(|region| region.kind == EguiPresentedRegionKind::Scroll);
-                let skipped_slots = child_assembly.presented_slots.clone();
+                let skipped_slots = child_assembly.claimed_slots.clone();
                 child_assembly.extend(present_authored_children(
                     ui,
                     &widget,
@@ -12919,6 +13747,7 @@ mod tests {
                     &geometry_index,
                     surface_rect.min,
                     &skipped_slots,
+                    None,
                     None,
                     None,
                 ));
@@ -13056,6 +13885,7 @@ mod tests {
                     &[],
                     None,
                     None,
+                    None,
                 );
 
                 paint_egui_jobs(ui, &mut assembly.paint_jobs);
@@ -13146,6 +13976,7 @@ mod tests {
                     &geometry_index,
                     surface_rect.min,
                     &[],
+                    None,
                     None,
                     None,
                 );
@@ -13240,6 +14071,7 @@ mod tests {
                     &geometry_index,
                     surface_rect.min,
                     &[],
+                    None,
                     None,
                     None,
                 );
@@ -13352,6 +14184,7 @@ mod tests {
                     &[],
                     None,
                     None,
+                    None,
                 );
                 paint_egui_jobs(ui, &mut assembly.paint_jobs);
                 selected_region =
@@ -13457,6 +14290,7 @@ mod tests {
                     &geometry_index,
                     surface_rect.min,
                     &[],
+                    None,
                     None,
                     None,
                 );
@@ -13701,10 +14535,26 @@ mod tests {
     fn earlier_scroll_explicit_overlay_flushes_after_later_lower_phase_and_routes_hit() {
         let high_color = test_rgb(14, 165, 233);
         let low_color = test_rgb(244, 114, 182);
+        let high_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 50.0,
+                height: 50.0,
+            },
+        };
         let widget = LayeredPaintApp {
             children: (
                 LayeredPaintChild::new("egui.scroll-high-explicit", 12, Some(0))
-                    .with_color(high_color),
+                    .with_color(high_color)
+                    .with_overflow_bounds(high_bounds)
+                    .with_hit_region(
+                        high_bounds,
+                        HitRegionOrder {
+                            z_index: 12,
+                            paint_order: 0,
+                            traversal_order: 0,
+                        },
+                    ),
                 LayeredPaintChild::new("egui.later-low-explicit", 2, Some(0)).with_color(low_color),
             ),
             root_fill: None,
@@ -13796,7 +14646,7 @@ mod tests {
                     &mut child_assembly,
                     None,
                 );
-                let skipped_slots = child_assembly.presented_slots.clone();
+                let skipped_slots = child_assembly.claimed_slots.clone();
                 child_assembly.extend(present_authored_children(
                     ui,
                     &widget,
@@ -13806,6 +14656,7 @@ mod tests {
                     &geometry_index,
                     surface_rect.min,
                     &skipped_slots,
+                    None,
                     None,
                     None,
                 ));
@@ -13918,6 +14769,7 @@ mod tests {
                         &[],
                         None,
                         None,
+                        None,
                     );
                     paint_egui_jobs(ui, &mut assembly.paint_jobs);
                 });
@@ -14026,6 +14878,7 @@ mod tests {
                 &[],
                 None,
                 None,
+                None,
             );
             paint_egui_jobs(ui, &mut assembly.paint_jobs);
             let hit_point = egui::pos2(surface_rect.min.x + 24.0, surface_rect.min.y + 24.0);
@@ -14103,6 +14956,7 @@ mod tests {
                 &geometry_index,
                 surface_rect.min,
                 &[],
+                None,
                 None,
                 None,
             );
@@ -14190,7 +15044,7 @@ mod tests {
                 &mut child_assembly,
                 None,
             );
-            let skipped_slots = child_assembly.presented_slots.clone();
+            let skipped_slots = child_assembly.claimed_slots.clone();
             child_assembly.extend(present_authored_children(
                 ui,
                 &widget,
@@ -14200,6 +15054,7 @@ mod tests {
                 &geometry_index,
                 surface_rect.min,
                 &skipped_slots,
+                None,
                 None,
                 None,
             ));
@@ -14252,22 +15107,33 @@ mod tests {
     }
 
     #[test]
-    fn scroll_background_response_is_registered_before_scroll_content() {
+    fn scroll_background_response_is_registered_before_declared_scroll_content() {
         let source = include_str!("lib.rs");
         let scroll_fn = source
             .find("fn allocate_scroll_region_with_skips")
             .expect("scroll allocation function is present");
-        let scroll_body = &source[scroll_fn..];
+        let scroll_end = source[scroll_fn..]
+            .find("\nfn clip_declared_scroll_child_assembly")
+            .expect("next scroll helper is present")
+            + scroll_fn;
+        let scroll_body = &source[scroll_fn..scroll_end];
         let response_interact = scroll_body
             .find("let response = ui.interact(")
             .expect("scroll response interact is present");
-        let show_viewport = scroll_body
-            .find(".show_viewport(ui, |content_ui, _viewport| {")
-            .expect("scroll content show_viewport is present");
+        let content_origin = scroll_body
+            .find("declared_scroll_content_origin(")
+            .expect("declared scroll content origin is present");
+        let child_presentation = scroll_body
+            .find("present_authored_children(")
+            .expect("declared scroll content child presentation is present");
 
         assert!(
-            response_interact < show_viewport,
-            "egui scroll background interaction must be registered before show_viewport content"
+            response_interact < content_origin && content_origin < child_presentation,
+            "egui scroll response must be registered before declared content origin and child presentation"
+        );
+        assert!(
+            !scroll_body.contains(".show_viewport(ui,"),
+            "declared scroll presenter must not delegate authority to egui ScrollArea::show_viewport"
         );
     }
 
@@ -15012,14 +15878,14 @@ mod tests {
 
         let custom = TextStyle {
             font_family: "Inter".to_string(),
-            ..TextStyle::default()
+            ..TextStyle::plain()
         };
         assert_eq!(egui_font_family(&custom), egui::FontFamily::Proportional);
     }
 
     #[test]
     fn egui_default_text_style_stays_plain() {
-        let style = TextStyle::default();
+        let style = TextStyle::plain();
         let format = egui_text_format(egui::Color32::BLACK, &style);
         let job = egui_text_layout_job("plain", egui::Color32::BLACK, &style, 42.0);
 
@@ -15051,7 +15917,7 @@ mod tests {
             .text_edit
             .as_mut()
             .expect("test focus has a text edit");
-        text_edit.typography.style = TextStyle::default().with_font_family("system-ui");
+        text_edit.typography.style = TextStyle::plain().with_font_family("system-ui");
         text_edit.typography.source = Some(ResourceSourceDeclaration {
             source_id: "authored-cjk".to_string(),
             kind: ResourceSourceKind::Asset,
@@ -15108,7 +15974,7 @@ mod tests {
                     blue: 0.0,
                     alpha: 1.0,
                 },
-                style: TextStyle::default(),
+                style: TextStyle::plain(),
             }],
             paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
             hit_regions: Vec::new(),
@@ -15177,7 +16043,7 @@ mod tests {
                 .text_edit
                 .as_mut()
                 .expect("test focus has a text edit");
-            text_edit.typography.style = TextStyle::default().with_font_family("AuthoredInputCjk");
+            text_edit.typography.style = TextStyle::plain().with_font_family("AuthoredInputCjk");
             text_edit.typography.source = Some(ResourceSourceDeclaration {
                 source_id: "authored-input-cjk".to_string(),
                 kind: ResourceSourceKind::Asset,
@@ -15958,7 +16824,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_app_delivers_bridge_input_without_runtime_evidence_gate() {
+    fn runtime_app_refuses_direct_bridge_input_before_runtime_mutation() {
         let applied = Rc::new(Cell::new(0usize));
         let applied_for_reducer = Rc::clone(&applied);
         let mut app = SlipwayEguiRuntimeApp::new(
@@ -15975,18 +16841,21 @@ mod tests {
 
         assert_eq!(
             *app.runtime().local_state(),
-            8,
-            "runtime must not re-block backend bridge input after the backend emits it"
+            7,
+            "direct backend bridge input must not mutate without dispatch evidence"
         );
-        assert_eq!(applied.get(), 1);
+        assert_eq!(applied.get(), 0);
         let traces = app.runtime().backend_input_traces().collect::<Vec<_>>();
         assert_eq!(traces.len(), 1);
-        assert!(traces[0].handled);
+        assert!(!traces[0].handled);
         assert!(traces[0].input.dispatch_evidence.is_none());
+        assert!(traces[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_MISSING
+        }));
     }
 
     #[test]
-    fn runtime_app_delivers_declared_backend_input_without_runtime_evidence_gate() {
+    fn runtime_app_refuses_forged_declared_backend_input_before_runtime_mutation() {
         let applied = Rc::new(Cell::new(0usize));
         let applied_for_reducer = Rc::clone(&applied);
         let mut app = SlipwayEguiRuntimeApp::new(
@@ -16003,13 +16872,13 @@ mod tests {
 
         assert_eq!(
             *app.runtime().local_state(),
-            8,
-            "runtime must not re-block declared backend input after the backend emits it"
+            7,
+            "forged declared backend input must not mutate"
         );
-        assert_eq!(applied.get(), 1);
+        assert_eq!(applied.get(), 0);
         let traces = app.runtime().backend_input_traces().collect::<Vec<_>>();
         assert_eq!(traces.len(), 1);
-        assert!(traces[0].handled);
+        assert!(!traces[0].handled);
         assert_eq!(
             traces[0]
                 .input
@@ -16018,6 +16887,9 @@ mod tests {
                 .and_then(|evidence| evidence.selected_region.as_ref()),
             Some(&PresentationRegionId::from("forged-hit"))
         );
+        assert!(traces[0].diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_REGION_MISMATCH
+        }));
     }
 
     #[test]
@@ -16075,7 +16947,7 @@ mod tests {
     }
 
     #[test]
-    fn handled_slipway_wheel_still_suppresses_root_fallback() {
+    fn direct_slipway_wheel_does_not_suppress_root_fallback() {
         let mut app = SlipwayEguiRuntimeApp::new(
             SlipwayRuntime::new(TallRootWidget::new(2_000.0), ()),
             HandledWheelBridge::default(),
@@ -16085,11 +16957,10 @@ mod tests {
 
         let _ = ctx.run_ui(raw_wheel_input(-10.0), |ui| app.render_ui(ui));
 
-        assert_eq!(*app.runtime().local_state(), 1);
+        assert_eq!(*app.runtime().local_state(), 0);
         assert_eq!(
-            app.root_scroll_offset,
-            egui::Vec2::ZERO,
-            "handled Slipway wheel traces must suppress root fallback scrolling"
+            app.root_scroll_offset.y, 10.0,
+            "direct Slipway wheel without dispatch evidence must not suppress root fallback scrolling"
         );
     }
 

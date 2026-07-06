@@ -8,7 +8,8 @@ use slipway_core::{
     ProbeRequest, Rect, RenderEvidence, RenderPacket, RenderRefusal, Size, SlipwayApp,
     SlipwayAppLocalState, SlipwayAppWidget, SlipwayAuthoredWidget, SlipwayEventDispositionPolicy,
     SlipwayEventRoutingPolicy, SlipwayOffscreenRenderer, SlipwayViewDefinition, SlipwayWidgetTypes,
-    TargetLocalRect, TextEditEvent, TextEditKind, TextSelectionRange, WidgetId, WidgetSlot,
+    TargetLocalRect, TextEditEvent, TextEditKind, TextSelectionRange, ViewDefinitionInput,
+    WidgetId, WidgetSlot,
 };
 #[cfg(test)]
 use slipway_core::{EventRoute, EventRoutePhase, FocusRegionDeclaration, WidgetSlotAddress};
@@ -914,19 +915,6 @@ where
         self.backend_input_traces.back().map(|trace| &trace.input)
     }
 
-    pub fn record_backend_input_event(&mut self, event: BackendInputEvent) {
-        self.record_backend_input_trace(BackendInputTrace {
-            input: event,
-            handled: false,
-            revision_before: None,
-            revision_after: None,
-            emitted_messages: Vec::new(),
-            local_state: Vec::new(),
-            changes: Vec::new(),
-            diagnostics: Vec::new(),
-        });
-    }
-
     pub fn last_backend_input_trace(&self) -> Option<&BackendInputTrace> {
         self.backend_input_traces.back()
     }
@@ -935,8 +923,26 @@ where
         self.backend_input_traces.iter()
     }
 
-    pub fn record_backend_input_trace(&mut self, trace: BackendInputTrace) {
+    fn record_backend_input_trace(&mut self, trace: BackendInputTrace) {
         push_backend_input_trace(&mut self.backend_input_traces, trace);
+    }
+
+    pub fn record_backend_input_trace_for_backend(
+        &mut self,
+        mut trace: BackendInputTrace,
+        expected_backend_id: &str,
+    ) where
+        W: SlipwayViewDefinition,
+    {
+        let contract_diagnostics = self.backend_input_contract_diagnostics_for_backend(
+            &trace.input,
+            Some(expected_backend_id),
+        );
+        if diagnostics_have_blocking_contract_error(&contract_diagnostics) {
+            trace.handled = false;
+            trace.diagnostics.extend(contract_diagnostics);
+        }
+        self.record_backend_input_trace(trace);
     }
 
     pub fn with_widget_state_mut<R>(
@@ -1002,6 +1008,12 @@ where
         }
     }
 
+    /// Applies a semantic event directly to the authored widget.
+    ///
+    /// This is not visible-backend physical input and must not be used as proof
+    /// that a real iced/egui pointer, wheel, focus, or text operation worked.
+    /// Backend-presented physical evidence must enter through a selected
+    /// backend path that supplies declared dispatch evidence and a backend id.
     pub fn apply_input_event(&mut self, event: InputEvent) -> EventOutcome<W::AppMessage> {
         let outcome =
             self.slot
@@ -1013,14 +1025,48 @@ where
         outcome
     }
 
-    pub fn apply_backend_input_event(
+    pub fn apply_backend_input_event_for_backend(
         &mut self,
         event: BackendInputEvent,
+        expected_backend_id: &str,
+    ) -> EventOutcome<W::AppMessage>
+    where
+        W: SlipwayEventRoutingPolicy + SlipwayEventDispositionPolicy + SlipwayViewDefinition,
+    {
+        self.apply_backend_input_event_inner(event, Some(expected_backend_id))
+    }
+
+    #[cfg(test)]
+    fn apply_backend_input_event(&mut self, event: BackendInputEvent) -> EventOutcome<W::AppMessage>
+    where
+        W: SlipwayEventRoutingPolicy + SlipwayEventDispositionPolicy + SlipwayViewDefinition,
+    {
+        self.apply_backend_input_event_inner(event, None)
+    }
+
+    fn apply_backend_input_event_inner(
+        &mut self,
+        event: BackendInputEvent,
+        expected_backend_id: Option<&str>,
     ) -> EventOutcome<W::AppMessage>
     where
         W: SlipwayEventRoutingPolicy + SlipwayEventDispositionPolicy + SlipwayViewDefinition,
     {
         let revision_before = self.revision;
+        let contract_diagnostics =
+            self.backend_input_contract_diagnostics_for_backend(&event, expected_backend_id);
+        if diagnostics_have_blocking_contract_error(&contract_diagnostics) {
+            let mut outcome = EventOutcome::ignored();
+            outcome.diagnostics = contract_diagnostics;
+            self.record_backend_input_trace(self.backend_trace_from_outcome(
+                event,
+                &outcome,
+                Some(revision_before),
+                Some(self.revision),
+                Vec::new(),
+            ));
+            return outcome;
+        }
         let input = event.event.clone();
         let declaration = slipway_core::declared_event_handling(
             &self.slot.widget,
@@ -1060,7 +1106,25 @@ where
         outcome
     }
 
-    pub fn apply_backend_input_event_with_app_reducer<F>(
+    pub fn apply_backend_input_event_for_backend_with_app_reducer<F>(
+        &mut self,
+        event: BackendInputEvent,
+        expected_backend_id: &str,
+        apply: &mut F,
+    ) -> SlipwayBackendInputApplyReport
+    where
+        W: SlipwayEventRoutingPolicy + SlipwayEventDispositionPolicy + SlipwayViewDefinition,
+        F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+    {
+        self.apply_backend_input_event_for_backend_with_app_reducer_inner(
+            event,
+            Some(expected_backend_id),
+            apply,
+        )
+    }
+
+    #[cfg(test)]
+    fn apply_backend_input_event_with_app_reducer<F>(
         &mut self,
         event: BackendInputEvent,
         apply: &mut F,
@@ -1069,7 +1133,39 @@ where
         W: SlipwayEventRoutingPolicy + SlipwayEventDispositionPolicy + SlipwayViewDefinition,
         F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
     {
+        self.apply_backend_input_event_for_backend_with_app_reducer_inner(event, None, apply)
+    }
+
+    fn apply_backend_input_event_for_backend_with_app_reducer_inner<F>(
+        &mut self,
+        event: BackendInputEvent,
+        expected_backend_id: Option<&str>,
+        apply: &mut F,
+    ) -> SlipwayBackendInputApplyReport
+    where
+        W: SlipwayEventRoutingPolicy + SlipwayEventDispositionPolicy + SlipwayViewDefinition,
+        F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+    {
         let revision_before = self.revision;
+        let contract_diagnostics =
+            self.backend_input_contract_diagnostics_for_backend(&event, expected_backend_id);
+        if diagnostics_have_blocking_contract_error(&contract_diagnostics) {
+            let mut outcome = EventOutcome::ignored();
+            outcome.diagnostics = contract_diagnostics;
+            self.record_backend_input_trace(self.backend_trace_from_outcome(
+                event,
+                &outcome,
+                Some(revision_before),
+                Some(self.revision),
+                Vec::new(),
+            ));
+            return SlipwayBackendInputApplyReport {
+                handled: false,
+                emitted_messages: 0,
+                applied_messages: 0,
+                diagnostics: outcome.diagnostics,
+            };
+        }
         let input = event.event.clone();
         let declaration = slipway_core::declared_event_handling(
             &self.slot.widget,
@@ -1131,6 +1227,46 @@ where
             applied_messages,
             diagnostics: outcome.diagnostics,
         }
+    }
+
+    fn backend_input_contract_diagnostics_for_backend(
+        &self,
+        event: &BackendInputEvent,
+        expected_backend_id: Option<&str>,
+    ) -> Vec<Diagnostic>
+    where
+        W: SlipwayViewDefinition,
+    {
+        let Some(_evidence) = event.dispatch_evidence.as_ref() else {
+            return vec![
+                slipway_core::backend_input_dispatch_evidence_missing_diagnostic(&event.event),
+            ];
+        };
+        let frame = self.last_frame_identity();
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(frame.viewport),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: frame.viewport.size,
+            },
+        };
+        let view = self.slot.widget.visible_backend_view_definition(
+            &self.external,
+            &self.slot.local_state,
+            ViewDefinitionInput {
+                frame,
+                layout_input,
+            },
+        );
+        slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+            &view,
+            event,
+            Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+            expected_backend_id,
+        )
     }
 
     fn backend_trace_from_outcome(
@@ -1840,10 +1976,55 @@ where
         owner.handle_debug_command(command)
     }
 
-    pub fn handle_backend_presented_physical_control_with_app_reducer<F>(
+    pub fn handle_backend_presented_physical_control_for_backend_with_app_reducer<F>(
         &mut self,
         command: DebugCommand,
         backend_input: BackendInputEvent,
+        expected_backend_id: &str,
+        apply: &mut F,
+    ) -> DebugReplyProduct
+    where
+        W: slipway_core::SlipwayViewDefinition
+            + SlipwayEventRoutingPolicy
+            + SlipwayEventDispositionPolicy,
+        W::LocalState: Clone,
+        F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+    {
+        self.handle_backend_presented_physical_control_for_backend_with_app_reducer_inner(
+            command,
+            backend_input,
+            Some(expected_backend_id),
+            apply,
+        )
+    }
+
+    #[cfg(test)]
+    fn handle_backend_presented_physical_control_with_app_reducer<F>(
+        &mut self,
+        command: DebugCommand,
+        backend_input: BackendInputEvent,
+        apply: &mut F,
+    ) -> DebugReplyProduct
+    where
+        W: slipway_core::SlipwayViewDefinition
+            + SlipwayEventRoutingPolicy
+            + SlipwayEventDispositionPolicy,
+        W::LocalState: Clone,
+        F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+    {
+        self.handle_backend_presented_physical_control_for_backend_with_app_reducer_inner(
+            command,
+            backend_input,
+            None,
+            apply,
+        )
+    }
+
+    fn handle_backend_presented_physical_control_for_backend_with_app_reducer_inner<F>(
+        &mut self,
+        command: DebugCommand,
+        backend_input: BackendInputEvent,
+        expected_backend_id: Option<&str>,
         apply: &mut F,
     ) -> DebugReplyProduct
     where
@@ -1889,6 +2070,19 @@ where
             });
         }
 
+        if let Some(expected_backend_id) = expected_backend_id {
+            if dispatch_evidence.source.backend_id.as_deref() != Some(expected_backend_id) {
+                return DebugReplyProduct::Error(DebugFailure {
+                    code: "backend-physical-control-backend-mismatch".to_string(),
+                    message: format!(
+                        "backend-presented physical ingress backend `{:?}` did not match expected `{}`",
+                        dispatch_evidence.source.backend_id, expected_backend_id
+                    ),
+                    dispatch_evidence: Some(dispatch_evidence),
+                });
+            }
+        }
+
         if dispatch_evidence.frame != frame {
             return DebugReplyProduct::Error(DebugFailure {
                 code: "backend-physical-control-frame-mismatch".to_string(),
@@ -1922,7 +2116,11 @@ where
             });
         }
 
-        self.apply_backend_input_event_with_app_reducer(backend_input, apply);
+        self.apply_backend_input_event_for_backend_with_app_reducer_inner(
+            backend_input,
+            expected_backend_id,
+            apply,
+        );
         let Some(trace) = self.last_backend_input_trace().cloned() else {
             return DebugReplyProduct::Error(DebugFailure {
                 code: "backend-physical-control-visible-trace-missing".to_string(),
@@ -1933,16 +2131,40 @@ where
             });
         };
 
-        self.backend_presented_physical_control_product_from_trace(
+        self.backend_presented_physical_control_product_from_trace_inner(
             DebugCommand::physical_control_with_trace(request_id, frame, operation),
             &trace,
+            expected_backend_id,
         )
     }
 
-    pub fn backend_presented_physical_control_product_from_trace(
+    pub fn backend_presented_physical_control_product_from_trace_for_backend(
         &self,
         command: DebugCommand,
         trace: &BackendInputTrace,
+        expected_backend_id: &str,
+    ) -> DebugReplyProduct {
+        self.backend_presented_physical_control_product_from_trace_inner(
+            command,
+            trace,
+            Some(expected_backend_id),
+        )
+    }
+
+    #[cfg(test)]
+    fn backend_presented_physical_control_product_from_trace(
+        &self,
+        command: DebugCommand,
+        trace: &BackendInputTrace,
+    ) -> DebugReplyProduct {
+        self.backend_presented_physical_control_product_from_trace_inner(command, trace, None)
+    }
+
+    fn backend_presented_physical_control_product_from_trace_inner(
+        &self,
+        command: DebugCommand,
+        trace: &BackendInputTrace,
+        expected_backend_id: Option<&str>,
     ) -> DebugReplyProduct {
         let DebugCommand {
             request_id,
@@ -1961,7 +2183,7 @@ where
             });
         };
 
-        let Some(mut dispatch_evidence) = trace.input.dispatch_evidence.clone() else {
+        let Some(dispatch_evidence) = trace.input.dispatch_evidence.clone() else {
             return DebugReplyProduct::Error(DebugFailure {
                 code: "backend-physical-control-dispatch-evidence-required".to_string(),
                 message:
@@ -1981,16 +2203,27 @@ where
             });
         }
 
-        if dispatch_evidence.frame.viewport != frame.viewport {
+        if let Some(expected_backend_id) = expected_backend_id {
+            if dispatch_evidence.source.backend_id.as_deref() != Some(expected_backend_id) {
+                return DebugReplyProduct::Error(DebugFailure {
+                    code: "backend-physical-control-backend-mismatch".to_string(),
+                    message: format!(
+                        "backend-presented physical trace backend `{:?}` did not match expected `{}`",
+                        dispatch_evidence.source.backend_id, expected_backend_id
+                    ),
+                    dispatch_evidence: Some(dispatch_evidence),
+                });
+            }
+        }
+
+        if dispatch_evidence.frame != frame {
             return DebugReplyProduct::Error(DebugFailure {
                 code: "backend-physical-control-frame-mismatch".to_string(),
-                message:
-                    "backend-presented physical trace viewport must match the MCP command frame"
-                        .to_string(),
+                message: "backend-presented physical trace frame must match the MCP command frame"
+                    .to_string(),
                 dispatch_evidence: Some(dispatch_evidence),
             });
         }
-        dispatch_evidence.frame = frame.clone();
 
         if dispatch_evidence.generated_event.as_ref() != Some(&trace.input.event) {
             return DebugReplyProduct::Error(DebugFailure {
@@ -2079,6 +2312,15 @@ where
             input.dispatch_evidence.as_ref(),
         )
     }
+}
+
+fn diagnostics_have_blocking_contract_error(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.severity,
+            DiagnosticSeverity::Error | DiagnosticSeverity::Unsupported
+        )
+    })
 }
 
 pub struct RuntimeDebugOwner<'a, W>
@@ -3431,7 +3673,7 @@ mod tests {
         ) -> slipway_core::TextInputTypographyDeclaration {
             slipway_core::TextInputTypographyDeclaration::explicit(
                 self.id.clone(),
-                slipway_core::TextStyle::default().with_font_family("system-ui"),
+                slipway_core::TextStyle::plain().with_font_family("system-ui"),
             )
         }
     }
@@ -4920,7 +5162,7 @@ mod tests {
                     blue: 0.3,
                     alpha: 1.0,
                 },
-                style: TextStyle::default(),
+                style: TextStyle::plain(),
             }]
         }
 
@@ -5050,7 +5292,7 @@ mod tests {
                     blue: 0.1,
                     alpha: 1.0,
                 },
-                style: TextStyle::default(),
+                style: TextStyle::plain(),
             }]
         }
 
@@ -5141,7 +5383,7 @@ mod tests {
                     blue: 0.0,
                     alpha: 1.0,
                 },
-                style: TextStyle::default(),
+                style: TextStyle::plain(),
             }]
         }
 
@@ -5358,7 +5600,7 @@ mod tests {
     fn backend_presented_physical_press(
         runtime: &SlipwayRuntime<PhysicalProbeWidget>,
     ) -> BackendInputEvent {
-        backend_presented_physical_press_for_frame(runtime, frame(35))
+        backend_presented_physical_press_for_frame(runtime, runtime.last_frame_identity())
     }
 
     fn backend_presented_physical_press_for_frame(
@@ -5415,7 +5657,7 @@ mod tests {
     fn backend_presented_clone_counting_physical_press(
         runtime: &SlipwayRuntime<CloneCountingPhysicalProbeWidget>,
     ) -> BackendInputEvent {
-        let frame = frame(35);
+        let frame = runtime.last_frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
@@ -5455,9 +5697,9 @@ mod tests {
 
     fn backend_presented_mismatch_press(
         runtime: &SlipwayRuntime<PhysicalMismatchWidget>,
-        frame_index: u64,
+        _frame_index: u64,
     ) -> BackendInputEvent {
-        let frame = frame(frame_index);
+        let frame = runtime.last_frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
@@ -5820,9 +6062,149 @@ mod tests {
     }
 
     #[test]
+    fn backend_presented_ingress_for_backend_refuses_wrong_backend_id_before_handler() {
+        let mut runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
+        let backend_input = backend_presented_physical_press(&runtime);
+
+        let outcome = runtime.apply_backend_input_event_for_backend(backend_input, "iced");
+
+        assert_eq!(runtime.local_state().presses, 0);
+        assert!(!outcome.handled);
+        assert!(outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_SOURCE_MISMATCH
+        }));
+    }
+
+    #[test]
+    fn backend_presented_physical_control_for_backend_refuses_wrong_backend_id() {
+        let mut runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
+        let backend_input = backend_presented_physical_press(&runtime);
+        let frame = backend_input
+            .dispatch_evidence
+            .as_ref()
+            .expect("backend input carries evidence")
+            .frame
+            .clone();
+
+        let product = runtime
+            .handle_backend_presented_physical_control_for_backend_with_app_reducer(
+                DebugCommand::physical_control_with_trace(
+                    "wrong-backend-physical-press",
+                    frame,
+                    DebugPhysicalControl::Pointer {
+                        position: Point { x: 4.0, y: 4.0 },
+                        kind: PointerEventKind::Press,
+                        button: Some(slipway_core::PointerButton::Primary),
+                        details: mouse_pointer_details(),
+                        pointer_is_pressed: true,
+                    },
+                ),
+                backend_input,
+                "iced",
+                &mut |_, _messages: Vec<Message>| {},
+            );
+
+        assert_eq!(runtime.local_state().presses, 0);
+        let DebugReplyProduct::Error(error) = product else {
+            panic!("wrong-backend physical ingress must be refused");
+        };
+        assert_eq!(error.code, "backend-physical-control-backend-mismatch");
+    }
+
+    #[test]
+    fn backend_presented_physical_trace_for_backend_refuses_wrong_backend_id() {
+        let runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
+        let backend_input = backend_presented_physical_press(&runtime);
+        let frame = backend_input
+            .dispatch_evidence
+            .as_ref()
+            .expect("backend input carries evidence")
+            .frame
+            .clone();
+        let trace = BackendInputTrace {
+            input: backend_input,
+            handled: true,
+            revision_before: Some(0),
+            revision_after: Some(1),
+            emitted_messages: Vec::new(),
+            local_state: Vec::new(),
+            changes: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let product = runtime.backend_presented_physical_control_product_from_trace_for_backend(
+            DebugCommand::physical_control_with_trace(
+                "wrong-backend-trace",
+                frame,
+                DebugPhysicalControl::Pointer {
+                    position: Point { x: 4.0, y: 4.0 },
+                    kind: PointerEventKind::Press,
+                    button: Some(slipway_core::PointerButton::Primary),
+                    details: mouse_pointer_details(),
+                    pointer_is_pressed: true,
+                },
+            ),
+            &trace,
+            "iced",
+        );
+
+        let DebugReplyProduct::Error(error) = product else {
+            panic!("wrong-backend physical trace completion must be refused");
+        };
+        assert_eq!(error.code, "backend-physical-control-backend-mismatch");
+    }
+
+    #[test]
+    fn backend_presented_physical_trace_for_backend_refuses_stale_frame_identity() {
+        let runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
+        let backend_input = backend_presented_physical_press(&runtime);
+        let trace_frame = backend_input
+            .dispatch_evidence
+            .as_ref()
+            .expect("backend input carries evidence")
+            .frame
+            .clone();
+        let stale_command_frame = FrameIdentity {
+            frame_index: trace_frame.frame_index + 1,
+            ..trace_frame.clone()
+        };
+        let trace = BackendInputTrace {
+            input: backend_input,
+            handled: true,
+            revision_before: Some(0),
+            revision_after: Some(1),
+            emitted_messages: Vec::new(),
+            local_state: Vec::new(),
+            changes: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let product = runtime.backend_presented_physical_control_product_from_trace_for_backend(
+            DebugCommand::physical_control_with_trace(
+                "stale-frame-trace",
+                stale_command_frame,
+                DebugPhysicalControl::Pointer {
+                    position: Point { x: 4.0, y: 4.0 },
+                    kind: PointerEventKind::Press,
+                    button: Some(slipway_core::PointerButton::Primary),
+                    details: mouse_pointer_details(),
+                    pointer_is_pressed: true,
+                },
+            ),
+            &trace,
+            "test-backend",
+        );
+
+        let DebugReplyProduct::Error(error) = product else {
+            panic!("stale-frame physical trace completion must be refused");
+        };
+        assert_eq!(error.code, "backend-physical-control-frame-mismatch");
+    }
+
+    #[test]
     fn backend_presented_pointer_press_can_complete_native_focus_trace() {
         let mut runtime = SlipwayRuntime::new(TextPhysicalProbeWidget, ());
-        let frame = frame(39);
+        let frame = runtime.last_frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
@@ -5929,7 +6311,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_presented_physical_control_obeys_authored_route_without_evidence_gate() {
+    fn backend_presented_physical_control_refuses_forged_authored_route_before_handler() {
         let mut runtime = SlipwayRuntime::new(
             PhysicalMismatchWidget::route_mismatch("mismatch-route-policy"),
             (),
@@ -5971,7 +6353,7 @@ mod tests {
         assert_eq!(runtime.local_state().presses, 0);
         let DebugReplyProduct::Error(error) = product else {
             panic!(
-                "unhandled backend-presented visible input must return an unhandled error, not an evidence-gate error"
+                "forged backend-presented visible input must return a backend physical control error"
             );
         };
         assert_eq!(error.code, "backend-physical-control-not-handled");
@@ -5979,7 +6361,7 @@ mod tests {
             .last_backend_input_trace()
             .expect("delivered route input is traced");
         assert!(!trace.handled);
-        assert!(!trace.diagnostics.iter().any(|diagnostic| {
+        assert!(trace.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_ROUTE_MISMATCH
         }));
     }
@@ -6226,7 +6608,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_presented_physical_input_does_not_runtime_recheck_dispatch_route_mismatch() {
+    fn backend_presented_physical_input_refuses_forged_dispatch_route_before_handler() {
         let mut runtime = SlipwayRuntime::new(
             PhysicalMismatchWidget::route_mismatch("mismatch-route-policy"),
             (),
@@ -6247,7 +6629,7 @@ mod tests {
         assert!(!outcome.handled);
         assert_eq!(runtime.local_state().presses, 0);
         let trace = runtime.last_backend_input_trace().expect("trace recorded");
-        assert!(!trace.diagnostics.iter().any(|diagnostic| {
+        assert!(trace.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_ROUTE_MISMATCH
         }));
     }
@@ -6854,23 +7236,24 @@ mod tests {
     }
 
     #[test]
-    fn direct_backend_input_reaches_handler_without_runtime_evidence_gate() {
+    fn direct_backend_input_is_refused_before_handler_runs() {
         let mut runtime = SlipwayRuntime::new(ProbeWidget, ());
         let backend_input = BackendInputEvent::direct(count_probe());
 
         let outcome = runtime.apply_backend_input_event(backend_input.clone());
 
-        assert!(outcome.handled);
-        assert_eq!(runtime.local_state().count, 1);
-        assert!(!outcome.diagnostics.iter().any(|diagnostic| {
+        assert!(!outcome.handled);
+        assert_eq!(runtime.local_state().count, 0);
+        assert!(outcome.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_MISSING
+                && diagnostic.severity == DiagnosticSeverity::Error
         }));
         let trace = runtime
             .last_backend_input_trace()
             .expect("backend input trace recorded");
         assert_eq!(trace.input, backend_input);
-        assert!(trace.handled);
-        assert_eq!(trace.emitted_messages.len(), 1);
+        assert!(!trace.handled);
+        assert!(trace.emitted_messages.is_empty());
         assert!(trace.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "backend_input.dispatch_evidence_missing"
                 && diagnostic.severity == DiagnosticSeverity::Error
@@ -7476,7 +7859,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_delivers_backend_input_with_forged_dispatch_evidence_without_runtime_gate() {
+    fn runtime_refuses_backend_input_with_forged_dispatch_evidence_before_handler_runs() {
         let mut runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
         let mut backend_input = backend_presented_physical_press_for_frame(&runtime, frame(46));
         let evidence = backend_input
@@ -7487,18 +7870,20 @@ mod tests {
 
         let outcome = runtime.apply_backend_input_event(backend_input);
 
-        assert!(outcome.handled);
-        assert_eq!(runtime.local_state().presses, 1);
-        assert!(!outcome.diagnostics.iter().any(|diagnostic| {
+        assert!(!outcome.handled);
+        assert_eq!(runtime.local_state().presses, 0);
+        assert!(outcome.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_SOURCE_MISMATCH
+                && diagnostic.severity == DiagnosticSeverity::Error
         }));
         let trace = runtime
             .last_backend_input_trace()
             .expect("backend input is recorded for evidence");
-        assert!(trace.handled);
-        assert_eq!(trace.emitted_messages.len(), 1);
-        assert!(!trace.diagnostics.iter().any(|diagnostic| {
+        assert!(!trace.handled);
+        assert!(trace.emitted_messages.is_empty());
+        assert!(trace.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_SOURCE_MISMATCH
+                && diagnostic.severity == DiagnosticSeverity::Error
         }));
     }
 

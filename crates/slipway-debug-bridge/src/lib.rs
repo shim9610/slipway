@@ -3,9 +3,277 @@ use slipway_core::{
     DeclaredEventDispatchEvidence, Diagnostic, EVIDENCE_SOURCE_BACKEND_PRESENTED,
     EventResultIdentity, FrameIdentity, InputEvent, KeyEventKind, KeyboardDetails, Modifiers,
     Point, PointerButton, PointerDetails, PointerEventKind, PresentationRegionId, ProbeProduct,
-    ProbeRequest, RenderEvidence, RenderPacket, RenderRefusal, TextEditKind, TextSelectionRange,
-    WidgetId,
+    ProbeRequest, RenderEvidence, RenderPacket, RenderRefusal, Size, TextEditKind,
+    TextSelectionRange, WidgetId,
 };
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+pub const VISIBLE_FRAME_TRACE_FILE_ENV: &str = "SLIPWAY_VISIBLE_FRAME_TRACE_FILE";
+pub const VISIBLE_FRAME_TRACE_CAPACITY_ENV: &str = "SLIPWAY_VISIBLE_FRAME_TRACE_CAPACITY";
+pub const VISIBLE_FRAME_BUDGET_HZ: u64 = 240;
+pub const VISIBLE_FRAME_BUDGET_NS: u128 = 1_000_000_000u128 / VISIBLE_FRAME_BUDGET_HZ as u128;
+const DEFAULT_VISIBLE_FRAME_TRACE_CAPACITY: usize = 8192;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleFrameTimingSummary {
+    pub backend: String,
+    pub budget_hz: u64,
+    pub budget_ns: u128,
+    pub budget_passed: bool,
+    pub over_budget_samples: usize,
+    pub root_frame_budget_passed: bool,
+    pub root_frame_over_budget_samples: usize,
+    pub capacity: usize,
+    pub dropped_samples: u64,
+    pub total_samples: usize,
+    pub kinds: Vec<VisibleFrameTimingKindSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleFrameTimingKindSummary {
+    pub kind: String,
+    pub samples: usize,
+    pub p50_ns: u128,
+    pub p95_ns: u128,
+    pub p99_ns: u128,
+    pub max_ns: u128,
+    pub over_budget_samples: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct VisibleFrameTimingRecorder {
+    backend: &'static str,
+    path: Option<PathBuf>,
+    capacity: usize,
+    samples: VecDeque<VisibleFrameTimingSample>,
+    next_sequence: u64,
+    dropped_samples: u64,
+}
+
+#[derive(Clone, Debug)]
+struct VisibleFrameTimingSample {
+    sequence: u64,
+    kind: &'static str,
+    duration_ns: u128,
+    event_count: usize,
+    viewport: Option<Size>,
+}
+
+impl VisibleFrameTimingRecorder {
+    pub fn from_env(backend: &'static str) -> Self {
+        let path = std::env::var_os(VISIBLE_FRAME_TRACE_FILE_ENV).map(PathBuf::from);
+        let capacity = std::env::var(VISIBLE_FRAME_TRACE_CAPACITY_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_VISIBLE_FRAME_TRACE_CAPACITY);
+
+        Self {
+            backend,
+            path,
+            capacity,
+            samples: VecDeque::with_capacity(capacity.min(1024)),
+            next_sequence: 0,
+            dropped_samples: 0,
+        }
+    }
+
+    pub fn disabled(backend: &'static str) -> Self {
+        Self {
+            backend,
+            path: None,
+            capacity: DEFAULT_VISIBLE_FRAME_TRACE_CAPACITY,
+            samples: VecDeque::new(),
+            next_sequence: 0,
+            dropped_samples: 0,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.path.is_some()
+    }
+
+    pub fn record(
+        &mut self,
+        kind: &'static str,
+        duration: Duration,
+        event_count: usize,
+        viewport: Option<Size>,
+    ) {
+        if self.path.is_none() {
+            return;
+        }
+        if self.samples.len() == self.capacity {
+            self.samples.pop_front();
+            self.dropped_samples += 1;
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.samples.push_back(VisibleFrameTimingSample {
+            sequence,
+            kind,
+            duration_ns: duration.as_nanos(),
+            event_count,
+            viewport,
+        });
+    }
+
+    pub fn summary(&self) -> VisibleFrameTimingSummary {
+        let mut by_kind: BTreeMap<&'static str, Vec<u128>> = BTreeMap::new();
+        for sample in &self.samples {
+            by_kind
+                .entry(sample.kind)
+                .or_default()
+                .push(sample.duration_ns);
+        }
+
+        let kinds: Vec<_> = by_kind
+            .into_iter()
+            .map(|(kind, mut durations)| {
+                durations.sort_unstable();
+                let samples = durations.len();
+                let max_ns = durations.last().copied().unwrap_or(0);
+                let over_budget_samples = durations
+                    .iter()
+                    .filter(|duration| **duration > VISIBLE_FRAME_BUDGET_NS)
+                    .count();
+                VisibleFrameTimingKindSummary {
+                    kind: kind.to_string(),
+                    samples,
+                    p50_ns: percentile_ns(&durations, 50),
+                    p95_ns: percentile_ns(&durations, 95),
+                    p99_ns: percentile_ns(&durations, 99),
+                    max_ns,
+                    over_budget_samples,
+                }
+            })
+            .collect();
+        let over_budget_samples = kinds
+            .iter()
+            .map(|kind| kind.over_budget_samples)
+            .sum::<usize>();
+        let root_frame_over_budget_samples = self
+            .samples
+            .iter()
+            .filter(|sample| is_visible_root_frame_timing_kind(sample.kind))
+            .filter(|sample| sample.duration_ns > VISIBLE_FRAME_BUDGET_NS)
+            .count();
+
+        VisibleFrameTimingSummary {
+            backend: self.backend.to_string(),
+            budget_hz: VISIBLE_FRAME_BUDGET_HZ,
+            budget_ns: VISIBLE_FRAME_BUDGET_NS,
+            budget_passed: over_budget_samples == 0,
+            over_budget_samples,
+            root_frame_budget_passed: root_frame_over_budget_samples == 0,
+            root_frame_over_budget_samples,
+            capacity: self.capacity,
+            dropped_samples: self.dropped_samples,
+            total_samples: self.samples.len(),
+            kinds,
+        }
+    }
+
+    pub fn flush_to_file(&self) -> std::io::Result<Option<PathBuf>> {
+        let Some(path) = &self.path else {
+            return Ok(None);
+        };
+        write_visible_frame_timing_file(path, &self.summary(), &self.samples)?;
+        Ok(Some(path.clone()))
+    }
+}
+
+impl Drop for VisibleFrameTimingRecorder {
+    fn drop(&mut self) {
+        let _ = self.flush_to_file();
+    }
+}
+
+fn is_visible_root_frame_timing_kind(kind: &str) -> bool {
+    matches!(kind, "iced.redraw_requested" | "egui.render_ui")
+}
+
+fn percentile_ns(sorted: &[u128], percentile: usize) -> u128 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = sorted.len().saturating_mul(percentile).div_ceil(100);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn write_visible_frame_timing_file(
+    path: &Path,
+    summary: &VisibleFrameTimingSummary,
+    samples: &VecDeque<VisibleFrameTimingSample>,
+) -> std::io::Result<()> {
+    let mut output = String::new();
+    let budget_status = if summary.budget_passed {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    let root_frame_budget_status = if summary.root_frame_budget_passed {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    let _ = writeln!(
+        output,
+        "# slipway-visible-frame-timing version=1 backend={} budget_hz={} budget_ns={} budget_status={} over_budget_total={} root_frame_budget_status={} root_frame_over_budget_total={} samples={} dropped={} capacity={}",
+        summary.backend,
+        summary.budget_hz,
+        summary.budget_ns,
+        budget_status,
+        summary.over_budget_samples,
+        root_frame_budget_status,
+        summary.root_frame_over_budget_samples,
+        summary.total_samples,
+        summary.dropped_samples,
+        summary.capacity
+    );
+    let _ = writeln!(
+        output,
+        "# summary kind samples p50_ns p95_ns p99_ns max_ns over_budget"
+    );
+    for kind in &summary.kinds {
+        let _ = writeln!(
+            output,
+            "# summary {} {} {} {} {} {} {}",
+            kind.kind,
+            kind.samples,
+            kind.p50_ns,
+            kind.p95_ns,
+            kind.p99_ns,
+            kind.max_ns,
+            kind.over_budget_samples
+        );
+    }
+    let _ = writeln!(
+        output,
+        "sequence,backend,kind,duration_ns,event_count,viewport_width,viewport_height"
+    );
+    for sample in samples {
+        let (width, height) = sample
+            .viewport
+            .map(|viewport| (viewport.width.to_string(), viewport.height.to_string()))
+            .unwrap_or_else(|| ("".to_string(), "".to_string()));
+        let _ = writeln!(
+            output,
+            "{},{},{},{},{},{},{}",
+            sample.sequence,
+            summary.backend,
+            sample.kind,
+            sample.duration_ns,
+            sample.event_count,
+            width,
+            height
+        );
+    }
+    std::fs::write(path, output)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DebugCommand {
@@ -1245,5 +1513,52 @@ mod tests {
 
         assert!(matches!(reply.product, DebugReplyProduct::Error(_)));
         assert_eq!(reply.frame.frame_index, 30);
+    }
+
+    #[test]
+    fn visible_frame_timing_summary_uses_bounded_samples_and_240hz_budget() {
+        let mut recorder = VisibleFrameTimingRecorder::disabled("iced");
+        recorder.path = Some(PathBuf::from("not-written-in-this-test.csv"));
+        recorder.capacity = 3;
+
+        recorder.record("iced.draw_present", Duration::from_micros(1000), 0, None);
+        recorder.record("iced.draw_present", Duration::from_micros(2000), 1, None);
+        recorder.record("iced.draw_present", Duration::from_micros(5000), 2, None);
+        recorder.record("iced.draw_present", Duration::from_micros(6000), 3, None);
+
+        recorder.path = None;
+        let summary = recorder.summary();
+        assert_eq!(summary.backend, "iced");
+        assert_eq!(summary.budget_hz, 240);
+        assert_eq!(summary.budget_ns, 4_166_666);
+        assert!(!summary.budget_passed);
+        assert_eq!(summary.over_budget_samples, 2);
+        assert!(summary.root_frame_budget_passed);
+        assert_eq!(summary.root_frame_over_budget_samples, 0);
+        assert_eq!(summary.total_samples, 3);
+        assert_eq!(summary.dropped_samples, 1);
+        assert_eq!(summary.kinds.len(), 1);
+        assert_eq!(summary.kinds[0].kind, "iced.draw_present");
+        assert_eq!(summary.kinds[0].samples, 3);
+        assert_eq!(summary.kinds[0].p50_ns, 5_000_000);
+        assert_eq!(summary.kinds[0].p95_ns, 6_000_000);
+        assert_eq!(summary.kinds[0].p99_ns, 6_000_000);
+        assert_eq!(summary.kinds[0].max_ns, 6_000_000);
+        assert_eq!(summary.kinds[0].over_budget_samples, 2);
+
+        let path = std::env::temp_dir().join(format!(
+            "slipway-visible-frame-timing-test-{}.csv",
+            std::process::id()
+        ));
+        write_visible_frame_timing_file(&path, &summary, &recorder.samples)
+            .expect("timing file writes");
+        let output = std::fs::read_to_string(&path).expect("timing file readable");
+        let _ = std::fs::remove_file(&path);
+        assert!(output.contains("budget_hz=240"));
+        assert!(output.contains("budget_ns=4166666"));
+        assert!(output.contains("budget_status=FAIL"));
+        assert!(output.contains("over_budget_total=2"));
+        assert!(output.contains("root_frame_budget_status=PASS"));
+        assert!(output.contains("root_frame_over_budget_total=0"));
     }
 }

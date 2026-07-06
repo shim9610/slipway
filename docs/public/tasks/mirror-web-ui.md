@@ -3,10 +3,11 @@
 This guide is for an LLM worker asked to mirror a web UI, such as a Svelte app,
 with Slipway.
 
-Before reading source code, read [Quickstart for app authors](../quickstart-authoring.md).
-The mirroring worker should not need to inspect Slipway internals. If a required
-operation is missing from public docs, report `PUBLIC_DOC_GAP` and name the
-missing operation.
+Before reading source code, read [Quickstart for app authors](../quickstart-authoring.md)
+and [LLM contract checklist](../llm-contract-checklist.md). The mirroring
+worker should not need to inspect Slipway internals. If a required operation is
+missing from public docs, report `PUBLIC_DOC_GAP` and name the missing
+operation.
 
 ## Goal
 
@@ -39,6 +40,10 @@ and backend evidence.
    view/probe evidence, screenshot or
    render evidence, physical-control behavior, resize, and scroll.
 10. Fix authoring gaps and repeat.
+
+When MCP/control evidence and manual visible behavior disagree, do not declare
+success. Classify the mismatch as `AUTHORING_GAP`, `BACKEND_GAP`, or
+`API_GAP`.
 
 ## Do Not Weaken The Goal
 

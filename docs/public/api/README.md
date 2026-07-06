@@ -13,12 +13,20 @@ Backend choice is the feature split. Do not add separate `slipway-core`,
 `slipway-runtime`, or backend crate dependencies unless you are deliberately
 working on the Slipway crates themselves.
 
+LLM workers should read [LLM contract checklist](../llm-contract-checklist.md)
+before choosing an API surface. If a type is not reachable from
+`slipway::prelude::*`, first decide whether the task is ordinary app authoring,
+backend-native wrapping, provider insertion, or a public API gap.
+
 ## Files
 
 - [Core API](core.md) - backend-neutral identity, state, logic, view,
   geometry, declarations, and event evidence.
 - [Backend API](backends.md) - iced/egui adapter gates, backend-specific
   wrappers, visible backend rules, and backend switching expectations.
+- [IME and Korean text input](ime.md) - platform IME policy, Hangul input
+  expectations, text-input visual/typography token contracts, and debug
+  checklist.
 - [Debug MCP](debug-mcp.md) - request-scoped debug tools, physical-control
   meaning, and frame identity.
 - [Provider surfaces](provider-surfaces.md) - canvas, plot, media, GPU, and
@@ -26,8 +34,11 @@ working on the Slipway crates themselves.
 
 ## How To Choose
 
+- Unsure whether an API is allowed: read
+  [LLM contract checklist](../llm-contract-checklist.md).
 - Writing normal widgets or app state: read [Core API](core.md).
 - Running on iced or egui: read [Backend API](backends.md).
+- Enabling Korean/Hangul text input: read [IME and Korean text input](ime.md).
 - Testing with debug/control/screenshot/probe evidence: read
   [Debug MCP](debug-mcp.md).
 - Inserting an existing chart, canvas, or GPU renderer: read

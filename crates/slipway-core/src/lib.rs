@@ -714,8 +714,19 @@ pub struct TextStyle {
 }
 
 impl TextStyle {
+    pub fn new(font_family: impl Into<String>, font_size: f32) -> Self {
+        Self {
+            font_family: font_family.into(),
+            font_size,
+            font_weight: FontWeight::default(),
+            font_style: FontStyle::default(),
+            decoration: TextDecoration::default(),
+            baseline: BaselineShift::default(),
+        }
+    }
+
     pub fn plain() -> Self {
-        Self::default()
+        Self::new(DEFAULT_TEXT_FONT_FAMILY, DEFAULT_TEXT_FONT_SIZE)
     }
 
     pub fn with_font_family(mut self, font_family: impl Into<String>) -> Self {
@@ -746,19 +757,6 @@ impl TextStyle {
     pub fn with_baseline(mut self, baseline: BaselineShift) -> Self {
         self.baseline = baseline;
         self
-    }
-}
-
-impl Default for TextStyle {
-    fn default() -> Self {
-        Self {
-            font_family: DEFAULT_TEXT_FONT_FAMILY.to_string(),
-            font_size: DEFAULT_TEXT_FONT_SIZE,
-            font_weight: FontWeight::default(),
-            font_style: FontStyle::default(),
-            decoration: TextDecoration::default(),
-            baseline: BaselineShift::default(),
-        }
     }
 }
 
@@ -1071,10 +1069,6 @@ pub enum PaintOp {
 }
 
 impl PaintOp {
-    pub fn text(bounds: Rect, content: impl Into<String>, color: Color) -> Self {
-        Self::styled_text(bounds, content, color, TextStyle::default())
-    }
-
     pub fn styled_text(
         bounds: Rect,
         content: impl Into<String>,
@@ -2239,8 +2233,14 @@ pub struct ProviderSurfaceRequest {
     pub target: WidgetId,
     pub provider_id: String,
     pub kind: ProviderSurfaceKind,
+    /// Provider bounds in the target widget's local coordinate space.
+    ///
+    /// Backends may map this into their own screen/root spaces, but provider
+    /// authors should treat this as target-local input and expose unsupported
+    /// diagnostics if their renderer cannot honor that mapping.
     pub bounds: Rect,
     pub payload_ref: Option<String>,
+    /// Dirty rectangles in the same target-local coordinate space as `bounds`.
     pub dirty_regions: Vec<Rect>,
 }
 
@@ -2248,6 +2248,7 @@ pub struct ProviderSurfaceRequest {
 pub struct ProviderHitTestEvidence {
     pub target: WidgetId,
     pub provider_id: String,
+    /// Hit-test point in the target widget's local coordinate space.
     pub point: Point,
     pub hit: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
@@ -2257,6 +2258,7 @@ pub struct ProviderHitTestEvidence {
 pub struct ProviderSnapshotRequest {
     pub target: WidgetId,
     pub provider_id: String,
+    /// Snapshot bounds in the target widget's local coordinate space.
     pub bounds: Rect,
     pub frame: FrameIdentity,
 }
@@ -3679,12 +3681,6 @@ fn route_path_for_address(target: &WidgetId, address: &Option<WidgetSlotAddress>
         .as_ref()
         .map(|address| address.path.clone())
         .unwrap_or_else(|| vec![target.clone()])
-}
-
-impl From<InputEvent> for BackendInputEvent {
-    fn from(event: InputEvent) -> Self {
-        Self::direct(event)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -8353,7 +8349,7 @@ mod tests {
                 target: self.id.clone(),
                 request_id: "title".to_string(),
                 content: "Official metric wrapper".to_string(),
-                style: TextStyle::default(),
+                style: TextStyle::plain(),
                 available_bounds: Some(input.viewport.into_rect()),
                 flow: Some(TextFlowPolicy {
                     target: self.id.clone(),
@@ -8530,11 +8526,11 @@ mod tests {
             alpha: 1.0,
         };
 
-        let plain = PaintOp::text(bounds, "plain", color);
+        let plain = PaintOp::styled_text(bounds, "plain", color, TextStyle::plain());
         let PaintOp::Text { style, .. } = plain else {
             panic!("text constructor returns text paint op");
         };
-        assert_eq!(style, TextStyle::default());
+        assert_eq!(style, TextStyle::plain());
         assert_eq!(style.font_family, DEFAULT_TEXT_FONT_FAMILY);
         assert_eq!(style.font_size, DEFAULT_TEXT_FONT_SIZE);
         assert_eq!(style.font_weight, FontWeight::Normal);
@@ -8542,7 +8538,7 @@ mod tests {
         assert_eq!(style.decoration, TextDecoration::none());
         assert_eq!(style.baseline, BaselineShift::Normal);
 
-        let overridden = TextStyle::default()
+        let overridden = TextStyle::plain()
             .with_font_family("system-ui")
             .with_font_size(18.0)
             .with_font_weight(FontWeight::Bold);
@@ -9713,7 +9709,7 @@ mod tests {
                 4.0,
                 test_rgb(15, 23, 42),
             ),
-            typography: TextInputTypographyDeclaration::explicit(target, TextStyle::default()),
+            typography: TextInputTypographyDeclaration::explicit(target, TextStyle::plain()),
             edit_commands: vec![TextEditCommandDeclaration {
                 command_id: "insert".to_string(),
                 kind: TextEditKind::InsertText,
@@ -10352,7 +10348,7 @@ mod tests {
         ) -> TextInputTypographyDeclaration {
             TextInputTypographyDeclaration::explicit(
                 self.id.clone(),
-                TextStyle::default().with_font_family("system-ui"),
+                TextStyle::plain().with_font_family("system-ui"),
             )
         }
     }
@@ -11849,7 +11845,7 @@ mod tests {
                     blue: 0.0,
                     alpha: 1.0,
                 },
-                style: TextStyle::default(),
+                style: TextStyle::plain(),
             }]
         }
 
@@ -11996,7 +11992,7 @@ mod tests {
                     blue: 0.0,
                     alpha: 1.0,
                 },
-                style: TextStyle::default(),
+                style: TextStyle::plain(),
             }]
         }
 
@@ -13423,7 +13419,12 @@ mod tests {
     }
 
     fn paint_test_text(label: &str, x: f32) -> PaintOp {
-        PaintOp::text(paint_test_rect(x), label, paint_test_color())
+        PaintOp::styled_text(
+            paint_test_rect(x),
+            label,
+            paint_test_color(),
+            TextStyle::plain(),
+        )
     }
 
     fn paint_test_unit(id: &str, traversal_order: usize, paint: Vec<PaintOp>) -> PaintUnit {
@@ -13575,7 +13576,7 @@ mod tests {
                 address: None,
                 order: declaration,
                 traversal_order,
-                paint: vec![PaintOp::text(
+                paint: vec![PaintOp::styled_text(
                     Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -13590,6 +13591,7 @@ mod tests {
                         blue: 0.0,
                         alpha: 1.0,
                     },
+                    TextStyle::plain(),
                 )],
             }
         };

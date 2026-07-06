@@ -2876,7 +2876,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slipway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "slipway-backend-egui",
  "slipway-backend-iced",
@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-backend-egui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "egui-wgpu",
@@ -2901,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-backend-iced"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "iced",
  "iced_core",
@@ -2915,11 +2915,11 @@ dependencies = [
 
 [[package]]
 name = "slipway-core"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "slipway-debug-bridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossbeam-channel",
  "slipway-core",
@@ -2927,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-debug-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossbeam-channel",
  "serde",
@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-debug-renderer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ab_glyph",
  "png",
@@ -2947,7 +2947,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-example-admission"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "slipway-backend-egui",
  "slipway-backend-iced",
@@ -2957,7 +2957,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossbeam-channel",
  "serde_json",

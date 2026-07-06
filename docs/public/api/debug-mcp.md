@@ -88,6 +88,10 @@ A successful physical-control result should mean:
 If the backend or app cannot prove that path, the MCP response should be an
 error or unsupported result, not fake success.
 
+LLM workers must not turn semantic direct control into a physical-control
+claim. A semantic state mutation can be useful debugging evidence, but it does
+not prove that the visible iced/egui path accepts the same user operation.
+
 ## Frame Identity
 
 Most debug calls bind to a frame:
@@ -102,6 +106,10 @@ viewport
 
 Use the active frame reported by the running backend. A stale or mismatched
 frame can correctly refuse input even when the coordinates look right.
+
+For physical-control proof, the command frame and backend-presented dispatch
+evidence frame must match as a full `FrameIdentity`. A matching viewport alone
+is not enough.
 
 ## User-Defined MCP Tools
 
