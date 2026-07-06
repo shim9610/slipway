@@ -1,17 +1,17 @@
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde_json::{Value, json};
 use slipway_core::{
-    BackendInputEvent, BackendInputTrace, ChangeShapeIdentity, DeclaredEventDispatchEvidence,
-    DeclaredEventDispatchKind, Diagnostic, DiagnosticIdentity, DiagnosticSeverity, EmittedMessage,
-    EmittedMessageEvidence, EventOutcome, EventResultIdentity, FrameIdentity, InputEvent,
-    LayoutConstraints, LayoutInput, Point, ProbeKind, ProbeProduct, ProbeRequest, Rect,
-    RenderEvidence, RenderPacket, RenderRefusal, Size, SlipwayApp, SlipwayAppLocalState,
-    SlipwayAppWidget, SlipwayAuthoredWidget, SlipwayEventDispositionPolicy,
+    BackendInputEvent, BackendInputTrace, ChangeEvidence, ChangeShapeIdentity,
+    DeclaredEventDispatchEvidence, DeclaredEventDispatchKind, Diagnostic, DiagnosticIdentity,
+    DiagnosticSeverity, EmittedMessage, EmittedMessageEvidence, EventOutcome, EventResultIdentity,
+    FrameIdentity, InputEvent, LayoutConstraints, LayoutInput, Point, ProbeKind, ProbeProduct,
+    ProbeRequest, Rect, RenderEvidence, RenderPacket, RenderRefusal, Size, SlipwayApp,
+    SlipwayAppLocalState, SlipwayAppWidget, SlipwayAuthoredWidget, SlipwayEventDispositionPolicy,
     SlipwayEventRoutingPolicy, SlipwayOffscreenRenderer, SlipwayViewDefinition, SlipwayWidgetTypes,
     TargetLocalRect, TextEditEvent, TextEditKind, TextSelectionRange, WidgetId, WidgetSlot,
 };
 #[cfg(test)]
-use slipway_core::{EventRoute, EventRoutePhase, FocusRegionDeclaration};
+use slipway_core::{EventRoute, EventRoutePhase, FocusRegionDeclaration, WidgetSlotAddress};
 use slipway_debug_bridge::{
     DebugBridgeClient, DebugBridgeError, DebugBridgeRuntime, DebugCommand, DebugCommandKind,
     DebugCommandLease, DebugControlMode, DebugControlTrace, DebugControlTraceStage, DebugFailure,
@@ -32,6 +32,7 @@ use std::thread::{self, JoinHandle};
 
 const DEFAULT_BRIDGE_CAPACITY: usize = 32;
 const DEFAULT_BACKEND_INPUT_TRACE_CAPACITY: usize = 32;
+const DEFAULT_EVENT_PROBE_TRACE_LIMIT: usize = 1;
 const DEFAULT_UI_TURN_DEBUG_BRIDGE_DRAIN_BUDGET: usize = 8;
 const DEFAULT_UI_TURN_RUNTIME_MCP_DRAIN_BUDGET: usize = 8;
 const DEFAULT_MCP_PENDING_DEBUG_BRIDGE_DRAIN_BUDGET: usize = 8;
@@ -97,6 +98,19 @@ fn event_result_identity_from_outcome<M>(
     }
 }
 
+fn compact_backend_trace_changes(changes: &[ChangeEvidence]) -> Vec<ChangeEvidence> {
+    changes
+        .iter()
+        .map(|change| ChangeEvidence {
+            target: change.target.clone(),
+            slot: change.slot.clone(),
+            field: change.field.clone(),
+            before: change.before.as_ref().map(|_| "<redacted>".to_string()),
+            after: change.after.as_ref().map(|_| "<redacted>".to_string()),
+        })
+        .collect()
+}
+
 fn push_backend_input_trace(
     traces: &mut VecDeque<BackendInputTrace>,
     mut trace: BackendInputTrace,
@@ -116,11 +130,9 @@ fn push_backend_input_trace(
     traces.push_back(trace);
 }
 
-fn backend_input_trace_equivalence_diagnostics(
-    traces: &VecDeque<BackendInputTrace>,
-) -> Vec<Diagnostic> {
+fn backend_input_trace_equivalence_diagnostics(traces: &[&BackendInputTrace]) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    for mcp_trace in traces {
+    for &mcp_trace in traces {
         let Some(mcp_evidence) = mcp_trace.input.dispatch_evidence.as_ref() else {
             continue;
         };
@@ -133,7 +145,7 @@ fn backend_input_trace_equivalence_diagnostics(
         let Some(mcp_pair_key) = event_equivalence_pair_key(mcp_evidence) else {
             continue;
         };
-        for backend_trace in traces {
+        for &backend_trace in traces {
             let Some(backend_evidence) = backend_trace.input.dispatch_evidence.as_ref() else {
                 continue;
             };
@@ -320,6 +332,20 @@ pub struct SlipwayRuntimeConfig {
     pub surface_instance_id: String,
     pub debug_bridge_capacity: usize,
     pub debug_mcp: DebugMcpConfig,
+    pub ime_policy: SlipwayImePolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SlipwayImePolicy {
+    #[default]
+    BackendRequested,
+    AlwaysAllowed,
+}
+
+impl SlipwayImePolicy {
+    pub fn keeps_platform_ime_allowed(self) -> bool {
+        matches!(self, Self::AlwaysAllowed)
+    }
 }
 
 impl Default for SlipwayRuntimeConfig {
@@ -329,6 +355,7 @@ impl Default for SlipwayRuntimeConfig {
             surface_instance_id: "default-instance".to_string(),
             debug_bridge_capacity: DEFAULT_BRIDGE_CAPACITY,
             debug_mcp: admitted_debug_mcp_config(),
+            ime_policy: SlipwayImePolicy::BackendRequested,
         }
     }
 }
@@ -351,6 +378,15 @@ impl SlipwayRuntimeConfig {
     pub fn with_debug_mcp(mut self, debug_mcp: DebugMcpConfig) -> Self {
         self.debug_mcp = debug_mcp;
         self
+    }
+
+    pub fn with_ime_policy(mut self, ime_policy: SlipwayImePolicy) -> Self {
+        self.ime_policy = ime_policy;
+        self
+    }
+
+    pub fn with_platform_ime_always_allowed(self) -> Self {
+        self.with_ime_policy(SlipwayImePolicy::AlwaysAllowed)
     }
 }
 
@@ -983,30 +1019,8 @@ where
     ) -> EventOutcome<W::AppMessage>
     where
         W: SlipwayEventRoutingPolicy + SlipwayEventDispositionPolicy + SlipwayViewDefinition,
-        W::LocalState: Clone,
     {
         let revision_before = self.revision;
-        let contract_diagnostics = self.backend_input_contract_diagnostics(&event);
-        if slipway_core::view_definition_has_blocking_contract_diagnostic(&contract_diagnostics) {
-            let outcome = EventOutcome {
-                handled: false,
-                propagate: false,
-                emitted_messages: Vec::new(),
-                changes: Vec::new(),
-                observations: Vec::new(),
-                probes: Vec::new(),
-                diagnostics: contract_diagnostics,
-            };
-            self.record_backend_input_trace(self.backend_trace_from_outcome(
-                event,
-                &outcome,
-                Some(revision_before),
-                Some(self.revision),
-                Vec::new(),
-            ));
-            return outcome;
-        }
-
         let input = event.event.clone();
         let declaration = slipway_core::declared_event_handling(
             &self.slot.widget,
@@ -1014,27 +1028,6 @@ where
             &self.slot.local_state,
             &input,
         );
-        let route_diagnostics =
-            slipway_core::dispatch_evidence_event_route_contract_diagnostics(&event, &declaration);
-        if slipway_core::view_definition_has_blocking_contract_diagnostic(&route_diagnostics) {
-            let outcome = EventOutcome {
-                handled: false,
-                propagate: true,
-                emitted_messages: Vec::new(),
-                changes: Vec::new(),
-                observations: Vec::new(),
-                probes: Vec::new(),
-                diagnostics: route_diagnostics,
-            };
-            self.record_backend_input_trace(self.backend_trace_from_outcome(
-                event,
-                &outcome,
-                Some(revision_before),
-                Some(self.revision),
-                Vec::new(),
-            ));
-            return outcome;
-        }
         if !declaration.disposition.final_disposition.handled {
             let outcome = slipway_core::refuse_event_declared_unhandled(declaration);
             self.record_backend_input_trace(self.backend_trace_from_outcome(
@@ -1046,7 +1039,6 @@ where
             ));
             return outcome;
         }
-        let local_before = self.slot.local_state.clone();
         let raw_outcome = self.slot.widget.handle_event(
             &self.external,
             &mut self.slot.local_state,
@@ -1054,9 +1046,6 @@ where
         );
         let outcome =
             slipway_core::apply_physical_event_handling_declaration(declaration, raw_outcome);
-        if slipway_core::event_outcome_has_physical_declaration_mismatch(&outcome) {
-            self.slot.local_state = local_before;
-        }
         if outcome.handled {
             self.revision += 1;
         }
@@ -1078,36 +1067,9 @@ where
     ) -> SlipwayBackendInputApplyReport
     where
         W: SlipwayEventRoutingPolicy + SlipwayEventDispositionPolicy + SlipwayViewDefinition,
-        W::LocalState: Clone,
         F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
     {
         let revision_before = self.revision;
-        let contract_diagnostics = self.backend_input_contract_diagnostics(&event);
-        if slipway_core::view_definition_has_blocking_contract_diagnostic(&contract_diagnostics) {
-            let outcome = EventOutcome {
-                handled: false,
-                propagate: false,
-                emitted_messages: Vec::new(),
-                changes: Vec::new(),
-                observations: Vec::new(),
-                probes: Vec::new(),
-                diagnostics: contract_diagnostics,
-            };
-            self.record_backend_input_trace(self.backend_trace_from_outcome(
-                event,
-                &outcome,
-                Some(revision_before),
-                Some(self.revision),
-                Vec::new(),
-            ));
-            return SlipwayBackendInputApplyReport {
-                handled: false,
-                emitted_messages: 0,
-                applied_messages: 0,
-                diagnostics: outcome.diagnostics,
-            };
-        }
-
         let input = event.event.clone();
         let declaration = slipway_core::declared_event_handling(
             &self.slot.widget,
@@ -1115,32 +1077,6 @@ where
             &self.slot.local_state,
             &input,
         );
-        let route_diagnostics =
-            slipway_core::dispatch_evidence_event_route_contract_diagnostics(&event, &declaration);
-        if slipway_core::view_definition_has_blocking_contract_diagnostic(&route_diagnostics) {
-            let outcome = EventOutcome {
-                handled: false,
-                propagate: true,
-                emitted_messages: Vec::new(),
-                changes: Vec::new(),
-                observations: Vec::new(),
-                probes: Vec::new(),
-                diagnostics: route_diagnostics,
-            };
-            self.record_backend_input_trace(self.backend_trace_from_outcome(
-                event,
-                &outcome,
-                Some(revision_before),
-                Some(self.revision),
-                Vec::new(),
-            ));
-            return SlipwayBackendInputApplyReport {
-                handled: false,
-                emitted_messages: 0,
-                applied_messages: 0,
-                diagnostics: outcome.diagnostics,
-            };
-        }
         if !declaration.disposition.final_disposition.handled {
             let outcome = slipway_core::refuse_event_declared_unhandled(declaration);
             self.record_backend_input_trace(self.backend_trace_from_outcome(
@@ -1157,7 +1093,6 @@ where
                 diagnostics: outcome.diagnostics,
             };
         }
-        let local_before = self.slot.local_state.clone();
         let raw_outcome = self.slot.widget.handle_event(
             &self.external,
             &mut self.slot.local_state,
@@ -1165,9 +1100,6 @@ where
         );
         let mut outcome =
             slipway_core::apply_physical_event_handling_declaration(declaration, raw_outcome);
-        if slipway_core::event_outcome_has_physical_declaration_mismatch(&outcome) {
-            self.slot.local_state = local_before;
-        }
         if outcome.handled {
             self.revision += 1;
         }
@@ -1201,48 +1133,6 @@ where
         }
     }
 
-    fn backend_input_contract_diagnostics(&self, event: &BackendInputEvent) -> Vec<Diagnostic>
-    where
-        W: SlipwayViewDefinition,
-    {
-        let frame = event
-            .dispatch_evidence
-            .as_ref()
-            .map(|evidence| evidence.frame.clone())
-            .unwrap_or_else(|| self.last_frame_identity());
-        let layout_input = LayoutInput {
-            viewport: TargetLocalRect::new(frame.viewport),
-            constraints: LayoutConstraints {
-                min: Size {
-                    width: 0.0,
-                    height: 0.0,
-                },
-                max: frame.viewport.size,
-            },
-        };
-        let view = self.slot.widget.visible_backend_view_definition(
-            &self.external,
-            &self.slot.local_state,
-            slipway_core::ViewDefinitionInput {
-                frame,
-                layout_input,
-            },
-        );
-        let mut diagnostics = slipway_core::view_definition_contract_diagnostics_for_capabilities(
-            &view,
-            &self.slot.widget.capabilities(),
-        );
-        diagnostics.extend(
-            slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
-                &view,
-                event,
-                Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
-                None,
-            ),
-        );
-        diagnostics
-    }
-
     fn backend_trace_from_outcome(
         &self,
         event: BackendInputEvent,
@@ -1257,11 +1147,8 @@ where
             revision_before,
             revision_after,
             emitted_messages,
-            local_state: self
-                .slot
-                .widget
-                .observe_state(&self.external, &self.slot.local_state),
-            changes: outcome.changes.clone(),
+            local_state: Vec::new(),
+            changes: compact_backend_trace_changes(&outcome.changes),
             diagnostics: outcome.diagnostics.clone(),
         }
     }
@@ -2128,14 +2015,6 @@ where
             });
         }
 
-        if slipway_core::view_definition_has_blocking_contract_diagnostic(&trace.diagnostics) {
-            return DebugReplyProduct::Error(DebugFailure {
-                code: "backend-physical-control-visible-contract-blocked".to_string(),
-                message: "backend-presented physical control was blocked by the visible backend input contract gates".to_string(),
-                dispatch_evidence: Some(dispatch_evidence),
-            });
-        }
-
         if !trace.handled {
             return DebugReplyProduct::Error(DebugFailure {
                 code: "backend-physical-control-not-handled".to_string(),
@@ -2280,6 +2159,20 @@ fn physical_control_operation_matches_backend_event(
             },
             InputEvent::Wheel(wheel),
         ) => wheel.delta_x == *delta_x && wheel.delta_y == *delta_y,
+        (
+            DebugPhysicalControl::Pointer {
+                position,
+                kind,
+                button,
+                ..
+            },
+            InputEvent::Focus(focus),
+        ) => {
+            *kind == slipway_core::PointerEventKind::Press
+                && button.is_some()
+                && focus.focused
+                && evidence.and_then(|evidence| evidence.input_position) == Some(*position)
+        }
         (DebugPhysicalControl::Focus { focused, .. }, InputEvent::Focus(focus)) => {
             focus.focused == *focused
         }
@@ -2490,11 +2383,19 @@ where
                     }
                 }
                 ProbeKind::Event => {
-                    for trace in self.backend_input_traces.iter() {
+                    let limit = request
+                        .event_trace_limit
+                        .unwrap_or(DEFAULT_EVENT_PROBE_TRACE_LIMIT);
+                    let skip = self.backend_input_traces.len().saturating_sub(limit);
+                    let selected_traces = self
+                        .backend_input_traces
+                        .iter()
+                        .skip(skip)
+                        .collect::<Vec<_>>();
+                    for trace in &selected_traces {
                         products.push(ProbeProduct::Event(trace.event_probe()));
                     }
-                    for diagnostic in
-                        backend_input_trace_equivalence_diagnostics(self.backend_input_traces)
+                    for diagnostic in backend_input_trace_equivalence_diagnostics(&selected_traces)
                     {
                         products.push(ProbeProduct::Diagnostic(diagnostic));
                     }
@@ -2644,68 +2545,6 @@ where
             &self.slot.local_state,
             &event,
         );
-        if mode == DebugControlMode::PhysicalEquivalent {
-            if let Some(evidence) = dispatch_evidence.as_ref() {
-                let backend_input = BackendInputEvent::declared(event.clone(), evidence.clone());
-                let route_diagnostics =
-                    slipway_core::dispatch_evidence_event_route_contract_diagnostics(
-                        &backend_input,
-                        &declaration,
-                    );
-                if slipway_core::view_definition_has_blocking_contract_diagnostic(
-                    &route_diagnostics,
-                ) {
-                    let outcome: EventOutcome<W::AppMessage> = EventOutcome {
-                        handled: false,
-                        propagate: true,
-                        emitted_messages: Vec::new(),
-                        changes: Vec::new(),
-                        observations: Vec::new(),
-                        probes: Vec::new(),
-                        diagnostics: route_diagnostics,
-                    };
-                    let result_identity = event_result_identity_from_outcome(&outcome, Vec::new());
-                    let reduction_stage = reduction_trace_stage(
-                        event.target().clone(),
-                        0,
-                        self.message_reducer.is_some(),
-                        0,
-                    );
-                    push_backend_input_trace(
-                        self.backend_input_traces,
-                        BackendInputTrace {
-                            input: backend_input,
-                            handled: false,
-                            revision_before: Some(revision_before),
-                            revision_after: Some(*self.revision),
-                            emitted_messages: Vec::new(),
-                            local_state: self
-                                .slot
-                                .widget
-                                .observe_state(self.external, &self.slot.local_state),
-                            changes: Vec::new(),
-                            diagnostics: outcome.diagnostics.clone(),
-                        },
-                    );
-                    return DebugReplyProduct::ControlTrace(
-                        DebugControlTrace::new(
-                            request_id,
-                            frame,
-                            &event,
-                            false,
-                            revision_before,
-                            *self.revision,
-                            outcome.diagnostics,
-                        )
-                        .with_mode(mode)
-                        .with_dispatch_evidence(dispatch_evidence)
-                        .with_result_identity(result_identity)
-                        .with_messages(Vec::new())
-                        .with_reduction_stage(reduction_stage),
-                    );
-                }
-            }
-        }
         if mode == DebugControlMode::PhysicalEquivalent
             && !declaration.disposition.final_disposition.handled
         {
@@ -3153,13 +2992,26 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn test_rgb(red: u8, green: u8, blue: u8) -> slipway_core::Color {
+        slipway_core::Color {
+            red: f32::from(red) / 255.0,
+            green: f32::from(green) / 255.0,
+            blue: f32::from(blue) / 255.0,
+            alpha: 1.0,
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ProbeWidget;
 
     #[derive(Clone, Debug, PartialEq)]
     struct PhysicalProbeWidget;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct CloneCountingPhysicalProbeWidget;
 
     #[derive(Clone, Debug, PartialEq)]
     struct TextPhysicalProbeWidget;
@@ -3189,6 +3041,22 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     struct PhysicalLocal {
         presses: u32,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct CloneCountingPhysicalLocal {
+        presses: u32,
+    }
+
+    static CLONE_COUNTING_PHYSICAL_LOCAL_CLONES: AtomicUsize = AtomicUsize::new(0);
+
+    impl Clone for CloneCountingPhysicalLocal {
+        fn clone(&self) -> Self {
+            CLONE_COUNTING_PHYSICAL_LOCAL_CLONES.fetch_add(1, Ordering::SeqCst);
+            Self {
+                presses: self.presses,
+            }
+        }
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -3531,6 +3399,40 @@ mod tests {
                     enabled: true,
                 },
             ]
+        }
+    }
+
+    impl slipway_core::SlipwayTextInputVisualStylePolicy for RuntimeInteractionDeclarationWidget {
+        fn text_input_visual_style(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> slipway_core::TextInputVisualStyleDeclaration {
+            slipway_core::TextInputVisualStyleDeclaration::explicit(
+                self.id.clone(),
+                test_rgb(15, 23, 42),
+                test_rgb(100, 116, 139),
+                test_rgb(15, 23, 42),
+                test_rgb(191, 219, 254),
+                test_rgb(255, 255, 255),
+                test_rgb(203, 213, 225),
+                1.0,
+                4.0,
+                test_rgb(15, 23, 42),
+            )
+        }
+    }
+
+    impl slipway_core::SlipwayTextInputTypographyPolicy for RuntimeInteractionDeclarationWidget {
+        fn text_input_typography(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> slipway_core::TextInputTypographyDeclaration {
+            slipway_core::TextInputTypographyDeclaration::explicit(
+                self.id.clone(),
+                slipway_core::TextStyle::default().with_font_family("system-ui"),
+            )
         }
     }
 
@@ -4218,6 +4120,198 @@ mod tests {
         }
     }
 
+    impl SlipwayWidgetTypes for CloneCountingPhysicalProbeWidget {
+        type ExternalState = ();
+        type LocalState = CloneCountingPhysicalLocal;
+        type AppMessage = Message;
+    }
+
+    impl SlipwaySsot for CloneCountingPhysicalProbeWidget {
+        fn id(&self) -> WidgetId {
+            WidgetId::from("clone-counting-physical-probe")
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for CloneCountingPhysicalProbeWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            match event {
+                InputEvent::Pointer(pointer)
+                    if pointer.target == self.id()
+                        && matches!(pointer.kind, PointerEventKind::Press) =>
+                {
+                    local.presses += 1;
+                    EventOutcome::message(self.id(), "press", Message::Counted)
+                }
+                _ => EventOutcome::ignored(),
+            }
+        }
+    }
+
+    impl SlipwayView for CloneCountingPhysicalProbeWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            CloneCountingPhysicalLocal { presses: 0 }
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            vec![PaintOp::Fill {
+                shape: ShapeDeclaration {
+                    id: Some("clone-counting-physical-probe-body".to_string()),
+                    kind: ShapeKind::Rectangle,
+                    bounds: layout.bounds.into_rect(),
+                    path: None,
+                    clip: None,
+                },
+                color: Color {
+                    red: 0.1,
+                    green: 0.1,
+                    blue: 0.1,
+                    alpha: 1.0,
+                },
+            }]
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            vec![StateObservation {
+                target: self.id(),
+                slot: None,
+                name: "presses".to_string(),
+                value: local.presses.to_string(),
+            }]
+        }
+    }
+
+    impl SlipwayViewDefinition for CloneCountingPhysicalProbeWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                paint: self.paint(external, local, &layout),
+                paint_order: PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: vec![slipway_core::hit_region_from_pointer_capability(
+                    self,
+                    external,
+                    local,
+                    PresentationRegionId::from("clone-counting-probe-hit"),
+                    None,
+                    layout.bounds,
+                    slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                    HitRegionOrder {
+                        z_index: 0,
+                        paint_order: 0,
+                        traversal_order: 0,
+                    },
+                    Some("press".to_string()),
+                    CursorCapability::Pointer,
+                    true,
+                    PointerCaptureIntent::OnPress,
+                )],
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+                layout,
+            }
+        }
+    }
+
+    impl SlipwayEventRoutingPolicy for CloneCountingPhysicalProbeWidget {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+        ) -> slipway_core::EventRoutingPolicyDeclaration {
+            slipway_core::EventRoutingPolicyDeclaration {
+                target: self.id(),
+                event_target: event.target().clone(),
+                route: EventRoute {
+                    route_id: Some("clone-counting-press".to_string()),
+                    address: event.target_slot().cloned(),
+                    path: vec![self.id()],
+                    phase: EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayEventDispositionPolicy for CloneCountingPhysicalProbeWidget {
+        fn event_disposition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+            route: &EventRoute,
+        ) -> slipway_core::EventPropagationEvidence {
+            let handled = event.target() == &self.id();
+            let disposition = slipway_core::EventDisposition {
+                handled,
+                propagate: !handled,
+                default_action_allowed: true,
+            };
+            slipway_core::EventPropagationEvidence {
+                target: self.id(),
+                event: event.clone(),
+                steps: vec![slipway_core::EventPropagationStep {
+                    stage: slipway_core::EventPropagationStage::Target,
+                    node: route.path.last().cloned(),
+                    disposition,
+                    emitted_messages: Vec::new(),
+                    changes: Vec::new(),
+                }],
+                final_disposition: disposition,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
     impl SlipwayWidgetTypes for PhysicalMismatchWidget {
         type ExternalState = ();
         type LocalState = PhysicalLocal;
@@ -4644,12 +4738,16 @@ mod tests {
     ) -> slipway_core::ScrollRegionDeclaration {
         let widget = RuntimeInteractionDeclarationWidget { id: target };
         let local = text_physical_local(String::new(), scroll_y);
-        let input = layout_input_for_bounds(bounds);
+        let layout = LayoutOutput {
+            bounds,
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
         let mut region = slipway_core::scroll_region_from_scrollable_capability(
             &widget,
             &(),
             &local,
-            &input,
+            &layout,
             Some(PresentationRegionId::from(region_id)),
             None,
             true,
@@ -5314,6 +5412,47 @@ mod tests {
         )
     }
 
+    fn backend_presented_clone_counting_physical_press(
+        runtime: &SlipwayRuntime<CloneCountingPhysicalProbeWidget>,
+    ) -> BackendInputEvent {
+        let frame = frame(35);
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(frame.viewport),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: frame.viewport.size,
+            },
+        };
+        let view = runtime.widget().visible_backend_view_definition(
+            runtime.external(),
+            runtime.local_state(),
+            ViewDefinitionInput {
+                frame: frame.clone(),
+                layout_input,
+            },
+        );
+        let (dispatch, evidence) = slipway_core::resolve_declared_pointer_dispatch_with_evidence(
+            slipway_core::EvidenceSource::backend_presented("test-backend", "physical-input"),
+            frame,
+            &view.layout,
+            &view.hit_regions,
+            Point { x: 4.0, y: 4.0 },
+            PointerEventKind::Press,
+            Some(slipway_core::PointerButton::Primary),
+            mouse_pointer_details(),
+            true,
+        );
+        BackendInputEvent::declared(
+            dispatch
+                .expect("backend press resolves clone-counting hit region")
+                .input,
+            evidence,
+        )
+    }
+
     fn backend_presented_mismatch_press(
         runtime: &SlipwayRuntime<PhysicalMismatchWidget>,
         frame_index: u64,
@@ -5555,7 +5694,7 @@ mod tests {
 
     fn probe_event_message(id: &str, frame: &FrameIdentity) -> String {
         format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.probe","arguments":{{"frame":{},"kinds":["event"]}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.probe","arguments":{{"frame":{},"kinds":["event"],"event_trace_limit":2}}}}}}"#,
             id,
             frame_json(frame),
         )
@@ -5681,7 +5820,75 @@ mod tests {
     }
 
     #[test]
-    fn backend_presented_physical_control_blocks_view_contract_diagnostics() {
+    fn backend_presented_pointer_press_can_complete_native_focus_trace() {
+        let mut runtime = SlipwayRuntime::new(TextPhysicalProbeWidget, ());
+        let frame = frame(39);
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(frame.viewport),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: frame.viewport.size,
+            },
+        };
+        let view = runtime.widget().visible_backend_view_definition(
+            runtime.external(),
+            runtime.local_state(),
+            ViewDefinitionInput {
+                frame: frame.clone(),
+                layout_input,
+            },
+        );
+        let region = view
+            .focus_regions
+            .iter()
+            .find(|region| region.target == WidgetId::from("text-probe"))
+            .expect("text probe focus region is declared");
+        let position = Point { x: 4.0, y: 4.0 };
+        let event = InputEvent::Focus(slipway_core::FocusEvent {
+            target: region.target.clone(),
+            target_slot: region.address.clone(),
+            focused: true,
+        });
+        let evidence = slipway_core::declared_focus_text_dispatch_evidence(
+            slipway_core::EvidenceSource::backend_presented("test-backend", "focused-input"),
+            frame.clone(),
+            &view.focus_regions,
+            Some(region),
+            DeclaredEventDispatchKind::Focus,
+            Some(position),
+            event.clone(),
+        );
+        let backend_input = BackendInputEvent::declared(event, evidence);
+
+        let product = runtime.handle_backend_presented_physical_control_with_app_reducer(
+            DebugCommand::physical_control_with_trace(
+                "pointer-focus",
+                frame,
+                DebugPhysicalControl::Pointer {
+                    position,
+                    kind: PointerEventKind::Press,
+                    button: Some(slipway_core::PointerButton::Primary),
+                    details: mouse_pointer_details(),
+                    pointer_is_pressed: true,
+                },
+            ),
+            backend_input,
+            &mut |_, _messages: Vec<Message>| {},
+        );
+
+        let DebugReplyProduct::ControlTrace(trace) = product else {
+            panic!("pointer press over native text input should complete as focus trace");
+        };
+        assert!(trace.handled);
+        assert_eq!(trace.event_summary, "focus:true");
+        assert!(runtime.local_state().focused);
+    }
+
+    #[test]
+    fn backend_presented_physical_control_ignores_view_contract_gate() {
         let mut runtime = SlipwayRuntime::new(
             PhysicalMismatchWidget::hit_bounds_outside_layout("mismatch-view-contract"),
             (),
@@ -5696,7 +5903,7 @@ mod tests {
 
         let product = runtime.handle_backend_presented_physical_control_with_app_reducer(
             DebugCommand::physical_control_with_trace(
-                "backend-presented-view-contract-blocked",
+                "backend-presented-view-contract-delivered",
                 frame,
                 DebugPhysicalControl::Pointer {
                     position: Point { x: 4.0, y: 4.0 },
@@ -5710,33 +5917,19 @@ mod tests {
             &mut |_, _messages: Vec<Message>| {},
         );
 
-        assert_eq!(runtime.local_state().presses, 0);
-        let DebugReplyProduct::Error(error) = product else {
-            panic!("blocking view contract diagnostics must return an error");
+        assert_eq!(runtime.local_state().presses, 1);
+        let DebugReplyProduct::ControlTrace(control_trace) = product else {
+            panic!("backend-presented visible input must not be blocked by runtime evidence gates");
         };
-        assert_eq!(
-            error.code,
-            "backend-physical-control-visible-contract-blocked"
-        );
-        assert_eq!(
-            error
-                .dispatch_evidence
-                .as_ref()
-                .and_then(|evidence| evidence.selected_region.as_ref()),
-            Some(&PresentationRegionId::from("mismatch-hit"))
-        );
+        assert!(control_trace.handled);
         let trace = runtime
             .last_backend_input_trace()
-            .expect("blocked visible input is traced");
-        assert!(!trace.handled);
-        assert!(trace.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "view_contract.hit_bounds_outside_layout"
-                && diagnostic.severity == DiagnosticSeverity::Error
-        }));
+            .expect("delivered visible input is traced");
+        assert!(trace.handled);
     }
 
     #[test]
-    fn backend_presented_physical_control_blocks_route_contract_diagnostics() {
+    fn backend_presented_physical_control_obeys_authored_route_without_evidence_gate() {
         let mut runtime = SlipwayRuntime::new(
             PhysicalMismatchWidget::route_mismatch("mismatch-route-policy"),
             (),
@@ -5761,7 +5954,7 @@ mod tests {
 
         let product = runtime.handle_backend_presented_physical_control_with_app_reducer(
             DebugCommand::physical_control_with_trace(
-                "backend-presented-route-contract-blocked",
+                "backend-presented-route-contract-delivered",
                 frame,
                 DebugPhysicalControl::Pointer {
                     position: Point { x: 4.0, y: 4.0 },
@@ -5777,26 +5970,17 @@ mod tests {
 
         assert_eq!(runtime.local_state().presses, 0);
         let DebugReplyProduct::Error(error) = product else {
-            panic!("blocking route contract diagnostics must return an error");
+            panic!(
+                "unhandled backend-presented visible input must return an unhandled error, not an evidence-gate error"
+            );
         };
-        assert_eq!(
-            error.code,
-            "backend-physical-control-visible-contract-blocked"
-        );
-        assert_eq!(
-            error
-                .dispatch_evidence
-                .as_ref()
-                .and_then(|evidence| evidence.selected_region.as_ref()),
-            Some(&PresentationRegionId::from("mismatch-hit"))
-        );
+        assert_eq!(error.code, "backend-physical-control-not-handled");
         let trace = runtime
             .last_backend_input_trace()
-            .expect("blocked route input is traced");
+            .expect("delivered route input is traced");
         assert!(!trace.handled);
-        assert!(trace.diagnostics.iter().any(|diagnostic| {
+        assert!(!trace.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_ROUTE_MISMATCH
-                && diagnostic.severity == DiagnosticSeverity::Error
         }));
     }
 
@@ -6006,7 +6190,7 @@ mod tests {
             mutating_ignored_runtime.apply_backend_input_event(mutating_ignored_input);
 
         assert!(!mutating_ignored_outcome.handled);
-        assert_eq!(mutating_ignored_runtime.local_state().presses, 0);
+        assert_eq!(mutating_ignored_runtime.local_state().presses, 1);
         let mutating_ignored_trace = mutating_ignored_runtime
             .last_backend_input_trace()
             .expect("backend trace recorded");
@@ -6042,7 +6226,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_presented_physical_input_refuses_dispatch_route_mismatch_before_handler() {
+    fn backend_presented_physical_input_does_not_runtime_recheck_dispatch_route_mismatch() {
         let mut runtime = SlipwayRuntime::new(
             PhysicalMismatchWidget::route_mismatch("mismatch-route-policy"),
             (),
@@ -6063,9 +6247,8 @@ mod tests {
         assert!(!outcome.handled);
         assert_eq!(runtime.local_state().presses, 0);
         let trace = runtime.last_backend_input_trace().expect("trace recorded");
-        assert!(trace.diagnostics.iter().any(|diagnostic| {
+        assert!(!trace.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_ROUTE_MISMATCH
-                && diagnostic.severity == DiagnosticSeverity::Error
         }));
     }
 
@@ -6538,6 +6721,7 @@ mod tests {
             ProbeRequest {
                 target: None,
                 kinds: vec![ProbeKind::Event],
+                event_trace_limit: None,
             },
         ));
         let DebugReplyProduct::Probes(products) = product else {
@@ -6574,14 +6758,7 @@ mod tests {
             WidgetId::from("physical-probe")
         );
         assert_eq!(event.emitted_messages[0].name, "press");
-        assert_eq!(
-            event
-                .local_state
-                .iter()
-                .find(|state| state.name == "presses")
-                .map(|state| state.value.as_str()),
-            Some("1")
-        );
+        assert!(event.local_state.is_empty());
         assert!(matches!(
             (event.revision_before, event.revision_after),
             (Some(before), Some(after)) if after > before
@@ -6622,43 +6799,89 @@ mod tests {
     }
 
     #[test]
-    fn direct_backend_input_is_refused_before_handler_runs() {
+    fn ordinary_backend_trace_change_values_are_compacted_but_shape_is_preserved() {
+        let change = slipway_core::ChangeEvidence {
+            target: WidgetId::from("trace-target"),
+            slot: Some(WidgetSlotAddress {
+                widget: WidgetId::from("trace-target"),
+                ordinal: 3,
+                path: vec![WidgetId::from("root"), WidgetId::from("trace-target")],
+            }),
+            field: "large-field".to_string(),
+            before: Some("large-before-value".repeat(128)),
+            after: Some("large-after-value".repeat(128)),
+        };
+
+        let compact = compact_backend_trace_changes(std::slice::from_ref(&change));
+
+        assert_eq!(compact.len(), 1);
+        assert_eq!(compact[0].target, change.target);
+        assert_eq!(compact[0].slot, change.slot);
+        assert_eq!(compact[0].field, change.field);
+        assert_eq!(compact[0].before.as_deref(), Some("<redacted>"));
+        assert_eq!(compact[0].after.as_deref(), Some("<redacted>"));
+        assert_eq!(
+            ChangeShapeIdentity::from(&compact[0]),
+            ChangeShapeIdentity {
+                target: WidgetId::from("trace-target"),
+                slot: Some(WidgetSlotAddress {
+                    widget: WidgetId::from("trace-target"),
+                    ordinal: 3,
+                    path: vec![WidgetId::from("root"), WidgetId::from("trace-target")],
+                }),
+                field: "large-field".to_string(),
+                before_present: true,
+                after_present: true,
+            }
+        );
+    }
+
+    #[test]
+    fn visible_backend_input_does_not_clone_local_state_for_rollback() {
+        CLONE_COUNTING_PHYSICAL_LOCAL_CLONES.store(0, Ordering::SeqCst);
+        let mut runtime = SlipwayRuntime::new(CloneCountingPhysicalProbeWidget, ());
+        let backend_input = backend_presented_clone_counting_physical_press(&runtime);
+
+        let outcome = runtime.apply_backend_input_event(backend_input);
+
+        assert!(outcome.handled);
+        assert_eq!(runtime.local_state().presses, 1);
+        assert_eq!(
+            CLONE_COUNTING_PHYSICAL_LOCAL_CLONES.load(Ordering::SeqCst),
+            0,
+            "visible backend input must not clone local state for rollback"
+        );
+    }
+
+    #[test]
+    fn direct_backend_input_reaches_handler_without_runtime_evidence_gate() {
         let mut runtime = SlipwayRuntime::new(ProbeWidget, ());
         let backend_input = BackendInputEvent::direct(count_probe());
 
         let outcome = runtime.apply_backend_input_event(backend_input.clone());
 
-        assert!(!outcome.handled);
-        assert_eq!(runtime.local_state().count, 0);
-        assert!(outcome.diagnostics.iter().any(|diagnostic| {
+        assert!(outcome.handled);
+        assert_eq!(runtime.local_state().count, 1);
+        assert!(!outcome.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_MISSING
-                && diagnostic.severity == DiagnosticSeverity::Error
         }));
         let trace = runtime
             .last_backend_input_trace()
             .expect("backend input trace recorded");
         assert_eq!(trace.input, backend_input);
-        assert!(!trace.handled);
-        assert!(trace.emitted_messages.is_empty());
-        let diagnostic = trace
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.code == "backend_input.dispatch_evidence_missing")
-            .expect("missing dispatch evidence error recorded");
-        assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
-        assert_eq!(diagnostic.target.as_ref(), Some(&WidgetId::from("probe")));
-        assert!(
-            diagnostic
-                .message
-                .contains("backend input did not carry declaration dispatch evidence")
-        );
+        assert!(trace.handled);
+        assert_eq!(trace.emitted_messages.len(), 1);
+        assert!(trace.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "backend_input.dispatch_evidence_missing"
+                && diagnostic.severity == DiagnosticSeverity::Error
+        }));
     }
 
     #[test]
-    fn backend_input_event_probe_returns_recent_backend_trace_log() {
+    fn backend_input_event_probe_defaults_to_latest_backend_trace() {
         let mut runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
         let first = backend_presented_physical_press(&runtime);
-        runtime.apply_backend_input_event(first.clone());
+        runtime.apply_backend_input_event(first);
         let second = backend_presented_physical_press(&runtime);
         runtime.apply_backend_input_event(second.clone());
 
@@ -6671,6 +6894,42 @@ mod tests {
             ProbeRequest {
                 target: None,
                 kinds: vec![ProbeKind::Event],
+                event_trace_limit: None,
+            },
+        ));
+        let DebugReplyProduct::Probes(products) = product else {
+            panic!("expected probe products");
+        };
+        let events = products
+            .iter()
+            .filter_map(|product| match product {
+                ProbeProduct::Event(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].dispatch_evidence.as_ref(),
+            second.dispatch_evidence.as_ref()
+        );
+        assert!(events[0].local_state.is_empty());
+    }
+
+    #[test]
+    fn backend_input_event_probe_respects_explicit_trace_limit() {
+        let mut runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
+        let first = backend_presented_physical_press(&runtime);
+        runtime.apply_backend_input_event(first.clone());
+        let second = backend_presented_physical_press(&runtime);
+        runtime.apply_backend_input_event(second.clone());
+
+        let product = runtime.handle_debug_command(DebugCommand::probe(
+            "backend-event-probe-log",
+            frame(38),
+            ProbeRequest {
+                target: None,
+                kinds: vec![ProbeKind::Event],
+                event_trace_limit: Some(2),
             },
         ));
         let DebugReplyProduct::Probes(products) = product else {
@@ -6692,22 +6951,8 @@ mod tests {
             events[1].dispatch_evidence.as_ref(),
             second.dispatch_evidence.as_ref()
         );
-        assert_eq!(
-            events[0]
-                .local_state
-                .iter()
-                .find(|state| state.name == "presses")
-                .map(|state| state.value.as_str()),
-            Some("1")
-        );
-        assert_eq!(
-            events[1]
-                .local_state
-                .iter()
-                .find(|state| state.name == "presses")
-                .map(|state| state.value.as_str()),
-            Some("2")
-        );
+        assert!(events[0].local_state.is_empty());
+        assert!(events[1].local_state.is_empty());
     }
 
     #[test]
@@ -7231,7 +7476,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_refuses_backend_input_with_forged_dispatch_evidence_before_handler_runs() {
+    fn runtime_delivers_backend_input_with_forged_dispatch_evidence_without_runtime_gate() {
         let mut runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
         let mut backend_input = backend_presented_physical_press_for_frame(&runtime, frame(46));
         let evidence = backend_input
@@ -7242,20 +7487,18 @@ mod tests {
 
         let outcome = runtime.apply_backend_input_event(backend_input);
 
-        assert!(!outcome.handled);
-        assert_eq!(runtime.local_state().presses, 0);
-        assert!(outcome.diagnostics.iter().any(|diagnostic| {
+        assert!(outcome.handled);
+        assert_eq!(runtime.local_state().presses, 1);
+        assert!(!outcome.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_SOURCE_MISMATCH
-                && diagnostic.severity == DiagnosticSeverity::Error
         }));
         let trace = runtime
             .last_backend_input_trace()
-            .expect("refused backend input is recorded for evidence");
-        assert!(!trace.handled);
-        assert!(trace.emitted_messages.is_empty());
-        assert!(trace.diagnostics.iter().any(|diagnostic| {
+            .expect("backend input is recorded for evidence");
+        assert!(trace.handled);
+        assert_eq!(trace.emitted_messages.len(), 1);
+        assert!(!trace.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_SOURCE_MISMATCH
-                && diagnostic.severity == DiagnosticSeverity::Error
         }));
     }
 
@@ -8718,6 +8961,18 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_exposes_platform_ime_allow_policy() {
+        let config = SlipwayRuntimeConfig::admitted_debug().with_platform_ime_always_allowed();
+        assert_eq!(config.ime_policy, SlipwayImePolicy::AlwaysAllowed);
+        assert!(config.ime_policy.keeps_platform_ime_allowed());
+
+        let config = SlipwayRuntimeConfig::admitted_debug()
+            .with_ime_policy(SlipwayImePolicy::BackendRequested);
+        assert_eq!(config.ime_policy, SlipwayImePolicy::BackendRequested);
+        assert!(!config.ime_policy.keeps_platform_ime_allowed());
+    }
+
+    #[test]
     fn render_request_through_attachment_returns_real_evidence() {
         let mut app = SlipwayAssembledApp::new(ProbeWidget, ());
         let pending = begin_pending(&app.debug_mcp, forged_render_message("render", &frame(2)));
@@ -8812,6 +9067,7 @@ mod tests {
             ProbeRequest {
                 target: None,
                 kinds: vec![ProbeKind::Topology, ProbeKind::State],
+                event_trace_limit: None,
             },
         ));
 

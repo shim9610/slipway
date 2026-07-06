@@ -318,7 +318,7 @@ fn render_op(
             diagnostics,
             fonts,
         ),
-        PaintOp::Group { ops, .. } => {
+        PaintOp::Group { ops, .. } | PaintOp::Layer { ops, .. } => {
             for child in ops {
                 render_op(child, viewport, target, diagnostics, fonts);
             }

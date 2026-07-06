@@ -1,18 +1,23 @@
 use super::*;
 
+use iced::advanced::Renderer as _;
 use iced::advanced::graphics::Compositor as _;
 use iced::advanced::graphics::Viewport;
 use iced::advanced::mouse;
 use iced::advanced::renderer;
+use iced::advanced::text::{self, Paragraph as _, Renderer as _};
 use iced::theme::Base as _;
+use iced_core::input_method;
 use iced_winit::runtime::user_interface::{self, UserInterface};
 use iced_winit::winit;
 use slipway_core::PointerButton as DebugPointerButton;
 use slipway_debug_bridge::DebugPhysicalControl;
-use slipway_runtime::SlipwayRuntimePendingNativeMcpCall;
+use slipway_runtime::{SlipwayImePolicy, SlipwayRuntimePendingNativeMcpCall};
+use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Instant;
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{
     DeviceId, ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
 };
@@ -20,7 +25,7 @@ use winit::event_loop::{
     ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
 };
 use winit::keyboard::ModifiersState;
-use winit::window::{Window, WindowId};
+use winit::window::{ImePurpose, Window, WindowId};
 
 #[derive(Clone, Copy, Debug)]
 enum NativeRunnerEvent {
@@ -40,6 +45,7 @@ where
     W::AppMessage: Clone + std::fmt::Debug + Send + 'static,
     F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>) + 'static,
 {
+    let ime_policy = config.ime_policy;
     let assembled = SlipwayAssembledApp::with_config(widget, external, config);
     let debug_mcp_transport = assembled
         .runtime
@@ -54,7 +60,8 @@ where
     event_loop.set_control_flow(ControlFlow::Wait);
     let display_handle = event_loop.owned_display_handle();
     let proxy = event_loop.create_proxy();
-    let mut runner = NativeIcedRunner::new(app, display_handle, proxy);
+    let ime_trace = std::env::var_os("SLIPWAY_IME_TRACE").is_some();
+    let mut runner = NativeIcedRunner::new(app, display_handle, proxy, ime_policy, ime_trace);
 
     event_loop
         .run_app(&mut runner)
@@ -72,8 +79,12 @@ where
     app: SlipwayIcedRuntimeApp<W, F>,
     display_handle: OwnedDisplayHandle,
     proxy: EventLoopProxy<NativeRunnerEvent>,
+    ime_policy: SlipwayImePolicy,
+    ime_trace: bool,
     window: Option<NativeIcedWindow>,
     pending_mcp: Option<SlipwayRuntimePendingNativeMcpCall>,
+    pending_iced_events: Vec<iced::Event>,
+    pending_resize: Option<PhysicalSize<u32>>,
 }
 
 struct NativeIcedWindow {
@@ -87,8 +98,127 @@ struct NativeIcedWindow {
     cursor_position: Option<PhysicalPosition<f64>>,
     modifiers: ModifiersState,
     mouse_interaction: mouse::Interaction,
+    ime_state: Option<(iced::Rectangle, iced_core::input_method::Purpose)>,
+    preedit: Option<NativePreedit>,
+    preedit_text_color: Option<iced::Color>,
+    preedit_font: Option<iced::Font>,
+    preedit_text_size: Option<f32>,
+    ime_composing: bool,
+    ime_allowed: bool,
+    ime_policy: SlipwayImePolicy,
+    ime_trace: bool,
+    redraw_at: Option<Instant>,
     theme: iced::Theme,
     style: renderer::Style,
+}
+
+struct NativePreedit {
+    cursor: iced::Rectangle,
+    content: <iced::Renderer as text::Renderer>::Paragraph,
+    spans: Vec<text::Span<'static, (), iced::Font>>,
+}
+
+impl NativePreedit {
+    fn new() -> Self {
+        Self {
+            cursor: iced::Rectangle::default(),
+            content: Default::default(),
+            spans: Vec::new(),
+        }
+    }
+
+    fn update(
+        &mut self,
+        cursor: iced::Rectangle,
+        preedit: &input_method::Preedit,
+        text_color: iced::Color,
+        font: iced::Font,
+        text_size: f32,
+        _renderer: &iced::Renderer,
+    ) {
+        self.cursor = cursor;
+
+        let spans = match &preedit.selection {
+            Some(selection) => vec![
+                text::Span::new(&preedit.content[..selection.start]).color(text_color),
+                text::Span::new(if selection.start == selection.end {
+                    "\u{200A}"
+                } else {
+                    &preedit.content[selection.start..selection.end]
+                })
+                .color(text_color),
+                text::Span::new(&preedit.content[selection.end..]).color(text_color),
+            ],
+            None => vec![text::Span::new(&preedit.content).color(text_color)],
+        };
+
+        if spans != self.spans.as_slice() {
+            self.content =
+                <iced::Renderer as text::Renderer>::Paragraph::with_spans(iced_core::Text {
+                    content: &spans,
+                    bounds: iced::Size::INFINITE,
+                    size: iced::Pixels(preedit.text_size.map_or(text_size, |size| size.0)),
+                    line_height: text::LineHeight::default(),
+                    font,
+                    align_x: text::Alignment::Default,
+                    align_y: iced::alignment::Vertical::Top,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                });
+
+            self.spans.clear();
+            self.spans
+                .extend(spans.into_iter().map(text::Span::to_static));
+        }
+    }
+
+    fn draw(&self, renderer: &mut iced::Renderer, color: iced::Color, viewport: &iced::Rectangle) {
+        if self.content.min_width() < 1.0 {
+            return;
+        }
+
+        let content_bounds = self.content.min_bounds();
+        let vertical_padding = (self.cursor.height - content_bounds.height).max(0.0) / 2.0;
+        let mut bounds = iced::Rectangle::new(
+            iced::Point::new(self.cursor.x, self.cursor.y + vertical_padding),
+            content_bounds,
+        );
+
+        bounds.x = bounds
+            .x
+            .max(viewport.x)
+            .min(viewport.x + viewport.width - bounds.width);
+        bounds.y = bounds
+            .y
+            .max(viewport.y)
+            .min(viewport.y + viewport.height - bounds.height);
+
+        renderer.with_layer(bounds, |renderer| {
+            renderer.fill_paragraph(&self.content, bounds.position(), color, bounds);
+
+            const UNDERLINE: f32 = 1.0;
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: bounds.shrink(iced::Padding {
+                        top: bounds.height - UNDERLINE,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                color,
+            );
+
+            for span_bounds in self.content.span_bounds(1) {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: span_bounds + (bounds.position() - iced::Point::ORIGIN),
+                        ..Default::default()
+                    },
+                    color,
+                );
+            }
+        });
+    }
 }
 
 impl<W, F> NativeIcedRunner<W, F>
@@ -103,13 +233,19 @@ where
         app: SlipwayIcedRuntimeApp<W, F>,
         display_handle: OwnedDisplayHandle,
         proxy: EventLoopProxy<NativeRunnerEvent>,
+        ime_policy: SlipwayImePolicy,
+        ime_trace: bool,
     ) -> Self {
         Self {
             app,
             display_handle,
             proxy,
+            ime_policy,
+            ime_trace,
             window: None,
             pending_mcp: None,
+            pending_iced_events: Vec::new(),
+            pending_resize: None,
         }
     }
 
@@ -151,6 +287,16 @@ where
                 .map_err(|error| iced::Error::WindowCreationFailed(Box::new(error)))?,
         );
         window.set_title(&title);
+        let ime_allowed = self.ime_policy.keeps_platform_ime_allowed();
+        if ime_allowed {
+            window.set_ime_allowed(true);
+            window.set_ime_cursor_area(LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 1.0));
+            window.set_ime_purpose(ImePurpose::Normal);
+            trace_ime(
+                self.ime_trace,
+                "window-create set_ime_allowed(true) cursor_area=(0,0,1,1)",
+            );
+        }
 
         let executor = <iced::executor::Default as iced::Executor>::new()
             .map_err(iced::Error::ExecutorCreationFailed)?;
@@ -166,6 +312,7 @@ where
                 ),
             )
             .map_err(iced::Error::GraphicsCreationFailed)?;
+        load_platform_text_fonts(&mut compositor, self.ime_trace);
         let physical_size = non_zero_physical_size(window.inner_size());
         let mut surface =
             compositor.create_surface(window.clone(), physical_size.width, physical_size.height);
@@ -185,6 +332,16 @@ where
             cursor_position: None,
             modifiers: ModifiersState::default(),
             mouse_interaction: mouse::Interaction::None,
+            ime_state: None,
+            preedit: None,
+            preedit_text_color: None,
+            preedit_font: None,
+            preedit_text_size: None,
+            ime_composing: false,
+            ime_allowed,
+            ime_policy: self.ime_policy,
+            ime_trace: self.ime_trace,
+            redraw_at: None,
             theme,
             style: renderer::Style {
                 text_color: base.text_color,
@@ -251,16 +408,34 @@ where
             &mut window.clipboard,
             &mut messages,
         );
-        let mouse_interaction = match state {
+        trace_iced_events_for_ime(window.ime_trace, events);
+        let (mouse_interaction, input_method, redraw_request) = match state {
             user_interface::State::Updated {
                 mouse_interaction,
-                redraw_request: _,
+                input_method,
+                redraw_request,
                 ..
-            } => Some(mouse_interaction),
-            user_interface::State::Outdated => None,
+            } => (
+                Some(mouse_interaction),
+                Some(input_method),
+                Some(redraw_request),
+            ),
+            user_interface::State::Outdated => (None, None, None),
         };
         window.cache = user_interface.into_cache();
-        let _ = window;
+        self.apply_preedit_style_messages(&messages);
+        if let Some(input_method) = input_method {
+            let Some(window) = self.window.as_mut() else {
+                return messages;
+            };
+            request_window_input_method(window, input_method);
+        }
+        if let Some(redraw_request) = redraw_request {
+            let Some(window) = self.window.as_mut() else {
+                return messages;
+            };
+            request_window_redraw(window, redraw_request);
+        }
         if let Some(mouse_interaction) = mouse_interaction {
             self.update_mouse_interaction(mouse_interaction);
         }
@@ -270,6 +445,10 @@ where
     fn process_messages(&mut self, messages: Vec<SlipwayIcedRuntimeMessage<W::AppMessage>>) {
         let mut should_redraw = false;
         for message in messages {
+            if let SlipwayIcedRuntimeMessage::PreeditStyle(style) = message {
+                self.apply_preedit_style(style);
+                continue;
+            }
             let update = self.app.update_without_debug_drain(message);
             should_redraw = true;
             if update.debug_error.is_some() {
@@ -281,6 +460,26 @@ where
                 window.raw.request_redraw();
             }
         }
+    }
+
+    fn apply_preedit_style_messages(
+        &mut self,
+        messages: &[SlipwayIcedRuntimeMessage<W::AppMessage>],
+    ) {
+        for message in messages {
+            if let SlipwayIcedRuntimeMessage::PreeditStyle(style) = message {
+                self.apply_preedit_style(style.clone());
+            }
+        }
+    }
+
+    fn apply_preedit_style(&mut self, style: IcedPreeditOverlayStyle) {
+        let Some(window) = self.window.as_mut() else {
+            return;
+        };
+        window.preedit_text_color = Some(style.text_color);
+        window.preedit_font = Some(style.font);
+        window.preedit_text_size = Some(style.size);
     }
 
     fn update_mouse_interaction(&mut self, interaction: mouse::Interaction) {
@@ -313,6 +512,7 @@ where
         );
         user_interface.draw(&mut window.renderer, &window.theme, &window.style, cursor);
         window.cache = user_interface.into_cache();
+        draw_window_preedit(window);
         let base = window.theme.base();
         let _ = window.compositor.present(
             &mut window.renderer,
@@ -342,7 +542,7 @@ where
                 return;
             }
             WindowEvent::Resized(size) => {
-                self.resize(*size);
+                self.queue_resize(*size);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(window) = self.window.as_mut() {
@@ -351,13 +551,47 @@ where
                         iced::Size::new(physical_size.width, physical_size.height),
                         *scale_factor as f32,
                     );
-                    window.compositor.configure_surface(
-                        &mut window.surface,
-                        physical_size.width,
-                        physical_size.height,
-                    );
+                    self.pending_resize = Some(physical_size);
                 }
                 self.sync_presented_viewport_from_window();
+            }
+            WindowEvent::Focused(true) => {
+                if let Some(window) = self.window.as_mut() {
+                    ensure_window_ime_policy(window, "focused");
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let Some(window) = self.window.as_mut() {
+                    trace_ime(
+                        window.ime_trace,
+                        format_args!(
+                            "raw KeyboardInput logical={:?} physical={:?} text={:?} state={:?}",
+                            event.logical_key, event.physical_key, event.text, event.state
+                        ),
+                    );
+                    ensure_window_ime_policy(window, "keyboard-input");
+                }
+            }
+            WindowEvent::Ime(event) => {
+                if let Some(window) = self.window.as_mut() {
+                    trace_ime(window.ime_trace, format_args!("raw Ime::{event:?}"));
+                    match event {
+                        Ime::Enabled => {
+                            window.ime_composing = true;
+                        }
+                        Ime::Preedit(content, selection) => {
+                            window.ime_composing = !content.is_empty() || selection.is_some();
+                            if !window.ime_composing {
+                                window.preedit = None;
+                            }
+                        }
+                        Ime::Commit(_) | Ime::Disabled => {
+                            window.ime_composing = false;
+                            window.preedit = None;
+                        }
+                    }
+                    ensure_window_ime_policy(window, "raw-ime-event");
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(window) = self.window.as_mut() {
@@ -375,6 +609,18 @@ where
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.apply_pending_resize();
+                self.dispatch_pending_iced_events();
+                if self
+                    .window
+                    .as_ref()
+                    .is_some_and(should_dispatch_redraw_event_update)
+                {
+                    let messages = self.dispatch_iced_events(&[iced::Event::Window(
+                        iced::window::Event::RedrawRequested(Instant::now()),
+                    )]);
+                    self.process_messages(messages);
+                }
                 self.redraw();
                 return;
             }
@@ -389,12 +635,11 @@ where
             window.viewport.scale_factor(),
             window.modifiers,
         ) {
-            let messages = self.dispatch_iced_events(&[event]);
-            self.process_messages(messages);
+            self.pending_iced_events.push(event);
         }
     }
 
-    fn resize(&mut self, size: PhysicalSize<u32>) {
+    fn queue_resize(&mut self, size: PhysicalSize<u32>) {
         let Some(window) = self.window.as_mut() else {
             return;
         };
@@ -403,6 +648,17 @@ where
             iced::Size::new(physical_size.width, physical_size.height),
             window.raw.scale_factor() as f32,
         );
+        self.pending_resize = Some(physical_size);
+        self.sync_presented_viewport_from_window();
+    }
+
+    fn apply_pending_resize(&mut self) {
+        let Some(physical_size) = self.pending_resize.take() else {
+            return;
+        };
+        let Some(window) = self.window.as_mut() else {
+            return;
+        };
         window.compositor.configure_surface(
             &mut window.surface,
             physical_size.width,
@@ -412,6 +668,15 @@ where
         let _ = window;
         self.sync_presented_viewport_from_window();
         raw.request_redraw();
+    }
+
+    fn dispatch_pending_iced_events(&mut self) {
+        if self.pending_iced_events.is_empty() {
+            return;
+        }
+        let events = std::mem::take(&mut self.pending_iced_events);
+        let messages = self.dispatch_iced_events(&events);
+        self.process_messages(messages);
     }
 
     fn pump_mcp(&mut self) {
@@ -491,6 +756,9 @@ where
             } => {
                 return self.run_native_scroll_control(command, selector, *offset_x, *offset_y);
             }
+            DebugPhysicalControl::Text { selector, text } => {
+                return self.run_native_text_control(command, selector, text);
+            }
             DebugPhysicalControl::TextEdit {
                 selector,
                 kind: slipway_core::TextEditKind::MoveCaret,
@@ -505,9 +773,23 @@ where
                     selection_after.clone(),
                 );
             }
-            DebugPhysicalControl::Text { selector, .. }
-            | DebugPhysicalControl::TextEdit { selector, .. }
-            | DebugPhysicalControl::Keyboard { selector, .. } => {
+            DebugPhysicalControl::TextEdit {
+                selector,
+                kind,
+                text,
+                selection_before,
+                selection_after,
+            } => {
+                return self.run_native_text_edit_control(
+                    command,
+                    selector,
+                    *kind,
+                    text.clone(),
+                    selection_before.clone(),
+                    selection_after.clone(),
+                );
+            }
+            DebugPhysicalControl::Keyboard { selector, .. } => {
                 if let Err(unsupported) = self.focus_native_region_for_selector(selector) {
                     return native_physical_control_error(unsupported);
                 }
@@ -556,12 +838,19 @@ where
             })
             .map(|index| backend_inputs.remove(index));
 
-        let Some(backend_input) = matched else {
-            return DebugReplyProduct::Error(DebugFailure {
-                code: "native-physical-control-produced-no-backend-input".to_string(),
-                message: "the synthesized iced native event reached UserInterface::update but produced no backend-presented input evidence matching the requested physical operation".to_string(),
-                dispatch_evidence: None,
-            });
+        let backend_input = match matched {
+            Some(backend_input) => backend_input,
+            None => {
+                let Some(focus_input) = self.pointer_press_focus_input_after_native_update(command)
+                else {
+                    return DebugReplyProduct::Error(DebugFailure {
+                        code: "native-physical-control-produced-no-backend-input".to_string(),
+                        message: "the synthesized iced native event reached UserInterface::update but produced no backend-presented input evidence matching the requested physical operation".to_string(),
+                        dispatch_evidence: None,
+                    });
+                };
+                focus_input
+            }
         };
 
         let product = self
@@ -574,6 +863,42 @@ where
         );
         self.process_messages(remaining);
         product
+    }
+
+    fn pointer_press_focus_input_after_native_update(
+        &mut self,
+        command: &DebugCommand,
+    ) -> Option<BackendInputEvent> {
+        let DebugCommandKind::PhysicalControl {
+            operation:
+                DebugPhysicalControl::Pointer {
+                    position,
+                    kind: slipway_core::PointerEventKind::Press,
+                    button: Some(_),
+                    ..
+                },
+            ..
+        } = &command.kind
+        else {
+            return None;
+        };
+        let presentation = self.current_visible_presentation().ok()?;
+        let selector = slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Position {
+            position: *position,
+        };
+        let region = focus_region_for_native_physical_selector(&presentation, &selector)?.clone();
+        let event = InputEvent::Focus(slipway_core::FocusEvent {
+            target: region.target.clone(),
+            target_slot: region.address.clone(),
+            focused: true,
+        });
+        Some(backend_focus_input_event(
+            &presentation,
+            &region,
+            DeclaredEventDispatchKind::Focus,
+            Some(*position),
+            event,
+        ))
     }
 
     fn run_native_focus_control(
@@ -714,6 +1039,102 @@ where
             &region,
             selection_before,
             selection_after,
+        );
+        self.app
+            .handle_backend_presented_physical_control(command.clone(), backend_input)
+    }
+
+    fn run_native_text_control(
+        &mut self,
+        command: &DebugCommand,
+        selector: &slipway_debug_bridge::DebugPhysicalControlDeclarationSelector,
+        text: &str,
+    ) -> DebugReplyProduct {
+        let presentation = match self.current_visible_presentation() {
+            Ok(presentation) => presentation,
+            Err(unsupported) => return native_physical_control_error(unsupported),
+        };
+        let Some(region) =
+            focus_region_for_native_physical_selector(&presentation, selector).cloned()
+        else {
+            return native_physical_control_error(NativePhysicalControlUnsupported::new(
+                "native-physical-control-text-region-not-found",
+                "the current iced visible presentation has no enabled text focus region matching the physical control selector",
+            ));
+        };
+        if region.text_edit.is_none() {
+            return native_physical_control_error(NativePhysicalControlUnsupported::new(
+                "native-physical-control-text-edit-region-required",
+                "text input requires a selected focus region backed by a TextEditRegionDeclaration",
+            ));
+        }
+        let event = InputEvent::Text(slipway_core::TextInputEvent {
+            target: region.target.clone(),
+            target_slot: region.address.clone(),
+            text: text.to_string(),
+        });
+        let backend_input = backend_focus_input_event(
+            &presentation,
+            &region,
+            DeclaredEventDispatchKind::Text,
+            None,
+            event,
+        );
+        self.app
+            .handle_backend_presented_physical_control(command.clone(), backend_input)
+    }
+
+    fn run_native_text_edit_control(
+        &mut self,
+        command: &DebugCommand,
+        selector: &slipway_debug_bridge::DebugPhysicalControlDeclarationSelector,
+        kind: slipway_core::TextEditKind,
+        text: Option<String>,
+        selection_before: Option<slipway_core::TextSelectionRange>,
+        selection_after: Option<slipway_core::TextSelectionRange>,
+    ) -> DebugReplyProduct {
+        let presentation = match self.current_visible_presentation() {
+            Ok(presentation) => presentation,
+            Err(unsupported) => return native_physical_control_error(unsupported),
+        };
+        let Some(region) =
+            focus_region_for_native_physical_selector(&presentation, selector).cloned()
+        else {
+            return native_physical_control_error(NativePhysicalControlUnsupported::new(
+                "native-physical-control-text-edit-region-not-found",
+                "the current iced visible presentation has no enabled text edit focus region matching the physical control selector",
+            ));
+        };
+        let Some(text_edit) = region.text_edit.as_ref() else {
+            return native_physical_control_error(NativePhysicalControlUnsupported::new(
+                "native-physical-control-text-edit-region-required",
+                "text edit requires a selected focus region backed by a TextEditRegionDeclaration",
+            ));
+        };
+        if !text_edit
+            .edit_commands
+            .iter()
+            .any(|command| command.enabled && command.kind == kind)
+        {
+            return native_physical_control_error(NativePhysicalControlUnsupported::new(
+                "native-physical-control-text-edit-command-unavailable",
+                "the selected text edit region does not declare an enabled command for the requested edit kind",
+            ));
+        }
+        let event = InputEvent::TextEdit(slipway_core::TextEditEvent {
+            target: region.target.clone(),
+            target_slot: region.address.clone(),
+            kind,
+            text,
+            selection_before,
+            selection_after,
+        });
+        let backend_input = backend_focus_input_event(
+            &presentation,
+            &region,
+            DeclaredEventDispatchKind::Text,
+            None,
+            event,
         );
         self.app
             .handle_backend_presented_physical_control(command.clone(), backend_input)
@@ -1072,11 +1493,29 @@ where
         self.handle_window_event(event_loop, id, event);
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(transport) = self.app.debug_mcp_transport.as_ref() {
             if transport.drain_wakes() > 0 {
                 self.pump_mcp();
             }
+        }
+        self.apply_pending_resize();
+        self.dispatch_pending_iced_events();
+        let Some(window) = self.window.as_mut() else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+        let Some(redraw_at) = window.redraw_at else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        };
+        let now = Instant::now();
+        if redraw_at <= now {
+            window.redraw_at = None;
+            window.raw.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(redraw_at));
         }
     }
 }
@@ -1085,12 +1524,256 @@ fn non_zero_physical_size(size: PhysicalSize<u32>) -> PhysicalSize<u32> {
     PhysicalSize::new(size.width.max(1), size.height.max(1))
 }
 
+fn load_platform_text_fonts(compositor: &mut iced_renderer::Compositor, ime_trace: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        const CANDIDATES: &[&str] = &[
+            "C:\\Windows\\Fonts\\NotoSansKR-VF.ttf",
+            "C:\\Windows\\Fonts\\malgun.ttf",
+            "C:\\Windows\\Fonts\\gulim.ttc",
+        ];
+
+        for path in CANDIDATES {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            compositor.load_font(Cow::Owned(bytes));
+            trace_ime(ime_trace, format_args!("loaded platform text font {path}"));
+            return;
+        }
+
+        trace_ime(
+            ime_trace,
+            "no Windows Korean platform font candidate was available",
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = compositor;
+        let _ = ime_trace;
+    }
+}
+
 fn viewport_from_window(size: &PhysicalSize<u32>, scale_factor: f32) -> Viewport {
     let physical_size = non_zero_physical_size(*size);
     Viewport::with_physical_size(
         iced::Size::new(physical_size.width, physical_size.height),
         scale_factor,
     )
+}
+
+fn ensure_window_ime_policy(window: &mut NativeIcedWindow, reason: &'static str) {
+    if window.ime_policy.keeps_platform_ime_allowed() {
+        set_window_ime_allowed(window, true, reason);
+    }
+}
+
+fn set_window_ime_allowed(
+    window: &mut NativeIcedWindow,
+    allowed: bool,
+    reason: impl std::fmt::Display,
+) {
+    if window.ime_allowed == allowed {
+        let _ = reason;
+        return;
+    }
+    window.raw.set_ime_allowed(allowed);
+    window.ime_allowed = allowed;
+    trace_ime(
+        window.ime_trace,
+        format_args!("{reason} set_ime_allowed({allowed})"),
+    );
+}
+
+fn request_window_input_method(
+    window: &mut NativeIcedWindow,
+    input_method: iced_core::InputMethod,
+) {
+    match input_method {
+        iced_core::InputMethod::Disabled => {
+            if window.ime_policy.keeps_platform_ime_allowed() {
+                set_window_ime_allowed(window, true, "iced InputMethod::Disabled");
+                if window.ime_composing {
+                    trace_ime(
+                        window.ime_trace,
+                        "iced disabled ignored during active platform IME composition",
+                    );
+                }
+                return;
+            }
+            trace_ime(window.ime_trace, "iced InputMethod::Disabled");
+            if window.ime_state.is_some() {
+                set_window_ime_allowed(window, false, "iced InputMethod::Disabled");
+                window.ime_state = None;
+            }
+        }
+        iced_core::InputMethod::Enabled {
+            cursor,
+            purpose,
+            preedit,
+        } => {
+            let ime_state_changed = window.ime_state != Some((cursor, purpose));
+            let has_visible_preedit = preedit
+                .as_ref()
+                .is_some_and(|preedit| !preedit.content.is_empty());
+            if ime_state_changed || has_visible_preedit {
+                trace_ime(
+                    window.ime_trace,
+                    format_args!(
+                        "iced InputMethod::Enabled cursor=({}, {}, {}, {}) purpose={:?} preedit={:?}",
+                        cursor.x, cursor.y, cursor.width, cursor.height, purpose, preedit
+                    ),
+                );
+            }
+            if window.ime_state.is_none() {
+                set_window_ime_allowed(window, true, "iced InputMethod::Enabled");
+                trace_ime(
+                    window.ime_trace,
+                    "iced InputMethod::Enabled keeps platform IME allowed",
+                );
+            }
+            if window.ime_state != Some((cursor, purpose)) {
+                window.raw.set_ime_cursor_area(
+                    LogicalPosition::new(cursor.x, cursor.y),
+                    LogicalSize::new(cursor.width, cursor.height),
+                );
+                window
+                    .raw
+                    .set_ime_purpose(iced_winit::conversion::ime_purpose(purpose));
+                window.ime_state = Some((cursor, purpose));
+            }
+            match preedit {
+                Some(preedit) if !preedit.content.is_empty() => {
+                    let Some(text_color) = window.preedit_text_color else {
+                        trace_ime(
+                            window.ime_trace,
+                            "iced preedit skipped because explicit Slipway text input visual style is missing",
+                        );
+                        return;
+                    };
+                    let Some(font) = window.preedit_font else {
+                        trace_ime(
+                            window.ime_trace,
+                            "iced preedit skipped because explicit Slipway text input typography is missing",
+                        );
+                        return;
+                    };
+                    let Some(text_size) = window.preedit_text_size else {
+                        trace_ime(
+                            window.ime_trace,
+                            "iced preedit skipped because explicit Slipway text input typography size is missing",
+                        );
+                        return;
+                    };
+                    window
+                        .preedit
+                        .get_or_insert_with(NativePreedit::new)
+                        .update(
+                            cursor,
+                            &preedit,
+                            text_color,
+                            font,
+                            text_size,
+                            &window.renderer,
+                        );
+                }
+                Some(_) => {
+                    window.preedit = None;
+                }
+                None if !window.ime_composing => {
+                    window.preedit = None;
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+fn draw_window_preedit(window: &mut NativeIcedWindow) {
+    let Some(preedit) = window.preedit.as_ref() else {
+        return;
+    };
+    let Some(color) = window.preedit_text_color else {
+        trace_ime(
+            window.ime_trace,
+            "iced preedit draw skipped because explicit Slipway text input visual style is missing",
+        );
+        return;
+    };
+    if window.preedit_font.is_none() || window.preedit_text_size.is_none() {
+        trace_ime(
+            window.ime_trace,
+            "iced preedit draw skipped because explicit Slipway text input typography is missing",
+        );
+        return;
+    }
+    let viewport = iced::Rectangle::new(iced::Point::ORIGIN, window.viewport.logical_size());
+    preedit.draw(&mut window.renderer, color, &viewport);
+}
+
+fn trace_iced_events_for_ime(trace: bool, events: &[iced::Event]) {
+    if !trace {
+        return;
+    }
+    for event in events {
+        match event {
+            iced::Event::InputMethod(event) => {
+                trace_ime(true, format_args!("iced Event::InputMethod::{event:?}"));
+            }
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key,
+                modified_key,
+                text,
+                ..
+            }) => {
+                trace_ime(
+                    true,
+                    format_args!(
+                        "iced Event::Keyboard::KeyPressed key={key:?} modified={modified_key:?} text={text:?}"
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+fn trace_ime(trace: bool, message: impl std::fmt::Display) {
+    if trace {
+        let line = format!("[slipway-ime] {message}");
+        if let Some(path) = std::env::var_os("SLIPWAY_IME_TRACE_FILE") {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+                let _ = std::io::Write::write_all(&mut file, b"\n");
+            }
+        } else {
+            eprintln!("{line}");
+        }
+    }
+}
+
+fn request_window_redraw(window: &mut NativeIcedWindow, request: iced::window::RedrawRequest) {
+    match request {
+        iced::window::RedrawRequest::NextFrame => {
+            window.redraw_at = None;
+            window.raw.request_redraw();
+        }
+        iced::window::RedrawRequest::At(at) => {
+            if window.redraw_at.is_none_or(|scheduled| at < scheduled) {
+                window.redraw_at = Some(at);
+            }
+        }
+        iced::window::RedrawRequest::Wait => {}
+    }
+}
+
+fn should_dispatch_redraw_event_update(window: &NativeIcedWindow) -> bool {
+    window.ime_composing || window.ime_state.is_some() || window.preedit.is_some()
 }
 
 fn debug_pointer_button(button: DebugPointerButton) -> MouseButton {

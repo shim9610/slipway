@@ -27,6 +27,12 @@ const TOOL_SCREENSHOT: &str = "slipway.debug.screenshot";
 const TOOL_CONTROL: &str = "slipway.debug.control";
 const TOOL_PHYSICAL_CONTROL: &str = "slipway.debug.physical_control";
 const TOOL_RESIZE: &str = "slipway.debug.resize";
+const EVENT_TRACE_LIMIT_FIELDS: &[&str] = &[
+    "event_trace_limit",
+    "eventTraceLimit",
+    "event_limit",
+    "eventLimit",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DebugMcpConfig {
@@ -933,11 +939,11 @@ fn default_tools() -> Vec<Value> {
     vec![
         tool_schema(TOOL_STATUS, "Read the current Slipway debug status."),
         tool_schema(TOOL_PROBE, "Request explicit Slipway debug probe products."),
-        tool_schema(
+        render_tool_schema(
             TOOL_RENDER,
             "Request offscreen render evidence through the app runtime.",
         ),
-        tool_schema(
+        render_tool_schema(
             TOOL_SCREENSHOT,
             "Alias slipway.debug.render for explicit screenshot capture requests.",
         ),
@@ -964,6 +970,22 @@ fn tool_schema(name: &str, description: &str) -> Value {
             "type": "object",
             "properties": {
                 "frame": frame_schema(),
+            },
+            "required": ["frame"],
+            "additionalProperties": true,
+        },
+    })
+}
+
+fn render_tool_schema(name: &str, description: &str) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "frame": frame_schema(),
+                "target": { "type": "string" },
             },
             "required": ["frame"],
             "additionalProperties": true,
@@ -1742,7 +1764,9 @@ fn parse_render_packet(arguments: &Value) -> Result<RenderPacket, RpcError> {
     } else {
         parse_frame_from_arguments(arguments)?
     };
-    let target = parse_widget_id(required_string_field(packet, "target")?);
+    let target = optional_string_field(packet, "target")?
+        .map(parse_widget_id)
+        .unwrap_or_else(|| parse_widget_id(&frame.surface_instance_id));
     Ok(RenderPacket {
         target,
         frame: frame.clone(),
@@ -1759,6 +1783,8 @@ fn parse_render_packet(arguments: &Value) -> Result<RenderPacket, RpcError> {
 
 fn parse_probe_request(arguments: &Value) -> Result<ProbeRequest, RpcError> {
     let target = optional_string_field(arguments, "target")?.map(parse_widget_id);
+    let event_trace_limit =
+        optional_usize_alias_field(arguments, EVENT_TRACE_LIMIT_FIELDS, "event trace limit")?;
     let kinds_value = required_array_field(arguments, "kinds")?;
     let mut kinds = Vec::with_capacity(kinds_value.len());
     for kind in kinds_value {
@@ -1767,7 +1793,11 @@ fn parse_probe_request(arguments: &Value) -> Result<ProbeRequest, RpcError> {
             .ok_or_else(|| RpcError::invalid_params("probe kinds must be strings"))?;
         kinds.push(parse_probe_kind(kind)?);
     }
-    Ok(ProbeRequest { target, kinds })
+    Ok(ProbeRequest {
+        target,
+        kinds,
+        event_trace_limit,
+    })
 }
 
 fn parse_control_trace_flag(arguments: &Value) -> Result<bool, RpcError> {
@@ -1815,6 +1845,7 @@ fn parse_input_event(event: &Value) -> Result<InputEvent, RpcError> {
         "wheel" | "Wheel" => Ok(InputEvent::Wheel(WheelEvent {
             target,
             target_slot,
+            region_id: None,
             delta_x: optional_f32_field(event, "delta_x")?.unwrap_or(0.0),
             delta_y: optional_f32_field(event, "delta_y")?.unwrap_or(0.0),
         })),
@@ -2268,6 +2299,34 @@ fn optional_u64_field(value: &Value, field: &str) -> Result<Option<u64>, RpcErro
     }
 }
 
+fn optional_usize_alias_field(
+    value: &Value,
+    fields: &[&str],
+    label: &str,
+) -> Result<Option<usize>, RpcError> {
+    let mut seen: Option<(usize, &str)> = None;
+    for &field in fields {
+        if value.get(field).is_none() {
+            continue;
+        }
+        let raw =
+            optional_u64_field(value, field)?.expect("field presence was checked before parsing");
+        let parsed = usize::try_from(raw).map_err(|_| {
+            RpcError::invalid_params(format!("field `{field}` is too large for usize"))
+        })?;
+        if let Some((existing, existing_field)) = seen {
+            if existing != parsed {
+                return Err(RpcError::invalid_params(format!(
+                    "conflicting {label} aliases `{existing_field}` and `{field}`"
+                )));
+            }
+        } else {
+            seen = Some((parsed, field));
+        }
+    }
+    Ok(seen.map(|(value, _field)| value))
+}
+
 fn required_f32_field(value: &Value, field: &str) -> Result<f32, RpcError> {
     value
         .get(field)
@@ -2402,6 +2461,12 @@ mod tests {
                 "frame": frame_json_value(),
                 "paint": []
             }
+        })
+    }
+
+    fn render_arguments_without_target() -> Value {
+        json!({
+            "frame": frame_json_value()
         })
     }
 
@@ -2615,6 +2680,30 @@ mod tests {
     }
 
     #[test]
+    fn tools_list_render_and_screenshot_target_is_optional() {
+        let server = DebugMcpServer::new(DebugMcpConfig::default());
+        let mut handler = FakeHandler::default();
+        let response = server
+            .handle_message(
+                request(json!("tools"), "tools/list", json!({})),
+                &mut handler,
+            )
+            .expect("tools/list has response");
+
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        for name in [TOOL_RENDER, TOOL_SCREENSHOT] {
+            let schema = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .expect("render tool exists")
+                .get("inputSchema")
+                .expect("schema exists");
+            assert_eq!(schema["required"], json!(["frame"]));
+            assert_eq!(schema["properties"]["target"]["type"], "string");
+        }
+    }
+
+    #[test]
     fn denied_status_probe_render_control_and_resize_return_refusal_content() {
         let server = DebugMcpServer::new(DebugMcpConfig::default());
         let mut handler = FakeHandler::default();
@@ -2713,6 +2802,68 @@ mod tests {
     }
 
     #[test]
+    fn admitted_render_and_screenshot_accept_frame_only_and_default_target() {
+        for tool in [TOOL_RENDER, TOOL_SCREENSHOT] {
+            let server = render_server();
+            let mut handler = FakeHandler::default();
+
+            let response = server
+                .handle_message(
+                    call_request(json!(tool), tool, render_arguments_without_target()),
+                    &mut handler,
+                )
+                .expect("tools/call has response");
+            let payload = tool_payload(&response);
+
+            assert_eq!(handler.calls.len(), 1);
+            match &handler.calls[0].kind {
+                slipway_debug_bridge::DebugCommandKind::Render { packet } => {
+                    assert_eq!(packet.frame, frame());
+                    assert_eq!(packet.target, WidgetId::from("instance"));
+                }
+                other => panic!("expected render command, got {other:?}"),
+            }
+            assert_eq!(payload["tool"], tool);
+            assert_eq!(payload["admitted"], true);
+        }
+    }
+
+    #[test]
+    fn admitted_render_preserves_explicit_target_and_rejects_bad_target() {
+        let server = render_server();
+        let mut handler = FakeHandler::default();
+
+        server
+            .handle_message(
+                call_request(json!("explicit"), TOOL_RENDER, render_arguments()),
+                &mut handler,
+            )
+            .expect("explicit target call has response");
+        match &handler.calls[0].kind {
+            slipway_debug_bridge::DebugCommandKind::Render { packet } => {
+                assert_eq!(packet.target, WidgetId::from("widget"));
+            }
+            other => panic!("expected render command, got {other:?}"),
+        }
+
+        let response = server
+            .handle_message(
+                call_request(
+                    json!("bad-target"),
+                    TOOL_RENDER,
+                    json!({ "frame": frame_json_value(), "target": 123 }),
+                ),
+                &mut handler,
+            )
+            .expect("bad target returns response");
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(
+            response["error"]["message"],
+            "field `target` must be a string"
+        );
+    }
+
+    #[test]
     fn bridged_screenshot_alias_uses_render_method_and_payload_shape() {
         let server = render_server();
         let (client, runtime) = bounded_debug_bridge(1);
@@ -2753,6 +2904,46 @@ mod tests {
     }
 
     #[test]
+    fn bridged_screenshot_accepts_frame_only_and_default_target() {
+        let server = render_server();
+        let (client, runtime) = bounded_debug_bridge(1);
+        let message = call_request(
+            json!("shot-frame-only"),
+            TOOL_SCREENSHOT,
+            render_arguments_without_target(),
+        )
+        .to_string();
+
+        let pending = match server.begin_bridge_message(&message, &client) {
+            DebugMcpBridgeMessage::Pending(pending) => pending,
+            DebugMcpBridgeMessage::Immediate(response) => {
+                panic!("admitted screenshot should be pending, got {response:?}")
+            }
+        };
+
+        let mut handler = FakeHandler::default();
+        runtime
+            .drain_one(&mut handler)
+            .expect("runtime drains")
+            .expect("screenshot alias reply generated");
+        match &handler.calls[0].kind {
+            slipway_debug_bridge::DebugCommandKind::Render { packet } => {
+                assert_eq!(packet.frame, frame());
+                assert_eq!(packet.target, WidgetId::from("instance"));
+            }
+            other => panic!("expected render command, got {other:?}"),
+        }
+        let response = pending
+            .try_finish()
+            .expect("pending finish should not fail")
+            .expect("reply is available after app drain");
+        let payload = tool_payload(&response);
+
+        assert_eq!(payload["tool"], TOOL_SCREENSHOT);
+        assert_eq!(payload["bridge_method"], "render");
+    }
+
+    #[test]
     fn admitted_status_reaches_handler_and_returns_status_product() {
         let server = DebugMcpServer::new(DebugMcpConfig::admitted());
         let mut handler = FakeHandler::default();
@@ -2776,6 +2967,116 @@ mod tests {
         assert_eq!(payload["product_kind"], "status");
         assert_eq!(payload["product"]["detail"], "fake handler ready");
         assert_eq!(payload["frame"], frame_json(&frame()));
+    }
+
+    fn admitted_probe_event_limit_call(arguments: Value) -> Result<Option<usize>, Value> {
+        let server = DebugMcpServer::new(DebugMcpConfig::admitted());
+        let mut handler = FakeHandler::default();
+        let response = server
+            .handle_message(
+                call_request(json!("probe-limit"), TOOL_PROBE, arguments),
+                &mut handler,
+            )
+            .expect("tools/call has response");
+        if response.get("error").is_some() {
+            return Err(response);
+        }
+        assert_eq!(handler.calls.len(), 1);
+        match &handler.calls[0].kind {
+            slipway_debug_bridge::DebugCommandKind::Probe { request, .. } => {
+                Ok(request.event_trace_limit)
+            }
+            other => panic!("expected probe command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admitted_probe_event_trace_limit_absent_means_runtime_default() {
+        let limit = admitted_probe_event_limit_call(json!({
+            "frame": frame_json_value(),
+            "kinds": ["event"]
+        }))
+        .expect("probe accepted");
+
+        assert_eq!(limit, None);
+    }
+
+    #[test]
+    fn admitted_probe_event_trace_limit_accepts_canonical_and_aliases() {
+        let canonical = admitted_probe_event_limit_call(json!({
+            "frame": frame_json_value(),
+            "kinds": ["event"],
+            "event_trace_limit": 2
+        }))
+        .expect("canonical limit accepted");
+        let camel = admitted_probe_event_limit_call(json!({
+            "frame": frame_json_value(),
+            "kinds": ["event"],
+            "eventTraceLimit": 3
+        }))
+        .expect("camel alias accepted");
+        let short = admitted_probe_event_limit_call(json!({
+            "frame": frame_json_value(),
+            "kinds": ["event"],
+            "eventLimit": 4
+        }))
+        .expect("short alias accepted");
+
+        assert_eq!(canonical, Some(2));
+        assert_eq!(camel, Some(3));
+        assert_eq!(short, Some(4));
+    }
+
+    #[test]
+    fn admitted_probe_event_trace_limit_accepts_identical_aliases() {
+        let limit = admitted_probe_event_limit_call(json!({
+            "frame": frame_json_value(),
+            "kinds": ["event"],
+            "event_trace_limit": 5,
+            "eventLimit": 5
+        }))
+        .expect("identical aliases accepted");
+
+        assert_eq!(limit, Some(5));
+    }
+
+    #[test]
+    fn admitted_probe_event_trace_limit_rejects_conflicting_aliases() {
+        let response = admitted_probe_event_limit_call(json!({
+            "frame": frame_json_value(),
+            "kinds": ["event"],
+            "event_trace_limit": 5,
+            "eventLimit": 6
+        }))
+        .expect_err("conflicting aliases are invalid");
+
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("conflicting event trace limit aliases")
+        );
+    }
+
+    #[test]
+    fn admitted_probe_event_trace_limit_rejects_invalid_values() {
+        for invalid in [json!(-1), json!(1.5), json!("2"), Value::Null, json!(1e40)] {
+            let response = admitted_probe_event_limit_call(json!({
+                "frame": frame_json_value(),
+                "kinds": ["event"],
+                "event_trace_limit": invalid
+            }))
+            .expect_err("invalid limit is rejected");
+
+            assert_eq!(response["error"]["code"], -32602);
+            assert!(
+                response["error"]["message"]
+                    .as_str()
+                    .expect("message")
+                    .contains("event_trace_limit")
+            );
+        }
     }
 
     #[test]

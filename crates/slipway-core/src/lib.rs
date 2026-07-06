@@ -480,6 +480,26 @@ pub struct ScrollConsumptionPolicy {
     pub programmatic: bool,
 }
 
+impl ScrollConsumptionPolicy {
+    pub fn passive() -> Self {
+        Self {
+            wheel: false,
+            drag: false,
+            keyboard: false,
+            programmatic: false,
+        }
+    }
+
+    pub fn exclusive_wheel() -> Self {
+        Self {
+            wheel: true,
+            drag: false,
+            keyboard: false,
+            programmatic: false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScrollInputKind {
     Wheel,
@@ -696,6 +716,36 @@ pub struct TextStyle {
 impl TextStyle {
     pub fn plain() -> Self {
         Self::default()
+    }
+
+    pub fn with_font_family(mut self, font_family: impl Into<String>) -> Self {
+        self.font_family = font_family.into();
+        self
+    }
+
+    pub fn with_font_size(mut self, font_size: f32) -> Self {
+        self.font_size = font_size;
+        self
+    }
+
+    pub fn with_font_weight(mut self, font_weight: FontWeight) -> Self {
+        self.font_weight = font_weight;
+        self
+    }
+
+    pub fn with_font_style(mut self, font_style: FontStyle) -> Self {
+        self.font_style = font_style;
+        self
+    }
+
+    pub fn with_decoration(mut self, decoration: TextDecoration) -> Self {
+        self.decoration = decoration;
+        self
+    }
+
+    pub fn with_baseline(mut self, baseline: BaselineShift) -> Self {
+        self.baseline = baseline;
+        self
     }
 }
 
@@ -960,6 +1010,35 @@ pub trait SlipwayTextMeasurementCache {
     ) -> TextMeasurementCacheEvidence;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaintLayerKey {
+    pub z_index: i32,
+    pub order: Option<usize>,
+}
+
+impl PaintLayerKey {
+    pub fn new(z_index: i32) -> Self {
+        Self {
+            z_index,
+            order: None,
+        }
+    }
+
+    pub fn ordered(z_index: i32, order: usize) -> Self {
+        Self {
+            z_index,
+            order: Some(order),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PaintInputTransparency {
+    #[default]
+    Opaque,
+    PassThrough,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaintOp {
     Fill {
@@ -982,6 +1061,13 @@ pub enum PaintOp {
         clip: Option<ClipDeclaration>,
         ops: Vec<PaintOp>,
     },
+    Layer {
+        id: Option<String>,
+        key: PaintLayerKey,
+        input_transparency: PaintInputTransparency,
+        clip: Option<ClipDeclaration>,
+        ops: Vec<PaintOp>,
+    },
 }
 
 impl PaintOp {
@@ -1001,6 +1087,45 @@ impl PaintOp {
             color,
             style,
         }
+    }
+
+    pub fn keyed_layer(key: PaintLayerKey, ops: Vec<PaintOp>) -> Self {
+        Self::Layer {
+            id: None,
+            key,
+            input_transparency: PaintInputTransparency::Opaque,
+            clip: None,
+            ops,
+        }
+    }
+
+    pub fn keyed_layer_pass_through(key: PaintLayerKey, ops: Vec<PaintOp>) -> Self {
+        Self::keyed_layer(key, ops).with_input_transparency(PaintInputTransparency::PassThrough)
+    }
+
+    pub fn with_input_transparency(mut self, input_transparency: PaintInputTransparency) -> Self {
+        if let Self::Layer {
+            input_transparency: current,
+            ..
+        } = &mut self
+        {
+            *current = input_transparency;
+        }
+        self
+    }
+
+    pub fn with_layer_id(mut self, id: impl Into<String>) -> Self {
+        if let Self::Layer { id: current, .. } = &mut self {
+            *current = Some(id.into());
+        }
+        self
+    }
+
+    pub fn with_layer_clip(mut self, clip: ClipDeclaration) -> Self {
+        if let Self::Layer { clip: current, .. } = &mut self {
+            *current = Some(clip);
+        }
+        self
     }
 }
 
@@ -1083,6 +1208,22 @@ fn translate_paint_op(op: PaintOp, offset: Point) -> PaintOp {
         },
         PaintOp::Group { id, clip, ops } => PaintOp::Group {
             id,
+            clip: clip.map(|clip| translate_clip(clip, offset)),
+            ops: ops
+                .into_iter()
+                .map(|op| translate_paint_op(op, offset))
+                .collect(),
+        },
+        PaintOp::Layer {
+            id,
+            key,
+            input_transparency,
+            clip,
+            ops,
+        } => PaintOp::Layer {
+            id,
+            key,
+            input_transparency,
             clip: clip.map(|clip| translate_clip(clip, offset)),
             ops: ops
                 .into_iter()
@@ -1334,6 +1475,7 @@ pub struct SelectionEvent {
 pub struct WheelEvent {
     pub target: WidgetId,
     pub target_slot: Option<WidgetSlotAddress>,
+    pub region_id: Option<PresentationRegionId>,
     pub delta_x: f32,
     pub delta_y: f32,
 }
@@ -1806,6 +1948,7 @@ pub struct OverlayDeclaration {
     pub id: WidgetId,
     pub owner: WidgetId,
     pub bounds: Rect,
+    pub allowed_bounds: Option<Rect>,
     pub modality: OverlayModality,
     pub focus_scope: Option<WidgetId>,
     pub dismiss_commands: Vec<String>,
@@ -2379,7 +2522,7 @@ pub struct ViewDefinitionInput {
     pub layout_input: LayoutInput,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct HitRegionOrder {
     pub z_index: i32,
     pub paint_order: usize,
@@ -2432,11 +2575,165 @@ pub enum PointerEventCoordinateSpace {
 
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
+pub struct TextInputVisualStyleDeclaration {
+    pub target: WidgetId,
+    pub value_color: Color,
+    pub placeholder_color: Color,
+    pub preedit_color: Color,
+    pub selection_color: Color,
+    pub background_color: Color,
+    pub border_color: Color,
+    pub border_width: f32,
+    pub border_radius: f32,
+    pub icon_color: Color,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl TextInputVisualStyleDeclaration {
+    pub fn explicit(
+        target: WidgetId,
+        value_color: Color,
+        placeholder_color: Color,
+        preedit_color: Color,
+        selection_color: Color,
+        background_color: Color,
+        border_color: Color,
+        border_width: f32,
+        border_radius: f32,
+        icon_color: Color,
+    ) -> Self {
+        Self {
+            target,
+            value_color,
+            placeholder_color,
+            preedit_color,
+            selection_color,
+            background_color,
+            border_color,
+            border_width,
+            border_radius,
+            icon_color,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: Vec<Diagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    pub fn with_value_color(mut self, color: Color) -> Self {
+        self.value_color = color;
+        self
+    }
+
+    pub fn with_placeholder_color(mut self, color: Color) -> Self {
+        self.placeholder_color = color;
+        self
+    }
+
+    pub fn with_preedit_color(mut self, color: Color) -> Self {
+        self.preedit_color = color;
+        self
+    }
+
+    pub fn with_selection_color(mut self, color: Color) -> Self {
+        self.selection_color = color;
+        self
+    }
+
+    pub fn with_background_color(mut self, color: Color) -> Self {
+        self.background_color = color;
+        self
+    }
+
+    pub fn with_border(mut self, color: Color, width: f32, radius: f32) -> Self {
+        self.border_color = color;
+        self.border_width = width;
+        self.border_radius = radius;
+        self
+    }
+
+    pub fn with_icon_color(mut self, color: Color) -> Self {
+        self.icon_color = color;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct TextInputTypographyDeclaration {
+    pub target: WidgetId,
+    pub style: TextStyle,
+    pub source: Option<ResourceSourceDeclaration>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl TextInputTypographyDeclaration {
+    pub fn explicit(target: WidgetId, style: TextStyle) -> Self {
+        Self {
+            target,
+            style,
+            source: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn with_source(mut self, source: ResourceSourceDeclaration) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    pub fn with_style(mut self, style: TextStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    pub fn with_font_family(mut self, font_family: impl Into<String>) -> Self {
+        self.style = self.style.with_font_family(font_family);
+        self
+    }
+
+    pub fn with_font_size(mut self, font_size: f32) -> Self {
+        self.style = self.style.with_font_size(font_size);
+        self
+    }
+
+    pub fn with_font_weight(mut self, font_weight: FontWeight) -> Self {
+        self.style = self.style.with_font_weight(font_weight);
+        self
+    }
+
+    pub fn with_font_style(mut self, font_style: FontStyle) -> Self {
+        self.style = self.style.with_font_style(font_style);
+        self
+    }
+
+    pub fn with_decoration(mut self, decoration: TextDecoration) -> Self {
+        self.style = self.style.with_decoration(decoration);
+        self
+    }
+
+    pub fn with_baseline(mut self, baseline: BaselineShift) -> Self {
+        self.style = self.style.with_baseline(baseline);
+        self
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: Vec<Diagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct TextEditRegionDeclaration {
     pub buffer: TextBufferSnapshot,
     pub selection: TextSelectionPolicyDeclaration,
     pub composition: ImeCompositionPolicyDeclaration,
     pub caret: CaretGeometryEvidence,
+    pub visual_style: TextInputVisualStyleDeclaration,
+    pub typography: TextInputTypographyDeclaration,
     pub edit_commands: Vec<TextEditCommandDeclaration>,
     pub undo_redo: Option<TextUndoRedoEvidence>,
     pub viewport: Option<TextViewport>,
@@ -2467,11 +2764,46 @@ pub struct ScrollRegionDeclaration {
     pub offset: Point,
     pub axes: ScrollAxes,
     pub wheel_routing: WheelRouting,
+    pub order: HitRegionOrder,
     pub virtual_viewport: Option<VirtualViewportRange>,
     pub consumption: ScrollConsumptionPolicy,
     pub evidence: Vec<ScrollConsumptionEvidence>,
     pub enabled: bool,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+impl ScrollRegionDeclaration {
+    #[allow(clippy::too_many_arguments)]
+    pub fn explicit(
+        id: PresentationRegionId,
+        target: WidgetId,
+        address: Option<WidgetSlotAddress>,
+        viewport: TargetLocalRect,
+        content_bounds: TargetLocalRect,
+        offset: Point,
+        axes: ScrollAxes,
+        wheel_routing: WheelRouting,
+        order: HitRegionOrder,
+        consumption: ScrollConsumptionPolicy,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            id,
+            target,
+            address,
+            viewport,
+            content_bounds,
+            offset,
+            axes,
+            wheel_routing,
+            order,
+            virtual_viewport: None,
+            consumption,
+            evidence: Vec::new(),
+            enabled,
+            diagnostics: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2501,6 +2833,7 @@ pub struct PaintOrderDeclaration {
     pub order: Option<usize>,
     pub allow_overlap: bool,
     pub allow_overflow_paint: bool,
+    pub overflow_bounds: Option<TargetLocalRect>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -2513,6 +2846,7 @@ impl PaintOrderDeclaration {
             order: None,
             allow_overlap: false,
             allow_overflow_paint: false,
+            overflow_bounds: None,
             diagnostics: Vec::new(),
         }
     }
@@ -2525,6 +2859,7 @@ impl PaintOrderDeclaration {
             order: None,
             allow_overlap: false,
             allow_overflow_paint: false,
+            overflow_bounds: None,
             diagnostics: Vec::new(),
         }
     }
@@ -2537,8 +2872,15 @@ impl PaintOrderDeclaration {
             order: Some(order),
             allow_overlap: false,
             allow_overflow_paint: false,
+            overflow_bounds: None,
             diagnostics: Vec::new(),
         }
+    }
+
+    pub fn with_overflow_bounds(mut self, bounds: TargetLocalRect) -> Self {
+        self.allow_overflow_paint = true;
+        self.overflow_bounds = Some(bounds);
+        self
     }
 }
 
@@ -2565,6 +2907,24 @@ pub fn view_definition_contract_diagnostics(view: &ViewDefinition) -> Vec<Diagno
             Some(view.target.clone()),
             "view_contract.paint_order_target_mismatch",
             "ViewDefinition paint_order target must match the view target",
+        ));
+    }
+
+    if view.paint_order.allow_overflow_paint && view.paint_order.overflow_bounds.is_none() {
+        diagnostics.push(Diagnostic::error(
+            Some(view.target.clone()),
+            "view_contract.overflow_bounds_missing",
+            "Views allowing overflow paint must declare overflow_bounds so backend paint, hit, focus, and scroll containment are explicit",
+        ));
+    }
+
+    if let Some(bounds) = view.paint_order.overflow_bounds
+        && !rect_is_valid(bounds)
+    {
+        diagnostics.push(Diagnostic::error(
+            Some(view.target.clone()),
+            "view_contract.overflow_bounds_invalid",
+            "Overflow bounds must be finite and non-negative",
         ));
     }
 
@@ -2930,7 +3290,7 @@ fn validate_pointer_dispatch_evidence(
             ));
             return;
         };
-        let expected_candidates = view
+        let mut expected_candidates = view
             .hit_regions
             .iter()
             .filter(|region| region.enabled)
@@ -2945,6 +3305,26 @@ fn validate_pointer_dispatch_evidence(
             })
             .map(|region| region.id.clone())
             .collect::<Vec<_>>();
+        let selected_declared = evidence.selected_region.as_ref().and_then(|selected| {
+            view.hit_regions
+                .iter()
+                .find(|region| &region.id == selected)
+        });
+        let captured_selected = selected_declared.is_some_and(|region| {
+            !expected_candidates
+                .iter()
+                .any(|candidate| candidate == &region.id)
+                && evidence.capture_event
+                && declared_pointer_capture_for_region(region, pointer.kind, true)
+        });
+        if captured_selected
+            && let Some(region) = selected_declared
+            && !expected_candidates
+                .iter()
+                .any(|candidate| candidate == &region.id)
+        {
+            expected_candidates.push(region.id.clone());
+        }
         if evidence.candidate_regions != expected_candidates {
             diagnostics.push(dispatch_contract_error(
                 &input.event,
@@ -2952,16 +3332,25 @@ fn validate_pointer_dispatch_evidence(
                 "pointer dispatch evidence candidates did not match current hit regions",
             ));
         }
-        let selected = select_declared_hit_region_at_root_local_point_with_geometry_index(
+        let current_selected = select_declared_hit_region_at_root_local_point_with_geometry_index(
             geometry_index,
             &view.hit_regions,
             position,
         );
+        let selected = if captured_selected {
+            selected_declared
+        } else {
+            current_selected
+        };
         validate_selected_region_id(
             &input.event,
             evidence.selected_region.as_ref(),
             selected.map(|region| &region.id),
-            "pointer dispatch evidence selected region did not match current hit resolution",
+            if captured_selected {
+                "captured pointer dispatch evidence selected region did not match the retained capture owner"
+            } else {
+                "pointer dispatch evidence selected region did not match current hit resolution"
+            },
             diagnostics,
         );
         if let Some(region) = selected {
@@ -3556,12 +3945,21 @@ pub fn select_declared_scroll_region_at_point<'a>(
     scroll_regions: &'a [ScrollRegionDeclaration],
     target_local_position: Point,
 ) -> Option<&'a ScrollRegionDeclaration> {
-    scroll_regions.iter().rev().find(|region| {
-        region.enabled
-            && region.consumption.wheel
-            && (region.axes.horizontal || region.axes.vertical)
-            && rect_contains_point(region.viewport, target_local_position)
-    })
+    scroll_regions
+        .iter()
+        .filter(|region| {
+            region.enabled
+                && region.consumption.wheel
+                && (region.axes.horizontal || region.axes.vertical)
+                && rect_contains_point(region.viewport, target_local_position)
+        })
+        .max_by(|a, b| {
+            a.order
+                .z_index
+                .cmp(&b.order.z_index)
+                .then(a.order.paint_order.cmp(&b.order.paint_order))
+                .then(a.order.traversal_order.cmp(&b.order.traversal_order))
+        })
 }
 
 pub fn select_declared_hit_region_at_root_local_point<'a>(
@@ -3654,18 +4052,79 @@ pub fn select_declared_scroll_region_at_root_local_point_with_geometry_index<'a>
     scroll_regions: &'a [ScrollRegionDeclaration],
     root_local_position: Point,
 ) -> Option<&'a ScrollRegionDeclaration> {
-    scroll_regions.iter().rev().find(|region| {
-        region.enabled
-            && region.consumption.wheel
-            && (region.axes.horizontal || region.axes.vertical)
-            && declared_region_contains_root_local_point_with_geometry_index(
-                geometry_index,
-                &region.target,
-                region.address.as_ref(),
-                region.viewport.into_rect(),
-                root_local_position,
-            )
-    })
+    scroll_regions
+        .iter()
+        .filter(|region| {
+            region.enabled
+                && region.consumption.wheel
+                && (region.axes.horizontal || region.axes.vertical)
+                && declared_region_contains_root_local_point_with_geometry_index(
+                    geometry_index,
+                    &region.target,
+                    region.address.as_ref(),
+                    region.viewport.into_rect(),
+                    root_local_position,
+                )
+        })
+        .max_by(|a, b| {
+            a.order
+                .z_index
+                .cmp(&b.order.z_index)
+                .then(a.order.paint_order.cmp(&b.order.paint_order))
+                .then(a.order.traversal_order.cmp(&b.order.traversal_order))
+        })
+}
+
+pub fn scroll_region_can_consume_wheel_delta(
+    region: &ScrollRegionDeclaration,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<bool> {
+    if !region.enabled
+        || !region.consumption.wheel
+        || (!region.axes.horizontal && !region.axes.vertical)
+    {
+        return None;
+    }
+
+    if delta_x.abs() <= f32::EPSILON && delta_y.abs() <= f32::EPSILON {
+        return Some(true);
+    }
+
+    Some(
+        (region.axes.horizontal
+            && scroll_axis_can_consume_wheel_delta(
+                region.offset.x,
+                region.content_bounds.size.width,
+                region.viewport.size.width,
+                delta_x,
+            ))
+            || (region.axes.vertical
+                && scroll_axis_can_consume_wheel_delta(
+                    region.offset.y,
+                    region.content_bounds.size.height,
+                    region.viewport.size.height,
+                    delta_y,
+                )),
+    )
+}
+
+fn scroll_axis_can_consume_wheel_delta(
+    offset: f32,
+    content: f32,
+    viewport: f32,
+    delta: f32,
+) -> bool {
+    if delta.abs() <= f32::EPSILON {
+        return false;
+    }
+
+    let max_offset = (content - viewport).max(0.0);
+    if delta < 0.0 {
+        offset < max_offset - f32::EPSILON
+    } else {
+        offset > f32::EPSILON
+    }
 }
 
 pub fn declared_pointer_capture_for_region(
@@ -3677,7 +4136,8 @@ pub fn declared_pointer_capture_for_region(
         PointerCaptureIntent::None => false,
         PointerCaptureIntent::OnPress => matches!(kind, PointerEventKind::Press),
         PointerCaptureIntent::DuringDrag => {
-            pointer_is_pressed || matches!(kind, PointerEventKind::Move | PointerEventKind::Release)
+            pointer_is_pressed
+                || matches!(kind, PointerEventKind::Release | PointerEventKind::Cancel)
         }
         PointerCaptureIntent::Explicit => true,
     }
@@ -4030,6 +4490,89 @@ pub fn resolve_declared_pointer_dispatch_with_evidence_and_geometry_index(
     (dispatch, evidence)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_declared_captured_pointer_dispatch_with_evidence_and_geometry_index(
+    source: EvidenceSource,
+    frame: FrameIdentity,
+    geometry_index: &PresentationGeometryIndex,
+    hit_regions: &[HitRegionDeclaration],
+    captured_region_id: &PresentationRegionId,
+    root_local_position: Point,
+    kind: PointerEventKind,
+    button: Option<PointerButton>,
+    details: PointerDetails,
+    pointer_is_pressed: bool,
+) -> (
+    Option<DeclaredPointerDispatch>,
+    DeclaredEventDispatchEvidence,
+) {
+    let mut candidate_regions = hit_regions
+        .iter()
+        .filter(|region| region.enabled)
+        .filter(|region| {
+            declared_region_contains_root_local_point_with_geometry_index(
+                geometry_index,
+                &region.target,
+                region.address.as_ref(),
+                region.bounds.into_rect(),
+                root_local_position,
+            )
+        })
+        .map(|region| region.id.clone())
+        .collect::<Vec<_>>();
+
+    let dispatch = hit_regions
+        .iter()
+        .find(|region| region.enabled && &region.id == captured_region_id)
+        .and_then(|region| {
+            declared_pointer_capture_for_region(region, kind, pointer_is_pressed).then(|| {
+                if !candidate_regions
+                    .iter()
+                    .any(|candidate| candidate == &region.id)
+                {
+                    candidate_regions.push(region.id.clone());
+                }
+                let input = declared_pointer_event_for_hit_region_with_geometry_index(
+                    geometry_index,
+                    region,
+                    root_local_position,
+                    kind,
+                    button,
+                    details.clone(),
+                );
+                DeclaredPointerDispatch {
+                    selected_region: region.id.clone(),
+                    candidate_regions: candidate_regions.clone(),
+                    input,
+                    route: region.route.clone(),
+                    capture_event: true,
+                }
+            })
+        });
+
+    let evidence = DeclaredEventDispatchEvidence {
+        source,
+        frame,
+        kind: DeclaredEventDispatchKind::Pointer,
+        input_position: Some(root_local_position),
+        candidate_regions,
+        selected_region: dispatch
+            .as_ref()
+            .map(|dispatch| dispatch.selected_region.clone()),
+        refusal_reason: dispatch.is_none().then(|| {
+            "no enabled captured hit region could retain the physical pointer event".to_string()
+        }),
+        generated_event: dispatch.as_ref().map(|dispatch| dispatch.input.clone()),
+        route: dispatch.as_ref().map(|dispatch| dispatch.route.clone()),
+        capture_event: dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.capture_event),
+        diagnostics: Vec::new(),
+    };
+
+    (dispatch, evidence)
+}
+
 pub fn resolve_declared_wheel_dispatch(
     layout: &LayoutOutput,
     scroll_regions: &[ScrollRegionDeclaration],
@@ -4068,10 +4611,12 @@ pub fn resolve_declared_wheel_dispatch_with_geometry_index(
         })
         .map(|region| region.id.clone())
         .collect::<Vec<_>>();
-    let region = select_declared_scroll_region_at_root_local_point_with_geometry_index(
+    let region = select_declared_wheel_consumer_at_root_local_point_with_geometry_index(
         geometry_index,
         scroll_regions,
         root_local_position,
+        delta_x,
+        delta_y,
     )?;
     Some(DeclaredWheelDispatch {
         selected_region: region.id.clone(),
@@ -4079,12 +4624,41 @@ pub fn resolve_declared_wheel_dispatch_with_geometry_index(
         input: InputEvent::Wheel(WheelEvent {
             target: region.target.clone(),
             target_slot: region.address.clone(),
+            region_id: Some(region.id.clone()),
             delta_x,
             delta_y,
         }),
         route: region_event_route(&region.id, &region.target, &region.address),
         capture_event: region.consumption.wheel,
     })
+}
+
+pub fn select_declared_wheel_consumer_at_root_local_point_with_geometry_index<'a>(
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &'a [ScrollRegionDeclaration],
+    root_local_position: Point,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<&'a ScrollRegionDeclaration> {
+    scroll_regions
+        .iter()
+        .filter(|region| {
+            scroll_region_can_consume_wheel_delta(region, delta_x, delta_y) == Some(true)
+                && declared_region_contains_root_local_point_with_geometry_index(
+                    geometry_index,
+                    &region.target,
+                    region.address.as_ref(),
+                    region.viewport.into_rect(),
+                    root_local_position,
+                )
+        })
+        .max_by(|a, b| {
+            a.order
+                .z_index
+                .cmp(&b.order.z_index)
+                .then(a.order.paint_order.cmp(&b.order.paint_order))
+                .then(a.order.traversal_order.cmp(&b.order.traversal_order))
+        })
 }
 
 pub fn resolve_declared_wheel_dispatch_with_evidence(
@@ -4179,8 +4753,8 @@ fn validate_hit_regions(
                 "view_contract.hit_bounds_invalid",
                 "Hit region bounds must be finite and non-negative",
             ));
-        } else if !view.paint_order.allow_overflow_paint
-            && !rect_contains_rect(
+        } else if !view.paint_order.allow_overflow_paint {
+            if !rect_contains_rect(
                 declared_target_local_bounds(
                     declared_target_rect_for_region_address_with_geometry_index(
                         geometry_index,
@@ -4189,13 +4763,27 @@ fn validate_hit_regions(
                     ),
                 ),
                 region.bounds,
-            )
-        {
-            diagnostics.push(Diagnostic::error(
-                Some(region.target.clone()),
-                "view_contract.hit_bounds_outside_layout",
-                "Enabled hit regions must stay inside layout bounds unless overflow paint is explicitly allowed",
-            ));
+            ) {
+                diagnostics.push(Diagnostic::error(
+                    Some(region.target.clone()),
+                    "view_contract.hit_bounds_outside_layout",
+                    "Enabled hit regions must stay inside layout bounds unless overflow paint is explicitly allowed",
+                ));
+            }
+        } else if let Some(overflow_bounds) = view.paint_order.overflow_bounds {
+            let root_bounds = declared_region_root_local_rect_with_geometry_index(
+                geometry_index,
+                &region.target,
+                region.address.as_ref(),
+                region.bounds.into_rect(),
+            );
+            if !rect_contains_rect(overflow_bounds, root_bounds) {
+                diagnostics.push(Diagnostic::error(
+                    Some(region.target.clone()),
+                    "view_contract.hit_bounds_outside_overflow_bounds",
+                    "Enabled hit regions must stay inside declared overflow bounds",
+                ));
+            }
         }
 
         if region.enabled && region.route.path.is_empty() {
@@ -4277,9 +4865,8 @@ fn validate_focus_regions(
                 "view_contract.focus_bounds_invalid",
                 "Focus region bounds must be finite and non-negative",
             ));
-        } else if region.enabled
-            && !view.paint_order.allow_overflow_paint
-            && !rect_contains_rect(
+        } else if region.enabled && !view.paint_order.allow_overflow_paint {
+            if !rect_contains_rect(
                 declared_target_local_bounds(
                     declared_target_rect_for_region_address_with_geometry_index(
                         geometry_index,
@@ -4288,13 +4875,29 @@ fn validate_focus_regions(
                     ),
                 ),
                 region.bounds,
-            )
+            ) {
+                diagnostics.push(Diagnostic::error(
+                    Some(region.target.clone()),
+                    "view_contract.focus_bounds_outside_layout",
+                    "Enabled focus regions must stay inside layout bounds unless overflow paint is explicitly allowed",
+                ));
+            }
+        } else if region.enabled
+            && let Some(overflow_bounds) = view.paint_order.overflow_bounds
         {
-            diagnostics.push(Diagnostic::error(
-                Some(region.target.clone()),
-                "view_contract.focus_bounds_outside_layout",
-                "Enabled focus regions must stay inside layout bounds unless overflow paint is explicitly allowed",
-            ));
+            let root_bounds = declared_region_root_local_rect_with_geometry_index(
+                geometry_index,
+                &region.target,
+                region.address.as_ref(),
+                region.bounds.into_rect(),
+            );
+            if !rect_contains_rect(overflow_bounds, root_bounds) {
+                diagnostics.push(Diagnostic::error(
+                    Some(region.target.clone()),
+                    "view_contract.focus_bounds_outside_overflow_bounds",
+                    "Enabled focus regions must stay inside declared overflow bounds",
+                ));
+            }
         }
 
         if let Some(text_edit) = &region.text_edit {
@@ -4396,6 +4999,44 @@ fn validate_text_edit_region(
         ));
     }
 
+    if text_edit.visual_style.target != focus.target {
+        diagnostics.push(Diagnostic::error(
+            target.clone(),
+            "view_contract.text_edit_visual_style_target_mismatch",
+            "Text input visual style target must match the focus region target",
+        ));
+    }
+
+    if text_edit.typography.target != focus.target {
+        diagnostics.push(Diagnostic::error(
+            target.clone(),
+            "view_contract.text_edit_typography_target_mismatch",
+            "Text input typography target must match the focus region target",
+        ));
+    }
+
+    if !text_edit.typography.style.font_size.is_finite()
+        || text_edit.typography.style.font_size <= 0.0
+    {
+        diagnostics.push(Diagnostic::error(
+            target.clone(),
+            "view_contract.text_edit_typography_invalid_font_size",
+            "Text input typography font size must be finite and positive",
+        ));
+    }
+
+    if !text_edit.visual_style.border_width.is_finite()
+        || text_edit.visual_style.border_width < 0.0
+        || !text_edit.visual_style.border_radius.is_finite()
+        || text_edit.visual_style.border_radius < 0.0
+    {
+        diagnostics.push(Diagnostic::error(
+            target.clone(),
+            "view_contract.text_edit_visual_style_invalid_metric",
+            "Text input visual style border metrics must be finite and non-negative",
+        ));
+    }
+
     if let Some(undo_redo) = &text_edit.undo_redo
         && undo_redo.target != focus.target
     {
@@ -4453,6 +5094,10 @@ fn validate_text_edit_region(
                 TextEditKind::DeleteBackward | TextEditKind::DeleteForward
             )
         });
+        let has_replace_buffer = text_edit
+            .edit_commands
+            .iter()
+            .any(|command| command.enabled && command.kind == TextEditKind::ReplaceBuffer);
 
         if !has_insert {
             diagnostics.push(Diagnostic::error(
@@ -4464,9 +5109,17 @@ fn validate_text_edit_region(
 
         if !has_delete {
             diagnostics.push(Diagnostic::error(
-                target,
+                target.clone(),
                 "view_contract.text_edit_missing_delete_command",
                 "Editable text edit regions must declare at least one delete command",
+            ));
+        }
+
+        if !has_replace_buffer {
+            diagnostics.push(Diagnostic::error(
+                target,
+                "view_contract.text_edit_missing_replace_buffer_command",
+                "Editable text edit regions must declare an enabled ReplaceBuffer command for native backend text widgets",
             ));
         }
     }
@@ -4504,9 +5157,8 @@ fn validate_scroll_regions(
                 "view_contract.scroll_geometry_invalid",
                 "Scroll region viewport and content bounds must be finite and non-negative",
             ));
-        } else if region.enabled
-            && !view.paint_order.allow_overflow_paint
-            && !rect_contains_rect(
+        } else if region.enabled && !view.paint_order.allow_overflow_paint {
+            if !rect_contains_rect(
                 declared_target_local_bounds(
                     declared_target_rect_for_region_address_with_geometry_index(
                         geometry_index,
@@ -4515,16 +5167,67 @@ fn validate_scroll_regions(
                     ),
                 ),
                 region.viewport,
-            )
+            ) {
+                diagnostics.push(Diagnostic::error(
+                    Some(region.target.clone()),
+                    "view_contract.scroll_viewport_outside_layout",
+                    "Enabled scroll viewport must stay inside layout bounds unless overflow paint is explicitly allowed",
+                ));
+            }
+        } else if region.enabled
+            && let Some(overflow_bounds) = view.paint_order.overflow_bounds
         {
-            diagnostics.push(Diagnostic::error(
-                Some(region.target.clone()),
-                "view_contract.scroll_viewport_outside_layout",
-                "Enabled scroll viewport must stay inside layout bounds unless overflow paint is explicitly allowed",
-            ));
+            let root_bounds = declared_region_root_local_rect_with_geometry_index(
+                geometry_index,
+                &region.target,
+                region.address.as_ref(),
+                region.viewport.into_rect(),
+            );
+            if !rect_contains_rect(overflow_bounds, root_bounds) {
+                diagnostics.push(Diagnostic::error(
+                    Some(region.target.clone()),
+                    "view_contract.scroll_viewport_outside_overflow_bounds",
+                    "Enabled scroll viewports must stay inside declared overflow bounds",
+                ));
+            }
         }
 
         validate_scroll_region_contract(region, diagnostics);
+    }
+
+    for left_index in 0..view.scroll_regions.len() {
+        let left = &view.scroll_regions[left_index];
+        if !left.enabled || !left.consumption.wheel || !rect_is_valid(left.viewport) {
+            continue;
+        }
+        for right in view.scroll_regions.iter().skip(left_index + 1) {
+            if !right.enabled
+                || !right.consumption.wheel
+                || !rect_is_valid(right.viewport)
+                || left.order != right.order
+            {
+                continue;
+            }
+            let left_bounds = declared_region_root_local_rect_with_geometry_index(
+                geometry_index,
+                &left.target,
+                left.address.as_ref(),
+                left.viewport.into_rect(),
+            );
+            let right_bounds = declared_region_root_local_rect_with_geometry_index(
+                geometry_index,
+                &right.target,
+                right.address.as_ref(),
+                right.viewport.into_rect(),
+            );
+            if rects_intersect(left_bounds, right_bounds) {
+                diagnostics.push(Diagnostic::error(
+                    Some(view.target.clone()),
+                    "view_contract.ambiguous_wheel_overlap",
+                    "Enabled wheel-consuming scroll regions overlap with identical ordering; declare a distinct wheel order so exactly one region consumes the wheel event",
+                ));
+            }
+        }
     }
 }
 
@@ -4595,13 +5298,30 @@ fn validate_scroll_region_contract(
 }
 
 fn validate_paint_bounds(view: &ViewDefinition, diagnostics: &mut Vec<Diagnostic>) {
-    if view.paint_order.allow_overflow_paint || !rect_is_valid(view.layout.bounds) {
+    if !rect_is_valid(view.layout.bounds) {
         return;
     }
 
     let mut paint_bounds = Vec::new();
     for op in &view.paint {
         collect_paint_bounds(op, &mut paint_bounds);
+    }
+
+    if let Some(overflow_bounds) = view.paint_order.overflow_bounds {
+        for bounds in paint_bounds {
+            if rect_is_valid(bounds) && !rect_contains_rect(overflow_bounds, bounds) {
+                diagnostics.push(Diagnostic::error(
+                    Some(view.target.clone()),
+                    "view_contract.paint_bounds_outside_overflow_bounds",
+                    "Paint bounds extend outside declared overflow bounds",
+                ));
+            }
+        }
+        return;
+    }
+
+    if view.paint_order.allow_overflow_paint {
+        return;
     }
 
     for bounds in paint_bounds {
@@ -4641,6 +5361,14 @@ fn collect_paint_bounds(op: &PaintOp, bounds: &mut Vec<Rect>) {
             ..
         } => bounds.push(*text_bounds),
         PaintOp::Group { clip, ops, .. } => {
+            if let Some(clip) = clip {
+                bounds.push(clip.bounds);
+            }
+            for op in ops {
+                collect_paint_bounds(op, bounds);
+            }
+        }
+        PaintOp::Layer { clip, ops, .. } => {
             if let Some(clip) = clip {
                 bounds.push(clip.bounds);
             }
@@ -4797,6 +5525,144 @@ impl PaintUnit {
             paint: view.paint,
         }
     }
+
+    pub fn from_view_ref(view: &ViewDefinition, traversal_order: usize) -> Self {
+        Self {
+            target: view.target.clone(),
+            address: None,
+            order: view.paint_order.clone(),
+            traversal_order,
+            paint: view.paint.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PaintGroupContext {
+    id: Option<String>,
+    clip: Option<ClipDeclaration>,
+}
+
+fn wrap_paint_with_group_context(
+    mut paint: Vec<PaintOp>,
+    context: &[PaintGroupContext],
+) -> Vec<PaintOp> {
+    for group in context.iter().rev() {
+        paint = vec![PaintOp::Group {
+            id: group.id.clone(),
+            clip: group.clip.clone(),
+            ops: paint,
+        }];
+    }
+    paint
+}
+
+fn paint_layer_order(target: &WidgetId, key: PaintLayerKey) -> PaintOrderDeclaration {
+    let mut order = PaintOrderDeclaration::layer(target.clone(), key.z_index);
+    order.order = key.order;
+    order
+}
+
+fn expand_paint_ops_into_units(
+    ops: Vec<PaintOp>,
+    unit: &PaintUnit,
+    context: &mut Vec<PaintGroupContext>,
+    expanded: &mut Vec<PaintUnit>,
+) -> Vec<PaintOp> {
+    let mut default_paint = Vec::new();
+
+    for op in ops {
+        match op {
+            PaintOp::Group { id, clip, ops } => {
+                context.push(PaintGroupContext {
+                    id: id.clone(),
+                    clip: clip.clone(),
+                });
+                let group_default = expand_paint_ops_into_units(ops, unit, context, expanded);
+                context.pop();
+
+                if !group_default.is_empty() {
+                    default_paint.push(PaintOp::Group {
+                        id,
+                        clip,
+                        ops: group_default,
+                    });
+                }
+            }
+            PaintOp::Layer {
+                id,
+                key,
+                input_transparency,
+                clip,
+                ops,
+            } => {
+                context.push(PaintGroupContext {
+                    id: id.clone(),
+                    clip: clip.clone(),
+                });
+                let layer_default = expand_paint_ops_into_units(ops, unit, context, expanded);
+                context.pop();
+
+                if !layer_default.is_empty() {
+                    let layer = PaintOp::Layer {
+                        id,
+                        key,
+                        input_transparency,
+                        clip,
+                        ops: layer_default,
+                    };
+                    expanded.push(PaintUnit {
+                        target: unit.target.clone(),
+                        address: unit.address.clone(),
+                        order: paint_layer_order(&unit.target, key),
+                        traversal_order: unit.traversal_order,
+                        paint: wrap_paint_with_group_context(vec![layer], context),
+                    });
+                }
+            }
+            op => default_paint.push(op),
+        }
+    }
+
+    default_paint
+}
+
+pub fn expand_paint_unit_layers(unit: PaintUnit) -> Vec<PaintUnit> {
+    let PaintUnit {
+        target,
+        address,
+        order,
+        traversal_order,
+        paint,
+    } = unit;
+    let template = PaintUnit {
+        target,
+        address,
+        order,
+        traversal_order,
+        paint: Vec::new(),
+    };
+    let mut expanded = Vec::new();
+    let mut context = Vec::new();
+    let default_paint = expand_paint_ops_into_units(paint, &template, &mut context, &mut expanded);
+    let mut units = Vec::new();
+
+    if !default_paint.is_empty() || expanded.is_empty() {
+        units.push(PaintUnit {
+            paint: default_paint,
+            ..template
+        });
+    }
+
+    units.extend(expanded);
+    units
+}
+
+pub fn expand_paint_unit_layers_in_units(units: Vec<PaintUnit>) -> Vec<PaintUnit> {
+    units
+        .into_iter()
+        .flat_map(expand_paint_unit_layers)
+        .collect()
 }
 
 pub fn paint_unit_sort_key(unit: &PaintUnit) -> (i32, usize, usize) {
@@ -4816,7 +5682,7 @@ pub fn ordered_paint_units(mut units: Vec<PaintUnit>) -> Vec<PaintUnit> {
 }
 
 pub fn flatten_ordered_paint_units(units: Vec<PaintUnit>) -> Vec<PaintOp> {
-    ordered_paint_units(units)
+    ordered_paint_units(expand_paint_unit_layers_in_units(units))
         .into_iter()
         .flat_map(|unit| unit.paint)
         .collect()
@@ -4895,6 +5761,7 @@ pub struct EventResultIdentity {
 pub struct ProbeRequest {
     pub target: Option<WidgetId>,
     pub kinds: Vec<ProbeKind>,
+    pub event_trace_limit: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5341,6 +6208,22 @@ pub trait SlipwayTextEditCommandPolicy: SlipwayWidgetTypes {
         external: &Self::ExternalState,
         local: &Self::LocalState,
     ) -> Vec<TextEditCommandDeclaration>;
+}
+
+pub trait SlipwayTextInputVisualStylePolicy: SlipwayWidgetTypes {
+    fn text_input_visual_style(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+    ) -> TextInputVisualStyleDeclaration;
+}
+
+pub trait SlipwayTextInputTypographyPolicy: SlipwayWidgetTypes {
+    fn text_input_typography(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+    ) -> TextInputTypographyDeclaration;
 }
 
 pub trait SlipwayTextUndoRedoPolicy: SlipwayWidgetTypes {
@@ -5823,6 +6706,8 @@ pub trait SlipwayTextInputCapability:
     + SlipwayImeCompositionPolicy
     + SlipwayCaretGeometryPolicy
     + SlipwayTextEditCommandPolicy
+    + SlipwayTextInputVisualStylePolicy
+    + SlipwayTextInputTypographyPolicy
     + SlipwayTextUndoRedoPolicy
     + SlipwayTextFlowPolicy
     + SlipwayTextMeasurementPolicy
@@ -5843,6 +6728,8 @@ impl<W> SlipwayTextInputCapability for W where
         + SlipwayImeCompositionPolicy
         + SlipwayCaretGeometryPolicy
         + SlipwayTextEditCommandPolicy
+        + SlipwayTextInputVisualStylePolicy
+        + SlipwayTextInputTypographyPolicy
         + SlipwayTextUndoRedoPolicy
         + SlipwayTextFlowPolicy
         + SlipwayTextMeasurementPolicy
@@ -5948,6 +6835,8 @@ where
             selection: widget.text_selection(external, local),
             composition: widget.ime_composition(external, local),
             caret: widget.caret_geometry(external, local, measurement),
+            visual_style: widget.text_input_visual_style(external, local),
+            typography: widget.text_input_typography(external, local),
             edit_commands: widget.text_edit_commands(external, local),
             undo_redo: Some(widget.text_undo_redo(external, local)),
             viewport: text_flow.viewport,
@@ -5995,7 +6884,7 @@ pub fn scroll_region_from_scrollable_capability<W>(
     widget: &W,
     external: &W::ExternalState,
     local: &W::LocalState,
-    input: &LayoutInput,
+    layout: &LayoutOutput,
     region_id: Option<PresentationRegionId>,
     address: Option<WidgetSlotAddress>,
     enabled: bool,
@@ -6003,7 +6892,18 @@ pub fn scroll_region_from_scrollable_capability<W>(
 where
     W: SlipwayScrollableContainerCapability,
 {
-    let policy = widget.scroll_behavior_policy(external, local, input);
+    let viewport = layout.bounds;
+    let policy_input = LayoutInput {
+        viewport,
+        constraints: LayoutConstraints {
+            min: Size {
+                width: 0.0,
+                height: 0.0,
+            },
+            max: viewport.size,
+        },
+    };
+    let policy = widget.scroll_behavior_policy(external, local, &policy_input);
     ScrollRegionDeclaration {
         id: region_id.or(policy.region_id).unwrap_or_else(|| {
             PresentationRegionId::from(format!("{}:scroll", widget.id().as_str()))
@@ -6021,11 +6921,17 @@ where
                 &WheelEvent {
                     target: widget.id(),
                     target_slot: None,
+                    region_id: None,
                     delta_x: 0.0,
                     delta_y: 0.0,
                 },
             )
             .routing,
+        order: HitRegionOrder {
+            z_index: 0,
+            paint_order: 0,
+            traversal_order: 0,
+        },
         virtual_viewport: None,
         consumption: policy.consumption,
         evidence: Vec::new(),
@@ -6785,7 +7691,6 @@ macro_rules! impl_widget_list_tuple {
                 + SlipwayEventRoutingPolicy
                 + SlipwayEventDispositionPolicy
                 + SlipwayViewDefinition,)+
-            $($widget::LocalState: Clone,)+
         {
             type ExternalState = ExternalState;
             type LocalState = ($($widget::LocalState,)+);
@@ -6908,16 +7813,12 @@ macro_rules! impl_widget_list_tuple {
                                 &child_slot,
                             );
                         }
-                        let local_before = local.$index.clone();
                         let outcome = self.$index.handle_event(
                             external,
                             &mut local.$index,
                             event.clone(),
                         );
                         let outcome = apply_physical_event_handling_declaration(declaration, outcome);
-                        if event_outcome_has_physical_declaration_mismatch(&outcome) {
-                            local.$index = local_before;
-                        }
                         return mount_event_outcome(outcome, &child_slot);
                     }
                 )+
@@ -7022,7 +7923,6 @@ macro_rules! impl_widget_list_tuple {
                 + SlipwayEventRoutingPolicy
                 + SlipwayEventDispositionPolicy
                 + SlipwayViewDefinition,)+
-            $($widget::LocalState: Clone,)+
         {
             fn child_view_definitions(
                 &self,
@@ -7068,6 +7968,14 @@ impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4);
 impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5);
 impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6);
 impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7);
+impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8);
+impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9);
+impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10);
+impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11);
+impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12);
+impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12, N 13);
+impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12, N 13, O 14);
+impl_widget_list_tuple!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11, M 12, N 13, O 14, P 15);
 
 fn widget_contains_target<W>(widget: &W, external: &W::ExternalState, target: &WidgetId) -> bool
 where
@@ -7367,6 +8275,73 @@ impl ProbeCollector {
 mod tests {
     use super::*;
 
+    fn test_rgb(red: u8, green: u8, blue: u8) -> Color {
+        Color {
+            red: f32::from(red) / 255.0,
+            green: f32::from(green) / 255.0,
+            blue: f32::from(blue) / 255.0,
+            alpha: 1.0,
+        }
+    }
+
+    fn test_hit_region_with_capture(capture: PointerCaptureIntent) -> HitRegionDeclaration {
+        let target = WidgetId::from("capture-target");
+        HitRegionDeclaration {
+            id: PresentationRegionId::from("capture-region"),
+            target: target.clone(),
+            address: None,
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 40.0,
+                },
+            }),
+            event_coordinate_space: PointerEventCoordinateSpace::TargetLocal,
+            order: HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            route: EventRoute {
+                route_id: Some("capture-test".to_string()),
+                address: None,
+                path: vec![target],
+                phase: EventRoutePhase::Target,
+            },
+            cursor: CursorCapability::Pointer,
+            enabled: true,
+            capture,
+            capture_evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn during_drag_capture_does_not_claim_hover_moves() {
+        let region = test_hit_region_with_capture(PointerCaptureIntent::DuringDrag);
+
+        assert!(!declared_pointer_capture_for_region(
+            &region,
+            PointerEventKind::Move,
+            false,
+        ));
+        assert!(declared_pointer_capture_for_region(
+            &region,
+            PointerEventKind::Move,
+            true,
+        ));
+        assert!(declared_pointer_capture_for_region(
+            &region,
+            PointerEventKind::Release,
+            false,
+        ));
+        assert!(declared_pointer_capture_for_region(
+            &region,
+            PointerEventKind::Cancel,
+            false,
+        ));
+    }
+
     #[derive(Clone, Debug, PartialEq)]
     struct FakeWidget {
         id: WidgetId,
@@ -7566,6 +8541,15 @@ mod tests {
         assert_eq!(style.font_style, FontStyle::Normal);
         assert_eq!(style.decoration, TextDecoration::none());
         assert_eq!(style.baseline, BaselineShift::Normal);
+
+        let overridden = TextStyle::default()
+            .with_font_family("system-ui")
+            .with_font_size(18.0)
+            .with_font_weight(FontWeight::Bold);
+        assert_eq!(overridden.font_family, "system-ui");
+        assert_eq!(overridden.font_size, 18.0);
+        assert_eq!(overridden.font_weight, FontWeight::Bold);
+        assert_eq!(overridden.font_style, FontStyle::Normal);
 
         let declared = TextStyle {
             font_family: "Inter, system-ui".to_string(),
@@ -7775,6 +8759,8 @@ mod tests {
                         selection: self.text_selection(external, local),
                         composition: self.ime_composition(external, local),
                         caret: self.caret_geometry(external, local, None),
+                        visual_style: self.text_input_visual_style(external, local),
+                        typography: self.text_input_typography(external, local),
                         edit_commands: self.text_edit_commands(external, local),
                         undo_redo: Some(self.text_undo_redo(external, local)),
                         viewport: None,
@@ -7794,6 +8780,7 @@ mod tests {
                         vertical: true,
                     },
                     wheel_routing: WheelRouting::SelfFirst,
+                    order: HitRegionOrder::default(),
                     virtual_viewport: None,
                     consumption: ScrollConsumptionPolicy {
                         wheel: true,
@@ -8312,6 +9299,7 @@ mod tests {
                 vertical: true,
             },
             wheel_routing: WheelRouting::NearestScrollable,
+            order: HitRegionOrder::default(),
             virtual_viewport: None,
             consumption: ScrollConsumptionPolicy {
                 wheel: true,
@@ -8325,6 +9313,11 @@ mod tests {
         };
         let mut scroll_b = scroll_a.clone();
         scroll_b.id = PresentationRegionId::from("inner");
+        scroll_b.order = HitRegionOrder {
+            z_index: 1,
+            paint_order: 0,
+            traversal_order: 0,
+        };
 
         let dispatch = resolve_declared_wheel_dispatch(
             &layout,
@@ -8352,7 +9345,167 @@ mod tests {
             panic!("expected wheel input");
         };
         assert_eq!(wheel.target, target);
+        assert_eq!(wheel.region_id, Some(PresentationRegionId::from("inner")));
         assert_eq!(wheel.delta_y, -4.0);
+    }
+
+    #[test]
+    fn declared_wheel_dispatch_skips_scroll_region_at_directional_boundary() {
+        let target = WidgetId::from("scroll");
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 100.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let outer = ScrollRegionDeclaration {
+            id: PresentationRegionId::from("outer"),
+            target: target.clone(),
+            address: None,
+            viewport: layout.bounds,
+            content_bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 300.0,
+                },
+            }),
+            offset: Point { x: 0.0, y: 0.0 },
+            axes: ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            wheel_routing: WheelRouting::NearestScrollable,
+            order: HitRegionOrder::default(),
+            virtual_viewport: None,
+            consumption: ScrollConsumptionPolicy::exclusive_wheel(),
+            evidence: Vec::new(),
+            enabled: true,
+            diagnostics: Vec::new(),
+        };
+        let mut inner = outer.clone();
+        inner.id = PresentationRegionId::from("inner");
+        inner.order = HitRegionOrder {
+            z_index: 1,
+            paint_order: 0,
+            traversal_order: 0,
+        };
+
+        let mut movable_inner = inner.clone();
+        movable_inner.offset.y = 100.0;
+        let dispatch = resolve_declared_wheel_dispatch(
+            &layout,
+            &[outer.clone(), movable_inner],
+            Point { x: 20.0, y: 20.0 },
+            0.0,
+            -4.0,
+        )
+        .expect("movable top scroll consumes");
+        assert_eq!(
+            dispatch.selected_region,
+            PresentationRegionId::from("inner")
+        );
+
+        let mut bottom_inner = inner.clone();
+        bottom_inner.offset.y = 200.0;
+        let dispatch = resolve_declared_wheel_dispatch(
+            &layout,
+            &[outer.clone(), bottom_inner],
+            Point { x: 20.0, y: 20.0 },
+            0.0,
+            -4.0,
+        )
+        .expect("boundary inner bubbles to outer scroll owner");
+        assert_eq!(
+            dispatch.selected_region,
+            PresentationRegionId::from("outer")
+        );
+
+        let mut bottom_outer = outer;
+        bottom_outer.offset.y = 200.0;
+        let mut bottom_inner = inner;
+        bottom_inner.offset.y = 200.0;
+        assert!(
+            resolve_declared_wheel_dispatch(
+                &layout,
+                &[bottom_outer, bottom_inner],
+                Point { x: 20.0, y: 20.0 },
+                0.0,
+                -4.0,
+            )
+            .is_none(),
+            "wheel has no owner when every containing scroll region is at the boundary"
+        );
+    }
+
+    #[test]
+    fn overlapping_wheel_consumers_with_same_order_are_contract_errors() {
+        let target = WidgetId::from("scroll");
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 100.0,
+                },
+            }),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let scroll = ScrollRegionDeclaration {
+            id: PresentationRegionId::from("outer"),
+            target: target.clone(),
+            address: None,
+            viewport: layout.bounds,
+            content_bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 300.0,
+                },
+            }),
+            offset: Point { x: 0.0, y: 0.0 },
+            axes: ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            wheel_routing: WheelRouting::NearestScrollable,
+            order: HitRegionOrder::default(),
+            virtual_viewport: None,
+            consumption: ScrollConsumptionPolicy::exclusive_wheel(),
+            evidence: Vec::new(),
+            enabled: true,
+            diagnostics: Vec::new(),
+        };
+        let mut inner = scroll.clone();
+        inner.id = PresentationRegionId::from("inner");
+
+        let view = ViewDefinition {
+            target: target.clone(),
+            frame: frame_identity(),
+            layout,
+            paint: Vec::new(),
+            paint_order: PaintOrderDeclaration::source_order(target),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll, inner],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let diagnostics = view_definition_contract_diagnostics(&view);
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "view_contract.ambiguous_wheel_overlap" })
+        );
     }
 
     #[test]
@@ -8405,6 +9558,7 @@ mod tests {
                 vertical: true,
             },
             wheel_routing: WheelRouting::NearestScrollable,
+            order: HitRegionOrder::default(),
             virtual_viewport: None,
             consumption: ScrollConsumptionPolicy {
                 wheel: true,
@@ -8437,6 +9591,10 @@ mod tests {
         };
         assert_eq!(wheel.target, child);
         assert_eq!(wheel.target_slot, Some(child_slot));
+        assert_eq!(
+            wheel.region_id,
+            Some(PresentationRegionId::from("child-scroll-region"))
+        );
         assert_eq!(wheel.delta_y, -12.0);
     }
 
@@ -8467,6 +9625,7 @@ mod tests {
                 vertical: true,
             },
             wheel_routing: WheelRouting::NearestScrollable,
+            order: HitRegionOrder::default(),
             virtual_viewport: None,
             consumption: ScrollConsumptionPolicy {
                 wheel: true,
@@ -8536,12 +9695,25 @@ mod tests {
                 diagnostics: Vec::new(),
             },
             caret: CaretGeometryEvidence {
-                target,
+                target: target.clone(),
                 caret_bounds: Vec::new(),
                 selection_bounds: Vec::new(),
                 measurement_request_ids: Vec::new(),
                 diagnostics: Vec::new(),
             },
+            visual_style: TextInputVisualStyleDeclaration::explicit(
+                target.clone(),
+                test_rgb(15, 23, 42),
+                test_rgb(100, 116, 139),
+                test_rgb(15, 23, 42),
+                test_rgb(191, 219, 254),
+                test_rgb(255, 255, 255),
+                test_rgb(203, 213, 225),
+                1.0,
+                4.0,
+                test_rgb(15, 23, 42),
+            ),
+            typography: TextInputTypographyDeclaration::explicit(target, TextStyle::default()),
             edit_commands: vec![TextEditCommandDeclaration {
                 command_id: "insert".to_string(),
                 kind: TextEditKind::InsertText,
@@ -8974,6 +10146,7 @@ mod tests {
                 id: WidgetId::from("popup"),
                 owner: self.id.clone(),
                 bounds: frame_identity().viewport,
+                allowed_bounds: Some(frame_identity().viewport),
                 modality: OverlayModality::Modal,
                 focus_scope: Some(self.id.clone()),
                 dismiss_commands: vec!["escape".to_string()],
@@ -9141,7 +10314,46 @@ mod tests {
                     kind: TextEditKind::DeleteBackward,
                     enabled: true,
                 },
+                TextEditCommandDeclaration {
+                    command_id: "replace-buffer".to_string(),
+                    kind: TextEditKind::ReplaceBuffer,
+                    enabled: true,
+                },
             ]
+        }
+    }
+
+    impl SlipwayTextInputVisualStylePolicy for FakeWidget {
+        fn text_input_visual_style(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> TextInputVisualStyleDeclaration {
+            TextInputVisualStyleDeclaration::explicit(
+                self.id.clone(),
+                test_rgb(15, 23, 42),
+                test_rgb(100, 116, 139),
+                test_rgb(15, 23, 42),
+                test_rgb(191, 219, 254),
+                test_rgb(255, 255, 255),
+                test_rgb(203, 213, 225),
+                1.0,
+                4.0,
+                test_rgb(15, 23, 42),
+            )
+        }
+    }
+
+    impl SlipwayTextInputTypographyPolicy for FakeWidget {
+        fn text_input_typography(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> TextInputTypographyDeclaration {
+            TextInputTypographyDeclaration::explicit(
+                self.id.clone(),
+                TextStyle::default().with_font_family("system-ui"),
+            )
         }
     }
 
@@ -11286,6 +12498,7 @@ mod tests {
         InputEvent::Wheel(WheelEvent {
             target: WidgetId::from(target),
             target_slot: None,
+            region_id: None,
             delta_x: 0.0,
             delta_y,
         })
@@ -12195,6 +13408,162 @@ mod tests {
         assert_eq!(labels, vec!["one:0", "two:1"]);
     }
 
+    fn paint_test_rect(x: f32) -> Rect {
+        Rect {
+            origin: Point { x, y: 0.0 },
+            size: Size {
+                width: 10.0,
+                height: 10.0,
+            },
+        }
+    }
+
+    fn paint_test_color() -> Color {
+        test_rgb(0, 0, 0)
+    }
+
+    fn paint_test_text(label: &str, x: f32) -> PaintOp {
+        PaintOp::text(paint_test_rect(x), label, paint_test_color())
+    }
+
+    fn paint_test_unit(id: &str, traversal_order: usize, paint: Vec<PaintOp>) -> PaintUnit {
+        PaintUnit::source_order(WidgetId::from(id), None, traversal_order, paint)
+    }
+
+    fn collect_paint_text_labels<'a>(ops: &'a [PaintOp], labels: &mut Vec<&'a str>) {
+        for op in ops {
+            match op {
+                PaintOp::Text { content, .. } => labels.push(content.as_str()),
+                PaintOp::Group { ops, .. } | PaintOp::Layer { ops, .. } => {
+                    collect_paint_text_labels(ops, labels);
+                }
+                PaintOp::Fill { .. } | PaintOp::Stroke { .. } => {}
+            }
+        }
+    }
+
+    fn paint_text_labels(ops: &[PaintOp]) -> Vec<&str> {
+        let mut labels = Vec::new();
+        collect_paint_text_labels(ops, &mut labels);
+        labels
+    }
+
+    #[test]
+    fn keyed_paint_subtrees_expand_into_separate_sorted_units() {
+        let mut sibling_order = PaintOrderDeclaration::layer(WidgetId::from("sibling"), 7);
+        sibling_order.order = Some(0);
+        let sibling = PaintUnit {
+            target: WidgetId::from("sibling"),
+            address: None,
+            order: sibling_order,
+            traversal_order: 2,
+            paint: vec![paint_test_text("sibling", 30.0)],
+        };
+        let paint = flatten_ordered_paint_units(vec![
+            paint_test_unit(
+                "root",
+                1,
+                vec![
+                    paint_test_text("default", 0.0),
+                    PaintOp::keyed_layer(
+                        PaintLayerKey::ordered(10, 0),
+                        vec![paint_test_text("top-key", 10.0)],
+                    ),
+                    PaintOp::keyed_layer_pass_through(
+                        PaintLayerKey::ordered(5, 0),
+                        vec![paint_test_text("middle-key", 20.0)],
+                    ),
+                ],
+            ),
+            sibling,
+        ]);
+
+        assert_eq!(
+            paint_text_labels(&paint),
+            vec!["default", "middle-key", "sibling", "top-key"]
+        );
+        assert!(paint.iter().any(|op| matches!(
+            op,
+            PaintOp::Layer {
+                input_transparency: PaintInputTransparency::PassThrough,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn unkeyed_paint_remains_in_default_bottom_unit() {
+        let units = expand_paint_unit_layers(paint_test_unit(
+            "root",
+            3,
+            vec![
+                paint_test_text("default", 0.0),
+                PaintOp::keyed_layer(
+                    PaintLayerKey::ordered(8, 0),
+                    vec![paint_test_text("keyed", 10.0)],
+                ),
+            ],
+        ));
+
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].order.mode, PaintOrderMode::SourceOrder);
+        assert_eq!(paint_text_labels(&units[0].paint), vec!["default"]);
+        assert_eq!(units[1].order.mode, PaintOrderMode::ExplicitLayered);
+        assert_eq!(units[1].order.z_index, 8);
+        assert_eq!(units[1].order.order, Some(0));
+        assert_eq!(paint_text_labels(&units[1].paint), vec!["keyed"]);
+    }
+
+    #[test]
+    fn equal_paint_layer_keys_preserve_deterministic_fallback_order() {
+        let paint = flatten_ordered_paint_units(vec![paint_test_unit(
+            "root",
+            1,
+            vec![
+                PaintOp::keyed_layer(
+                    PaintLayerKey::ordered(4, 1),
+                    vec![paint_test_text("first", 0.0)],
+                ),
+                PaintOp::keyed_layer(
+                    PaintLayerKey::ordered(4, 1),
+                    vec![paint_test_text("second", 10.0)],
+                ),
+            ],
+        )]);
+
+        assert_eq!(paint_text_labels(&paint), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn translation_and_bounds_collection_visit_keyed_paint_subtrees() {
+        let clip = ClipDeclaration {
+            id: Some("layer-clip".to_string()),
+            bounds: paint_test_rect(1.0),
+            path: None,
+        };
+        let op = PaintOp::keyed_layer(PaintLayerKey::new(1), vec![paint_test_text("inside", 2.0)])
+            .with_layer_clip(clip);
+
+        let translated = translate_paint_op(op, Point { x: 5.0, y: 7.0 });
+        let PaintOp::Layer { clip, ops, .. } = &translated else {
+            panic!("expected keyed paint layer");
+        };
+        assert_eq!(clip.as_ref().map(|clip| clip.bounds.origin.x), Some(6.0));
+        assert_eq!(clip.as_ref().map(|clip| clip.bounds.origin.y), Some(7.0));
+        assert_eq!(paint_text_labels(ops), vec!["inside"]);
+        let PaintOp::Text { bounds, .. } = &ops[0] else {
+            panic!("expected translated text child");
+        };
+        assert_eq!(bounds.origin.x, 7.0);
+        assert_eq!(bounds.origin.y, 7.0);
+
+        let mut bounds = Vec::new();
+        collect_paint_bounds(&translated, &mut bounds);
+        assert_eq!(bounds.len(), 2);
+        assert_eq!(bounds[0].origin.x, 6.0);
+        assert_eq!(bounds[1].origin.x, 7.0);
+    }
+
     #[test]
     fn paint_units_sort_by_layer_then_explicit_order_then_source_traversal() {
         let unit = |id: &str, z_index: i32, order: Option<usize>, traversal_order: usize| {
@@ -12597,8 +13966,13 @@ mod tests {
             &input,
             None,
         );
+        let layout = LayoutOutput {
+            bounds: input.viewport,
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
         let scroll = scroll_region_from_scrollable_capability(
-            &widget, &external, &local, &input, None, None, true,
+            &widget, &external, &local, &layout, None, None, true,
         );
 
         assert_eq!(focus.target, widget.id());
@@ -12670,6 +14044,8 @@ mod tests {
             .as_mut()
             .expect("fake widget declares text edit");
         text_edit.buffer.target = WidgetId::from("other");
+        text_edit.typography.target = WidgetId::from("other-typography");
+        text_edit.typography.style.font_size = 0.0;
         text_edit
             .edit_commands
             .retain(|command| command.kind != TextEditKind::DeleteBackward);
@@ -12690,6 +14066,8 @@ mod tests {
             &diagnostics
         ));
         assert!(codes.contains(&"view_contract.text_edit_buffer_target_mismatch"));
+        assert!(codes.contains(&"view_contract.text_edit_typography_target_mismatch"));
+        assert!(codes.contains(&"view_contract.text_edit_typography_invalid_font_size"));
         assert!(codes.contains(&"view_contract.text_edit_missing_delete_command"));
         assert!(codes.contains(&"view_contract.scroll_axes_empty"));
         assert!(codes.contains(&"view_contract.scroll_offset_on_disabled_x_axis"));
@@ -12900,6 +14278,7 @@ mod tests {
                     ProbeKind::State,
                     ProbeKind::ViewDefinition,
                 ],
+                event_trace_limit: None,
             },
             &view.frame,
         );

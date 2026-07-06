@@ -1229,6 +1229,7 @@ mod tests {
                 slipway_core::ProbeRequest {
                     target: None,
                     kinds: vec![slipway_core::ProbeKind::RenderEvidence],
+                    event_trace_limit: None,
                 },
             ))
             .expect("command queued");

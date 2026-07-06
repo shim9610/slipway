@@ -3,25 +3,28 @@ use slipway_backend_egui::{
     run_slipway_egui_runtime_app_with_default_bridge,
 };
 use slipway_backend_iced::{
-    SlipwayIcedAuthoredChildren, SlipwayIcedWidgetListVisitor, run_slipway_iced_runtime_app,
+    IcedChildTraversalOrder, SlipwayIcedAuthoredChildren, SlipwayIcedWidgetListVisitor,
+    run_slipway_iced_runtime_app_with_config,
 };
 use slipway_core::{
     AppLayoutPlan, Capability, CaretGeometryEvidence, CaretSet, ChangeEvidence, ChildLayoutPlan,
-    ChildLayoutSeed, Color, CursorCapability, Diagnostic, EdgeInsets, EmittedMessage, EventOutcome,
-    EventRoute, EventRoutePhase, EvidenceSource, FocusRegionDeclaration, FocusTraversalMember,
+    ChildLayoutSeed, Color, CursorCapability, Diagnostic, EmittedMessage, EventOutcome, EventRoute,
+    EventRoutePhase, EvidenceSource, FocusRegionDeclaration, FocusTraversalMember,
     FontResolutionEvidence, FontResolutionRequest, HitRegionDeclaration, HitRegionOrder,
     ImeCompositionPolicyDeclaration, InputEvent, LayoutConstraints, LayoutInput, LayoutOutput,
-    PaintOp, PaintOrderDeclaration, ParentLocalRect, Point, PointerCaptureIntent,
-    PresentationRegionId, ProbeCollector, ProbeMetadataDeclaration, ProbeProduct, Rect,
-    ResourceRefusalEvidence, ScrollRegionDeclaration, SemanticNode, SemanticSlotDeclaration,
-    ShapeDeclaration, ShapeKind, Size, SlipwayApp, SlipwayAppWidget, SlipwayFontResolutionPolicy,
-    SlipwayLogic, SlipwaySsot, SlipwayView, SlipwayViewDefinition, SlipwayWidgetListVisitor,
-    SlipwayWidgetTypes, SourceValidityEvidence, SourceValidityKind, StateObservation,
-    TargetLocalRect, TextBufferSnapshot, TextEditCommandDeclaration, TextEditKind, TextLineMode,
-    TextSelectionPolicyDeclaration, TextSelectionRange, TextStyle, TextViewport, TopologyNode,
-    ViewDefinition, ViewDefinitionInput, WheelRouting, WidgetId, WidgetSlotAddress,
+    PaintLayerKey, PaintOp, PaintOrderDeclaration, ParentLocalRect, PathCommand, PathDeclaration,
+    Point, PointerCaptureIntent, PresentationRegionId, ProbeCollector, ProbeMetadataDeclaration,
+    ProbeProduct, Rect, ResourceInstallationEvidence, ResourceInstallationStatus,
+    ResourceRefusalEvidence, ResourceSourceDeclaration, ResourceSourceKind,
+    ScrollRegionDeclaration, SemanticNode, SemanticSlotDeclaration, ShapeDeclaration, ShapeKind,
+    Size, SlipwayApp, SlipwayAppWidget, SlipwayFontResolutionPolicy, SlipwayLogic, SlipwaySsot,
+    SlipwayView, SlipwayViewDefinition, SlipwayWidgetListVisitor, SlipwayWidgetTypes,
+    SourceValidityEvidence, SourceValidityKind, StateObservation, TargetLocalRect,
+    TextBufferSnapshot, TextEditCommandDeclaration, TextEditKind, TextInputTypographyDeclaration,
+    TextLineMode, TextSelectionPolicyDeclaration, TextSelectionRange, TextStyle, TextViewport,
+    TopologyNode, ViewDefinition, ViewDefinitionInput, WheelRouting, WidgetId, WidgetSlotAddress,
 };
-use slipway_runtime::SlipwayRuntime;
+use slipway_runtime::{SlipwayRuntime, SlipwayRuntimeConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
@@ -55,12 +58,14 @@ fn run_egui() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_iced() -> Result<(), Box<dyn std::error::Error>> {
-    run_slipway_iced_runtime_app(
+    let config = SlipwayRuntimeConfig::admitted_debug().with_platform_ime_always_allowed();
+    run_slipway_iced_runtime_app_with_config(
         AdmissionRuntimeAppWidget::new(AdmissionApp {
             widgets: admission_widget_tuple(),
         }),
         AdmissionState::default(),
         apply_messages,
+        config,
     )?;
     Ok(())
 }
@@ -109,10 +114,16 @@ struct AdmissionApp {
         AdmissionWidget,
         AdmissionWidget,
         AdmissionWidget,
+        AdmissionWidget,
+        AdmissionWidget,
+        AdmissionWidget,
     ),
 }
 
 fn admission_widget_tuple() -> (
+    AdmissionWidget,
+    AdmissionWidget,
+    AdmissionWidget,
     AdmissionWidget,
     AdmissionWidget,
     AdmissionWidget,
@@ -127,14 +138,20 @@ fn admission_widget_tuple() -> (
         AdmissionWidget::Toggle(ToggleWidget),
         AdmissionWidget::Slider(SliderWidget),
         AdmissionWidget::List(ListWidget),
+        AdmissionWidget::Overlay(OverlayWidget),
+        AdmissionWidget::OverlayStack(OverlayStackWidget),
+        AdmissionWidget::NestedScroll(NestedScrollWidget),
     )
 }
 
 impl SlipwayApp for AdmissionApp {
     type ExternalState = AdmissionState;
-    type LocalState = ();
+    type LocalState = AdmissionAppLocal;
     type AppMessage = AdmissionMessage;
     type Widgets = (
+        AdmissionWidget,
+        AdmissionWidget,
+        AdmissionWidget,
         AdmissionWidget,
         AdmissionWidget,
         AdmissionWidget,
@@ -151,7 +168,49 @@ impl SlipwayApp for AdmissionApp {
         &self.widgets
     }
 
-    fn initial_local_state(&self) -> Self::LocalState {}
+    fn initial_local_state(&self) -> Self::LocalState {
+        AdmissionAppLocal::default()
+    }
+
+    fn handle_event(
+        &self,
+        _external: &Self::ExternalState,
+        local: &mut Self::LocalState,
+        event: InputEvent,
+    ) -> EventOutcome<Self::AppMessage> {
+        match event {
+            InputEvent::Scroll(scroll)
+                if scroll.region_id == AdmissionAppLocal::root_scroll_region_id() =>
+            {
+                local.root_scroll_y = scroll.offset_y.max(0.0);
+                local_change_outcome(
+                    self.id(),
+                    "root-scroll",
+                    "root-scroll-y",
+                    format!("{:.1}", local.root_scroll_y),
+                )
+            }
+            InputEvent::Wheel(wheel)
+                if wheel.region_id == Some(AdmissionAppLocal::root_scroll_region_id()) =>
+            {
+                let direction = if wheel.delta_y < 0.0 {
+                    48.0
+                } else if wheel.delta_y > 0.0 {
+                    -48.0
+                } else {
+                    0.0
+                };
+                local.root_scroll_y = (local.root_scroll_y + direction).max(0.0);
+                local_change_outcome(
+                    self.id(),
+                    "root-wheel",
+                    "root-scroll-y",
+                    format!("{:.1}", local.root_scroll_y),
+                )
+            }
+            _ => EventOutcome::ignored(),
+        }
+    }
 
     fn layout_plan(
         &self,
@@ -165,10 +224,12 @@ impl SlipwayApp for AdmissionApp {
         let mut plans = Vec::new();
 
         for seed in children {
-            let height = if seed.child.as_str() == "admission.list" {
-                168.0
-            } else {
-                76.0
+            let height = match seed.child.as_str() {
+                "admission.list" => 168.0,
+                "admission.overlay" => 228.0,
+                "admission.overlay-stack" => 276.0,
+                "admission.nested-scroll" => 292.0,
+                _ => 76.0,
             };
             let bounds = Rect {
                 origin: Point { x: 16.0, y },
@@ -252,6 +313,17 @@ impl SlipwayApp for AdmissionApp {
             ),
             color: rgb(241, 245, 249),
         }]
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AdmissionAppLocal {
+    root_scroll_y: f32,
+}
+
+impl AdmissionAppLocal {
+    fn root_scroll_region_id() -> PresentationRegionId {
+        PresentationRegionId::from("admission.app:root-scroll")
     }
 }
 
@@ -353,8 +425,76 @@ impl SlipwayViewDefinition for AdmissionRuntimeAppWidget {
         local: &Self::LocalState,
         input: ViewDefinitionInput,
     ) -> ViewDefinition {
-        self.inner.view_definition(external, local, input)
+        let visible_viewport = input.layout_input.viewport.into_rect();
+        let mut view = self.inner.view_definition(external, local, input);
+        view.paint_order.allow_overlap = true;
+        view.paint_order = view
+            .paint_order
+            .with_overflow_bounds(TargetLocalRect::new(Rect {
+                origin: Point {
+                    x: -1800.0,
+                    y: -1400.0,
+                },
+                size: Size {
+                    width: view.layout.bounds.size.width + 3600.0,
+                    height: view.layout.bounds.size.height + 2800.0,
+                },
+            }));
+        if view.layout.bounds.size.height > visible_viewport.size.height + 0.5 {
+            let root_slot = WidgetSlotAddress::new(self.id(), 0);
+            let content_bounds = view.layout.bounds.into_rect();
+            view.scroll_regions
+                .push(root_scroll_region_for_admission_app(
+                    self.id(),
+                    root_slot,
+                    visible_viewport,
+                    content_bounds,
+                    local.app.root_scroll_y,
+                ));
+        }
+        view
     }
+}
+
+fn root_scroll_region_for_admission_app(
+    target: WidgetId,
+    address: WidgetSlotAddress,
+    viewport: Rect,
+    content_bounds: Rect,
+    offset_y: f32,
+) -> ScrollRegionDeclaration {
+    ScrollRegionDeclaration::explicit(
+        AdmissionAppLocal::root_scroll_region_id(),
+        target,
+        Some(address),
+        TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: viewport.size,
+        }),
+        TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: content_bounds.size.width.max(viewport.size.width),
+                height: content_bounds.size.height.max(viewport.size.height),
+            },
+        }),
+        Point {
+            x: 0.0,
+            y: offset_y.max(0.0),
+        },
+        slipway_core::ScrollAxes {
+            horizontal: false,
+            vertical: true,
+        },
+        WheelRouting::SelfFirst,
+        HitRegionOrder {
+            z_index: -1,
+            paint_order: 0,
+            traversal_order: 0,
+        },
+        slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+        true,
+    )
 }
 
 impl slipway_core::SlipwayEventRoutingPolicy for AdmissionRuntimeAppWidget {
@@ -403,6 +543,27 @@ impl SlipwayIcedAuthoredChildren for AdmissionRuntimeAppWidget {
         self.inner
             .visit_iced_authored_children(external, local, visitor);
     }
+
+    fn visit_iced_authored_children_in_paint_order<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        frame: &slipway_core::FrameIdentity,
+        placements: &[slipway_core::ChildPlacement],
+        traversal_order: IcedChildTraversalOrder,
+        visitor: &mut V,
+    ) where
+        V: SlipwayIcedWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+    {
+        self.inner.visit_iced_authored_children_in_paint_order(
+            external,
+            local,
+            frame,
+            placements,
+            traversal_order,
+            visitor,
+        );
+    }
 }
 
 impl SlipwayEguiAuthoredChildren for AdmissionRuntimeAppWidget {
@@ -417,6 +578,23 @@ impl SlipwayEguiAuthoredChildren for AdmissionRuntimeAppWidget {
         self.inner
             .visit_egui_authored_children(external, local, visitor);
     }
+
+    fn visit_egui_authored_children_in_paint_order<V>(
+        &self,
+        external: &Self::ExternalState,
+        local: &Self::LocalState,
+        parent_view: &ViewDefinition,
+        visitor: &mut V,
+    ) where
+        V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+    {
+        self.inner.visit_egui_authored_children_in_paint_order(
+            external,
+            local,
+            parent_view,
+            visitor,
+        );
+    }
 }
 
 fn admission_widgets() -> Vec<AdmissionWidget> {
@@ -427,6 +605,9 @@ fn admission_widgets() -> Vec<AdmissionWidget> {
         AdmissionWidget::Toggle(ToggleWidget),
         AdmissionWidget::Slider(SliderWidget),
         AdmissionWidget::List(ListWidget),
+        AdmissionWidget::Overlay(OverlayWidget),
+        AdmissionWidget::OverlayStack(OverlayStackWidget),
+        AdmissionWidget::NestedScroll(NestedScrollWidget),
     ]
 }
 
@@ -485,7 +666,7 @@ enum AdmissionMessage {
     UpdateDraft(String),
     ToggleEnabled,
     SetIntensity(f32),
-    SelectNextItem,
+    SelectItem(usize),
 }
 
 fn apply_messages(state: &mut AdmissionState, messages: Vec<AdmissionMessage>) {
@@ -496,7 +677,7 @@ fn apply_messages(state: &mut AdmissionState, messages: Vec<AdmissionMessage>) {
             AdmissionMessage::UpdateDraft(text) => state.draft = text,
             AdmissionMessage::ToggleEnabled => state.enabled = !state.enabled,
             AdmissionMessage::SetIntensity(value) => state.intensity = value.clamp(0.0, 1.0),
-            AdmissionMessage::SelectNextItem => state.selected_item = (state.selected_item + 1) % 5,
+            AdmissionMessage::SelectItem(index) => state.selected_item = index.min(4),
         }
     }
 }
@@ -524,6 +705,68 @@ fn apply_text_edit_to_draft(current: &str, edit: &slipway_core::TextEditEvent) -
     }
 }
 
+fn list_row_from_pointer_y(y: f32) -> Option<usize> {
+    let row = ((y - 44.0) / 20.0).floor() as i32;
+    (0..5).contains(&row).then_some(row as usize)
+}
+
+fn list_scroll_rows_after_wheel(current: i32, delta_y: f32) -> i32 {
+    let direction = if delta_y < 0.0 {
+        1
+    } else if delta_y > 0.0 {
+        -1
+    } else {
+        0
+    };
+    (current + direction).clamp(0, 5)
+}
+
+fn list_scroll_content_height(viewport_height: f32) -> f32 {
+    260.0_f32.max(viewport_height)
+}
+
+fn list_scroll_offset_y(scroll_rows: i32, viewport_height: f32) -> f32 {
+    let content_height = list_scroll_content_height(viewport_height);
+    let max_offset = (content_height - viewport_height).max(0.0);
+    (scroll_rows as f32 * 20.0).clamp(0.0, max_offset)
+}
+
+fn nested_scroll_local(local: &AdmissionLocal) -> Option<(i32, [i32; 3])> {
+    match local {
+        AdmissionLocal::NestedScroll {
+            outer_scroll_rows,
+            inner_scroll_rows,
+        } => Some((*outer_scroll_rows, *inner_scroll_rows)),
+        _ => None,
+    }
+}
+
+fn nested_scroll_rows_after_wheel(current: i32, delta_y: f32, max_rows: i32) -> i32 {
+    let direction = if delta_y < 0.0 {
+        1
+    } else if delta_y > 0.0 {
+        -1
+    } else {
+        0
+    };
+    (current + direction).clamp(0, max_rows)
+}
+
+fn nested_scroll_region_index(region_id: &PresentationRegionId) -> Option<Option<usize>> {
+    let text = region_id.as_str();
+    if text.ends_with(":outer") {
+        Some(None)
+    } else if text.ends_with(":inner-0") {
+        Some(Some(0))
+    } else if text.ends_with(":inner-1") {
+        Some(Some(1))
+    } else if text.ends_with(":inner-2") {
+        Some(Some(2))
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum AdmissionWidget {
     Action(ActionWidget),
@@ -532,6 +775,9 @@ enum AdmissionWidget {
     Toggle(ToggleWidget),
     Slider(SliderWidget),
     List(ListWidget),
+    Overlay(OverlayWidget),
+    OverlayStack(OverlayStackWidget),
+    NestedScroll(NestedScrollWidget),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -555,6 +801,21 @@ enum AdmissionLocal {
     List {
         scroll_rows: i32,
     },
+    Overlay {
+        offset: Point,
+        dragging: bool,
+        drag_anchor: Point,
+    },
+    OverlayStack {
+        offsets: [Point; 4],
+        order: [usize; 4],
+        dragging: Option<usize>,
+        drag_anchor: Point,
+    },
+    NestedScroll {
+        outer_scroll_rows: i32,
+        inner_scroll_rows: [i32; 3],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -575,7 +836,293 @@ struct SliderWidget;
 #[derive(Clone, Debug, PartialEq)]
 struct ListWidget;
 
+#[derive(Clone, Debug, PartialEq)]
+struct OverlayWidget;
+
+#[derive(Clone, Debug, PartialEq)]
+struct OverlayStackWidget;
+
+#[derive(Clone, Debug, PartialEq)]
+struct NestedScrollWidget;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OverlayStackLayerSpec {
+    overlay: usize,
+    key: PaintLayerKey,
+}
+
+impl OverlayStackLayerSpec {
+    fn new(overlay: usize, rank: usize) -> Self {
+        Self {
+            overlay,
+            key: PaintLayerKey::ordered(10, rank),
+        }
+    }
+
+    fn paint_layer(self, ops: Vec<PaintOp>) -> PaintOp {
+        PaintOp::keyed_layer(self.key, ops)
+            .with_layer_id(format!("overlay-stack-window-{}", self.overlay))
+    }
+
+    fn hit_order(self) -> HitRegionOrder {
+        HitRegionOrder {
+            z_index: self.key.z_index,
+            paint_order: self.key.order.unwrap_or(self.overlay),
+            traversal_order: self.overlay,
+        }
+    }
+}
+
 impl AdmissionWidget {
+    fn overlay_layer_key() -> PaintLayerKey {
+        PaintLayerKey::ordered(12, 12)
+    }
+
+    fn overlay_default_offset() -> Point {
+        Point { x: 220.0, y: -44.0 }
+    }
+
+    fn overlay_allowed_bounds(bounds: Rect) -> Rect {
+        Rect {
+            origin: Point {
+                x: -1600.0,
+                y: -1200.0,
+            },
+            size: Size {
+                width: bounds.size.width + 3200.0,
+                height: bounds.size.height + 2400.0,
+            },
+        }
+    }
+
+    fn clamp_overlay_offset_to_allowed(bounds: Rect, offset: Point) -> Point {
+        let allowed = Self::overlay_allowed_bounds(bounds);
+        Point {
+            x: offset.x.clamp(
+                allowed.origin.x,
+                allowed.origin.x + (allowed.size.width - 224.0).max(0.0),
+            ),
+            y: offset.y.clamp(
+                allowed.origin.y,
+                allowed.origin.y + (allowed.size.height - 132.0).max(0.0),
+            ),
+        }
+    }
+
+    fn overlay_rect(bounds: Rect, offset: Point) -> Rect {
+        let offset = Self::clamp_overlay_offset_to_allowed(bounds, offset);
+        Rect {
+            origin: offset,
+            size: Size {
+                width: 224.0,
+                height: 132.0,
+            },
+        }
+    }
+
+    fn overlay_titlebar_rect(bounds: Rect, offset: Point) -> Rect {
+        let overlay = Self::overlay_rect(bounds, offset);
+        Rect {
+            origin: overlay.origin,
+            size: Size {
+                width: overlay.size.width,
+                height: 30.0,
+            },
+        }
+    }
+
+    fn overlay_stack_default_offsets() -> [Point; 4] {
+        [
+            Point { x: 236.0, y: 108.0 },
+            Point { x: 300.0, y: 128.0 },
+            Point { x: 252.0, y: 152.0 },
+            Point { x: 364.0, y: 176.0 },
+        ]
+    }
+
+    fn overlay_stack_default_order() -> [usize; 4] {
+        [0, 1, 2, 3]
+    }
+
+    fn overlay_stack_allowed_bounds(bounds: Rect) -> Rect {
+        Rect {
+            origin: Point {
+                x: -1600.0,
+                y: -1200.0,
+            },
+            size: Size {
+                width: bounds.size.width + 3200.0,
+                height: bounds.size.height + 2400.0,
+            },
+        }
+    }
+
+    fn clamp_overlay_stack_offset_to_allowed(bounds: Rect, offset: Point) -> Point {
+        let allowed = Self::overlay_stack_allowed_bounds(bounds);
+        Point {
+            x: offset.x.clamp(
+                allowed.origin.x,
+                allowed.origin.x + (allowed.size.width - 176.0).max(0.0),
+            ),
+            y: offset.y.clamp(
+                allowed.origin.y,
+                allowed.origin.y + (allowed.size.height - 104.0).max(0.0),
+            ),
+        }
+    }
+
+    fn overlay_stack_rect(bounds: Rect, offsets: [Point; 4], index: usize) -> Rect {
+        Rect {
+            origin: Self::clamp_overlay_stack_offset_to_allowed(bounds, offsets[index]),
+            size: Size {
+                width: 176.0,
+                height: 104.0,
+            },
+        }
+    }
+
+    fn overlay_stack_titlebar_rect(bounds: Rect, offsets: [Point; 4], index: usize) -> Rect {
+        let overlay = Self::overlay_stack_rect(bounds, offsets, index);
+        Rect {
+            origin: overlay.origin,
+            size: Size {
+                width: overlay.size.width,
+                height: 28.0,
+            },
+        }
+    }
+
+    fn overlay_stack_help_text_rect(bounds: Rect) -> Rect {
+        Rect {
+            origin: Point { x: 20.0, y: 44.0 },
+            size: Size {
+                width: (bounds.size.width - 40.0).clamp(1.0, 216.0),
+                height: 18.0,
+            },
+        }
+    }
+
+    fn overlay_stack_order_button_rect(index: usize) -> Rect {
+        Rect {
+            origin: Point {
+                x: 20.0 + index as f32 * 52.0,
+                y: 68.0,
+            },
+            size: Size {
+                width: 44.0,
+                height: 24.0,
+            },
+        }
+    }
+
+    fn overlay_stack_rank(order: [usize; 4], overlay: usize) -> usize {
+        order
+            .iter()
+            .position(|candidate| *candidate == overlay)
+            .unwrap_or(overlay)
+    }
+
+    fn overlay_stack_bring_front(order: &mut [usize; 4], overlay: usize) {
+        let mut next = Vec::with_capacity(4);
+        for candidate in order.iter().copied() {
+            if candidate != overlay {
+                next.push(candidate);
+            }
+        }
+        next.push(overlay);
+        for (index, value) in next.into_iter().enumerate() {
+            order[index] = value;
+        }
+    }
+
+    fn overlay_stack_layer_spec(overlay: usize, rank: usize) -> OverlayStackLayerSpec {
+        OverlayStackLayerSpec::new(overlay, rank)
+    }
+
+    fn overlay_stack_topmost_overlay_at(
+        bounds: Rect,
+        offsets: [Point; 4],
+        order: [usize; 4],
+        point: Point,
+    ) -> Option<usize> {
+        order
+            .iter()
+            .rev()
+            .copied()
+            .find(|index| point_in_rect(point, Self::overlay_stack_rect(bounds, offsets, *index)))
+    }
+
+    fn nested_outer_viewport(bounds: Rect) -> Rect {
+        Rect {
+            origin: Point { x: 18.0, y: 44.0 },
+            size: Size {
+                width: (bounds.size.width - 36.0).max(1.0),
+                height: (bounds.size.height - 68.0).max(1.0),
+            },
+        }
+    }
+
+    fn nested_inner_content_viewport(index: usize, outer_offset_y: f32) -> Rect {
+        Rect {
+            origin: Point {
+                x: 32.0,
+                y: 58.0 + index as f32 * 70.0 - outer_offset_y,
+            },
+            size: Size {
+                width: 156.0,
+                height: 62.0,
+            },
+        }
+    }
+
+    fn nested_inner_visible_viewport(
+        index: usize,
+        outer_offset_y: f32,
+        outer_viewport: Rect,
+    ) -> Option<Rect> {
+        intersect_rect(
+            Self::nested_inner_content_viewport(index, outer_offset_y),
+            outer_viewport,
+        )
+    }
+
+    fn nested_outer_content_height() -> f32 {
+        360.0
+    }
+
+    fn nested_inner_content_height() -> f32 {
+        132.0
+    }
+
+    fn nested_scroll_offset_y(rows: i32, viewport_height: f32, content_height: f32) -> f32 {
+        let max_offset = (content_height - viewport_height).max(0.0);
+        (rows as f32 * 18.0).clamp(0.0, max_offset)
+    }
+
+    fn text_input_focus_bounds(bounds: Rect) -> Rect {
+        Rect {
+            origin: Point { x: 12.0, y: 36.0 },
+            size: Size {
+                width: (bounds.size.width - 24.0).max(1.0),
+                height: 28.0,
+            },
+        }
+    }
+
+    fn card_header_text_rect(&self, bounds: Rect) -> Rect {
+        let width = match self {
+            Self::OverlayStack(_) => 232.0,
+            _ => bounds.size.width - 24.0,
+        };
+        Rect {
+            origin: Point { x: 12.0, y: 12.0 },
+            size: Size {
+                width: width.max(1.0).min((bounds.size.width - 24.0).max(1.0)),
+                height: 20.0,
+            },
+        }
+    }
+
     fn role(&self) -> &'static str {
         match self {
             Self::Action(_) => "action",
@@ -584,6 +1131,9 @@ impl AdmissionWidget {
             Self::Toggle(_) => "toggle",
             Self::Slider(_) => "slider",
             Self::List(_) => "scroll-list",
+            Self::Overlay(_) => "movable-overlay",
+            Self::OverlayStack(_) => "overlay-stack",
+            Self::NestedScroll(_) => "nested-scroll",
         }
     }
 
@@ -602,6 +1152,9 @@ impl AdmissionWidget {
             Self::Toggle(_) => 3,
             Self::Slider(_) => 4,
             Self::List(_) => 5,
+            Self::Overlay(_) => 6,
+            Self::OverlayStack(_) => 7,
+            Self::NestedScroll(_) => 8,
         }
     }
 
@@ -610,6 +1163,7 @@ impl AdmissionWidget {
         external: &AdmissionState,
         local: &AdmissionLocal,
         input: &LayoutInput,
+        layout: &LayoutOutput,
         bounds: Rect,
         address: Option<WidgetSlotAddress>,
     ) -> AdmissionViewDeclarations {
@@ -636,7 +1190,38 @@ impl AdmissionWidget {
             ..AdmissionViewDeclarations::default()
         };
 
-        if self.has_pointer_region() {
+        if matches!(self, Self::OverlayStack(_)) {
+            self.push_overlay_stack_hit_regions(
+                &mut declarations,
+                external,
+                local,
+                address.clone(),
+                bounds,
+            );
+        } else if self.has_pointer_region() {
+            let hit_bounds = if matches!(self, Self::Overlay(_)) {
+                let offset = match local {
+                    AdmissionLocal::Overlay { offset, .. } => *offset,
+                    _ => Self::overlay_default_offset(),
+                };
+                Self::overlay_titlebar_rect(bounds, offset)
+            } else {
+                bounds
+            };
+            let hit_order = if matches!(self, Self::Overlay(_)) {
+                let key = Self::overlay_layer_key();
+                HitRegionOrder {
+                    z_index: key.z_index,
+                    paint_order: key.order.unwrap_or(self.traversal_order()),
+                    traversal_order: self.traversal_order(),
+                }
+            } else {
+                HitRegionOrder {
+                    z_index: 0,
+                    paint_order: self.traversal_order(),
+                    traversal_order: self.traversal_order(),
+                }
+            };
             declarations
                 .hit_regions
                 .push(slipway_core::hit_region_from_pointer_capability(
@@ -645,22 +1230,38 @@ impl AdmissionWidget {
                     local,
                     PresentationRegionId::from(format!("{}:hit", target.as_str())),
                     address.clone(),
-                    TargetLocalRect::new(bounds),
+                    TargetLocalRect::new(hit_bounds),
                     slipway_core::PointerEventCoordinateSpace::TargetLocal,
-                    HitRegionOrder {
-                        z_index: 0,
-                        paint_order: self.traversal_order(),
-                        traversal_order: self.traversal_order(),
-                    },
+                    hit_order,
                     Some(format!("{}:hit", target.as_str())),
                     self.cursor(local),
                     true,
-                    if matches!(self, Self::Slider(_)) {
+                    if matches!(self, Self::Slider(_) | Self::Overlay(_)) {
                         PointerCaptureIntent::DuringDrag
                     } else {
                         PointerCaptureIntent::OnPress
                     },
                 ));
+        }
+
+        if matches!(self, Self::List(_)) {
+            self.push_list_row_hit_regions(
+                &mut declarations,
+                external,
+                local,
+                address.clone(),
+                bounds,
+            );
+        }
+
+        if matches!(self, Self::NestedScroll(_)) {
+            self.push_nested_scroll_regions(
+                &mut declarations,
+                external,
+                local,
+                address.clone(),
+                bounds,
+            );
         }
 
         if matches!(self, Self::Text(_)) {
@@ -672,7 +1273,7 @@ impl AdmissionWidget {
                     local,
                     PresentationRegionId::from(format!("{}:focus", target.as_str())),
                     address.clone(),
-                    TargetLocalRect::new(bounds),
+                    TargetLocalRect::new(Self::text_input_focus_bounds(bounds)),
                     slipway_core::SlipwayFocusTraversal::focus_member(self, external, local),
                     true,
                     input,
@@ -686,7 +1287,7 @@ impl AdmissionWidget {
                     self,
                     external,
                     local,
-                    input,
+                    layout,
                     Some(PresentationRegionId::from(format!(
                         "{}:scroll",
                         target.as_str()
@@ -703,8 +1304,714 @@ impl AdmissionWidget {
     fn has_pointer_region(&self) -> bool {
         matches!(
             self,
-            Self::Action(_) | Self::Segment(_) | Self::Toggle(_) | Self::Slider(_) | Self::List(_)
+            Self::Action(_)
+                | Self::Segment(_)
+                | Self::Toggle(_)
+                | Self::Slider(_)
+                | Self::Overlay(_)
         )
+    }
+
+    fn push_list_row_hit_regions(
+        &self,
+        declarations: &mut AdmissionViewDeclarations,
+        external: &AdmissionState,
+        local: &AdmissionLocal,
+        address: Option<WidgetSlotAddress>,
+        bounds: Rect,
+    ) {
+        let target = self.id();
+        for row in 0..5 {
+            let id = PresentationRegionId::from(format!("{}:row-{row}", target.as_str()));
+            declarations
+                .hit_regions
+                .push(slipway_core::hit_region_from_pointer_capability(
+                    self,
+                    external,
+                    local,
+                    id,
+                    address.clone(),
+                    TargetLocalRect::new(Rect {
+                        origin: Point {
+                            x: 24.0,
+                            y: 44.0 + row as f32 * 20.0,
+                        },
+                        size: Size {
+                            width: (bounds.size.width - 48.0).max(1.0),
+                            height: 18.0,
+                        },
+                    }),
+                    slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                    HitRegionOrder {
+                        z_index: 1,
+                        paint_order: row,
+                        traversal_order: row,
+                    },
+                    Some(format!("{}:row-{row}", target.as_str())),
+                    CursorCapability::Pointer,
+                    true,
+                    PointerCaptureIntent::OnPress,
+                ));
+        }
+    }
+
+    fn push_overlay_stack_hit_regions(
+        &self,
+        declarations: &mut AdmissionViewDeclarations,
+        external: &AdmissionState,
+        local: &AdmissionLocal,
+        address: Option<WidgetSlotAddress>,
+        bounds: Rect,
+    ) {
+        let target = self.id();
+        let (offsets, order, dragging) = match local {
+            AdmissionLocal::OverlayStack {
+                offsets,
+                order,
+                dragging,
+                ..
+            } => (*offsets, *order, *dragging),
+            _ => (
+                Self::overlay_stack_default_offsets(),
+                Self::overlay_stack_default_order(),
+                None,
+            ),
+        };
+
+        for index in 0..4 {
+            declarations
+                .hit_regions
+                .push(slipway_core::hit_region_from_pointer_capability(
+                    self,
+                    external,
+                    local,
+                    PresentationRegionId::from(format!("{}:order-{index}", target.as_str())),
+                    address.clone(),
+                    TargetLocalRect::new(Self::overlay_stack_order_button_rect(index)),
+                    slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                    HitRegionOrder {
+                        z_index: 0,
+                        paint_order: index,
+                        traversal_order: index,
+                    },
+                    Some(format!("{}:order-{index}", target.as_str())),
+                    CursorCapability::Pointer,
+                    true,
+                    PointerCaptureIntent::OnPress,
+                ));
+        }
+
+        for overlay in order {
+            let rank = Self::overlay_stack_rank(order, overlay);
+            let layer_spec = Self::overlay_stack_layer_spec(overlay, rank);
+            let cursor = if dragging == Some(overlay) {
+                CursorCapability::Grabbing
+            } else {
+                CursorCapability::Grab
+            };
+            declarations
+                .hit_regions
+                .push(slipway_core::hit_region_from_pointer_capability(
+                    self,
+                    external,
+                    local,
+                    PresentationRegionId::from(format!(
+                        "{}:overlay-{overlay}:drag",
+                        target.as_str()
+                    )),
+                    address.clone(),
+                    TargetLocalRect::new(Self::overlay_stack_rect(bounds, offsets, overlay)),
+                    slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                    layer_spec.hit_order(),
+                    Some(format!("{}:overlay-{overlay}:drag", target.as_str())),
+                    cursor,
+                    true,
+                    PointerCaptureIntent::DuringDrag,
+                ));
+        }
+    }
+
+    fn push_nested_scroll_regions(
+        &self,
+        declarations: &mut AdmissionViewDeclarations,
+        external: &AdmissionState,
+        local: &AdmissionLocal,
+        address: Option<WidgetSlotAddress>,
+        bounds: Rect,
+    ) {
+        let Some((outer_scroll_rows, inner_scroll_rows)) = nested_scroll_local(local) else {
+            return;
+        };
+        let outer_viewport = Self::nested_outer_viewport(bounds);
+        let outer_offset_y = Self::nested_scroll_offset_y(
+            outer_scroll_rows,
+            outer_viewport.size.height,
+            Self::nested_outer_content_height(),
+        );
+        declarations.scroll_regions.push(self.nested_scroll_region(
+            external,
+            local,
+            address.clone(),
+            "outer",
+            outer_viewport,
+            Self::nested_outer_content_height(),
+            outer_offset_y,
+        ));
+        for index in 0..3 {
+            let Some(viewport) =
+                Self::nested_inner_visible_viewport(index, outer_offset_y, outer_viewport)
+            else {
+                continue;
+            };
+            let offset_y = Self::nested_scroll_offset_y(
+                inner_scroll_rows[index],
+                viewport.size.height,
+                Self::nested_inner_content_height(),
+            );
+            declarations.scroll_regions.push(self.nested_scroll_region(
+                external,
+                local,
+                address.clone(),
+                &format!("inner-{index}"),
+                viewport,
+                Self::nested_inner_content_height(),
+                offset_y,
+            ));
+        }
+    }
+
+    fn nested_scroll_region(
+        &self,
+        external: &AdmissionState,
+        local: &AdmissionLocal,
+        address: Option<WidgetSlotAddress>,
+        region: &str,
+        viewport: Rect,
+        content_height: f32,
+        offset_y: f32,
+    ) -> ScrollRegionDeclaration {
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(viewport),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut declaration = slipway_core::scroll_region_from_scrollable_capability(
+            self,
+            external,
+            local,
+            &layout,
+            Some(PresentationRegionId::from(format!(
+                "{}:{region}",
+                self.id().as_str()
+            ))),
+            address,
+            true,
+        );
+        declaration.viewport = TargetLocalRect::new(viewport);
+        declaration.content_bounds = TargetLocalRect::new(Rect {
+            origin: viewport.origin,
+            size: Size {
+                width: viewport.size.width,
+                height: content_height.max(viewport.size.height),
+            },
+        });
+        declaration.offset = Point {
+            x: 0.0,
+            y: offset_y,
+        };
+        declaration.order = if let Some(index) = region
+            .strip_prefix("inner-")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            HitRegionOrder {
+                z_index: 1,
+                paint_order: index + 1,
+                traversal_order: index + 1,
+            }
+        } else {
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            }
+        };
+        declaration
+    }
+
+    fn push_overlay_paint_ops(
+        &self,
+        out_ops: &mut Vec<PaintOp>,
+        local: &AdmissionLocal,
+        bounds: Rect,
+    ) {
+        let offset = match local {
+            AdmissionLocal::Overlay { offset, .. } => *offset,
+            _ => Self::overlay_default_offset(),
+        };
+        let overlay = Self::overlay_rect(bounds, offset);
+        let titlebar = Self::overlay_titlebar_rect(bounds, offset);
+        let mut window_ops = Vec::new();
+        let ops = &mut window_ops;
+        ops.push(PaintOp::Fill {
+            shape: rect_shape(
+                "overlay-window-shadow",
+                overlay,
+                ShapeKind::RoundedRectangle,
+            ),
+            color: rgba(15, 23, 42, 38),
+        });
+        ops.push(PaintOp::Fill {
+            shape: rect_shape("overlay-window", overlay, ShapeKind::RoundedRectangle),
+            color: rgb(255, 255, 255),
+        });
+        ops.push(PaintOp::Stroke {
+            shape: rect_shape(
+                "overlay-window-outline",
+                overlay,
+                ShapeKind::RoundedRectangle,
+            ),
+            color: rgb(124, 58, 237),
+            width: 1.5,
+        });
+        ops.push(PaintOp::Fill {
+            shape: rect_shape("overlay-titlebar", titlebar, ShapeKind::RoundedRectangle),
+            color: rgb(237, 233, 254),
+        });
+        ops.push(PaintOp::Text {
+            bounds: Rect {
+                origin: Point {
+                    x: titlebar.origin.x + 12.0,
+                    y: titlebar.origin.y + 8.0,
+                },
+                size: Size {
+                    width: titlebar.size.width - 24.0,
+                    height: 16.0,
+                },
+            },
+            content: "drag overlay".to_string(),
+            color: rgb(76, 29, 149),
+            style: TextStyle::default().with_font_size(12.0),
+        });
+        let graph = Rect {
+            origin: Point {
+                x: overlay.origin.x + 14.0,
+                y: overlay.origin.y + 44.0,
+            },
+            size: Size {
+                width: overlay.size.width - 28.0,
+                height: overlay.size.height - 58.0,
+            },
+        };
+        ops.push(PaintOp::Fill {
+            shape: rect_shape("overlay-complex-bg", graph, ShapeKind::RoundedRectangle),
+            color: rgb(248, 250, 252),
+        });
+        ops.push(PaintOp::Stroke {
+            shape: path_shape(
+                "overlay-curve",
+                graph,
+                PathDeclaration {
+                    commands: vec![
+                        PathCommand::MoveTo(Point {
+                            x: graph.origin.x + 12.0,
+                            y: graph.origin.y + graph.size.height * 0.70,
+                        }),
+                        PathCommand::CubicTo {
+                            control_1: Point {
+                                x: graph.origin.x + graph.size.width * 0.28,
+                                y: graph.origin.y + graph.size.height * 0.10,
+                            },
+                            control_2: Point {
+                                x: graph.origin.x + graph.size.width * 0.56,
+                                y: graph.origin.y + graph.size.height * 0.90,
+                            },
+                            to: Point {
+                                x: graph.origin.x + graph.size.width - 14.0,
+                                y: graph.origin.y + graph.size.height * 0.28,
+                            },
+                        },
+                    ],
+                },
+            ),
+            color: rgb(124, 58, 237),
+            width: 2.0,
+        });
+        ops.push(PaintOp::Group {
+            id: Some("overlay-curve-nodes".to_string()),
+            clip: None,
+            ops: (0..11)
+                .map(|index| {
+                    let t = index as f32 / 10.0;
+                    let y = (t * std::f32::consts::PI * 1.75).sin() * 22.0;
+                    PaintOp::Fill {
+                        shape: rect_shape(
+                            "overlay-curve-node",
+                            Rect {
+                                origin: Point {
+                                    x: graph.origin.x + 10.0 + t * (graph.size.width - 28.0),
+                                    y: graph.origin.y + graph.size.height * 0.45 - y,
+                                },
+                                size: Size {
+                                    width: 8.0,
+                                    height: 8.0,
+                                },
+                            },
+                            ShapeKind::Circle,
+                        ),
+                        color: rgb(124, 58, 237),
+                    }
+                })
+                .collect(),
+        });
+        for (index, (x, y, color)) in [
+            (18.0, 34.0, rgb(20, 184, 166)),
+            (64.0, 18.0, rgb(59, 130, 246)),
+            (118.0, 56.0, rgb(245, 158, 11)),
+            (166.0, 26.0, rgb(244, 63, 94)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ops.push(PaintOp::Fill {
+                shape: rect_shape(
+                    "overlay-node",
+                    Rect {
+                        origin: Point {
+                            x: graph.origin.x + x,
+                            y: graph.origin.y + y,
+                        },
+                        size: Size {
+                            width: 13.0 + index as f32 * 2.0,
+                            height: 13.0 + index as f32 * 2.0,
+                        },
+                    },
+                    ShapeKind::Circle,
+                ),
+                color,
+            });
+        }
+        ops.push(PaintOp::Group {
+            id: Some("overlay-bars".to_string()),
+            clip: None,
+            ops: (0..5)
+                .map(|index| PaintOp::Fill {
+                    shape: rect_shape(
+                        "overlay-bar",
+                        Rect {
+                            origin: Point {
+                                x: graph.origin.x + 16.0 + index as f32 * 30.0,
+                                y: graph.origin.y + graph.size.height - 12.0 - index as f32 * 8.0,
+                            },
+                            size: Size {
+                                width: 16.0,
+                                height: 12.0 + index as f32 * 8.0,
+                            },
+                        },
+                        ShapeKind::RoundedRectangle,
+                    ),
+                    color: rgba(124, 58, 237, 66),
+                })
+                .collect(),
+        });
+        out_ops.push(
+            PaintOp::keyed_layer(Self::overlay_layer_key(), window_ops)
+                .with_layer_id("movable-overlay-window"),
+        );
+    }
+
+    fn push_overlay_stack_paint_ops(
+        &self,
+        ops: &mut Vec<PaintOp>,
+        local: &AdmissionLocal,
+        bounds: Rect,
+    ) {
+        let (offsets, order, dragging) = match local {
+            AdmissionLocal::OverlayStack {
+                offsets,
+                order,
+                dragging,
+                ..
+            } => (*offsets, *order, *dragging),
+            _ => (
+                Self::overlay_stack_default_offsets(),
+                Self::overlay_stack_default_order(),
+                None,
+            ),
+        };
+
+        ops.push(PaintOp::Text {
+            bounds: Self::overlay_stack_help_text_rect(bounds),
+            content: "front buttons; drag title bars".to_string(),
+            color: rgb(71, 85, 105),
+            style: TextStyle::default().with_font_size(12.0),
+        });
+
+        for index in 0..4 {
+            let rect = Self::overlay_stack_order_button_rect(index);
+            let is_front = order[3] == index;
+            ops.push(PaintOp::Fill {
+                shape: rect_shape(
+                    "overlay-stack-order-button",
+                    rect,
+                    ShapeKind::RoundedRectangle,
+                ),
+                color: if is_front {
+                    rgb(124, 58, 237)
+                } else {
+                    rgb(237, 233, 254)
+                },
+            });
+            ops.push(PaintOp::Text {
+                bounds: Rect {
+                    origin: Point {
+                        x: rect.origin.x + 13.0,
+                        y: rect.origin.y + 6.0,
+                    },
+                    size: Size {
+                        width: 24.0,
+                        height: 14.0,
+                    },
+                },
+                content: overlay_stack_label(index).to_string(),
+                color: if is_front {
+                    rgb(255, 255, 255)
+                } else {
+                    rgb(76, 29, 149)
+                },
+                style: TextStyle::default().with_font_size(12.0),
+            });
+        }
+
+        for overlay in order {
+            let rank = Self::overlay_stack_rank(order, overlay);
+            let layer_spec = Self::overlay_stack_layer_spec(overlay, rank);
+            let mut window_ops = Vec::new();
+            self.push_overlay_stack_window_paint_ops(
+                &mut window_ops,
+                bounds,
+                offsets,
+                overlay,
+                rank,
+                dragging == Some(overlay),
+            );
+            ops.push(layer_spec.paint_layer(window_ops));
+        }
+    }
+
+    fn push_overlay_stack_window_paint_ops(
+        &self,
+        ops: &mut Vec<PaintOp>,
+        bounds: Rect,
+        offsets: [Point; 4],
+        index: usize,
+        rank: usize,
+        dragging: bool,
+    ) {
+        let overlay = Self::overlay_stack_rect(bounds, offsets, index);
+        let titlebar = Self::overlay_stack_titlebar_rect(bounds, offsets, index);
+        let palette = [
+            (rgb(237, 233, 254), rgb(124, 58, 237)),
+            (rgb(219, 234, 254), rgb(37, 99, 235)),
+            (rgb(204, 251, 241), rgb(15, 118, 110)),
+            (rgb(254, 243, 199), rgb(180, 83, 9)),
+        ][index];
+
+        ops.push(PaintOp::Fill {
+            shape: rect_shape("overlay-stack-shadow", overlay, ShapeKind::RoundedRectangle),
+            color: rgba(15, 23, 42, 28 + rank as u8 * 8),
+        });
+        ops.push(PaintOp::Fill {
+            shape: rect_shape("overlay-stack-window", overlay, ShapeKind::RoundedRectangle),
+            color: rgb(255, 255, 255),
+        });
+        ops.push(PaintOp::Stroke {
+            shape: rect_shape(
+                "overlay-stack-outline",
+                overlay,
+                ShapeKind::RoundedRectangle,
+            ),
+            color: palette.1,
+            width: if dragging { 2.5 } else { 1.5 },
+        });
+        ops.push(PaintOp::Fill {
+            shape: rect_shape(
+                "overlay-stack-titlebar",
+                titlebar,
+                ShapeKind::RoundedRectangle,
+            ),
+            color: palette.0,
+        });
+        ops.push(PaintOp::Text {
+            bounds: Rect {
+                origin: Point {
+                    x: titlebar.origin.x + 10.0,
+                    y: titlebar.origin.y + 7.0,
+                },
+                size: Size {
+                    width: titlebar.size.width - 20.0,
+                    height: 14.0,
+                },
+            },
+            content: format!("{} layer {rank}", overlay_stack_label(index)),
+            color: palette.1,
+            style: TextStyle::default().with_font_size(12.0),
+        });
+
+        let graph = Rect {
+            origin: Point {
+                x: overlay.origin.x + 12.0,
+                y: overlay.origin.y + 40.0,
+            },
+            size: Size {
+                width: overlay.size.width - 24.0,
+                height: overlay.size.height - 52.0,
+            },
+        };
+        ops.push(PaintOp::Stroke {
+            shape: path_shape(
+                "overlay-stack-line",
+                graph,
+                PathDeclaration {
+                    commands: vec![
+                        PathCommand::MoveTo(Point {
+                            x: graph.origin.x + 4.0,
+                            y: graph.origin.y + graph.size.height - 8.0,
+                        }),
+                        PathCommand::LineTo(Point {
+                            x: graph.origin.x + graph.size.width * 0.33,
+                            y: graph.origin.y + 10.0 + index as f32 * 4.0,
+                        }),
+                        PathCommand::LineTo(Point {
+                            x: graph.origin.x + graph.size.width * 0.66,
+                            y: graph.origin.y + graph.size.height * 0.62,
+                        }),
+                        PathCommand::LineTo(Point {
+                            x: graph.origin.x + graph.size.width - 6.0,
+                            y: graph.origin.y + 14.0,
+                        }),
+                    ],
+                },
+            ),
+            color: palette.1,
+            width: 2.0,
+        });
+        for point in 0..4 {
+            ops.push(PaintOp::Fill {
+                shape: rect_shape(
+                    "overlay-stack-node",
+                    Rect {
+                        origin: Point {
+                            x: graph.origin.x + 10.0 + point as f32 * 38.0,
+                            y: graph.origin.y + 8.0 + ((point + index) % 3) as f32 * 14.0,
+                        },
+                        size: Size {
+                            width: 8.0,
+                            height: 8.0,
+                        },
+                    },
+                    ShapeKind::Circle,
+                ),
+                color: palette.1,
+            });
+        }
+    }
+
+    fn push_nested_scroll_paint_ops(
+        &self,
+        ops: &mut Vec<PaintOp>,
+        local: &AdmissionLocal,
+        bounds: Rect,
+    ) {
+        let (outer_rows, inner_rows) = nested_scroll_local(local).unwrap_or((0, [0, 0, 0]));
+        let outer = Self::nested_outer_viewport(bounds);
+        let outer_offset = Self::nested_scroll_offset_y(
+            outer_rows,
+            outer.size.height,
+            Self::nested_outer_content_height(),
+        );
+        ops.push(PaintOp::Fill {
+            shape: rect_shape("nested-outer-bg", outer, ShapeKind::RoundedRectangle),
+            color: rgb(241, 245, 249),
+        });
+        ops.push(PaintOp::Stroke {
+            shape: rect_shape("nested-outer-outline", outer, ShapeKind::RoundedRectangle),
+            color: rgb(148, 163, 184),
+            width: 1.0,
+        });
+        let mut content_ops = Vec::new();
+        for index in 0..3 {
+            let viewport = Self::nested_inner_content_viewport(index, outer_offset);
+            content_ops.push(PaintOp::Fill {
+                shape: rect_shape("nested-inner-bg", viewport, ShapeKind::RoundedRectangle),
+                color: rgb(255, 255, 255),
+            });
+            content_ops.push(PaintOp::Stroke {
+                shape: rect_shape(
+                    "nested-inner-outline",
+                    viewport,
+                    ShapeKind::RoundedRectangle,
+                ),
+                color: rgb(203, 213, 225),
+                width: 1.0,
+            });
+            let inner_offset = Self::nested_scroll_offset_y(
+                inner_rows[index],
+                viewport.size.height,
+                Self::nested_inner_content_height(),
+            );
+            let mut row_ops = Vec::new();
+            for row in 0..4 {
+                row_ops.push(PaintOp::Text {
+                    bounds: Rect {
+                        origin: Point {
+                            x: viewport.origin.x + 12.0,
+                            y: viewport.origin.y + 8.0 + row as f32 * 18.0 - inner_offset,
+                        },
+                        size: Size {
+                            width: viewport.size.width - 24.0,
+                            height: 16.0,
+                        },
+                    },
+                    content: format!("inner {} row {}", index + 1, row + inner_rows[index] + 1),
+                    color: rgb(51, 65, 85),
+                    style: TextStyle::default().with_font_size(12.0),
+                });
+            }
+            content_ops.push(PaintOp::Group {
+                id: Some(format!("nested-inner-{index}-rows")),
+                clip: Some(slipway_core::ClipDeclaration {
+                    id: Some(format!("nested-inner-{index}-clip")),
+                    bounds: viewport,
+                    path: None,
+                }),
+                ops: row_ops,
+            });
+        }
+        content_ops.push(PaintOp::Text {
+            bounds: Rect {
+                origin: Point {
+                    x: outer.origin.x + 212.0,
+                    y: outer.origin.y + 18.0,
+                },
+                size: Size {
+                    width: (outer.size.width - 236.0).max(1.0),
+                    height: 32.0,
+                },
+            },
+            content: "Wheel over outer or each inner panel; MCP should report distinct region ids."
+                .to_string(),
+            color: rgb(100, 116, 139),
+            style: TextStyle::default().with_font_size(12.0),
+        });
+        ops.push(PaintOp::Group {
+            id: Some("nested-scroll-content".to_string()),
+            clip: Some(slipway_core::ClipDeclaration {
+                id: Some("nested-outer-clip".to_string()),
+                bounds: outer,
+                path: None,
+            }),
+            ops: content_ops,
+        });
     }
 
     fn cursor(&self, local: &AdmissionLocal) -> CursorCapability {
@@ -713,6 +2020,10 @@ impl AdmissionWidget {
                 CursorCapability::Grabbing
             }
             (Self::Slider(_), _) => CursorCapability::Grab,
+            (Self::Overlay(_), AdmissionLocal::Overlay { dragging: true, .. }) => {
+                CursorCapability::Grabbing
+            }
+            (Self::Overlay(_), _) => CursorCapability::Grab,
             _ => CursorCapability::Pointer,
         }
     }
@@ -745,6 +2056,9 @@ impl AdmissionWidget {
             }
             Self::Slider(_) => format!("Intensity {:.0} percent", external.intensity * 100.0),
             Self::List(_) => format!("Selected row {}", external.selected_item + 1),
+            Self::Overlay(_) => "Movable overlay window".to_string(),
+            Self::OverlayStack(_) => "Ordered overlay stack".to_string(),
+            Self::NestedScroll(_) => "Nested scroll verification".to_string(),
         }
         .to_string()
     }
@@ -761,6 +2075,36 @@ impl AdmissionWidget {
                     format!("row {}, scroll {}", external.selected_item + 1, scroll_rows)
                 }
                 _ => (external.selected_item + 1).to_string(),
+            },
+            Self::Overlay(_) => match local {
+                AdmissionLocal::Overlay {
+                    offset, dragging, ..
+                } => {
+                    format!(
+                        "offset {:.0},{:.0}, dragging {}",
+                        offset.x, offset.y, dragging
+                    )
+                }
+                _ => "overlay".to_string(),
+            },
+            Self::OverlayStack(_) => match local {
+                AdmissionLocal::OverlayStack {
+                    order, dragging, ..
+                } => {
+                    let front = overlay_stack_label(order[3]);
+                    let dragging = dragging.map(overlay_stack_label).unwrap_or("none");
+                    format!("front {front}, dragging {dragging}")
+                }
+                _ => "overlay-stack".to_string(),
+            },
+            Self::NestedScroll(_) => match local {
+                AdmissionLocal::NestedScroll {
+                    outer_scroll_rows,
+                    inner_scroll_rows,
+                } => {
+                    format!("outer {outer_scroll_rows}, inner {inner_scroll_rows:?}")
+                }
+                _ => "nested-scroll".to_string(),
             },
         }
     }
@@ -865,7 +2209,43 @@ impl slipway_core::SlipwayTextEditCommandPolicy for AdmissionWidget {
                 kind: TextEditKind::DeleteBackward,
                 enabled: !external.draft.is_empty(),
             },
+            TextEditCommandDeclaration {
+                command_id: "replace-buffer".to_string(),
+                kind: TextEditKind::ReplaceBuffer,
+                enabled: true,
+            },
         ]
+    }
+}
+
+impl slipway_core::SlipwayTextInputVisualStylePolicy for AdmissionWidget {
+    fn text_input_visual_style(
+        &self,
+        _external: &Self::ExternalState,
+        _local: &Self::LocalState,
+    ) -> slipway_core::TextInputVisualStyleDeclaration {
+        slipway_core::TextInputVisualStyleDeclaration::explicit(
+            self.id(),
+            rgb(15, 23, 42),
+            rgb(100, 116, 139),
+            rgb(15, 23, 42),
+            rgb(191, 219, 254),
+            rgb(248, 250, 252),
+            rgb(203, 213, 225),
+            1.0,
+            4.0,
+            rgb(15, 23, 42),
+        )
+    }
+}
+
+impl slipway_core::SlipwayTextInputTypographyPolicy for AdmissionWidget {
+    fn text_input_typography(
+        &self,
+        _external: &Self::ExternalState,
+        _local: &Self::LocalState,
+    ) -> TextInputTypographyDeclaration {
+        admission_text_input_typography(self.id())
     }
 }
 
@@ -1057,9 +2437,67 @@ impl slipway_core::SlipwayEventDispositionPolicy for AdmissionWidget {
         event: &InputEvent,
         route: &EventRoute,
     ) -> slipway_core::EventPropagationEvidence {
+        let handled = event.target() == &self.id()
+            && match (self, event) {
+                (Self::Action(_), InputEvent::Pointer(pointer))
+                | (Self::Segment(_), InputEvent::Pointer(pointer))
+                | (Self::Toggle(_), InputEvent::Pointer(pointer)) => matches!(
+                    pointer.kind,
+                    slipway_core::PointerEventKind::Press | slipway_core::PointerEventKind::Release
+                ),
+                (Self::Slider(_), InputEvent::Pointer(pointer)) => matches!(
+                    pointer.kind,
+                    slipway_core::PointerEventKind::Press
+                        | slipway_core::PointerEventKind::Move
+                        | slipway_core::PointerEventKind::Release
+                ),
+                (Self::Text(_), InputEvent::Text(_))
+                | (Self::Text(_), InputEvent::TextEdit(_))
+                | (Self::Text(_), InputEvent::Focus(_))
+                | (Self::Text(_), InputEvent::Command(_)) => true,
+                (Self::Text(_), InputEvent::Keyboard(key)) => {
+                    key.kind == slipway_core::KeyEventKind::Press
+                        && key.key.to_ascii_lowercase().contains("backspace")
+                }
+                (Self::List(_), InputEvent::Wheel(_)) | (Self::List(_), InputEvent::Scroll(_)) => {
+                    true
+                }
+                (Self::List(_), InputEvent::Pointer(pointer)) => {
+                    matches!(
+                        pointer.kind,
+                        slipway_core::PointerEventKind::Press
+                            | slipway_core::PointerEventKind::Release
+                    ) && list_row_from_pointer_y(pointer.position.y).is_some()
+                }
+                (Self::Overlay(_), InputEvent::Pointer(pointer)) => match pointer.kind {
+                    slipway_core::PointerEventKind::Press
+                    | slipway_core::PointerEventKind::Release
+                    | slipway_core::PointerEventKind::Cancel => true,
+                    slipway_core::PointerEventKind::Move => {
+                        matches!(_local, AdmissionLocal::Overlay { dragging: true, .. })
+                    }
+                    _ => false,
+                },
+                (Self::OverlayStack(_), InputEvent::Pointer(pointer)) => match pointer.kind {
+                    slipway_core::PointerEventKind::Press
+                    | slipway_core::PointerEventKind::Release
+                    | slipway_core::PointerEventKind::Cancel => true,
+                    slipway_core::PointerEventKind::Move => matches!(
+                        _local,
+                        AdmissionLocal::OverlayStack {
+                            dragging: Some(_),
+                            ..
+                        }
+                    ),
+                    _ => false,
+                },
+                (Self::NestedScroll(_), InputEvent::Wheel(_))
+                | (Self::NestedScroll(_), InputEvent::Scroll(_)) => true,
+                _ => false,
+            };
         let disposition = slipway_core::EventDisposition {
-            handled: true,
-            propagate: false,
+            handled,
+            propagate: !handled,
             default_action_allowed: true,
         };
         slipway_core::EventPropagationEvidence {
@@ -1162,8 +2600,22 @@ impl slipway_core::SlipwayScrollBehaviorPolicy for AdmissionWidget {
         input: &LayoutInput,
     ) -> slipway_core::ScrollBehaviorPolicyDeclaration {
         let viewport = input.viewport.into_rect();
+        let content_height = if matches!(self, Self::NestedScroll(_)) {
+            Self::nested_outer_content_height().max(viewport.size.height)
+        } else {
+            list_scroll_content_height(viewport.size.height)
+        };
         let scroll_y = match local {
-            AdmissionLocal::List { scroll_rows } => (*scroll_rows as f32 * 20.0).max(0.0),
+            AdmissionLocal::List { scroll_rows } => {
+                list_scroll_offset_y(*scroll_rows, viewport.size.height)
+            }
+            AdmissionLocal::NestedScroll {
+                outer_scroll_rows, ..
+            } => Self::nested_scroll_offset_y(
+                *outer_scroll_rows,
+                viewport.size.height,
+                content_height,
+            ),
             _ => 0.0,
         };
         slipway_core::ScrollBehaviorPolicyDeclaration {
@@ -1179,14 +2631,14 @@ impl slipway_core::SlipwayScrollBehaviorPolicy for AdmissionWidget {
             },
             extent: Size {
                 width: viewport.size.width,
-                height: 260.0_f32.max(viewport.size.height),
+                height: content_height,
             },
             viewport: input.viewport,
             content_bounds: TargetLocalRect::new(Rect {
                 origin: Point { x: 0.0, y: 0.0 },
                 size: Size {
                     width: viewport.size.width,
-                    height: 260.0_f32.max(viewport.size.height),
+                    height: content_height,
                 },
             }),
             offset: Point {
@@ -1234,8 +2686,22 @@ impl slipway_core::SlipwayViewportObservationPolicy for AdmissionWidget {
             },
         };
         let offset_y = match local {
-            AdmissionLocal::List { scroll_rows } => (*scroll_rows as f32 * 20.0).max(0.0),
+            AdmissionLocal::List { scroll_rows } => {
+                list_scroll_offset_y(*scroll_rows, viewport.size.height)
+            }
+            AdmissionLocal::NestedScroll {
+                outer_scroll_rows, ..
+            } => Self::nested_scroll_offset_y(
+                *outer_scroll_rows,
+                viewport.size.height,
+                Self::nested_outer_content_height(),
+            ),
             _ => 0.0,
+        };
+        let content_height = if matches!(self, Self::NestedScroll(_)) {
+            Self::nested_outer_content_height()
+        } else {
+            list_scroll_content_height(viewport.size.height)
         };
         slipway_core::ViewportObservationEvidence {
             target: self.id(),
@@ -1256,14 +2722,14 @@ impl slipway_core::SlipwayViewportObservationPolicy for AdmissionWidget {
                 },
                 extent: Size {
                     width: viewport.size.width,
-                    height: 260.0,
+                    height: content_height,
                 },
                 viewport,
                 content_bounds: Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
                         width: viewport.size.width,
-                        height: 260.0,
+                        height: content_height,
                     },
                 },
                 consumption: Vec::new(),
@@ -1320,6 +2786,9 @@ impl SlipwaySsot for AdmissionWidget {
             Self::Toggle(_) => WidgetId::from("admission.toggle"),
             Self::Slider(_) => WidgetId::from("admission.slider"),
             Self::List(_) => WidgetId::from("admission.list"),
+            Self::Overlay(_) => WidgetId::from("admission.overlay"),
+            Self::OverlayStack(_) => WidgetId::from("admission.overlay-stack"),
+            Self::NestedScroll(_) => WidgetId::from("admission.nested-scroll"),
         }
     }
 
@@ -1338,6 +2807,22 @@ impl SlipwaySsot for AdmissionWidget {
             Self::List(_) => vec![
                 Capability::WheelInput,
                 Capability::PointerInput,
+                Capability::ScrollRegionPresentation,
+                Capability::Paint,
+            ],
+            Self::Overlay(_) => vec![
+                Capability::PointerInput,
+                Capability::ShapePathClipPresentation,
+                Capability::Paint,
+            ],
+            Self::OverlayStack(_) => vec![
+                Capability::PointerInput,
+                Capability::ShapePathClipPresentation,
+                Capability::Paint,
+            ],
+            Self::NestedScroll(_) => vec![
+                Capability::WheelInput,
+                Capability::ScrollRegionPresentation,
                 Capability::Paint,
             ],
         }
@@ -1380,6 +2865,11 @@ impl SlipwayLogic for AdmissionWidget {
                     "true",
                 )
             }
+            (Self::Action(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Release =>
+            {
+                handled_no_change_outcome(self.id())
+            }
             (Self::Segment(_), InputEvent::Pointer(pointer))
                 if pointer.kind == slipway_core::PointerEventKind::Press =>
             {
@@ -1393,6 +2883,11 @@ impl SlipwayLogic for AdmissionWidget {
                     "segment",
                     external.segment.next().label(),
                 )
+            }
+            (Self::Segment(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Release =>
+            {
+                handled_no_change_outcome(self.id())
             }
             (Self::Text(_), InputEvent::Text(text)) => {
                 if let AdmissionLocal::Text {
@@ -1444,7 +2939,12 @@ impl SlipwayLogic for AdmissionWidget {
                 if let AdmissionLocal::Text { focused, .. } = local {
                     *focused = focus.focused;
                 }
-                EventOutcome::ignored()
+                local_change_outcome(
+                    self.id(),
+                    "text-focus",
+                    "focused",
+                    focus.focused.to_string(),
+                )
             }
             (Self::Text(_), InputEvent::Command(_)) => {
                 if let Some(text) = self.text_after_command(external) {
@@ -1470,6 +2970,11 @@ impl SlipwayLogic for AdmissionWidget {
                     "enabled",
                     (!external.enabled).to_string(),
                 )
+            }
+            (Self::Toggle(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Release =>
+            {
+                handled_no_change_outcome(self.id())
             }
             (Self::Slider(_), InputEvent::Pointer(pointer))
                 if pointer.kind == slipway_core::PointerEventKind::Press =>
@@ -1506,28 +3011,31 @@ impl SlipwayLogic for AdmissionWidget {
                 if let AdmissionLocal::Slider { dragging } = local {
                     *dragging = false;
                 }
-                EventOutcome::ignored()
+                local_change_outcome(self.id(), "slider-release", "dragging", "false".to_string())
             }
             (Self::List(_), InputEvent::Wheel(wheel)) => {
-                if let AdmissionLocal::List { scroll_rows } = local {
-                    *scroll_rows += wheel.delta_y.signum() as i32;
-                }
-                message_outcome(
+                let next_rows = if let AdmissionLocal::List { scroll_rows } = local {
+                    let next = list_scroll_rows_after_wheel(*scroll_rows, wheel.delta_y);
+                    *scroll_rows = next;
+                    next
+                } else {
+                    0
+                };
+                local_change_outcome(
                     self.id(),
-                    "select-next-item",
-                    AdmissionMessage::SelectNextItem,
-                    "selected-item",
-                    "wheel",
+                    "scroll-list-wheel",
+                    "scroll-rows",
+                    next_rows.to_string(),
                 )
             }
             (Self::List(_), InputEvent::Scroll(scroll)) => {
+                let next_rows = (scroll.offset_y / 20.0).round().clamp(0.0, 5.0) as i32;
                 if let AdmissionLocal::List { scroll_rows } = local {
-                    *scroll_rows = (scroll.offset_y / 20.0).round().max(0.0) as i32;
+                    *scroll_rows = next_rows;
                 }
-                message_outcome(
+                local_change_outcome(
                     self.id(),
                     "scroll-list",
-                    AdmissionMessage::SelectNextItem,
                     "scroll-offset-y",
                     format!("{:.1}", scroll.offset_y),
                 )
@@ -1535,13 +3043,340 @@ impl SlipwayLogic for AdmissionWidget {
             (Self::List(_), InputEvent::Pointer(pointer))
                 if pointer.kind == slipway_core::PointerEventKind::Press =>
             {
+                let Some(row) = list_row_from_pointer_y(pointer.position.y) else {
+                    return EventOutcome::ignored();
+                };
                 message_outcome(
                     self.id(),
-                    "select-next-item",
-                    AdmissionMessage::SelectNextItem,
+                    "select-list-row",
+                    AdmissionMessage::SelectItem(row),
                     "selected-item",
-                    "pointer",
+                    (row + 1).to_string(),
                 )
+            }
+            (Self::List(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Release =>
+            {
+                if list_row_from_pointer_y(pointer.position.y).is_some() {
+                    handled_no_change_outcome(self.id())
+                } else {
+                    EventOutcome::ignored()
+                }
+            }
+            (Self::Overlay(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Press =>
+            {
+                let bounds = pointer
+                    .target_bounds
+                    .map(TargetLocalRect::into_rect)
+                    .unwrap_or(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 560.0,
+                            height: 228.0,
+                        },
+                    });
+                let offset = match local {
+                    AdmissionLocal::Overlay { offset, .. } => *offset,
+                    _ => Self::overlay_default_offset(),
+                };
+                let titlebar = Self::overlay_titlebar_rect(bounds, offset);
+                if point_in_rect(pointer.position, titlebar) {
+                    *local = AdmissionLocal::Overlay {
+                        offset,
+                        dragging: true,
+                        drag_anchor: Point {
+                            x: pointer.position.x - offset.x,
+                            y: pointer.position.y - offset.y,
+                        },
+                    };
+                    local_change_outcome(self.id(), "overlay-drag-start", "dragging", "true")
+                } else {
+                    handled_no_change_outcome(self.id())
+                }
+            }
+            (Self::Overlay(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Move =>
+            {
+                let bounds = pointer
+                    .target_bounds
+                    .map(TargetLocalRect::into_rect)
+                    .unwrap_or(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 560.0,
+                            height: 228.0,
+                        },
+                    });
+                let Some((drag_anchor, dragging)) = (match local {
+                    AdmissionLocal::Overlay {
+                        drag_anchor,
+                        dragging,
+                        ..
+                    } => Some((*drag_anchor, *dragging)),
+                    _ => None,
+                }) else {
+                    return EventOutcome::ignored();
+                };
+                if !dragging {
+                    return EventOutcome::ignored();
+                }
+                let next = Self::clamp_overlay_offset_to_allowed(
+                    bounds,
+                    Point {
+                        x: pointer.position.x - drag_anchor.x,
+                        y: pointer.position.y - drag_anchor.y,
+                    },
+                );
+                *local = AdmissionLocal::Overlay {
+                    offset: next,
+                    dragging: true,
+                    drag_anchor,
+                };
+                local_change_outcome(
+                    self.id(),
+                    "overlay-drag-move",
+                    "offset",
+                    format!("{:.0},{:.0}", next.x, next.y),
+                )
+            }
+            (Self::Overlay(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Release =>
+            {
+                if let AdmissionLocal::Overlay {
+                    offset,
+                    drag_anchor,
+                    ..
+                } = local
+                {
+                    *local = AdmissionLocal::Overlay {
+                        offset: *offset,
+                        dragging: false,
+                        drag_anchor: *drag_anchor,
+                    };
+                }
+                local_change_outcome(self.id(), "overlay-drag-release", "dragging", "false")
+            }
+            (Self::Overlay(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Cancel =>
+            {
+                if let AdmissionLocal::Overlay {
+                    offset,
+                    drag_anchor,
+                    ..
+                } = local
+                {
+                    *local = AdmissionLocal::Overlay {
+                        offset: *offset,
+                        dragging: false,
+                        drag_anchor: *drag_anchor,
+                    };
+                }
+                local_change_outcome(self.id(), "overlay-drag-cancel", "dragging", "false")
+            }
+            (Self::OverlayStack(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Press =>
+            {
+                let bounds = pointer
+                    .target_bounds
+                    .map(TargetLocalRect::into_rect)
+                    .unwrap_or(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 560.0,
+                            height: 276.0,
+                        },
+                    });
+                let AdmissionLocal::OverlayStack {
+                    offsets,
+                    order,
+                    dragging,
+                    drag_anchor,
+                } = local
+                else {
+                    return EventOutcome::ignored();
+                };
+
+                for index in 0..4 {
+                    if point_in_rect(
+                        pointer.position,
+                        Self::overlay_stack_order_button_rect(index),
+                    ) {
+                        Self::overlay_stack_bring_front(order, index);
+                        *dragging = None;
+                        *drag_anchor = Point { x: 0.0, y: 0.0 };
+                        return local_change_outcome(
+                            self.id(),
+                            "overlay-stack-bring-front",
+                            "front",
+                            overlay_stack_label(index).to_string(),
+                        );
+                    }
+                }
+
+                if let Some(index) = Self::overlay_stack_topmost_overlay_at(
+                    bounds,
+                    *offsets,
+                    *order,
+                    pointer.position,
+                ) {
+                    Self::overlay_stack_bring_front(order, index);
+                    *dragging = Some(index);
+                    *drag_anchor = Point {
+                        x: pointer.position.x - offsets[index].x,
+                        y: pointer.position.y - offsets[index].y,
+                    };
+                    local_change_outcome(
+                        self.id(),
+                        "overlay-stack-drag-start",
+                        "dragging",
+                        overlay_stack_label(index).to_string(),
+                    )
+                } else {
+                    EventOutcome::ignored()
+                }
+            }
+            (Self::OverlayStack(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Move =>
+            {
+                let bounds = pointer
+                    .target_bounds
+                    .map(TargetLocalRect::into_rect)
+                    .unwrap_or(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 560.0,
+                            height: 276.0,
+                        },
+                    });
+                let AdmissionLocal::OverlayStack {
+                    offsets,
+                    dragging,
+                    drag_anchor,
+                    ..
+                } = local
+                else {
+                    return EventOutcome::ignored();
+                };
+                let Some(index) = *dragging else {
+                    return EventOutcome::ignored();
+                };
+                offsets[index] = Self::clamp_overlay_stack_offset_to_allowed(
+                    bounds,
+                    Point {
+                        x: pointer.position.x - drag_anchor.x,
+                        y: pointer.position.y - drag_anchor.y,
+                    },
+                );
+                local_change_outcome(
+                    self.id(),
+                    "overlay-stack-drag-move",
+                    "offset",
+                    format!("{:.0},{:.0}", offsets[index].x, offsets[index].y),
+                )
+            }
+            (Self::OverlayStack(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Release =>
+            {
+                if let AdmissionLocal::OverlayStack { dragging, .. } = local {
+                    *dragging = None;
+                }
+                local_change_outcome(
+                    self.id(),
+                    "overlay-stack-drag-release",
+                    "dragging",
+                    "false".to_string(),
+                )
+            }
+            (Self::OverlayStack(_), InputEvent::Pointer(pointer))
+                if pointer.kind == slipway_core::PointerEventKind::Cancel =>
+            {
+                if let AdmissionLocal::OverlayStack { dragging, .. } = local {
+                    *dragging = None;
+                }
+                local_change_outcome(
+                    self.id(),
+                    "overlay-stack-drag-cancel",
+                    "dragging",
+                    "false".to_string(),
+                )
+            }
+            (Self::NestedScroll(_), InputEvent::Wheel(wheel)) => {
+                let selected_region = wheel
+                    .region_id
+                    .as_ref()
+                    .and_then(nested_scroll_region_index)
+                    .unwrap_or(None);
+                if let AdmissionLocal::NestedScroll {
+                    outer_scroll_rows,
+                    inner_scroll_rows,
+                } = local
+                {
+                    match selected_region {
+                        Some(index) => {
+                            inner_scroll_rows[index] = nested_scroll_rows_after_wheel(
+                                inner_scroll_rows[index],
+                                wheel.delta_y,
+                                4,
+                            );
+                            local_change_outcome(
+                                self.id(),
+                                "nested-scroll-wheel-inner",
+                                "inner-scroll-rows",
+                                format!("{inner_scroll_rows:?}"),
+                            )
+                        }
+                        None => {
+                            *outer_scroll_rows = nested_scroll_rows_after_wheel(
+                                *outer_scroll_rows,
+                                wheel.delta_y,
+                                7,
+                            );
+                            local_change_outcome(
+                                self.id(),
+                                "nested-scroll-wheel-outer",
+                                "outer-scroll-rows",
+                                (*outer_scroll_rows).to_string(),
+                            )
+                        }
+                    }
+                } else {
+                    EventOutcome::ignored()
+                }
+            }
+            (Self::NestedScroll(_), InputEvent::Scroll(scroll)) => {
+                let Some(region) = nested_scroll_region_index(&scroll.region_id) else {
+                    return EventOutcome::ignored();
+                };
+                let next_rows = (scroll.offset_y / 18.0).round().clamp(0.0, 7.0) as i32;
+                if let AdmissionLocal::NestedScroll {
+                    outer_scroll_rows,
+                    inner_scroll_rows,
+                } = local
+                {
+                    match region {
+                        None => {
+                            *outer_scroll_rows = next_rows;
+                            local_change_outcome(
+                                self.id(),
+                                "nested-scroll-outer",
+                                "outer-scroll-rows",
+                                (*outer_scroll_rows).to_string(),
+                            )
+                        }
+                        Some(index) => {
+                            inner_scroll_rows[index] = next_rows.min(4);
+                            local_change_outcome(
+                                self.id(),
+                                "nested-scroll-inner",
+                                "inner-scroll-rows",
+                                format!("{inner_scroll_rows:?}"),
+                            )
+                        }
+                    }
+                } else {
+                    EventOutcome::ignored()
+                }
             }
             _ => EventOutcome::ignored(),
         }
@@ -1562,17 +3397,29 @@ impl SlipwayViewDefinition for AdmissionWidget {
             external,
             local,
             &layout_input,
+            &layout,
             layout.bounds.into_rect(),
             Some(WidgetSlotAddress::new(self.id(), 0)),
         );
         declarations.diagnostics.extend(layout.diagnostics.clone());
+        let mut paint_order = PaintOrderDeclaration::source_order(self.id());
+        if matches!(self, Self::Overlay(_) | Self::OverlayStack(_)) {
+            paint_order.allow_overlap = true;
+            paint_order = paint_order.with_overflow_bounds(TargetLocalRect::new(
+                if matches!(self, Self::OverlayStack(_)) {
+                    Self::overlay_stack_allowed_bounds(layout.bounds.into_rect())
+                } else {
+                    Self::overlay_allowed_bounds(layout.bounds.into_rect())
+                },
+            ));
+        }
 
         ViewDefinition {
             target: self.id(),
             frame: input.frame,
             layout,
             paint,
-            paint_order: PaintOrderDeclaration::source_order(self.id()),
+            paint_order,
             hit_regions: declarations.hit_regions,
             focus_regions: declarations.focus_regions,
             scroll_regions: declarations.scroll_regions,
@@ -1626,6 +3473,38 @@ fn unresolved_example_font_evidence(
     fallback_chain.push(request.family.clone());
     fallback_chain.extend(request.fallback_families.clone());
     let source = request.source.clone();
+
+    if let Some(source) = source {
+        let resolved_ref = source
+            .family
+            .clone()
+            .unwrap_or_else(|| source.source_id.clone());
+        return FontResolutionEvidence {
+            request,
+            resolved_ref: Some(resolved_ref.clone()),
+            fallback_chain,
+            installation: Some(ResourceInstallationEvidence {
+                resource_id: resolved_ref,
+                source: Some(source.clone()),
+                status: ResourceInstallationStatus::NotRequested,
+                evidence_source: EvidenceSource {
+                    label: "example_authored_font_source".to_string(),
+                    backend_id: None,
+                    provider_id: Some("slipway-example-admission".to_string()),
+                    pass_id: None,
+                },
+                diagnostics: Vec::new(),
+            }),
+            refusal: None,
+            valid_source: Some(SourceValidityEvidence {
+                source_id: source.source_id,
+                validity: SourceValidityKind::Valid,
+                diagnostics: Vec::new(),
+            }),
+            diagnostics: Vec::new(),
+        };
+    }
+
     let diagnostic = Diagnostic::unsupported(
         Some(target),
         "example-font-unresolved",
@@ -1673,6 +3552,21 @@ impl SlipwayView for AdmissionWidget {
             Self::Toggle(_) => AdmissionLocal::Toggle { armed: false },
             Self::Slider(_) => AdmissionLocal::Slider { dragging: false },
             Self::List(_) => AdmissionLocal::List { scroll_rows: 0 },
+            Self::Overlay(_) => AdmissionLocal::Overlay {
+                offset: Self::overlay_default_offset(),
+                dragging: false,
+                drag_anchor: Point { x: 0.0, y: 0.0 },
+            },
+            Self::OverlayStack(_) => AdmissionLocal::OverlayStack {
+                offsets: Self::overlay_stack_default_offsets(),
+                order: Self::overlay_stack_default_order(),
+                dragging: None,
+                drag_anchor: Point { x: 0.0, y: 0.0 },
+            },
+            Self::NestedScroll(_) => AdmissionLocal::NestedScroll {
+                outer_scroll_rows: 0,
+                inner_scroll_rows: [0, 1, 2],
+            },
         }
     }
 
@@ -1691,6 +3585,9 @@ impl SlipwayView for AdmissionWidget {
             .max(220.0);
         let height = match self {
             Self::List(_) => 168.0,
+            Self::Overlay(_) => 228.0,
+            Self::OverlayStack(_) => 276.0,
+            Self::NestedScroll(_) => 292.0,
             _ => 76.0,
         };
         LayoutOutput {
@@ -1713,7 +3610,7 @@ impl SlipwayView for AdmissionWidget {
         let title = match self {
             Self::Action(_) => format!("Counter button: {}", external.counter),
             Self::Segment(_) => format!("Segment: {}", external.segment.label()),
-            Self::Text(_) => format!("Draft: {}", external.draft),
+            Self::Text(_) => "Draft".to_string(),
             Self::Toggle(_) => format!(
                 "Notifications: {}",
                 if external.enabled {
@@ -1734,6 +3631,40 @@ impl SlipwayView for AdmissionWidget {
                     scroll
                 )
             }
+            Self::Overlay(_) => match local {
+                AdmissionLocal::Overlay {
+                    offset, dragging, ..
+                } => {
+                    format!(
+                        "Overlay offset: {:.0},{:.0}{}",
+                        offset.x,
+                        offset.y,
+                        if *dragging { " dragging" } else { "" }
+                    )
+                }
+                _ => "Overlay".to_string(),
+            },
+            Self::OverlayStack(_) => match local {
+                AdmissionLocal::OverlayStack {
+                    order, dragging, ..
+                } => format!(
+                    "Overlay stack front {}{}",
+                    overlay_stack_label(order[3]),
+                    dragging
+                        .map(|index| format!(" dragging {}", overlay_stack_label(index)))
+                        .unwrap_or_default()
+                ),
+                _ => "Overlay stack".to_string(),
+            },
+            Self::NestedScroll(_) => match local {
+                AdmissionLocal::NestedScroll {
+                    outer_scroll_rows,
+                    inner_scroll_rows,
+                } => {
+                    format!("Nested scroll outer {outer_scroll_rows} inner {inner_scroll_rows:?}")
+                }
+                _ => "Nested scroll".to_string(),
+            },
         };
 
         let mut ops = vec![
@@ -1747,15 +3678,7 @@ impl SlipwayView for AdmissionWidget {
                 width: 1.0,
             },
             PaintOp::Text {
-                bounds: inset(
-                    bounds,
-                    EdgeInsets {
-                        top: 12.0,
-                        right: 12.0,
-                        bottom: 12.0,
-                        left: 12.0,
-                    },
-                ),
+                bounds: self.card_header_text_rect(bounds),
                 content: format!("{} | {}", self.role(), title),
                 color: rgb(15, 23, 42),
                 style: TextStyle::default(),
@@ -1881,6 +3804,18 @@ impl SlipwayView for AdmissionWidget {
             }
         }
 
+        if matches!(self, Self::Overlay(_)) {
+            self.push_overlay_paint_ops(&mut ops, local, bounds);
+        }
+
+        if matches!(self, Self::OverlayStack(_)) {
+            self.push_overlay_stack_paint_ops(&mut ops, local, bounds);
+        }
+
+        if matches!(self, Self::NestedScroll(_)) {
+            self.push_nested_scroll_paint_ops(&mut ops, local, bounds);
+        }
+
         ops
     }
 
@@ -1902,6 +3837,9 @@ impl SlipwayView for AdmissionWidget {
                 Self::Toggle(_) => external.enabled.to_string(),
                 Self::Slider(_) => format!("{:.2}", external.intensity),
                 Self::List(_) => external.selected_item.to_string(),
+                Self::Overlay(_) => "local-overlay".to_string(),
+                Self::OverlayStack(_) => "local-overlay-stack".to_string(),
+                Self::NestedScroll(_) => "local-nested-scroll".to_string(),
             },
         }];
 
@@ -1947,8 +3885,88 @@ fn message_outcome(
     }
 }
 
+fn local_change_outcome(
+    target: WidgetId,
+    _name: &'static str,
+    field: &'static str,
+    after: impl Into<String>,
+) -> EventOutcome<AdmissionMessage> {
+    let change = ChangeEvidence {
+        target: target.clone(),
+        slot: Some(WidgetSlotAddress::new(target.clone(), 0)),
+        field: field.to_string(),
+        before: None,
+        after: Some(after.into()),
+    };
+    EventOutcome {
+        handled: true,
+        propagate: false,
+        emitted_messages: Vec::new(),
+        changes: vec![change.clone()],
+        observations: Vec::new(),
+        probes: vec![ProbeProduct::Change(slipway_core::ChangeProbe {
+            target,
+            changes: vec![change],
+        })],
+        diagnostics: Vec::new(),
+    }
+}
+
+fn handled_no_change_outcome(_target: WidgetId) -> EventOutcome<AdmissionMessage> {
+    EventOutcome {
+        handled: true,
+        propagate: false,
+        emitted_messages: Vec::new(),
+        changes: Vec::new(),
+        observations: Vec::new(),
+        probes: Vec::new(),
+        diagnostics: Vec::new(),
+    }
+}
+
 fn intensity_from_pointer(x: f32) -> f32 {
     ((x - 24.0) / 496.0).clamp(0.0, 1.0)
+}
+
+fn admission_text_input_style_token() -> TextStyle {
+    TextStyle::default()
+        .with_font_family("system-ui")
+        .with_font_size(14.0)
+}
+
+fn admission_text_input_typography(target: WidgetId) -> TextInputTypographyDeclaration {
+    let declaration =
+        TextInputTypographyDeclaration::explicit(target, admission_text_input_style_token());
+    if let Some(source) = admission_cjk_font_source() {
+        declaration.with_source(source)
+    } else {
+        declaration
+    }
+}
+
+fn admission_cjk_font_source() -> Option<ResourceSourceDeclaration> {
+    #[cfg(target_os = "windows")]
+    {
+        const CANDIDATES: &[(&str, &str)] = &[
+            ("Noto Sans KR", "C:\\Windows\\Fonts\\NotoSansKR-VF.ttf"),
+            ("Malgun Gothic", "C:\\Windows\\Fonts\\malgun.ttf"),
+            ("Gulim", "C:\\Windows\\Fonts\\gulim.ttc"),
+        ];
+
+        for (family, path) in CANDIDATES {
+            if std::path::Path::new(path).exists() {
+                return Some(ResourceSourceDeclaration {
+                    source_id: format!("windows-cjk-font:{family}"),
+                    kind: ResourceSourceKind::Asset,
+                    family: Some((*family).to_string()),
+                    asset_ref: Some((*path).to_string()),
+                    revision: Vec::new(),
+                });
+            }
+        }
+    }
+
+    None
 }
 
 fn rgb(red: u8, green: u8, blue: u8) -> Color {
@@ -1957,6 +3975,15 @@ fn rgb(red: u8, green: u8, blue: u8) -> Color {
         green: f32::from(green) / 255.0,
         blue: f32::from(blue) / 255.0,
         alpha: 1.0,
+    }
+}
+
+fn rgba(red: u8, green: u8, blue: u8, alpha: u8) -> Color {
+    Color {
+        red: f32::from(red) / 255.0,
+        green: f32::from(green) / 255.0,
+        blue: f32::from(blue) / 255.0,
+        alpha: f32::from(alpha) / 255.0,
     }
 }
 
@@ -1970,23 +3997,48 @@ fn rect_shape(id: &'static str, bounds: Rect, kind: ShapeKind) -> ShapeDeclarati
     }
 }
 
-fn inset(rect: Rect, insets: EdgeInsets) -> Rect {
-    Rect {
-        origin: Point {
-            x: rect.origin.x + insets.left,
-            y: rect.origin.y + insets.top,
-        },
-        size: Size {
-            width: (rect.size.width - insets.left - insets.right).max(0.0),
-            height: (rect.size.height - insets.top - insets.bottom).max(0.0),
-        },
+fn path_shape(id: &'static str, bounds: Rect, path: PathDeclaration) -> ShapeDeclaration {
+    ShapeDeclaration {
+        id: Some(id.to_string()),
+        kind: ShapeKind::Path,
+        bounds,
+        path: Some(path),
+        clip: None,
     }
+}
+
+fn point_in_rect(point: Point, rect: Rect) -> bool {
+    point.x >= rect.origin.x
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y >= rect.origin.y
+        && point.y <= rect.origin.y + rect.size.height
+}
+
+fn intersect_rect(left: Rect, right: Rect) -> Option<Rect> {
+    let min_x = left.origin.x.max(right.origin.x);
+    let min_y = left.origin.y.max(right.origin.y);
+    let max_x = (left.origin.x + left.size.width).min(right.origin.x + right.size.width);
+    let max_y = (left.origin.y + left.size.height).min(right.origin.y + right.size.height);
+    (max_x > min_x && max_y > min_y).then_some(Rect {
+        origin: Point { x: min_x, y: min_y },
+        size: Size {
+            width: max_x - min_x,
+            height: max_y - min_y,
+        },
+    })
+}
+
+fn overlay_stack_label(index: usize) -> &'static str {
+    ["A", "B", "C", "D"].get(index).copied().unwrap_or("?")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slipway_core::FrameIdentity;
+    use slipway_backend_egui::{
+        SlipwayEguiBackendChildWidget, SlipwayEguiNativeChildWidget, egui_backend_admission,
+    };
+    use slipway_core::{FrameIdentity, PaintInputTransparency};
 
     fn admission_test_frame(width: f32, height: f32) -> FrameIdentity {
         FrameIdentity {
@@ -2023,6 +4075,22 @@ mod tests {
                 layout_input,
             },
         )
+    }
+
+    fn widget_layout_input(width: f32, height: f32) -> LayoutInput {
+        LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size { width, height },
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: Size { width, height },
+            },
+        }
     }
 
     fn pointer_backend_input_for_view(
@@ -2099,10 +4167,170 @@ mod tests {
         runtime.apply_backend_input_event_with_app_reducer(input, &mut reducer)
     }
 
+    fn clipped_group_count(ops: &[PaintOp], prefix: &str) -> usize {
+        let mut count = 0;
+        for op in ops {
+            if let PaintOp::Group { id, clip, ops } = op {
+                if id.as_deref().is_some_and(|id| id.starts_with(prefix)) && clip.is_some() {
+                    count += 1;
+                }
+                count += clipped_group_count(ops, prefix);
+            }
+        }
+        count
+    }
+
+    fn overlay_stack_layer_labels(ops: &[PaintOp]) -> Vec<String> {
+        let mut labels = Vec::new();
+        for op in ops {
+            match op {
+                PaintOp::Text { content, .. } if content.contains(" layer ") => {
+                    labels.push(content.clone());
+                }
+                PaintOp::Group { ops, .. } | PaintOp::Layer { ops, .. } => {
+                    labels.extend(overlay_stack_layer_labels(ops));
+                }
+                _ => {}
+            }
+        }
+        labels
+    }
+
+    fn first_overlay_stack_layer_label(ops: &[PaintOp]) -> Option<String> {
+        for op in ops {
+            match op {
+                PaintOp::Text { content, .. } if content.contains(" layer ") => {
+                    return Some(content.clone());
+                }
+                PaintOp::Group { ops, .. } | PaintOp::Layer { ops, .. } => {
+                    if let Some(label) = first_overlay_stack_layer_label(ops) {
+                        return Some(label);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn overlay_stack_paint_layers(
+        ops: &[PaintOp],
+    ) -> Vec<(String, PaintLayerKey, PaintInputTransparency)> {
+        let mut layers = Vec::new();
+        for op in ops {
+            match op {
+                PaintOp::Layer {
+                    key,
+                    input_transparency,
+                    ops,
+                    ..
+                } => {
+                    if let Some(label) = first_overlay_stack_layer_label(ops) {
+                        layers.push((label, *key, *input_transparency));
+                    }
+                }
+                PaintOp::Group { ops, .. } => layers.extend(overlay_stack_paint_layers(ops)),
+                _ => {}
+            }
+        }
+        layers
+    }
+
+    fn paint_layer_by_id<'a>(
+        ops: &'a [PaintOp],
+        wanted_id: &str,
+    ) -> Option<(PaintLayerKey, PaintInputTransparency, &'a [PaintOp])> {
+        for op in ops {
+            match op {
+                PaintOp::Layer {
+                    id,
+                    key,
+                    input_transparency,
+                    ops,
+                    ..
+                } if id.as_deref() == Some(wanted_id) => {
+                    return Some((*key, *input_transparency, ops));
+                }
+                PaintOp::Layer { ops, .. } | PaintOp::Group { ops, .. } => {
+                    if let Some(layer) = paint_layer_by_id(ops, wanted_id) {
+                        return Some(layer);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn text_labels(ops: &[PaintOp]) -> Vec<String> {
+        let mut labels = Vec::new();
+        for op in ops {
+            match op {
+                PaintOp::Text { content, .. } => labels.push(content.clone()),
+                PaintOp::Group { ops, .. } | PaintOp::Layer { ops, .. } => {
+                    labels.extend(text_labels(ops));
+                }
+                _ => {}
+            }
+        }
+        labels
+    }
+
+    fn assert_overlay_stack_layers_match_order(view: &ViewDefinition, order: [usize; 4]) {
+        let layers = overlay_stack_paint_layers(&view.paint);
+        assert_eq!(layers.len(), 4);
+        for (rank, overlay) in order.into_iter().enumerate() {
+            let spec = AdmissionWidget::overlay_stack_layer_spec(overlay, rank);
+            let expected_label = format!("{} layer {rank}", overlay_stack_label(overlay));
+            assert_eq!(layers[rank].0, expected_label);
+            assert_eq!(layers[rank].1, spec.key);
+            assert_eq!(layers[rank].2, PaintInputTransparency::Opaque);
+
+            let hit = view
+                .hit_regions
+                .iter()
+                .find(|region| {
+                    region
+                        .id
+                        .as_str()
+                        .contains(&format!(":overlay-{overlay}:drag"))
+                })
+                .expect("overlay drag hit region is declared");
+            assert_eq!(hit.order, spec.hit_order());
+        }
+    }
+
+    fn overlay_stack_control_rects(bounds: Rect) -> Vec<Rect> {
+        let mut rects = vec![AdmissionWidget::overlay_stack_help_text_rect(bounds)];
+        rects.extend((0..4).map(AdmissionWidget::overlay_stack_order_button_rect));
+        rects
+    }
+
+    fn text_bounds_for_content_prefix(ops: &[PaintOp], prefix: &str) -> Option<Rect> {
+        for op in ops {
+            match op {
+                PaintOp::Text {
+                    bounds, content, ..
+                } if content.starts_with(prefix) => return Some(*bounds),
+                PaintOp::Group { ops, .. } => {
+                    if let Some(bounds) = text_bounds_for_content_prefix(ops, prefix) {
+                        return Some(bounds);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn rects_overlap(left: Rect, right: Rect) -> bool {
+        intersect_rect(left, right).is_some()
+    }
+
     #[test]
     fn example_uses_core_traits_for_all_widgets() {
         let widgets = admission_widgets();
-        assert_eq!(widgets.len(), 6);
+        assert_eq!(widgets.len(), 9);
         for widget in widgets {
             assert!(!widget.capabilities().is_empty());
             let local = widget.initial_local_state();
@@ -2208,25 +4436,7 @@ mod tests {
         let state = AdmissionState::default();
         let list = AdmissionWidget::List(ListWidget);
         let mut local = list.initial_local_state();
-        let layout_input = LayoutInput {
-            viewport: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 560.0,
-                    height: 168.0,
-                },
-            }),
-            constraints: LayoutConstraints {
-                min: Size {
-                    width: 0.0,
-                    height: 0.0,
-                },
-                max: Size {
-                    width: 560.0,
-                    height: 168.0,
-                },
-            },
-        };
+        let layout_input = widget_layout_input(560.0, 168.0);
 
         let view = list.view_definition(
             &state,
@@ -2265,11 +4475,984 @@ mod tests {
 
         assert!(outcome.handled);
         assert_eq!(local, AdmissionLocal::List { scroll_rows: 3 });
-        assert_eq!(outcome.emitted_messages.len(), 1);
-        assert_eq!(
-            outcome.emitted_messages[0].message,
-            AdmissionMessage::SelectNextItem
+        assert!(outcome.emitted_messages.is_empty());
+    }
+
+    #[test]
+    fn overlay_widget_declares_layered_complex_paint_and_draggable_local_state() {
+        let state = AdmissionState::default();
+        let overlay = AdmissionWidget::Overlay(OverlayWidget);
+        let mut local = overlay.initial_local_state();
+        let layout_input = widget_layout_input(560.0, 228.0);
+        let view = overlay.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input: layout_input.clone(),
+            },
         );
+
+        assert_eq!(
+            view.paint_order.mode,
+            slipway_core::PaintOrderMode::SourceOrder
+        );
+        assert!(view.paint_order.allow_overlap);
+        assert!(view.paint_order.allow_overflow_paint);
+        let (overlay_key, overlay_transparency, overlay_ops) =
+            paint_layer_by_id(&view.paint, "movable-overlay-window")
+                .expect("movable overlay window must be the only ordered overlay layer");
+        assert_eq!(overlay_key, AdmissionWidget::overlay_layer_key());
+        assert_eq!(overlay_transparency, PaintInputTransparency::Opaque);
+        assert!(overlay_ops.iter().any(|op| matches!(
+            op,
+            PaintOp::Stroke { shape, .. }
+                if shape.id.as_deref() == Some("overlay-curve")
+                    && shape.kind == ShapeKind::Path
+                    && shape.path.is_some()
+        )));
+        assert!(overlay_ops.iter().any(|op| matches!(
+            op,
+            PaintOp::Group { id, ops, .. }
+                if id.as_deref() == Some("overlay-curve-nodes") && ops.len() >= 8
+        )));
+        assert!(view.hit_regions.iter().any(|region| {
+            region.id.as_str().ends_with(":hit")
+                && region.capture == PointerCaptureIntent::DuringDrag
+                && region.order.z_index == overlay_key.z_index
+                && region.order.paint_order == overlay_key.order.unwrap_or_default()
+                && region.bounds.origin.y < 0.0
+        }));
+
+        let press = overlay.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: overlay.id(),
+                target_slot: None,
+                position: Point { x: 244.0, y: -32.0 },
+                target_bounds: Some(TargetLocalRect::new(view.layout.bounds.into_rect())),
+                kind: slipway_core::PointerEventKind::Press,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+        assert!(press.handled);
+
+        let moved = overlay.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: overlay.id(),
+                target_slot: None,
+                position: Point { x: 304.0, y: 10.0 },
+                target_bounds: Some(TargetLocalRect::new(view.layout.bounds.into_rect())),
+                kind: slipway_core::PointerEventKind::Move,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+        assert!(moved.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::Overlay {
+                offset,
+                dragging: true,
+                ..
+            } if offset.x > 220.0 && offset.y > -44.0
+        ));
+
+        let cancel = overlay.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: overlay.id(),
+                target_slot: None,
+                position: Point { x: 640.0, y: 360.0 },
+                target_bounds: Some(TargetLocalRect::new(view.layout.bounds.into_rect())),
+                kind: slipway_core::PointerEventKind::Cancel,
+                button: None,
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+        assert!(cancel.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::Overlay {
+                dragging: false,
+                ..
+            }
+        ));
+    }
+
+    fn pointer_event_for_widget(
+        widget: &AdmissionWidget,
+        kind: slipway_core::PointerEventKind,
+    ) -> InputEvent {
+        InputEvent::Pointer(slipway_core::PointerEvent {
+            target: widget.id(),
+            target_slot: None,
+            position: Point { x: 24.0, y: 24.0 },
+            target_bounds: Some(TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 240.0,
+                    height: 160.0,
+                },
+            })),
+            kind,
+            button: Some(slipway_core::PointerButton::Primary),
+            details: slipway_core::PointerDetails::default(),
+        })
+    }
+
+    fn target_route_for_widget(widget: &AdmissionWidget) -> EventRoute {
+        EventRoute {
+            route_id: Some("test-route".to_string()),
+            address: None,
+            path: vec![widget.id()],
+            phase: EventRoutePhase::Target,
+        }
+    }
+
+    fn disposition_handled(
+        widget: &AdmissionWidget,
+        state: &AdmissionState,
+        local: &AdmissionLocal,
+        event: &InputEvent,
+    ) -> bool {
+        let evidence = slipway_core::SlipwayEventDispositionPolicy::event_disposition(
+            widget,
+            state,
+            local,
+            event,
+            &target_route_for_widget(widget),
+        );
+        evidence
+            .steps
+            .last()
+            .expect("event disposition should record a target step")
+            .disposition
+            .handled
+    }
+
+    #[test]
+    fn overlay_move_is_declared_handled_only_while_dragging() {
+        let state = AdmissionState::default();
+        let overlay = AdmissionWidget::Overlay(OverlayWidget);
+        let event = pointer_event_for_widget(&overlay, slipway_core::PointerEventKind::Move);
+
+        let idle = AdmissionLocal::Overlay {
+            offset: AdmissionWidget::overlay_default_offset(),
+            dragging: false,
+            drag_anchor: Point { x: 0.0, y: 0.0 },
+        };
+        assert!(!disposition_handled(&overlay, &state, &idle, &event));
+
+        let dragging = AdmissionLocal::Overlay {
+            offset: AdmissionWidget::overlay_default_offset(),
+            dragging: true,
+            drag_anchor: Point { x: 0.0, y: 0.0 },
+        };
+        assert!(disposition_handled(&overlay, &state, &dragging, &event));
+    }
+
+    #[test]
+    fn overlay_stack_move_is_declared_handled_only_while_dragging() {
+        let state = AdmissionState::default();
+        let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
+        let event = pointer_event_for_widget(&stack, slipway_core::PointerEventKind::Move);
+        let offsets = AdmissionWidget::overlay_stack_default_offsets();
+        let order = [0, 1, 2, 3];
+
+        let idle = AdmissionLocal::OverlayStack {
+            offsets,
+            order,
+            dragging: None,
+            drag_anchor: Point { x: 0.0, y: 0.0 },
+        };
+        assert!(!disposition_handled(&stack, &state, &idle, &event));
+
+        let dragging = AdmissionLocal::OverlayStack {
+            offsets,
+            order,
+            dragging: Some(0),
+            drag_anchor: Point { x: 0.0, y: 0.0 },
+        };
+        assert!(disposition_handled(&stack, &state, &dragging, &event));
+    }
+
+    #[test]
+    fn overlay_stack_declares_multiple_ordered_overlays_and_changes_front() {
+        let state = AdmissionState::default();
+        let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
+        let mut local = stack.initial_local_state();
+        let layout_input = widget_layout_input(560.0, 276.0);
+        let view = stack.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input: layout_input.clone(),
+            },
+        );
+
+        assert_eq!(
+            view.paint_order.mode,
+            slipway_core::PaintOrderMode::SourceOrder
+        );
+        assert_eq!(view.paint_order.z_index, 0);
+        assert_eq!(view.paint_order.order, None);
+        assert!(view.paint_order.allow_overlap);
+        assert!(view.paint_order.allow_overflow_paint);
+        assert!(view.paint_order.overflow_bounds.is_some());
+        assert_eq!(
+            view.hit_regions
+                .iter()
+                .filter(|region| region.id.as_str().contains(":overlay-"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            view.hit_regions
+                .iter()
+                .filter(|region| region.id.as_str().contains(":order-"))
+                .count(),
+            4
+        );
+        let overlay_0_order = view
+            .hit_regions
+            .iter()
+            .find(|region| region.id.as_str().contains(":overlay-0:drag"))
+            .expect("overlay 0 drag region is declared")
+            .order
+            .clone();
+        let overlay_3_order = view
+            .hit_regions
+            .iter()
+            .find(|region| region.id.as_str().contains(":overlay-3:drag"))
+            .expect("overlay 3 drag region is declared")
+            .order
+            .clone();
+        assert_eq!(
+            overlay_0_order,
+            AdmissionWidget::overlay_stack_layer_spec(0, 0).hit_order()
+        );
+        assert_eq!(
+            overlay_3_order,
+            AdmissionWidget::overlay_stack_layer_spec(3, 3).hit_order()
+        );
+        assert!(overlay_3_order.paint_order > overlay_0_order.paint_order);
+        for index in 0..4 {
+            let button_order = view
+                .hit_regions
+                .iter()
+                .find(|region| region.id.as_str().contains(&format!(":order-{index}")))
+                .expect("overlay-stack order button is declared")
+                .order
+                .clone();
+            assert_eq!(
+                button_order,
+                HitRegionOrder {
+                    z_index: 0,
+                    paint_order: index,
+                    traversal_order: index,
+                },
+                "overlay-stack control buttons are local/default controls, not overlay layers"
+            );
+        }
+
+        let press_a_order = stack.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: stack.id(),
+                target_slot: None,
+                position: Point { x: 32.0, y: 78.0 },
+                target_bounds: Some(TargetLocalRect::new(view.layout.bounds.into_rect())),
+                kind: slipway_core::PointerEventKind::Press,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+        assert!(press_a_order.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::OverlayStack {
+                order,
+                ..
+            } if order[3] == 0
+        ));
+
+        let drag_bounds = view.layout.bounds.into_rect();
+        let drag_offsets = match &local {
+            AdmissionLocal::OverlayStack { offsets, .. } => *offsets,
+            _ => AdmissionWidget::overlay_stack_default_offsets(),
+        };
+        let drag_card = AdmissionWidget::overlay_stack_rect(drag_bounds, drag_offsets, 0);
+        let drag_start_position = Point {
+            x: drag_card.origin.x + drag_card.size.width - 18.0,
+            y: drag_card.origin.y + drag_card.size.height - 18.0,
+        };
+        let drag_start = stack.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: stack.id(),
+                target_slot: None,
+                position: drag_start_position,
+                target_bounds: Some(TargetLocalRect::new(drag_bounds)),
+                kind: slipway_core::PointerEventKind::Press,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+        assert!(drag_start.handled);
+        let drag_move = stack.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: stack.id(),
+                target_slot: None,
+                position: Point { x: 470.0, y: 48.0 },
+                target_bounds: Some(TargetLocalRect::new(drag_bounds)),
+                kind: slipway_core::PointerEventKind::Move,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+        assert!(drag_move.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::OverlayStack {
+                offsets,
+                dragging: Some(0),
+                ..
+            } if offsets[0].x > drag_offsets[0].x && offsets[0].y < drag_offsets[0].y
+        ));
+    }
+
+    #[test]
+    fn overlay_stack_paint_layers_follow_authored_order_and_match_hit_order() {
+        let state = AdmissionState::default();
+        let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
+        let mut local = stack.initial_local_state();
+        let layout_input = widget_layout_input(560.0, 276.0);
+        let frame = FrameIdentity {
+            surface_id: "test-surface".to_string(),
+            surface_instance_id: "test-instance".to_string(),
+            revision: 0,
+            frame_index: 0,
+            viewport: layout_input.viewport.into_rect(),
+        };
+        let view = stack.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: frame.clone(),
+                layout_input: layout_input.clone(),
+            },
+        );
+
+        assert_eq!(
+            overlay_stack_layer_labels(&view.paint),
+            vec!["A layer 0", "B layer 1", "C layer 2", "D layer 3"]
+        );
+        assert_overlay_stack_layers_match_order(&view, [0, 1, 2, 3]);
+        let labels = text_labels(&slipway_core::flatten_ordered_paint_units(vec![
+            slipway_core::PaintUnit::from_view(view.clone(), stack.traversal_order()),
+        ]));
+        let control_text = labels
+            .iter()
+            .position(|label| label == "front buttons; drag title bars")
+            .expect("overlay-stack default control text is painted");
+        let first_layer = labels
+            .iter()
+            .position(|label| label == "A layer 0")
+            .expect("first overlay-stack layer is painted");
+        let front_layer = labels
+            .iter()
+            .position(|label| label == "D layer 3")
+            .expect("front overlay-stack layer is painted");
+        assert!(
+            control_text < first_layer && control_text < front_layer,
+            "overlay-stack default/card controls must stay below ordered overlay cards"
+        );
+
+        let bring_a_front = stack.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: stack.id(),
+                target_slot: None,
+                position: Point { x: 32.0, y: 78.0 },
+                target_bounds: Some(TargetLocalRect::new(view.layout.bounds.into_rect())),
+                kind: slipway_core::PointerEventKind::Press,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+        assert!(bring_a_front.handled);
+
+        let view = stack.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame,
+                layout_input,
+            },
+        );
+
+        assert_eq!(
+            overlay_stack_layer_labels(&view.paint),
+            vec!["B layer 0", "C layer 1", "D layer 2", "A layer 3"]
+        );
+        assert_overlay_stack_layers_match_order(&view, [1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn overlay_stack_front_key_sorts_above_lower_key_sibling_paint() {
+        let state = AdmissionState::default();
+        let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
+        let local = stack.initial_local_state();
+        let layout_input = widget_layout_input(560.0, 276.0);
+        let stack_view = stack.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "stack-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input,
+            },
+        );
+        let lower_key_sibling = slipway_core::PaintUnit {
+            target: WidgetId::from("admission.lower-key-sibling"),
+            address: None,
+            order: PaintOrderDeclaration::layered_order(
+                WidgetId::from("admission.lower-key-sibling"),
+                10,
+                2,
+            ),
+            traversal_order: 99,
+            paint: vec![PaintOp::Text {
+                bounds: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 20.0,
+                    },
+                },
+                content: "lower-key sibling".to_string(),
+                color: rgb(0, 0, 0),
+                style: TextStyle::default(),
+            }],
+        };
+
+        let labels = text_labels(&slipway_core::flatten_ordered_paint_units(vec![
+            slipway_core::PaintUnit::from_view(stack_view, stack.traversal_order()),
+            lower_key_sibling,
+        ]));
+        let sibling_index = labels
+            .iter()
+            .position(|label| label == "lower-key sibling")
+            .expect("lower-key sibling text is painted");
+        let front_index = labels
+            .iter()
+            .position(|label| label == "D layer 3")
+            .expect("front overlay-stack layer is painted");
+        assert!(
+            sibling_index < front_index,
+            "front overlay-stack keyed layer must paint above a lower-key sibling"
+        );
+    }
+
+    #[test]
+    fn overlay_stack_text_control_layout_has_non_overlapping_bounds() {
+        let state = AdmissionState::default();
+        let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
+        let local = stack.initial_local_state();
+        let layout_input = widget_layout_input(560.0, 276.0);
+        let view = stack.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input,
+            },
+        );
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 560.0,
+                height: 276.0,
+            },
+        };
+        let header = text_bounds_for_content_prefix(&view.paint, "overlay-stack |")
+            .expect("overlay-stack card header text is painted");
+        let mut controls = vec![header];
+        controls.extend(overlay_stack_control_rects(bounds));
+
+        for (index, left) in controls.iter().enumerate() {
+            for right in controls.iter().skip(index + 1) {
+                assert!(
+                    !rects_overlap(*left, *right),
+                    "overlay-stack text/control bounds must not overlap: {left:?} {right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_stack_default_overlay_bounds_do_not_unintentionally_overlap_controls() {
+        let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 560.0,
+                height: 276.0,
+            },
+        };
+        let offsets = AdmissionWidget::overlay_stack_default_offsets();
+        let mut controls = vec![stack.card_header_text_rect(bounds)];
+        controls.extend(overlay_stack_control_rects(bounds));
+        let overlays = (0..4)
+            .map(|index| AdmissionWidget::overlay_stack_rect(bounds, offsets, index))
+            .collect::<Vec<_>>();
+
+        assert!(
+            overlays
+                .iter()
+                .any(|overlay| overlay.origin.y + overlay.size.height
+                    > bounds.origin.y + bounds.size.height),
+            "default overlay stack should still provide bounded overflow evidence"
+        );
+        for overlay in overlays {
+            for control in &controls {
+                assert!(
+                    !rects_overlap(overlay, *control),
+                    "default overlay bounds must not accidentally cover text/control bounds: {overlay:?} {control:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_and_overlay_stack_layers_keep_drag_overlay_visibly_above_stack() {
+        let state = AdmissionState::default();
+        let overlay = AdmissionWidget::Overlay(OverlayWidget);
+        let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
+        let overlay_local = overlay.initial_local_state();
+        let stack_local = stack.initial_local_state();
+        let overlay_input = widget_layout_input(560.0, 228.0);
+        let stack_input = widget_layout_input(560.0, 276.0);
+        let overlay_view = overlay.view_definition(
+            &state,
+            &overlay_local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "overlay-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: overlay_input.viewport.into_rect(),
+                },
+                layout_input: overlay_input,
+            },
+        );
+        let stack_view = stack.view_definition(
+            &state,
+            &stack_local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "stack-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: stack_input.viewport.into_rect(),
+                },
+                layout_input: stack_input,
+            },
+        );
+
+        assert_eq!(
+            overlay_view.paint_order.mode,
+            slipway_core::PaintOrderMode::SourceOrder
+        );
+        assert_eq!(
+            stack_view.paint_order.mode,
+            slipway_core::PaintOrderMode::SourceOrder
+        );
+        assert!(overlay_view.paint_order.allow_overflow_paint);
+        assert!(stack_view.paint_order.allow_overflow_paint);
+        let (overlay_key, _, _) = paint_layer_by_id(&overlay_view.paint, "movable-overlay-window")
+            .expect("movable overlay window is the ordered layer, not its card view");
+        let stack_front_key = AdmissionWidget::overlay_stack_layer_spec(3, 3).key;
+        assert!(
+            (overlay_key.z_index, overlay_key.order)
+                > (stack_front_key.z_index, stack_front_key.order),
+            "drag overlay must paint above the overlay-stack ordered cards"
+        );
+
+        let labels = text_labels(&slipway_core::flatten_ordered_paint_units(vec![
+            slipway_core::PaintUnit::from_view(overlay_view, overlay.traversal_order()),
+            slipway_core::PaintUnit::from_view(stack_view, stack.traversal_order()),
+        ]));
+        let stack_front = labels
+            .iter()
+            .position(|label| label == "D layer 3")
+            .expect("overlay-stack front layer is painted");
+        let movable_overlay = labels
+            .iter()
+            .position(|label| label == "drag overlay")
+            .expect("movable overlay window is painted");
+        assert!(
+            stack_front < movable_overlay,
+            "movable overlay keyed window must paint above overlay-stack cards"
+        );
+    }
+
+    #[test]
+    fn nested_scroll_widget_declares_outer_and_inner_scroll_regions() {
+        let state = AdmissionState::default();
+        let nested = AdmissionWidget::NestedScroll(NestedScrollWidget);
+        let mut local = nested.initial_local_state();
+        let layout_input = widget_layout_input(560.0, 292.0);
+        let view = nested.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input,
+            },
+        );
+
+        assert_eq!(view.scroll_regions.len(), 4);
+        assert!(
+            view.scroll_regions
+                .iter()
+                .any(|region| region.id.as_str().ends_with(":outer"))
+        );
+        assert!(
+            view.scroll_regions
+                .iter()
+                .filter(|region| region.id.as_str().contains(":inner-"))
+                .count()
+                == 3
+        );
+        for region in &view.scroll_regions {
+            assert!(region.enabled);
+            assert!(region.axes.vertical);
+            assert!(region.consumption.wheel);
+            assert!(
+                region.content_bounds.size.height > region.viewport.size.height,
+                "nested scroll regions must declare enough content extent for scrollbar evidence"
+            );
+        }
+        let inner_viewports = view
+            .scroll_regions
+            .iter()
+            .filter(|region| region.id.as_str().contains(":inner-"))
+            .map(|region| region.viewport.into_rect())
+            .collect::<Vec<_>>();
+        assert_eq!(inner_viewports.len(), 3);
+        assert!(
+            inner_viewports
+                .windows(2)
+                .all(|pair| pair[0].origin.y + pair[0].size.height <= pair[1].origin.y),
+            "inner scroll regions must stay as distinct visible owners"
+        );
+        let inner_one = view
+            .scroll_regions
+            .iter()
+            .find(|region| region.id.as_str().ends_with(":inner-1"))
+            .expect("inner scroll region 1 is declared");
+        let outcome = nested.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Scroll(slipway_core::ScrollEvent {
+                target: nested.id(),
+                target_slot: None,
+                region_id: inner_one.id.clone(),
+                offset_x: 0.0,
+                offset_y: 54.0,
+                viewport: inner_one.viewport,
+                content_bounds: inner_one.content_bounds,
+            }),
+        );
+
+        assert!(outcome.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::NestedScroll {
+                inner_scroll_rows, ..
+            } if inner_scroll_rows[1] == 3
+        ));
+        assert_eq!(
+            clipped_group_count(&view.paint, "nested-inner-"),
+            3,
+            "each inner scroll panel must clip its own rows"
+        );
+    }
+
+    #[test]
+    fn nested_scroll_wheel_routes_to_topmost_visible_region_and_respects_direction() {
+        let state = AdmissionState::default();
+        let nested = AdmissionWidget::NestedScroll(NestedScrollWidget);
+        let mut local = nested.initial_local_state();
+        let layout_input = widget_layout_input(560.0, 292.0);
+        let mut view = nested.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input: layout_input.clone(),
+            },
+        );
+
+        let inner_down = wheel_backend_input_for_view(&view, Point { x: 42.0, y: 70.0 }, -1.0);
+        assert_eq!(
+            inner_down
+                .dispatch_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.selected_region.as_ref())
+                .map(PresentationRegionId::as_str),
+            Some("admission.nested-scroll:inner-0")
+        );
+        let outcome = nested.handle_event(&state, &mut local, inner_down.event);
+        assert!(outcome.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::NestedScroll {
+                outer_scroll_rows: 0,
+                inner_scroll_rows,
+            } if inner_scroll_rows[0] == 1
+        ));
+
+        view = nested.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 1,
+                    frame_index: 1,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input: layout_input.clone(),
+            },
+        );
+        let inner_up = wheel_backend_input_for_view(&view, Point { x: 42.0, y: 70.0 }, 1.0);
+        let outcome = nested.handle_event(&state, &mut local, inner_up.event);
+        assert!(outcome.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::NestedScroll {
+                outer_scroll_rows: 0,
+                inner_scroll_rows,
+            } if inner_scroll_rows[0] == 0
+        ));
+
+        let outer_down = wheel_backend_input_for_view(&view, Point { x: 260.0, y: 70.0 }, -1.0);
+        assert_eq!(
+            outer_down
+                .dispatch_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.selected_region.as_ref())
+                .map(PresentationRegionId::as_str),
+            Some("admission.nested-scroll:outer")
+        );
+        let outcome = nested.handle_event(&state, &mut local, outer_down.event);
+        assert!(outcome.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::NestedScroll {
+                outer_scroll_rows: 1,
+                ..
+            }
+        ));
+
+        view = nested.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 2,
+                    frame_index: 2,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input: layout_input.clone(),
+            },
+        );
+        let outer_up = wheel_backend_input_for_view(&view, Point { x: 260.0, y: 70.0 }, 1.0);
+        let outcome = nested.handle_event(&state, &mut local, outer_up.event);
+        assert!(outcome.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::NestedScroll {
+                outer_scroll_rows: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wheel_event_scrolls_list_by_delta_direction_without_selecting_item() {
+        let state = AdmissionState::default();
+        let list = AdmissionWidget::List(ListWidget);
+        let mut local = AdmissionLocal::List { scroll_rows: 2 };
+
+        let down = list.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Wheel(slipway_core::WheelEvent {
+                target: list.id(),
+                target_slot: None,
+                region_id: None,
+                delta_x: 0.0,
+                delta_y: -1.0,
+            }),
+        );
+
+        assert!(down.handled);
+        assert_eq!(local, AdmissionLocal::List { scroll_rows: 3 });
+        assert!(down.emitted_messages.is_empty());
+
+        let up = list.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Wheel(slipway_core::WheelEvent {
+                target: list.id(),
+                target_slot: None,
+                region_id: None,
+                delta_x: 0.0,
+                delta_y: 1.0,
+            }),
+        );
+
+        assert!(up.handled);
+        assert_eq!(local, AdmissionLocal::List { scroll_rows: 2 });
+        assert!(up.emitted_messages.is_empty());
+    }
+
+    #[test]
+    fn list_bottom_scroll_offset_stays_inside_declared_bounds() {
+        let state = AdmissionState::default();
+        let list = AdmissionWidget::List(ListWidget);
+        let local = AdmissionLocal::List { scroll_rows: 5 };
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 560.0,
+                    height: 168.0,
+                },
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: Size {
+                    width: 560.0,
+                    height: 168.0,
+                },
+            },
+        };
+
+        let view = list.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input,
+            },
+        );
+        let scroll = view
+            .scroll_regions
+            .first()
+            .expect("list exposes a scroll region");
+        let max_offset = (scroll.content_bounds.size.height - scroll.viewport.size.height).max(0.0);
+
+        assert!(scroll.offset.y <= max_offset);
+        let diagnostics = slipway_core::view_definition_contract_diagnostics_for_capabilities(
+            &view,
+            &list.capabilities(),
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "view_contract.scroll_offset_out_of_range"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn list_release_is_consumed_without_changing_selection_or_scroll() {
+        let state = AdmissionState::default();
+        let list = AdmissionWidget::List(ListWidget);
+        let mut local = AdmissionLocal::List { scroll_rows: 2 };
+
+        let outcome = list.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: list.id(),
+                target_slot: None,
+                position: Point { x: 48.0, y: 64.0 },
+                target_bounds: None,
+                kind: slipway_core::PointerEventKind::Release,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+
+        assert!(outcome.handled);
+        assert!(outcome.emitted_messages.is_empty());
+        assert_eq!(local, AdmissionLocal::List { scroll_rows: 2 });
     }
 
     #[test]
@@ -2324,11 +5507,82 @@ mod tests {
                 .all(|op| !matches!(op, PaintOp::Text { .. })),
             "root view paint must not duplicate child text paint"
         );
-        assert_eq!(view.layout.child_placements.len(), 6);
+        assert_eq!(view.layout.child_placements.len(), 9);
         assert!(
             view.hit_regions
                 .iter()
                 .any(|region| region.target == WidgetId::from("admission.toggle"))
+        );
+    }
+
+    #[test]
+    fn runtime_app_declares_root_scroll_when_content_exceeds_viewport() {
+        let widget = AdmissionRuntimeAppWidget::new(AdmissionApp {
+            widgets: admission_widget_tuple(),
+        });
+        let external = AdmissionState::default();
+        let local = widget.initial_local_state();
+        let view = widget.view_definition(
+            &external,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 640.0,
+                            height: 480.0,
+                        },
+                    },
+                },
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 640.0,
+                            height: 480.0,
+                        },
+                    }),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: Size {
+                            width: 640.0,
+                            height: 480.0,
+                        },
+                    },
+                },
+            },
+        );
+
+        let root_scroll = view
+            .scroll_regions
+            .iter()
+            .find(|region| region.id == AdmissionAppLocal::root_scroll_region_id())
+            .expect("root overflow must be an explicit scroll declaration");
+        assert_eq!(root_scroll.target, widget.id());
+        assert_eq!(
+            root_scroll.address,
+            Some(WidgetSlotAddress::new(widget.id(), 0))
+        );
+        assert!(root_scroll.content_bounds.size.height > root_scroll.viewport.size.height);
+        assert_eq!(root_scroll.order.z_index, -1);
+        assert_eq!(
+            view.scroll_regions
+                .iter()
+                .filter(|region| region
+                    .id
+                    .as_str()
+                    .contains("admission.nested-scroll:inner-"))
+                .count(),
+            3,
+            "runtime app view must preserve nested inner scroll declarations"
         );
     }
 
@@ -2373,7 +5627,153 @@ mod tests {
                 WidgetId::from("admission.toggle"),
                 WidgetId::from("admission.slider"),
                 WidgetId::from("admission.list"),
+                WidgetId::from("admission.overlay"),
+                WidgetId::from("admission.overlay-stack"),
+                WidgetId::from("admission.nested-scroll"),
             ]
+        );
+    }
+
+    #[test]
+    fn runtime_app_wrapper_forwards_egui_paint_ordered_children() {
+        struct CountingEguiVisitor {
+            ids: Vec<WidgetId>,
+        }
+
+        impl SlipwayEguiWidgetListVisitor<AdmissionState, AdmissionMessage> for CountingEguiVisitor {
+            fn visit_egui_child<W>(
+                &mut self,
+                widget: &W,
+                _external: &AdmissionState,
+                _local: &W::LocalState,
+                _slot: WidgetSlotAddress,
+            ) where
+                W: SlipwayEguiBackendChildWidget<
+                        ExternalState = AdmissionState,
+                        AppMessage = AdmissionMessage,
+                    >,
+            {
+                self.ids.push(widget.id());
+            }
+
+            fn visit_egui_native_child<N>(
+                &mut self,
+                widget: &N,
+                _external: &AdmissionState,
+                _local: &N::LocalState,
+                _slot: WidgetSlotAddress,
+            ) where
+                N: SlipwayEguiNativeChildWidget<
+                        ExternalState = AdmissionState,
+                        AppMessage = AdmissionMessage,
+                    >,
+            {
+                self.ids.push(widget.id());
+            }
+        }
+
+        let widget = AdmissionRuntimeAppWidget::new(AdmissionApp {
+            widgets: admission_widget_tuple(),
+        });
+        let external = AdmissionState::default();
+        let local = widget.initial_local_state();
+        let frame = FrameIdentity {
+            surface_id: "egui-wrapper-test".to_string(),
+            surface_instance_id: "egui-wrapper-test-instance".to_string(),
+            revision: 0,
+            frame_index: 0,
+            viewport: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 640.0,
+                    height: 520.0,
+                },
+            },
+        };
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(frame.viewport),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: frame.viewport.size,
+            },
+        };
+        let view = widget.view_definition(
+            &external,
+            &local,
+            ViewDefinitionInput {
+                frame,
+                layout_input,
+            },
+        );
+        let mut visitor = CountingEguiVisitor { ids: Vec::new() };
+
+        widget.visit_egui_authored_children_in_paint_order(&external, &local, &view, &mut visitor);
+
+        assert_eq!(
+            visitor.ids,
+            vec![
+                WidgetId::from("admission.action"),
+                WidgetId::from("admission.segment"),
+                WidgetId::from("admission.text"),
+                WidgetId::from("admission.toggle"),
+                WidgetId::from("admission.slider"),
+                WidgetId::from("admission.list"),
+                WidgetId::from("admission.nested-scroll"),
+                WidgetId::from("admission.overlay-stack"),
+                WidgetId::from("admission.overlay"),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_app_visible_egui_root_admission_keeps_children() {
+        let widget = AdmissionRuntimeAppWidget::new(AdmissionApp {
+            widgets: admission_widget_tuple(),
+        });
+        let external = AdmissionState::default();
+        let local = widget.initial_local_state();
+        let frame = FrameIdentity {
+            surface_id: "egui-root-admission-test".to_string(),
+            surface_instance_id: "egui-root-admission-test-instance".to_string(),
+            revision: 0,
+            frame_index: 0,
+            viewport: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 904.0,
+                    height: 721.0,
+                },
+            },
+        };
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(frame.viewport),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: frame.viewport.size,
+            },
+        };
+        let view = widget.visible_backend_view_definition(
+            &external,
+            &local,
+            ViewDefinitionInput {
+                frame,
+                layout_input,
+            },
+        );
+        let admission = egui_backend_admission()
+            .admit_view_definition_with_capabilities(&widget.capabilities(), &view);
+
+        assert_eq!(view.layout.child_placements.len(), 9);
+        assert!(
+            admission.accepted,
+            "root admission refused: {:?}",
+            admission.unsupported
         );
     }
 
@@ -2504,17 +5904,17 @@ mod tests {
         let view = admission_view(&runtime, frame.clone());
         let report = apply_test_backend_input(
             &mut runtime,
-            wheel_backend_input_for_view(&view, Point { x: 24.0, y: 464.0 }, 1.0),
+            wheel_backend_input_for_view(&view, Point { x: 24.0, y: 464.0 }, -1.0),
         );
         assert!(report.handled, "{:?}", report.diagnostics);
-        assert_eq!(runtime.external().selected_item, 1);
+        assert_eq!(runtime.external().selected_item, 0);
 
         let view = admission_view(&runtime, frame);
         let report = apply_test_backend_input(
             &mut runtime,
-            pointer_backend_input_for_view(&view, Point { x: 24.0, y: 464.0 }),
+            pointer_backend_input_for_view(&view, Point { x: 48.0, y: 520.0 }),
         );
         assert!(report.handled, "{:?}", report.diagnostics);
-        assert_eq!(runtime.external().selected_item, 2);
+        assert_eq!(runtime.external().selected_item, 1);
     }
 }

@@ -14,6 +14,7 @@ pub use slipway_debug_renderer as debug_renderer;
 pub use slipway_runtime as runtime;
 
 pub use slipway_core::*;
+pub use slipway_runtime::{SlipwayImePolicy, SlipwayRuntime, SlipwayRuntimeConfig};
 
 #[cfg(feature = "iced")]
 pub use slipway_backend_iced as backend_iced;
@@ -33,10 +34,12 @@ pub mod prelude {
         SlipwayView, SlipwayViewDefinition, SlipwayWidgetTypes, TargetLocalRect, ViewDefinition,
         ViewDefinitionInput, WidgetId, WidgetSlotAddress,
     };
-    pub use slipway_runtime::SlipwayRuntime;
+    pub use slipway_runtime::{SlipwayImePolicy, SlipwayRuntime, SlipwayRuntimeConfig};
 
     #[cfg(feature = "iced")]
-    pub use slipway_backend_iced::run_slipway_iced_runtime_app;
+    pub use slipway_backend_iced::{
+        run_slipway_iced_runtime_app, run_slipway_iced_runtime_app_with_config,
+    };
 
     #[cfg(feature = "egui")]
     pub use slipway_backend_egui::run_slipway_egui_runtime_app_with_default_bridge;
