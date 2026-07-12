@@ -29,6 +29,15 @@ clamped to `content - viewport` per enabled axis; enabled regions declare at
 least one axis. The wheel is consumed only when the declared
 `ScrollConsumptionPolicy.wheel` is true.
 
+If admission sent you here with the
+`view_contract.content_overflow_without_scroll_region` advisory, your view
+paints content beyond its layout/frame viewport that no enabled scroll
+region's `content_bounds` covers: declare one of the regions above sized to
+the full content (for a whole page taller than the window, the app-level
+page region under "Chaining" below), or clip the overflow intentionally
+(group/layer clip, or `PaintOrderDeclaration::with_overflow_bounds` for
+deliberate overflow paint).
+
 ## Nesting Order: HitRegionOrder And The Equal-Order Refusal
 
 `HitRegionOrder { z_index, paint_order, traversal_order }` is the one total
@@ -40,12 +49,24 @@ The plain helper defaults the order to `{0, 0, 0}`. Enabled wheel-consuming
 scroll regions that can overlap with identical ordering refuse admission
 with `view_contract.ambiguous_wheel_overlap` (naming both region ids and the
 shared order); overlapping hit regions with identical ordering refuse with
-`view_contract.ambiguous_hit_overlap` unless overlap is explicitly allowed.
-The fix is the one the refusal names: distinct orders via
-`scroll_region_from_scrollable_capability_with_order` (or the `order`
-argument of `hit_region_from_pointer_capability`). Rule of thumb: any widget
-declaring more than one scroll region — or whose scroll region can sit under
-an overlay's hit region — uses `_with_order` instead of the 0/0/0 default.
+`view_contract.ambiguous_hit_overlap`. The fix is the one the refusal names:
+distinct orders via `scroll_region_from_scrollable_capability_with_order`
+(or the `order` argument of `hit_region_from_pointer_capability`). Rule of
+thumb: any widget declaring more than one scroll region — or whose scroll
+region can sit under an overlay's hit region — uses `_with_order` instead of
+the 0/0/0 default.
+
+Paint-overlap allowance is NOT hit-ambiguity acceptance: setting
+`PaintOrderDeclaration.allow_overlap` (the overlay/popup paint intent) does
+not silence `ambiguous_hit_overlap` — an overlay whose hit region ties with
+the regions it covers still refuses admission, because equal orders make
+pointer selection in the shared area arbitrary. The only escape hatch is the
+explicit `PaintOrderDeclaration.allow_ambiguous_hits` flag; prefer a
+distinct order on the overlay's hit region instead (a `z_index` above
+everything it covers, mirroring its paint layer). The composed app view
+re-checks the flattened regions of ALL children, so a full-viewport modal
+child whose hit region ties with sibling regions is refused at app
+admission even though each child alone validates cleanly.
 
 ## Wheel Routing Modes
 
@@ -178,6 +199,19 @@ controls; wheel transparency only opens the wheel channel to the scroll
 owner behind the layer. The reverse also works:
 `with_wheel_transparency(PaintInputTransparency::Opaque)` blocks the wheel
 on a pointer-pass-through layer.
+
+Your own opaque layer never blocks your own hit regions declared at the
+layer's `z_index`: a hit region rides the layer it accompanies (declare the
+region's `z_index` equal to the layer's z, as in a full-viewport modal with
+a `z_index: 100` layer and a `z_index: 100` hit region). Within one
+widget's same-z stack, only an AUTHORED within-z order
+(`PaintLayerKey::ordered(z, order)`) fronts a lower declared `paint_order`
+— overlapping card stacks keep absorbing presses for the cards beneath
+them. A press over an opaque layer that reaches NO hit region is consumed,
+and the backend records refusal evidence naming the blocking layer
+(inspect it via the `diagnostics` probe kind or the physical-control
+reply's `post_hoc_diagnosis` attachment) — blocked presses never vanish
+silently.
 
 Worked example: the movable overlays in the same `view.rs` (pointer-opaque,
 wheel-transparent `keyed_layer`s, drag capture, and the layer clip that

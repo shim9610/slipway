@@ -55,6 +55,10 @@ const CANONICAL_ANCHORS: &[(&str, &str)] = &[
         "Painting a shape or text is never enough to make it interactive.",
     ),
     (
+        "scroll inducement rule",
+        "ask the scroll question explicitly: does any content",
+    ),
+    (
         "style rule",
         "Backend theme/defaults are not Slipway style authority.",
     ),
@@ -65,6 +69,10 @@ const CANONICAL_ANCHORS: &[(&str, &str)] = &[
     (
         "admission-refusal routing rule",
         "an admission refusal is not a doc gap",
+    ),
+    (
+        "gap landing-zone rule",
+        "records every gap in a `GAPS.md` file at its own project root",
     ),
 ];
 
@@ -134,9 +142,21 @@ const PINNED_COPIES: &[PinnedCopy] = &[
         must_link_canonical: false,
     },
     PinnedCopy {
+        page: "quickstart-authoring.md",
+        rule: "scroll inducement rule",
+        pinned: &["does any content exceed its container or the window?"],
+        must_link_canonical: false,
+    },
+    PinnedCopy {
         page: "api/README.md",
         rule: "facade/prelude rule",
         pinned: &["LLM workers should read [LLM contract checklist](../llm-contract-checklist.md)"],
+        must_link_canonical: true,
+    },
+    PinnedCopy {
+        page: "llm-entry.md",
+        rule: "gap landing-zone rule",
+        pinned: &["`GAPS.md` at your own project root"],
         must_link_canonical: true,
     },
 ];
@@ -175,6 +195,26 @@ const PHRASE_ALLOWLIST: &[(&str, &[&str])] = &[
             "authoring-layout.md",
             "tasks/mirror-web-ui.md",
         ],
+    ),
+    (
+        // scroll-inducement rule statements (roadmap Phase 6 item 2, NC-13)
+        "exceed its container or the window",
+        &["llm-contract-checklist.md", "quickstart-authoring.md"],
+    ),
+    (
+        // the overflow advisory's code: the pages allowed to teach it
+        "content_overflow_without_scroll_region",
+        &[
+            "llm-contract-checklist.md",
+            "quickstart-authoring.md",
+            "api/diagnostics.md",
+            "api/routing-and-scroll.md",
+        ],
+    ),
+    (
+        // gap landing-zone rule statements (roadmap Phase 6 item 6a, NC-12)
+        "GAPS.md",
+        &["llm-contract-checklist.md", "llm-entry.md"],
     ),
 ];
 

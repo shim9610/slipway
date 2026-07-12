@@ -47,6 +47,28 @@ pub struct ShowcaseState {
     /// "no frame presented yet"; every consumer unions it with authored
     /// constants so the degenerate value stays admissible.
     pub viewport: Size,
+    /// PATTERN: measurement-truth projection
+    /// (`SlipwayApp::project_text_metrics`,
+    /// docs/public/api/backends.md "Text Wrap and Alignment"). The input
+    /// card's window-size badge label MEASURED by the presenting
+    /// backend's real text layout, written by the runtime-invoked hook in
+    /// `communication.rs`. The paint site sizes the badge rect to
+    /// `size` — never to an estimated character width (the NC-4/NC-14
+    /// anti-pattern this replaces). `None` means "no valid measurement
+    /// yet" (no frame presented, or the provider refused) and the badge
+    /// is honestly not painted.
+    pub window_badge: Option<MeasuredLabel>,
+}
+
+/// A label together with its backend-measured laid-out size — the value
+/// shape the measurement projection writes and paint consumes. The style
+/// used to measure MUST be the style the paint op declares
+/// (`badge_text()`), or the measured size describes different pixels
+/// than the ones presented.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeasuredLabel {
+    pub text: String,
+    pub size: Size,
 }
 
 impl Default for ShowcaseState {
@@ -62,6 +84,7 @@ impl Default for ShowcaseState {
                 width: 0.0,
                 height: 0.0,
             },
+            window_badge: None,
         }
     }
 }
@@ -338,7 +361,7 @@ pub fn page_max_scroll_y(viewport: Size) -> f32 {
     (APP_ROOT_HEIGHT - viewport.height).max(0.0)
 }
 pub const LIST_CARD_HEIGHT: f32 = 120.0;
-pub const INPUT_CARD_HEIGHT: f32 = 72.0;
+pub const INPUT_CARD_HEIGHT: f32 = 96.0;
 pub const OVERLAY_CARD_HEIGHT: f32 = 160.0;
 pub const NESTED_CARD_HEIGHT: f32 = 176.0;
 
@@ -347,7 +370,7 @@ pub const NESTED_CARD_HEIGHT: f32 = 176.0;
 /// `communication.rs::layout_plan` produces — the roaming allowance below
 /// translates the root view area into overlay-card-local space with this.
 pub const OVERLAY_CARD_ROOT_TOP: f32 =
-    CARD_TOP + LIST_CARD_HEIGHT + CARD_GAP + INPUT_CARD_HEIGHT + CARD_GAP; // 228
+    CARD_TOP + LIST_CARD_HEIGHT + CARD_GAP + INPUT_CARD_HEIGHT + CARD_GAP; // 252
 
 /// Height of the four stacked cards' column (top margin + four heights +
 /// three gaps + bottom margin). MUST agree with
@@ -365,7 +388,7 @@ pub const APP_ROOT_HEIGHT: f32 = CARD_TOP
     + OVERLAY_CARD_HEIGHT
     + CARD_GAP
     + NESTED_CARD_HEIGHT
-    + CARD_TOP; // 590
+    + CARD_TOP; // 614
 
 /// Card height per widget id — the single source `layout_plan`
 /// (communication.rs) and each widget's own `layout` (view.rs) both read.
@@ -461,6 +484,22 @@ pub fn list_rows_band(card_width: f32) -> Rect {
 pub const INPUT_FIELD_TOP: f32 = 32.0;
 pub const INPUT_FIELD_HEIGHT: f32 = 28.0;
 pub const INPUT_INSET_X: f32 = 12.0;
+/// Meta row under the text field: the measurement-sized window badge on
+/// the left, the no-wrap CJK label on the right (both text-presentation
+/// PATTERNS, docs/public/api/backends.md "Text Wrap and Alignment").
+pub const INPUT_META_TOP: f32 = 66.0;
+pub const INPUT_META_HEIGHT: f32 = 22.0;
+/// Horizontal padding INSIDE the badge around its measured label (each
+/// side). The badge's total width derives from the MEASURED label width
+/// plus this constant — the whole point of the measurement channel.
+pub const INPUT_BADGE_PAD_X: f32 = 8.0;
+/// Declared width of the no-wrap CJK label's rect — deliberately
+/// NARROWER than the laid-out text so the `TextWrap::None` contract is
+/// visible: one line, clipped at the rect edge (word wrap would break it
+/// into rows and overflow the meta row).
+pub const INPUT_NOWRAP_LABEL_WIDTH: f32 = 132.0;
+/// The no-wrap demo label (audit NC-4's forced-CJK-wrap shape).
+pub const INPUT_NOWRAP_LABEL: &str = "줄바꿈 없이 한 줄로 유지되는 한국어 라벨";
 
 pub fn input_field_rect(card_width: f32) -> Rect {
     Rect {
@@ -471,6 +510,54 @@ pub fn input_field_rect(card_width: f32) -> Rect {
         size: Size {
             width: (card_width - 2.0 * INPUT_INSET_X).max(1.0),
             height: INPUT_FIELD_HEIGHT,
+        },
+    }
+}
+
+/// The window badge label for the CURRENT projected viewport — built
+/// here so the measuring hook (`communication.rs`) and any consumer
+/// derive the identical string from the identical state.
+pub fn window_badge_label(viewport: Size) -> String {
+    format!(
+        "{}×{}",
+        viewport.width.round() as i64,
+        viewport.height.round() as i64
+    )
+}
+
+/// The badge rect: sized to the MEASURED label (width + padding, meta-row
+/// height), clamped to the card's inset width so a degenerate measurement
+/// cannot push paint outside the card. This is the measurement pattern's
+/// core line: geometry from `MeasuredLabel::size`, not from a per-glyph
+/// width guess.
+pub fn input_badge_rect(card_width: f32, measured: Size) -> Rect {
+    let width = (measured.width.ceil() + 2.0 * INPUT_BADGE_PAD_X)
+        .min((card_width - 2.0 * INPUT_INSET_X).max(1.0))
+        .max(1.0);
+    Rect {
+        origin: Point {
+            x: INPUT_INSET_X,
+            y: INPUT_META_TOP,
+        },
+        size: Size {
+            width,
+            height: INPUT_META_HEIGHT,
+        },
+    }
+}
+
+/// The no-wrap CJK label's rect: right-aligned in the meta row at a
+/// FIXED width narrower than the laid-out text (see
+/// [`INPUT_NOWRAP_LABEL_WIDTH`]).
+pub fn input_nowrap_label_rect(card_width: f32) -> Rect {
+    Rect {
+        origin: Point {
+            x: (card_width - INPUT_INSET_X - INPUT_NOWRAP_LABEL_WIDTH).max(INPUT_INSET_X),
+            y: INPUT_META_TOP,
+        },
+        size: Size {
+            width: INPUT_NOWRAP_LABEL_WIDTH,
+            height: INPUT_META_HEIGHT,
         },
     }
 }
@@ -914,6 +1001,22 @@ pub fn header_text() -> TextStyle {
 
 pub fn row_text() -> TextStyle {
     TextStyle::plain().with_font_size(12.0)
+}
+
+/// The window badge's style token — the ONE style both the measuring
+/// hook (`communication.rs`) and the badge paint op (`view.rs`) use, so
+/// the measured size describes exactly the presented pixels. `.centered()`
+/// is the button-label pattern (full badge rect as the op bounds);
+/// alignment does not change the measured size.
+pub fn badge_text() -> TextStyle {
+    row_text().centered()
+}
+
+/// The no-wrap CJK label's style token: `.no_wrap()` declares the
+/// single-line contract (`TextWrap::None`) — the NC-4 opt-out. Without
+/// it the label word-wraps at the rect width into stacked rows.
+pub fn nowrap_label_text() -> TextStyle {
+    row_text().no_wrap()
 }
 
 /// The text-input token: explicit family and size, never a backend

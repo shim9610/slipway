@@ -817,6 +817,87 @@ impl Default for BaselineShift {
     }
 }
 
+/// Horizontal anchoring of painted text INSIDE [`PaintOp::Text`]'s
+/// `bounds`, carried by [`TextStyle::align_x`]. WHEN: set it via
+/// [`TextStyle::with_align_x`] (or [`TextStyle::centered`] for the
+/// button-label pattern) — leave it unset (`Start`) unless a UX decision
+/// needs a non-left anchor. LOAD-BEARING on both visible backends; the
+/// authored-controls principle (ADR-0002): explicit when declared,
+/// automatic when unspecified, default byte-identical. Alignment moves the
+/// laid-out text WITHIN the declared rect — it never grows the rect, and
+/// wrapping still happens at the rect width first (word wrap is currently
+/// hardcoded per backend). Failure mode: none at admission — alignment is
+/// presentation intent, not geometry, so no `view_contract.*` code guards
+/// it; pin the declared value with a declaration-level test (the reference
+/// example's `overlay_roam_title_declares_centered_alignment`). Contract:
+/// `docs/public/api/backends.md` ("Text Wrap and Alignment").
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextAlignX {
+    /// Anchor the text at the left edge of `bounds` (the default):
+    /// byte-identical to the historical hardcoded left/top presentation.
+    #[default]
+    Start,
+    /// Center the laid-out text horizontally within `bounds`; wrapped
+    /// lines are centered per line on both visible backends.
+    Center,
+    /// Anchor the text at the right edge of `bounds`; wrapped lines are
+    /// right-aligned per line on both visible backends.
+    End,
+}
+
+/// Vertical anchoring of painted text INSIDE [`PaintOp::Text`]'s
+/// `bounds`, carried by [`TextStyle::align_y`]. WHEN: set it via
+/// [`TextStyle::with_align_y`] (or [`TextStyle::centered`]) — leave it
+/// unset (`Top`) unless a UX decision needs a non-top anchor.
+/// LOAD-BEARING on both visible backends; default byte-identical
+/// (ADR-0002 authored-controls principle). The whole laid-out text BLOCK
+/// (all wrapped lines) is anchored; text taller than `bounds` is still
+/// clipped to the rect exactly as before. Failure mode: none at
+/// admission — presentation intent, not geometry; pin declared values
+/// with a declaration-level test. Contract:
+/// `docs/public/api/backends.md` ("Text Wrap and Alignment").
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextAlignY {
+    /// Anchor the text block at the top edge of `bounds` (the default):
+    /// byte-identical to the historical hardcoded left/top presentation.
+    #[default]
+    Top,
+    /// Center the laid-out text block vertically within `bounds`.
+    Center,
+    /// Anchor the text block at the bottom edge of `bounds`.
+    Bottom,
+}
+
+/// Per-op soft-wrap declaration for painted text INSIDE
+/// [`PaintOp::Text`]'s `bounds`, carried by [`TextStyle::wrap`]. WHEN:
+/// declare [`TextWrap::None`] via [`TextStyle::with_wrap`] (or the
+/// [`TextStyle::no_wrap`] convenience) when a label must stay on ONE line
+/// — CJK headers, tabs, badges — instead of word-wrapping at the rect
+/// width (audit NC-4: the consumer fought forced CJK wrapping through
+/// eight artifact rounds because this opt-out did not exist). Unset =
+/// [`TextWrap::Word`], byte-identical to the historical hardcoded word
+/// wrap. LOAD-BEARING on both visible backends and the canonical debug
+/// renderer. The two modes are the honest parity-equivalent subset of
+/// the backends' native wrap options (iced `Wrapping`, egui
+/// `TextWrapping`); glyph-level wrapping is deliberately not exposed
+/// (ADR-0004). In BOTH modes an explicit `\n` still breaks the line and
+/// clipping to the rect is unchanged — a `None` line wider than `bounds`
+/// clips at the rect edge around the declared [`TextAlignX`] anchor.
+/// Failure mode: none at admission — presentation intent, not geometry;
+/// pin declared values with a declaration-level test. Contract:
+/// `docs/public/api/backends.md` ("Text Wrap and Alignment").
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TextWrap {
+    /// Word-wrap at the rect width (the default): byte-identical to the
+    /// historical hardcoded `Wrapping::Word` presentation.
+    #[default]
+    Word,
+    /// No soft wrapping: the text lays out as one line per explicit `\n`
+    /// and clips at the rect edge (single-line contract on both visible
+    /// backends and the debug renderer).
+    None,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
     pub font_family: String,
@@ -825,6 +906,15 @@ pub struct TextStyle {
     pub font_style: FontStyle,
     pub decoration: TextDecoration,
     pub baseline: BaselineShift,
+    /// Horizontal anchoring within the op's `bounds`; `Start` = the
+    /// historical left anchoring. See [`TextAlignX`].
+    pub align_x: TextAlignX,
+    /// Vertical anchoring within the op's `bounds`; `Top` = the
+    /// historical top anchoring. See [`TextAlignY`].
+    pub align_y: TextAlignY,
+    /// Soft-wrap mode within the op's `bounds`; `Word` = the historical
+    /// hardcoded word wrap at the rect width. See [`TextWrap`].
+    pub wrap: TextWrap,
 }
 
 impl TextStyle {
@@ -836,6 +926,9 @@ impl TextStyle {
             font_style: FontStyle::default(),
             decoration: TextDecoration::default(),
             baseline: BaselineShift::default(),
+            align_x: TextAlignX::default(),
+            align_y: TextAlignY::default(),
+            wrap: TextWrap::default(),
         }
     }
 
@@ -871,6 +964,55 @@ impl TextStyle {
     pub fn with_baseline(mut self, baseline: BaselineShift) -> Self {
         self.baseline = baseline;
         self
+    }
+
+    /// Declare the horizontal anchoring of the text within the op's
+    /// `bounds`. WHEN: a label must not sit at the left edge (tabs,
+    /// button captions, numeric columns). Unset = [`TextAlignX::Start`],
+    /// byte-identical to the pre-alignment presentation. See
+    /// [`TextAlignX`] for the per-variant contract.
+    pub fn with_align_x(mut self, align_x: TextAlignX) -> Self {
+        self.align_x = align_x;
+        self
+    }
+
+    /// Declare the vertical anchoring of the text within the op's
+    /// `bounds`. WHEN: a label must not hug the top edge (title bars,
+    /// badges). Unset = [`TextAlignY::Top`], byte-identical to the
+    /// pre-alignment presentation. See [`TextAlignY`] for the
+    /// per-variant contract.
+    pub fn with_align_y(mut self, align_y: TextAlignY) -> Self {
+        self.align_y = align_y;
+        self
+    }
+
+    /// The button-label pattern: center the text BOTH ways within the
+    /// op's `bounds` (`align_x: Center, align_y: Center` in one call).
+    /// Declare the FULL control rect as the text op's `bounds` and let
+    /// the backends center inside it — do not hand-compute insets from
+    /// estimated glyph widths (the NC-14 anti-pattern). Contract:
+    /// `docs/public/api/backends.md` ("Text Wrap and Alignment").
+    pub fn centered(self) -> Self {
+        self.with_align_x(TextAlignX::Center)
+            .with_align_y(TextAlignY::Center)
+    }
+
+    /// Declare the soft-wrap mode within the op's `bounds`. WHEN: a
+    /// label must not word-wrap at the rect width (CJK headers, tabs,
+    /// badges — pass [`TextWrap::None`]). Unset = [`TextWrap::Word`],
+    /// byte-identical to the historical hardcoded word wrap. See
+    /// [`TextWrap`] for the per-variant contract.
+    pub fn with_wrap(mut self, wrap: TextWrap) -> Self {
+        self.wrap = wrap;
+        self
+    }
+
+    /// The single-line convenience: `with_wrap(TextWrap::None)`. The
+    /// text lays out as one line (explicit `\n` still breaks) and clips
+    /// at the rect edge around the declared alignment anchor. Contract:
+    /// `docs/public/api/backends.md` ("Text Wrap and Alignment").
+    pub fn no_wrap(self) -> Self {
+        self.with_wrap(TextWrap::None)
     }
 }
 
@@ -1795,7 +1937,13 @@ pub enum Capability {
     PointerInput,
     /// LOAD-BEARING: requires an enabled focus region
     /// ([`focus_region_from_focus_capability`]) or admission refuses with
-    /// `view_contract.focus_capability_missing_focus_region`.
+    /// `view_contract.focus_capability_missing_focus_region`. Delivery
+    /// caveat (NC-10): with only PLAIN focus regions, keyboard events are
+    /// undeliverable on the iced visible backend (real ingress and
+    /// physical control both reach text-edit focus regions only) —
+    /// admission warns with
+    /// `view_contract.keyboard_capability_plain_focus_delivery_limited`;
+    /// see `docs/public/api/backends.md` ("Keyboard Delivery").
     KeyboardInput,
     /// LOAD-BEARING: requires an enabled text-edit focus region
     /// ([`text_edit_focus_region_from_capability`]) or admission refuses
@@ -3342,7 +3490,23 @@ pub struct PaintOrderDeclaration {
     pub mode: PaintOrderMode,
     pub z_index: i32,
     pub order: Option<usize>,
+    /// Declares that this view's PAINT may overlap other painted content
+    /// (the overlay/popup intent flag). PAINT allowance only: it does NOT
+    /// accept hit ambiguity — enabled hit regions that overlap with an
+    /// identical [`HitRegionOrder`] still refuse admission with
+    /// `view_contract.ambiguous_hit_overlap` (NC-11 split: paint-overlap
+    /// allowance and hit-ambiguity acceptance are separate declarations;
+    /// see [`Self::allow_ambiguous_hits`]).
     pub allow_overlap: bool,
+    /// Accepts equal-order overlapping enabled hit regions, silencing
+    /// `view_contract.ambiguous_hit_overlap` for this view. Equal orders
+    /// are NOT front of each other, so which region receives a pointer
+    /// event in the shared area is arbitrary — set this ONLY when that
+    /// genuinely does not matter. The ordinary fix is a distinct
+    /// [`HitRegionOrder`] per region (the `order` argument of
+    /// [`hit_region_from_pointer_capability`]). Defaults to `false` in
+    /// every constructor.
+    pub allow_ambiguous_hits: bool,
     pub allow_overflow_paint: bool,
     pub overflow_bounds: Option<TargetLocalRect>,
     pub diagnostics: Vec<Diagnostic>,
@@ -3356,6 +3520,7 @@ impl PaintOrderDeclaration {
             z_index: 0,
             order: None,
             allow_overlap: false,
+            allow_ambiguous_hits: false,
             allow_overflow_paint: false,
             overflow_bounds: None,
             diagnostics: Vec::new(),
@@ -3369,6 +3534,7 @@ impl PaintOrderDeclaration {
             z_index,
             order: None,
             allow_overlap: false,
+            allow_ambiguous_hits: false,
             allow_overflow_paint: false,
             overflow_bounds: None,
             diagnostics: Vec::new(),
@@ -3382,6 +3548,7 @@ impl PaintOrderDeclaration {
             z_index,
             order: Some(order),
             allow_overlap: false,
+            allow_ambiguous_hits: false,
             allow_overflow_paint: false,
             overflow_bounds: None,
             diagnostics: Vec::new(),
@@ -3487,6 +3654,7 @@ pub fn view_definition_contract_diagnostics(view: &ViewDefinition) -> Vec<Diagno
     validate_focus_regions(view, &geometry_index, &mut diagnostics);
     validate_scroll_regions(view, &geometry_index, &mut diagnostics);
     validate_paint_bounds(view, &mut diagnostics);
+    validate_content_overflow_scroll_coverage(view, &mut diagnostics);
     validate_view_contract_diagnostics(view, &mut diagnostics);
 
     diagnostics
@@ -4356,6 +4524,56 @@ pub fn compare_hit_region_order(left: &HitRegionOrder, right: &HitRegionOrder) -
 /// other, matching both backends' occlusion filters.
 pub fn hit_region_order_is_front_of(front: &HitRegionOrder, back: &HitRegionOrder) -> bool {
     compare_hit_region_order(front, back) == Ordering::Greater
+}
+
+/// Whether a pointer-opaque paint occluder blocks a declared hit region.
+/// LOAD-BEARING pointer-channel occlusion rule (NC-2 repair).
+///
+/// WHEN: every pointer-channel comparison of an opaque paint layer against
+/// a declared hit region — the derived dispatch graph's pointer `Occlusion`
+/// edges and the iced backend's pointer occlusion filter both call this, so
+/// the declared-route oracle and live dispatch cannot drift apart.
+///
+/// Rule: a FOREIGN occluder (different owning widget) blocks exactly when
+/// its order key is strictly front of the region
+/// ([`hit_region_order_is_front_of`]) — unchanged stacking semantics. A
+/// SAME-OWNER occluder at the region's own `z_index` blocks only when the
+/// occluding layer carries an AUTHORED within-z order
+/// (`PaintLayerKey::ordered` -> `occluder_authored_z_order`) strictly
+/// greater than the region's declared `paint_order` — the authored-stack
+/// case (e.g. overlapping overlay cards of one widget). A same-owner
+/// same-z layer WITHOUT an authored order never blocks: the hit region
+/// rides the layer it accompanies (the pointer-opaque overlay recipe,
+/// `docs/public/api/routing-and-scroll.md`). Same-owner occluders at a
+/// DIFFERENT z compare by the full key like foreign ones (a deliberately
+/// higher-z own layer still covers the widget's own lower-z regions).
+///
+/// Failure mode the same-owner rule repairs: occluder order keys carry
+/// paint-unit tie-break fields (defaulted unit order and traversal — the
+/// mounted child's SLOT ORDINAL; see [`paint_unit_sort_key`]), a DIFFERENT
+/// space from the author-declared [`HitRegionOrder`] tie-break fields.
+/// Without the exemption an authored opaque overlay (layer z 100 + own
+/// full-bounds hit region z 100) is occluded by ITSELF whenever its slot
+/// ordinal exceeds the declared `paint_order`/`traversal_order`, and every
+/// press over it drops (live-reproduced: the 2026-07-12 naive-consumer
+/// audit's NC-2 modal). A press blocked by an occluder that DOES front the
+/// selected region is still consumed, and the iced backend constructs
+/// refusal evidence naming the occluder (`refusal_reason`) instead of
+/// silence. The egui backend expresses the same-owner rule in its
+/// allocation-key space, where both sides of the comparison are paint-unit
+/// keys (`egui_occlusion_blocks_region`).
+pub fn paint_occlusion_blocks_declared_hit_region(
+    occluder_target: &WidgetId,
+    occluder_order: &HitRegionOrder,
+    occluder_authored_z_order: Option<usize>,
+    region_target: &WidgetId,
+    region_order: &HitRegionOrder,
+) -> bool {
+    if occluder_target == region_target && occluder_order.z_index == region_order.z_index {
+        return occluder_authored_z_order
+            .is_some_and(|authored| authored > region_order.paint_order);
+    }
+    hit_region_order_is_front_of(occluder_order, region_order)
 }
 
 pub fn select_declared_hit_region_at_point<'a>(
@@ -5583,15 +5801,19 @@ pub struct DispatchGraph {
 
 /// Occlusion input for dispatch-graph derivation: one pointer-opaque paint
 /// layer in root-local space. `order` is the paint-unit sort key of the
-/// layer ([`paint_unit_sort_key`]), `blocks_wheel` is the resolved
-/// wheel-channel opacity ([`paint_layer_blocks_wheel`]). Pointer-opaque is
-/// implied: both backends only materialize occluders for pointer-opaque
-/// layers.
+/// layer ([`paint_unit_sort_key`]), `authored_z_order` is the layer's
+/// AUTHORED within-z order when one was declared
+/// ([`paint_unit_authored_z_order`] — the only tie-break component
+/// same-owner occlusion comparisons may use, NC-2), `blocks_wheel` is the
+/// resolved wheel-channel opacity ([`paint_layer_blocks_wheel`]).
+/// Pointer-opaque is implied: both backends only materialize occluders for
+/// pointer-opaque layers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DispatchGraphOcclusionRegion {
     pub target: WidgetId,
     pub address: Option<WidgetSlotAddress>,
     pub order: HitRegionOrder,
+    pub authored_z_order: Option<usize>,
     pub bounds: Rect,
     pub blocks_wheel: bool,
 }
@@ -5627,6 +5849,7 @@ pub fn dispatch_graph_occlusion_regions_for_view(
                 paint_order: key.1,
                 traversal_order: key.2,
             },
+            paint_unit_authored_z_order(unit),
             None,
             &mut regions,
         );
@@ -5764,6 +5987,7 @@ impl<ExternalState, AppMessage> SlipwayWidgetListVisitor<ExternalState, AppMessa
                     paint_order: key.1,
                     traversal_order: key.2,
                 },
+                paint_unit_authored_z_order(unit),
                 None,
                 self.regions,
             );
@@ -5779,6 +6003,7 @@ fn collect_dispatch_graph_occlusion_regions(
     target: &WidgetId,
     address: Option<&WidgetSlotAddress>,
     order: HitRegionOrder,
+    authored_z_order: Option<usize>,
     clip: Option<Rect>,
     out: &mut Vec<DispatchGraphOcclusionRegion>,
 ) {
@@ -5794,6 +6019,7 @@ fn collect_dispatch_graph_occlusion_regions(
                     target,
                     address,
                     order.clone(),
+                    authored_z_order,
                     dispatch_graph_combine_clips(clip, group_clip.as_ref().map(|clip| clip.bounds)),
                     out,
                 );
@@ -5815,6 +6041,7 @@ fn collect_dispatch_graph_occlusion_regions(
                         target: target.clone(),
                         address: address.cloned(),
                         order: order.clone(),
+                        authored_z_order,
                         bounds,
                         blocks_wheel: paint_layer_blocks_wheel(
                             *input_transparency,
@@ -5827,6 +6054,7 @@ fn collect_dispatch_graph_occlusion_regions(
                     target,
                     address,
                     order.clone(),
+                    authored_z_order,
                     active_clip,
                     out,
                 );
@@ -6178,14 +6406,23 @@ pub fn derive_dispatch_graph_with_geometry_index(
     }
 
     // Occlusion: occluder overlaps the region's root-local rect and is
-    // strictly front of it. Pointer channel targets hit regions; wheel
-    // channel targets wheel-consuming scroll regions and additionally
-    // requires the occluder's resolved wheel opacity.
+    // strictly front of it. Pointer channel targets hit regions through
+    // [`paint_occlusion_blocks_declared_hit_region`] (same-owner same-z
+    // exemption, NC-2) — the same predicate the iced pointer occlusion
+    // filter dispatches through; wheel channel targets wheel-consuming
+    // scroll regions and additionally requires the occluder's resolved
+    // wheel opacity.
     for (occlusion, occlusion_id) in occlusion_regions.iter().zip(&occlusion_node_ids) {
         for (region, root_rect) in hit_regions.iter().zip(&hit_root_rects) {
             if region.enabled
                 && dispatch_graph_intersect_rects(occlusion.bounds, *root_rect).is_some()
-                && hit_region_order_is_front_of(&occlusion.order, &region.order)
+                && paint_occlusion_blocks_declared_hit_region(
+                    &occlusion.target,
+                    &occlusion.order,
+                    occlusion.authored_z_order,
+                    &region.target,
+                    &region.order,
+                )
             {
                 edges.push(DispatchGraphEdge {
                     kind: DispatchGraphEdgeKind::Occlusion,
@@ -6388,7 +6625,13 @@ fn validate_hit_regions(
         }
     }
 
-    if view.paint_order.allow_overlap {
+    // NC-11 split (roadmap Phase 6 item 5): paint-overlap allowance
+    // (`allow_overlap`) is a PAINT declaration and must not disarm the
+    // hit-ambiguity guard — the naive-consumer modal set it for paint
+    // reasons and a genuine hit tie on such a view shipped unseen. Only
+    // the explicit `allow_ambiguous_hits` acceptance silences this check
+    // (the wheel twin `ambiguous_wheel_overlap` never had a disarm).
+    if view.paint_order.allow_ambiguous_hits {
         return;
     }
 
@@ -6420,7 +6663,7 @@ fn validate_hit_regions(
                     Some(view.target.clone()),
                     "view_contract.ambiguous_hit_overlap",
                     format!(
-                        "Enabled hit regions overlap with identical ordering: `{}` and `{}` share HitRegionOrder {{ z_index: {}, paint_order: {}, traversal_order: {} }}; give each region a distinct HitRegionOrder (the `order` argument of hit_region_from_pointer_capability), declare overlap/layering explicitly, or make the hit geometry disjoint",
+                        "Enabled hit regions overlap with identical ordering: `{}` and `{}` share HitRegionOrder {{ z_index: {}, paint_order: {}, traversal_order: {} }}; give each region a distinct HitRegionOrder (the `order` argument of hit_region_from_pointer_capability) or make the hit geometry disjoint. Paint-overlap allowance (allow_overlap) does not accept hit ambiguity; only PaintOrderDeclaration::allow_ambiguous_hits does, and it makes pointer selection in the shared area arbitrary",
                         left.id.as_str(),
                         right.id.as_str(),
                         left.order.z_index,
@@ -6534,6 +6777,33 @@ fn validate_view_capabilities(
             Some(view.target.clone()),
             "view_contract.text_input_missing_text_edit_focus_region",
             "Widgets declaring Capability::TextInput must expose at least one enabled focus region with a TextEditRegionDeclaration; use text_edit_focus_region_from_capability or remove TextInput",
+        ));
+    }
+
+    // NC-10 deliverability advisory (roadmap Phase 6 item 5): declaring
+    // KeyboardInput on plain (non-text-edit) focus regions admits, but the
+    // iced visible backend delivers keyboard input ONLY to text-edit focus
+    // regions — real ingress routes exclusively through text-edit regions
+    // and physical control refuses with
+    // `native-physical-control-text-focus-widget-unavailable` — so the
+    // widget's keyboard handlers are unreachable there (egui delivers once
+    // the region is focused). Warning, not blocking: the capability IS
+    // deliverable on egui. Suppressed when any enabled text-edit focus
+    // region exists (keyboard has a deliverable target on both backends)
+    // and when there is no enabled focus region at all (the blocking
+    // `focus_capability_missing_focus_region` error already owns that
+    // shape).
+    if capabilities.contains(&Capability::KeyboardInput)
+        && view.focus_regions.iter().any(|region| region.enabled)
+        && !view
+            .focus_regions
+            .iter()
+            .any(|region| region.enabled && region.text_edit.is_some())
+    {
+        diagnostics.push(Diagnostic::warning(
+            Some(view.target.clone()),
+            "view_contract.keyboard_capability_plain_focus_delivery_limited",
+            "Capability::KeyboardInput is declared with only plain (non-text-edit) focus regions: the iced backend delivers keyboard events exclusively to text-edit focus regions — real keyboard input never reaches a plain focus region there, and physical control refuses with native-physical-control-text-focus-widget-unavailable, so keyboard handlers on this widget cannot run or be test-exercised on iced (egui delivers after the region gains focus). Declare a text-edit focus region (text_edit_focus_region_from_capability) if keyboard delivery must work on every visible backend, or treat the handler as egui-only (docs/public/api/backends.md, Keyboard Delivery)",
         ));
     }
 
@@ -6957,6 +7227,97 @@ fn validate_paint_bounds(view: &ViewDefinition, diagnostics: &mut Vec<Diagnostic
     }
 }
 
+/// NC-13 inducement advisory (LLM-ergonomics roadmap Phase 6 item 2):
+/// painted content that extends beyond the view's own container — the layout
+/// bounds intersected with the frame viewport — needs a covering enabled
+/// scroll region or an intentional overflow declaration, or the user simply
+/// cannot reach it. Emits ONE
+/// `view_contract.content_overflow_without_scroll_region` warning
+/// (advisory, NON-blocking: admission still passes) when the CLIP-AWARE
+/// painted extent leaves the container and no enabled scroll region's
+/// `content_bounds` covers the overflowing ops.
+///
+/// Deliberately silent for the intentional-overflow patterns:
+///
+/// * a declared `PaintOrderDeclaration::overflow_bounds` (the Step-210
+///   roaming-overlay pattern legitimately paints outside layout; paint
+///   outside the declared rect is already the
+///   `view_contract.paint_bounds_outside_overflow_bounds` error);
+/// * overflow a group/layer/shape clip already clips — the effective extent
+///   is the clip intersection ([`collect_effective_paint_extents`]), so
+///   clipped content never counts as reachable overflow;
+/// * overflow covered by an enabled scroll region's `content_bounds` —
+///   scrolling is exactly how the user reaches it.
+fn validate_content_overflow_scroll_coverage(
+    view: &ViewDefinition,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !rect_is_valid(view.layout.bounds) {
+        return;
+    }
+    // Intentional-overflow declarations (Step 210): `overflow_bounds` is the
+    // author's explicit allowance; `allow_overflow_paint` without bounds is
+    // already the `view_contract.overflow_bounds_missing` error.
+    if view.paint_order.allow_overflow_paint || view.paint_order.overflow_bounds.is_some() {
+        return;
+    }
+
+    let mut container: Rect = view.layout.bounds.into_rect();
+    if rect_is_valid(view.frame.viewport)
+        && view.frame.viewport.size.width > 0.0
+        && view.frame.viewport.size.height > 0.0
+        && let Some(visible) = rect_intersection(container, view.frame.viewport)
+    {
+        container = visible;
+    }
+
+    let mut extents = Vec::new();
+    for op in &view.paint {
+        collect_effective_paint_extents(op, &mut extents);
+    }
+
+    let mut painted_extent: Option<Rect> = None;
+    let mut any_uncovered = false;
+    for bounds in extents {
+        painted_extent = Some(match painted_extent {
+            Some(existing) => bounding_union_rect(existing, bounds),
+            None => bounds,
+        });
+        if rect_contains_rect(container, bounds) {
+            continue;
+        }
+        let covered = view.scroll_regions.iter().any(|region| {
+            region.enabled
+                && rect_is_valid(region.content_bounds)
+                && rect_contains_rect(region.content_bounds, bounds)
+        });
+        if !covered {
+            any_uncovered = true;
+        }
+    }
+
+    let Some(extent) = painted_extent else {
+        return;
+    };
+    if !any_uncovered {
+        return;
+    }
+    let overflow = (rect_max_x(extent) - rect_max_x(container))
+        .max(rect_max_y(extent) - rect_max_y(container))
+        .max(container.origin.x - extent.origin.x)
+        .max(container.origin.y - extent.origin.y)
+        .max(0.0);
+    diagnostics.push(Diagnostic::warning(
+        Some(view.target.clone()),
+        "view_contract.content_overflow_without_scroll_region",
+        format!(
+            "content extends {overflow} px beyond the view's bounds {} (painted extent {}) and no enabled scroll region covers the overflow; declare a scroll region (`scroll_region_from_scrollable_capability`, `_with_order` when regions can overlap, app-level page pattern `SlipwayApp::app_scroll_regions` — docs/public/api/routing-and-scroll.md) or clip intentionally (group/layer clip, or `PaintOrderDeclaration::with_overflow_bounds` for deliberate overflow)",
+            contract_rect_display(container),
+            contract_rect_display(extent),
+        ),
+    ));
+}
+
 fn validate_view_contract_diagnostics(view: &ViewDefinition, diagnostics: &mut Vec<Diagnostic>) {
     for diagnostic in &view.diagnostics {
         if diagnostic.code.starts_with("view_contract.")
@@ -6999,6 +7360,71 @@ fn collect_paint_bounds(op: &PaintOp, bounds: &mut Vec<Rect>) {
             }
         }
     }
+}
+
+/// Clip-aware painted extents for the NC-13 overflow advisory
+/// ([`validate_content_overflow_scroll_coverage`]): a clipped shape
+/// contributes only the shape-clip intersection, and ops under a clipped
+/// group/layer contribute only their intersection with that clip — clipped
+/// overflow never reaches pixels, so it never counts as unreachable content.
+/// Unlike [`collect_paint_bounds`], clip rects themselves are NOT extents.
+fn collect_effective_paint_extents(op: &PaintOp, extents: &mut Vec<Rect>) {
+    match op {
+        PaintOp::Fill { shape, .. } | PaintOp::Stroke { shape, .. } => {
+            if !rect_is_valid(shape.bounds) {
+                return;
+            }
+            match &shape.clip {
+                Some(clip) if rect_is_valid(clip.bounds) => {
+                    if let Some(visible) = rect_intersection(shape.bounds, clip.bounds) {
+                        extents.push(visible);
+                    }
+                }
+                _ => extents.push(shape.bounds),
+            }
+        }
+        PaintOp::Text { bounds, .. } => {
+            if rect_is_valid(*bounds) {
+                extents.push(*bounds);
+            }
+        }
+        PaintOp::Group { clip, ops, .. } | PaintOp::Layer { clip, ops, .. } => {
+            let mut inner = Vec::new();
+            for op in ops {
+                collect_effective_paint_extents(op, &mut inner);
+            }
+            match clip {
+                Some(clip) if rect_is_valid(clip.bounds) => {
+                    for bounds in inner {
+                        if let Some(visible) = rect_intersection(bounds, clip.bounds) {
+                            extents.push(visible);
+                        }
+                    }
+                }
+                _ => extents.extend(inner),
+            }
+        }
+    }
+}
+
+/// The overlapping region of two rects, `None` when they are disjoint.
+fn rect_intersection(left: impl Into<Rect>, right: impl Into<Rect>) -> Option<Rect> {
+    let left = left.into();
+    let right = right.into();
+    let x0 = left.origin.x.max(right.origin.x);
+    let y0 = left.origin.y.max(right.origin.y);
+    let x1 = rect_max_x(left).min(rect_max_x(right));
+    let y1 = rect_max_y(left).min(rect_max_y(right));
+    if x1 < x0 || y1 < y0 {
+        return None;
+    }
+    Some(Rect {
+        origin: Point { x: x0, y: y0 },
+        size: Size {
+            width: x1 - x0,
+            height: y1 - y0,
+        },
+    })
 }
 
 fn rect_is_valid(rect: impl Into<Rect>) -> bool {
@@ -7297,6 +7723,21 @@ pub fn paint_unit_sort_key(unit: &PaintUnit) -> (i32, usize, usize) {
             unit.order.order.unwrap_or(unit.traversal_order),
             unit.traversal_order,
         ),
+    }
+}
+
+/// The AUTHORED within-z order of a paint unit's layer, when the author
+/// declared one (`PaintLayerKey::ordered` / an explicit
+/// `PaintOrderDeclaration.order`). `None` for source-order units and for
+/// explicit layers keyed without an order (`PaintLayerKey::new`), whose
+/// sort-key tie-break fields are DEFAULTED from the unit traversal (the
+/// mounted slot ordinal) and therefore carry no authored meaning. Same-owner
+/// occlusion comparisons ([`paint_occlusion_blocks_declared_hit_region`])
+/// may only consult this authored component (NC-2).
+pub fn paint_unit_authored_z_order(unit: &PaintUnit) -> Option<usize> {
+    match unit.order.mode {
+        PaintOrderMode::SourceOrder => None,
+        PaintOrderMode::ExplicitLayered => unit.order.order,
     }
 }
 
@@ -7623,13 +8064,13 @@ pub fn apply_event_handling_declaration<M>(
         outcome.diagnostics.push(Diagnostic::warning(
             Some(target.clone()),
             EVENT_DECLARATION_HANDLER_IGNORED_DECLARED_HANDLED,
-            "Event disposition policy declared this event handled, but the widget handler returned ignored",
+            "Event disposition policy declared this event handled, but the widget handler returned ignored; author both from one table via event_handling_table! (or align the hand-written disposition)",
         ));
     } else if !declaration.disposition.final_disposition.handled && outcome.handled {
         outcome.diagnostics.push(Diagnostic::warning(
             Some(target),
             EVENT_DECLARATION_HANDLER_HANDLED_DECLARED_UNHANDLED,
-            "Widget handler handled an event that its disposition policy did not declare as handled",
+            "Widget handler handled an event that its disposition policy did not declare as handled; author both from one table via event_handling_table! (or align the hand-written disposition)",
         ));
     }
     if outcome.handled {
@@ -7693,6 +8134,218 @@ pub fn refuse_event_declared_unhandled<M>(
         probes: Vec::new(),
         diagnostics,
     }
+}
+
+/// Builds the standard single-step, target-phase
+/// [`EventPropagationEvidence`] from one `handled` decision:
+/// `propagate: !handled`, `default_action_allowed: true`, one `Target`
+/// stage step whose node is the route's last path entry.
+///
+/// WHEN: inside a hand-written [`SlipwayEventDispositionPolicy`] impl
+/// for the ordinary consume-or-ignore widget (the same shape
+/// [`event_handling_table!`] generates — prefer the table, which also
+/// derives `handled` itself). Failure mode of hand-building the evidence
+/// instead: a `final_disposition` that disagrees with the steps, or a
+/// `propagate` that silently swallows unhandled events; misdeclared
+/// handledness surfaces as `event_declaration.handler_ignored_declared_handled`
+/// / `event_declaration.handler_handled_declared_unhandled`.
+/// LOAD-BEARING: the physical dispatch path refuses declared-unhandled
+/// events before the handler runs. Docs: `docs/public/api/core.md`
+/// ("Interaction Declarations").
+pub fn target_event_disposition(
+    target: WidgetId,
+    event: &InputEvent,
+    route: &EventRoute,
+    handled: bool,
+) -> EventPropagationEvidence {
+    let disposition = EventDisposition {
+        handled,
+        propagate: !handled,
+        default_action_allowed: true,
+    };
+    EventPropagationEvidence {
+        target,
+        event: event.clone(),
+        steps: vec![EventPropagationStep {
+            stage: EventPropagationStage::Target,
+            node: route.path.last().cloned(),
+            disposition,
+            emitted_messages: Vec::new(),
+            changes: Vec::new(),
+        }],
+        final_disposition: disposition,
+        diagnostics: Vec::new(),
+    }
+}
+
+/// Generates [`SlipwayLogic::handle_event`] AND
+/// [`SlipwayEventDispositionPolicy::event_disposition`] from ONE match
+/// table, so declared handledness and actual handler behavior are
+/// synchronized BY CONSTRUCTION (audit NC-8: hand-duplicating the
+/// predicate arm-for-arm is a guaranteed-drift design; ADR-0003).
+///
+/// WHEN: every ordinary consume-or-ignore widget — this is the taught
+/// authoring form (`crates/slipway-example-authored/src/internal_logic.rs`
+/// models it). Hand-write the two impls only for capture/bubble-phase
+/// declarations, custom propagation (`handled: true, propagate: true`
+/// bubbling), or a [`SlipwayLogic::project_frame_viewport`] override.
+///
+/// Table contract:
+///
+/// * `|widget, external, local| match event { .. }` — four author-chosen
+///   names: `widget` binds the receiver (`self` cannot cross the macro
+///   boundary), `external`/`local` the state parameters, and `event` the
+///   matched `&InputEvent`.
+/// * Each arm's PATTERN + GUARD is the declared disposition: the arm
+///   body runs exactly when the event is declared handled. Guards see
+///   `local` as `&LocalState` in BOTH expansions; bodies see it as
+///   `&mut LocalState`. Patterns bind by reference (the scrutinee is
+///   `&InputEvent` in both expansions), so payload fields are read via
+///   `Copy`/`&` access.
+/// * Events that match no arm — or whose target is not
+///   `SlipwaySsot::id(self)` — are ignored AND declared unhandled; do
+///   NOT write a `_` catch-all arm (it would declare every event kind
+///   handled, and the runtime reconciliation errors on the physical
+///   path: `event_declaration.handler_ignored_declared_handled`).
+/// * Bodies must return a HANDLED [`EventOutcome`] (`handled()` /
+///   `message(..)` / merged variants) — returning `ignored()` from a
+///   matched arm contradicts the arm's own declaration and is diagnosed
+///   by the unchanged runtime reconciliation.
+///
+/// Requires [`SlipwayWidgetTypes`] and [`SlipwaySsot`] on the widget
+/// (the declaration target is `SlipwaySsot::id`); the generated
+/// disposition is the single-step target-phase evidence of
+/// [`target_event_disposition`]. LOAD-BEARING. Docs:
+/// `docs/public/api/core.md` ("Interaction Declarations"),
+/// `docs/public/api/diagnostics.md` ("event_declaration").
+///
+/// ```
+/// use slipway_core::*;
+///
+/// struct Toggle;
+///
+/// impl SlipwayWidgetTypes for Toggle {
+///     type ExternalState = ();
+///     type LocalState = bool;
+///     type AppMessage = ();
+/// }
+///
+/// impl SlipwaySsot for Toggle {
+///     fn id(&self) -> WidgetId {
+///         WidgetId::from("toggle")
+///     }
+///     fn capabilities(&self) -> Vec<Capability> {
+///         vec![Capability::PointerInput]
+///     }
+///     fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+///         TopologyNode::leaf(self.id())
+///     }
+///     fn unsupported(&self) -> Vec<Diagnostic> {
+///         Vec::new()
+///     }
+/// }
+///
+/// event_handling_table! {
+///     impl Toggle {
+///         |widget, external, local| match event {
+///             InputEvent::Pointer(pointer)
+///                 if pointer.kind == PointerEventKind::Press && !*local =>
+///             {
+///                 *local = true;
+///                 EventOutcome::handled()
+///             },
+///         }
+///     }
+/// }
+///
+/// let toggle = Toggle;
+/// let press = InputEvent::Pointer(PointerEvent {
+///     target: toggle.id(),
+///     target_slot: None,
+///     position: Point { x: 1.0, y: 1.0 },
+///     target_bounds: None,
+///     kind: PointerEventKind::Press,
+///     button: Some(PointerButton::Primary),
+///     details: PointerDetails::default(),
+/// });
+/// let route = EventRoute {
+///     route_id: None,
+///     address: None,
+///     path: vec![toggle.id()],
+///     phase: EventRoutePhase::Target,
+/// };
+///
+/// // The declared disposition and the handler agree by construction:
+/// // the same pattern+guard tokens decide both.
+/// let declared = toggle.event_disposition(&(), &false, &press, &route);
+/// let mut local = false;
+/// let outcome = toggle.handle_event(&(), &mut local, press.clone());
+/// assert!(declared.final_disposition.handled);
+/// assert!(outcome.handled && local);
+///
+/// // Guard false (already toggled): ignored AND declared unhandled.
+/// let declared = toggle.event_disposition(&(), &true, &press, &route);
+/// let mut local = true;
+/// let outcome = toggle.handle_event(&(), &mut local, press);
+/// assert!(!declared.final_disposition.handled);
+/// assert!(!outcome.handled);
+/// ```
+#[macro_export]
+macro_rules! event_handling_table {
+    (
+        impl $widget:ty {
+            |$this:ident, $external:ident, $local:ident| match $event:ident {
+                $( $pattern:pat $( if $guard:expr )? => $body:expr ),+ $(,)?
+            }
+        }
+    ) => {
+        impl $crate::SlipwayLogic for $widget {
+            #[allow(unused_variables)]
+            fn handle_event(
+                &self,
+                $external: &Self::ExternalState,
+                $local: &mut Self::LocalState,
+                event: $crate::InputEvent,
+            ) -> $crate::EventOutcome<Self::AppMessage> {
+                if event.target() != &<Self as $crate::SlipwaySsot>::id(self) {
+                    return $crate::EventOutcome::ignored();
+                }
+                let $this = self;
+                let $event: &$crate::InputEvent = &event;
+                match $event {
+                    $( $pattern $( if { let $local = &*$local; $guard } )? => $body, )+
+                    #[allow(unreachable_patterns)]
+                    _ => $crate::EventOutcome::ignored(),
+                }
+            }
+        }
+
+        impl $crate::SlipwayEventDispositionPolicy for $widget {
+            #[allow(unused_variables)]
+            fn event_disposition(
+                &self,
+                $external: &Self::ExternalState,
+                $local: &Self::LocalState,
+                event: &$crate::InputEvent,
+                route: &$crate::EventRoute,
+            ) -> $crate::EventPropagationEvidence {
+                let $this = self;
+                let $event: &$crate::InputEvent = event;
+                let handled = event.target() == &<Self as $crate::SlipwaySsot>::id(self)
+                    && match $event {
+                        $( $pattern $( if { let $local = &*$local; $guard } )? => true, )+
+                        #[allow(unreachable_patterns)]
+                        _ => false,
+                    };
+                $crate::target_event_disposition(
+                    <Self as $crate::SlipwaySsot>::id(self),
+                    event,
+                    route,
+                    handled,
+                )
+            }
+        }
+    };
 }
 
 pub fn merge_event_outcomes<M>(
@@ -7799,10 +8452,42 @@ pub trait SlipwayLogic: SlipwayWidgetTypes {
     /// LOAD-BEARING when overridden; the default is a no-op and
     /// byte-identical for every widget that ignores it. Unlike
     /// `handle_event`, this is invoked by the RUNTIME (not by routed
-    /// input) and is the one sanctioned external-state writer besides the
-    /// app reducer. Docs: `docs/public/api/routing-and-scroll.md`
-    /// ("Overlay Drag Patterns").
+    /// input) and — with [`SlipwayLogic::project_text_metrics`] — is a
+    /// sanctioned external-state writer besides the app reducer. Docs:
+    /// `docs/public/api/routing-and-scroll.md` ("Overlay Drag Patterns").
     fn project_frame_viewport(&self, _external: &mut Self::ExternalState, _viewport: Rect) {}
+
+    /// Platform-truth projection, measurement flavor: the runtime calls
+    /// this with the presenting backend's REAL text-metric provider
+    /// (`SlipwayRuntime::project_text_metrics`), on the same cadence as
+    /// [`SlipwayLogic::project_frame_viewport`].
+    ///
+    /// WHEN: override it when authored geometry must track laid-out text
+    /// size (a badge sized to its label, a center-ellipsized header) —
+    /// build a [`TextMeasurementRequest`] with the SAME [`TextStyle`] the
+    /// paint op declares, call `metrics.measure_text(..)`, and write the
+    /// [`TextMeasurementFacts`] into external state; `paint`,
+    /// `view_definition`, and `handle_event` then read the measured size
+    /// like any other state (the MUST-agree chain). Pattern:
+    /// `SlipwayApp::project_text_metrics` +
+    /// `crates/slipway-example-authored` (`ShowcaseState::window_badge`
+    /// sizes the input card's badge to its measured label). Failure mode
+    /// of hand-rolling it: estimated character-width ratios drift off
+    /// wherever the guess is wrong (audit NC-4/NC-14 — the anti-pattern
+    /// this hook replaces); honor the receipt honestly — an
+    /// `Invalid`/`Unsupported` [`TextMeasurementReceipt`] means "no
+    /// measurement", never a fabricated size. LOAD-BEARING when
+    /// overridden; the default is a no-op and byte-identical for every
+    /// widget that ignores it. This runtime-invoked hook,
+    /// `project_frame_viewport`, and the app reducer are the ONLY
+    /// sanctioned writers of external state. Docs:
+    /// `docs/public/api/backends.md` ("Text Wrap and Alignment").
+    fn project_text_metrics(
+        &self,
+        _external: &mut Self::ExternalState,
+        _metrics: &mut dyn SlipwayTextMetricProvider,
+    ) {
+    }
 }
 
 /// Focus-traversal policy. `focus_member` is consulted at declaration time
@@ -8067,11 +8752,27 @@ pub trait SlipwayEventRoutingPolicy: SlipwayWidgetTypes {
 }
 
 /// Declares the intended disposition (handled/propagate) of an event along
-/// a route. The declared disposition never overrides the widget handler's
-/// actual outcome: the two are reconciled only by runtime diagnostics
-/// ([`apply_event_handling_declaration`] warns — and the physical path
-/// errors — on mismatch), and the declared propagation is applied only
-/// when the handler actually handled the event.
+/// a route, consulted BEFORE the handler runs: the backend physical path
+/// refuses a declared-unhandled event without calling
+/// [`SlipwayLogic::handle_event`] ([`refuse_event_declared_unhandled`]),
+/// and the declared propagation is applied only when the handler actually
+/// handled the event. The declared disposition never overrides the widget
+/// handler's actual outcome: the two are reconciled only by runtime
+/// diagnostics ([`apply_event_handling_declaration`] warns — and the
+/// physical path errors — on mismatch).
+///
+/// WHEN: author this together with `handle_event` from ONE table via
+/// [`event_handling_table!`] — that is the taught pattern
+/// (`crates/slipway-example-authored/src/internal_logic.rs`). A
+/// hand-written impl duplicates handledness the handler already encodes,
+/// which is the audited guaranteed-drift design (NC-8); hand-write it
+/// only for capture/bubble-phase declarations or custom propagation, and
+/// build the evidence with [`target_event_disposition`]. Failure mode of
+/// drift: `event_declaration.handler_ignored_declared_handled` /
+/// `event_declaration.handler_handled_declared_unhandled` (Error on the
+/// physical path, which also strips the outcome). LOAD-BEARING. Docs:
+/// `docs/public/api/core.md` ("Interaction Declarations"),
+/// `docs/public/api/diagnostics.md` ("event_declaration").
 pub trait SlipwayEventDispositionPolicy: SlipwayWidgetTypes {
     fn event_disposition(
         &self,
@@ -10151,10 +10852,36 @@ pub trait SlipwayApp {
     /// of skipping it: window-true geometry computed in `view_definition`
     /// only silently diverges from paint and handlers (no diagnostic).
     /// LOAD-BEARING when overridden; the no-op default is byte-identical.
-    /// This runtime-invoked hook and the app reducer are the ONLY
-    /// sanctioned writers of external state. Docs:
-    /// `docs/public/api/routing-and-scroll.md` ("Overlay Drag Patterns").
+    /// This runtime-invoked hook, [`SlipwayApp::project_text_metrics`],
+    /// and the app reducer are the ONLY sanctioned writers of external
+    /// state. Docs: `docs/public/api/routing-and-scroll.md` ("Overlay
+    /// Drag Patterns").
     fn project_frame_viewport(&self, _external: &mut Self::ExternalState, _viewport: Rect) {}
+
+    /// App-level text-measurement projection (see
+    /// [`SlipwayLogic::project_text_metrics`] for the full contract —
+    /// [`SlipwayAppWidget<A>`] forwards to this hook). WHEN: override it
+    /// when an element must size itself to laid-out text (a badge hugging
+    /// its label, a center-ellipsized header): build a
+    /// [`TextMeasurementRequest`] with the SAME [`TextStyle`] the paint
+    /// op declares, call `metrics.measure_text(..)`, and write the valid
+    /// receipt's [`TextMeasurementFacts`] into external state for
+    /// `paint`/`view_definition`/`handle_event` to read. The provider is
+    /// the presenting backend's REAL text layout (never an estimate), so
+    /// the measured size equals what the backend presents. Pattern:
+    /// `crates/slipway-example-authored/src/communication.rs`
+    /// (`ShowcaseState::window_badge`). Failure mode of skipping it:
+    /// hand-computed character-width ratios drift wherever the guess is
+    /// wrong (audit NC-4/NC-14 anti-pattern); never fabricate a size from
+    /// an `Invalid`/`Unsupported` receipt. LOAD-BEARING when overridden;
+    /// the no-op default is byte-identical. Docs:
+    /// `docs/public/api/backends.md` ("Text Wrap and Alignment").
+    fn project_text_metrics(
+        &self,
+        _external: &mut Self::ExternalState,
+        _metrics: &mut dyn SlipwayTextMetricProvider,
+    ) {
+    }
 
     /// App-level scroll regions appended to the COMPOSED view — the
     /// wrapper-less path to a page/root scroll region. WHEN: the whole
@@ -10396,6 +11123,14 @@ impl<A: SlipwayApp> SlipwayLogic for SlipwayAppWidget<A> {
 
     fn project_frame_viewport(&self, external: &mut Self::ExternalState, viewport: Rect) {
         self.app.project_frame_viewport(external, viewport);
+    }
+
+    fn project_text_metrics(
+        &self,
+        external: &mut Self::ExternalState,
+        metrics: &mut dyn SlipwayTextMetricProvider,
+    ) {
+        self.app.project_text_metrics(external, metrics);
     }
 }
 
@@ -11688,6 +12423,16 @@ mod tests {
         assert_eq!(style.font_style, FontStyle::Normal);
         assert_eq!(style.decoration, TextDecoration::none());
         assert_eq!(style.baseline, BaselineShift::Normal);
+        // Unspecified alignment is the historical left/top anchoring —
+        // the byte-identical default the backends key off (NC-14).
+        assert_eq!(style.align_x, TextAlignX::Start);
+        assert_eq!(style.align_y, TextAlignY::Top);
+        assert_eq!(TextAlignX::default(), TextAlignX::Start);
+        assert_eq!(TextAlignY::default(), TextAlignY::Top);
+        // Unspecified wrap is the historical hardcoded word wrap — the
+        // byte-identical default the backends key off (NC-4).
+        assert_eq!(style.wrap, TextWrap::Word);
+        assert_eq!(TextWrap::default(), TextWrap::Word);
 
         let overridden = TextStyle::plain()
             .with_font_family("system-ui")
@@ -11697,6 +12442,21 @@ mod tests {
         assert_eq!(overridden.font_size, 18.0);
         assert_eq!(overridden.font_weight, FontWeight::Bold);
         assert_eq!(overridden.font_style, FontStyle::Normal);
+
+        let aligned = TextStyle::plain()
+            .with_align_x(TextAlignX::End)
+            .with_align_y(TextAlignY::Bottom);
+        assert_eq!(aligned.align_x, TextAlignX::End);
+        assert_eq!(aligned.align_y, TextAlignY::Bottom);
+        let centered = TextStyle::plain().centered();
+        assert_eq!(centered.align_x, TextAlignX::Center);
+        assert_eq!(centered.align_y, TextAlignY::Center);
+        let unwrapped = TextStyle::plain().no_wrap();
+        assert_eq!(unwrapped.wrap, TextWrap::None);
+        assert_eq!(
+            TextStyle::plain().with_wrap(TextWrap::Word),
+            TextStyle::plain()
+        );
 
         let declared = TextStyle {
             font_family: "Inter, system-ui".to_string(),
@@ -11708,6 +12468,9 @@ mod tests {
                 strikethrough: true,
             },
             baseline: BaselineShift::Superscript,
+            align_x: TextAlignX::Center,
+            align_y: TextAlignY::Bottom,
+            wrap: TextWrap::None,
         };
         let styled = PaintOp::styled_text(bounds, "styled", color, declared.clone());
         let PaintOp::Text { style, .. } = styled else {
@@ -16695,6 +17458,315 @@ mod tests {
         assert!(physical_outcome.observations.is_empty());
     }
 
+    // ----- NC-8 sync-by-construction fixtures (roadmap Phase 6 item 4,
+    // ADR-0003): the consumer app's KPI-modal shape, authored twice — the
+    // NEW single-table form and the OLD hand-duplicated form with the
+    // audited drift. -----
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ModalLocal {
+        open: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct TableModalWidget {
+        id: WidgetId,
+    }
+
+    impl SlipwayWidgetTypes for TableModalWidget {
+        type ExternalState = AppExternal;
+        type LocalState = ModalLocal;
+        type AppMessage = AppMessage;
+    }
+
+    impl SlipwaySsot for TableModalWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::WheelInput]
+        }
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id())
+        }
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayEventRoutingPolicy for TableModalWidget {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+        ) -> EventRoutingPolicyDeclaration {
+            EventRoutingPolicyDeclaration {
+                target: self.id(),
+                event_target: event.target().clone(),
+                route: EventRoute {
+                    route_id: None,
+                    address: event.target_slot().cloned(),
+                    path: vec![self.id()],
+                    phase: EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    event_handling_table! {
+        impl TableModalWidget {
+            |widget, external, local| match event {
+                // The close press is handled only while the modal is OPEN
+                // — exactly the state-dependence the fixture app
+                // hand-duplicated and let drift (NC-8).
+                InputEvent::Pointer(pointer)
+                    if pointer.kind == PointerEventKind::Press && local.open =>
+                {
+                    local.open = false;
+                    EventOutcome::message(
+                        widget.id(),
+                        "modal-closed",
+                        AppMessage::Counted(widget.id()),
+                    )
+                },
+                InputEvent::Wheel(wheel) if wheel.delta_y < 0.0 => EventOutcome::handled(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct DriftModalWidget {
+        id: WidgetId,
+    }
+
+    impl SlipwayWidgetTypes for DriftModalWidget {
+        type ExternalState = AppExternal;
+        type LocalState = ModalLocal;
+        type AppMessage = AppMessage;
+    }
+
+    impl SlipwaySsot for DriftModalWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput]
+        }
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id())
+        }
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayEventRoutingPolicy for DriftModalWidget {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+        ) -> EventRoutingPolicyDeclaration {
+            EventRoutingPolicyDeclaration {
+                target: self.id(),
+                event_target: event.target().clone(),
+                route: EventRoute {
+                    route_id: None,
+                    address: event.target_slot().cloned(),
+                    path: vec![self.id()],
+                    phase: EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayLogic for DriftModalWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            if event.target() != &self.id() {
+                return EventOutcome::ignored();
+            }
+            match &event {
+                InputEvent::Pointer(pointer)
+                    if pointer.kind == PointerEventKind::Press && local.open =>
+                {
+                    local.open = false;
+                    EventOutcome::handled()
+                }
+                _ => EventOutcome::ignored(),
+            }
+        }
+    }
+
+    impl SlipwayEventDispositionPolicy for DriftModalWidget {
+        fn event_disposition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+            route: &EventRoute,
+        ) -> EventPropagationEvidence {
+            // The audited drift, verbatim in shape: a second hand-written
+            // predicate (the fixture app's `handles_kpi_card`) that
+            // declares every press handled and never consults the local
+            // state the handler consults.
+            let handled = event.target() == &self.id()
+                && matches!(
+                    event,
+                    InputEvent::Pointer(pointer) if pointer.kind == PointerEventKind::Press
+                );
+            target_event_disposition(self.id(), event, route, handled)
+        }
+    }
+
+    fn modal_press(target: &str) -> InputEvent {
+        InputEvent::Pointer(PointerEvent {
+            target: WidgetId::from(target),
+            target_slot: None,
+            position: Point { x: 4.0, y: 4.0 },
+            target_bounds: None,
+            kind: PointerEventKind::Press,
+            button: Some(PointerButton::Primary),
+            details: PointerDetails::default(),
+        })
+    }
+
+    fn modal_wheel(target: &str, delta_y: f32) -> InputEvent {
+        InputEvent::Wheel(WheelEvent {
+            target: WidgetId::from(target),
+            target_slot: None,
+            region_id: None,
+            delta_x: 0.0,
+            delta_y,
+        })
+    }
+
+    #[test]
+    fn event_handling_table_disposition_matches_handler_by_construction() {
+        let widget = TableModalWidget {
+            id: WidgetId::from("modal"),
+        };
+        let cases: Vec<(InputEvent, ModalLocal, bool)> = vec![
+            (modal_press("modal"), ModalLocal { open: true }, true),
+            (modal_press("modal"), ModalLocal { open: false }, false),
+            (modal_wheel("modal", -1.0), ModalLocal { open: true }, true),
+            (modal_wheel("modal", 1.0), ModalLocal { open: true }, false),
+            (command("modal"), ModalLocal { open: true }, false),
+            (modal_press("elsewhere"), ModalLocal { open: true }, false),
+        ];
+
+        for (event, local, expected_handled) in cases {
+            let declaration = declared_event_handling(&widget, &AppExternal, &local, &event);
+            let declared = declaration.disposition.final_disposition.handled;
+            assert_eq!(
+                declared, expected_handled,
+                "declared disposition for {event:?} with {local:?}"
+            );
+
+            // The backend physical gate: declared-unhandled events are
+            // refused WITHOUT calling the handler; declared-handled events
+            // run the handler and reconcile.
+            if declared {
+                let mut handler_local = local.clone();
+                let raw_outcome =
+                    widget.handle_event(&AppExternal, &mut handler_local, event.clone());
+                assert!(raw_outcome.handled, "handler agrees for {event:?}");
+                let outcome = apply_physical_event_handling_declaration(declaration, raw_outcome);
+                assert!(
+                    !outcome.diagnostics.iter().any(|diagnostic| {
+                        diagnostic.code.starts_with("event_declaration.handler_")
+                    }),
+                    "no reconciliation mismatch for {event:?}: {:?}",
+                    outcome.diagnostics
+                );
+            } else {
+                // The handler, asked anyway (the semantic path), agrees:
+                // the same pattern+guard tokens decided both sides.
+                let mut handler_local = local.clone();
+                let raw_outcome =
+                    widget.handle_event(&AppExternal, &mut handler_local, event.clone());
+                assert!(!raw_outcome.handled, "handler agrees for {event:?}");
+                assert_eq!(handler_local, local, "ignored events do not mutate");
+                let refusal: EventOutcome<AppMessage> =
+                    refuse_event_declared_unhandled(declaration);
+                assert!(!refusal.handled);
+                assert!(refusal.propagate);
+            }
+        }
+    }
+
+    #[test]
+    fn hand_written_disposition_drift_recurs_while_the_table_form_cannot_express_it() {
+        // OLD form: the fixture app's NC-8 drift shape — declared handled
+        // for a press the handler ignores — still produces the live Error
+        // pair on the physical path (the unchanged runtime backstop).
+        let drift = DriftModalWidget {
+            id: WidgetId::from("modal"),
+        };
+        let closed = ModalLocal { open: false };
+        let event = modal_press("modal");
+        let declaration = declared_event_handling(&drift, &AppExternal, &closed, &event);
+        assert!(declaration.disposition.final_disposition.handled);
+        let mut local = closed.clone();
+        let raw_outcome = drift.handle_event(&AppExternal, &mut local, event.clone());
+        assert!(!raw_outcome.handled);
+        let outcome = apply_physical_event_handling_declaration(declaration, raw_outcome);
+        assert!(outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == EVENT_DECLARATION_HANDLER_IGNORED_DECLARED_HANDLED
+                && diagnostic.severity == DiagnosticSeverity::Error
+        }));
+
+        // NEW form: the same widget shape authored via
+        // `event_handling_table!` cannot express that drift — the arm's
+        // pattern+guard IS the declaration, so the closed-modal press is
+        // declared unhandled AND ignored by the same tokens, and neither
+        // reconciliation diagnostic can fire.
+        let table = TableModalWidget {
+            id: WidgetId::from("modal"),
+        };
+        let declaration = declared_event_handling(&table, &AppExternal, &closed, &event);
+        assert!(!declaration.disposition.final_disposition.handled);
+        let mut local = closed.clone();
+        let raw_outcome = table.handle_event(&AppExternal, &mut local, event.clone());
+        assert!(!raw_outcome.handled);
+        let outcome = apply_physical_event_handling_declaration(declaration, raw_outcome);
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.starts_with("event_declaration.handler_")),
+            "{:?}",
+            outcome.diagnostics
+        );
+
+        // And the open-modal press is handled on BOTH sides, with the
+        // emitted message intact (nothing stripped).
+        let open = ModalLocal { open: true };
+        let declaration = declared_event_handling(&table, &AppExternal, &open, &event);
+        assert!(declaration.disposition.final_disposition.handled);
+        let mut local = open.clone();
+        let raw_outcome = table.handle_event(&AppExternal, &mut local, event);
+        assert!(raw_outcome.handled);
+        assert!(!local.open);
+        let outcome = apply_physical_event_handling_declaration(declaration, raw_outcome);
+        assert_eq!(outcome.emitted_messages.len(), 1);
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.starts_with("event_declaration.handler_"))
+        );
+    }
+
     #[test]
     fn duplicate_child_events_route_by_exact_slot_before_widget_id() {
         let widgets = (
@@ -17120,6 +18192,339 @@ mod tests {
         );
         assert!(!view_definition_has_blocking_contract_diagnostic(
             &view_definition_contract_diagnostics(&view)
+        ));
+    }
+
+    // NC-11 fixture (roadmap Phase 6 item 5): the naive-consumer app's
+    // EXACT modal tie shape — an opaque full-viewport overlay child
+    // (`PaintLayerKey::new(100)`, `allow_overlap = true` for the paint
+    // overlap, overflow bounds declared) whose full-bounds hit region
+    // carries the DEFAULT `HitRegionOrder { 0, 0, 0 }`, mounted beside a
+    // card child whose hit region carries the same default order. Each
+    // widget alone has one hit region (nothing to pair); only the
+    // composed view can see the tie.
+    #[derive(Clone, Debug, PartialEq)]
+    struct ModalOverlayTieWidget {
+        id: WidgetId,
+        hit_z_index: i32,
+    }
+
+    impl SlipwayWidgetTypes for ModalOverlayTieWidget {
+        type ExternalState = AppExternal;
+        type LocalState = CounterLocal;
+        type AppMessage = AppMessage;
+    }
+
+    impl SlipwaySsot for ModalOverlayTieWidget {
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for ModalOverlayTieWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            EventOutcome::ignored()
+        }
+    }
+
+    impl SlipwayView for ModalOverlayTieWidget {
+        fn initial_local_state(&self) -> Self::LocalState {
+            CounterLocal { count: 0 }
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            vec![PaintOp::Layer {
+                id: Some(format!("{}:layer", self.id.as_str())),
+                key: PaintLayerKey::new(100),
+                input_transparency: PaintInputTransparency::Opaque,
+                wheel_transparency: None,
+                clip: None,
+                ops: vec![PaintOp::Fill {
+                    shape: ShapeDeclaration {
+                        id: Some(format!("{}:backdrop", self.id.as_str())),
+                        kind: ShapeKind::Rectangle,
+                        bounds: layout.bounds.into_rect(),
+                        path: None,
+                        clip: None,
+                    },
+                    color: Color {
+                        red: 1.0,
+                        green: 1.0,
+                        blue: 1.0,
+                        alpha: 1.0,
+                    },
+                }],
+            }]
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayViewDefinition for ModalOverlayTieWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            let paint = self.paint(external, local, &layout);
+            let bounds = layout.bounds;
+            let mut paint_order = PaintOrderDeclaration::layer(self.id(), 100);
+            paint_order.allow_overlap = true;
+            paint_order = paint_order.with_overflow_bounds(bounds);
+
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                hit_regions: vec![HitRegionDeclaration {
+                    id: PresentationRegionId::from(format!("{}:hit", self.id.as_str())),
+                    target: self.id(),
+                    address: Some(WidgetSlotAddress::new(self.id(), 0)),
+                    bounds,
+                    event_coordinate_space: PointerEventCoordinateSpace::TargetLocal,
+                    order: HitRegionOrder {
+                        z_index: self.hit_z_index,
+                        paint_order: 0,
+                        traversal_order: 0,
+                    },
+                    route: EventRoute {
+                        route_id: Some(format!("{}:route", self.id.as_str())),
+                        address: Some(WidgetSlotAddress::new(self.id(), 0)),
+                        path: vec![self.id()],
+                        phase: EventRoutePhase::Target,
+                    },
+                    cursor: CursorCapability::Pointer,
+                    enabled: true,
+                    capture: PointerCaptureIntent::OnPress,
+                    capture_evidence: Vec::new(),
+                }],
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+                paint_order,
+                layout,
+                paint,
+            }
+        }
+    }
+
+    impl_core_test_event_policy!(ModalOverlayTieWidget);
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ModalTieApp {
+        widgets: (CounterWidget, ModalOverlayTieWidget),
+    }
+
+    impl SlipwayApp for ModalTieApp {
+        type ExternalState = AppExternal;
+        type LocalState = AppLocal;
+        type AppMessage = AppMessage;
+        type Widgets = (CounterWidget, ModalOverlayTieWidget);
+
+        fn id(&self) -> WidgetId {
+            WidgetId::from("modal-tie-app")
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {
+            AppLocal
+        }
+
+        fn layout_plan(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+            children: Vec<ChildLayoutSeed>,
+        ) -> AppLayoutPlan {
+            let viewport = input.viewport.into_rect();
+            AppLayoutPlan {
+                bounds: input.viewport,
+                children: children
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, seed)| {
+                        // The card sits inside the viewport; the modal
+                        // covers the ENTIRE viewport (the consumer's
+                        // full-viewport detail modal).
+                        let bounds = if index == 0 {
+                            Rect {
+                                origin: Point { x: 16.0, y: 8.0 },
+                                size: Size {
+                                    width: 48.0,
+                                    height: 16.0,
+                                },
+                            }
+                        } else {
+                            viewport
+                        };
+                        ChildLayoutPlan::placed_for_seed(
+                            seed,
+                            child_layout_input_for_size(bounds.size),
+                            ParentLocalRect::new(bounds),
+                        )
+                    })
+                    .collect(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+            children: Vec<ChildPlacement>,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: children,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    fn modal_tie_app_widget(hit_z_index: i32) -> SlipwayAppWidget<ModalTieApp> {
+        SlipwayAppWidget::new(ModalTieApp {
+            widgets: (
+                CounterWidget {
+                    id: WidgetId::from("card"),
+                    origin_x: 0.0,
+                },
+                ModalOverlayTieWidget {
+                    id: WidgetId::from("modal"),
+                    hit_z_index,
+                },
+            ),
+        })
+    }
+
+    // NC-11 acceptance (roadmap Phase 6 item 5): the consumer's exact
+    // modal tie shape MUST be flagged at pre-flight. Composed scope pin:
+    // per-widget pre-flight cannot see this tie (each child view has one
+    // hit region), so the composed `SlipwayAppWidget` view — the view the
+    // visible backends admit — is the catching surface. The child's
+    // paint-only `allow_overlap` must not shield the composed check.
+    #[test]
+    fn composed_app_view_flags_consumer_modal_hit_tie_at_preflight() {
+        let widget = modal_tie_app_widget(0);
+        let external = AppExternal;
+        let local = widget.initial_local_state();
+        let view = widget.view_definition(
+            &external,
+            &local,
+            ViewDefinitionInput {
+                frame: frame_identity(),
+                layout_input: app_layout_input(),
+            },
+        );
+
+        // Per-widget pre-flight is structurally blind here: one region.
+        let modal_view = widget.app.widgets.1.view_definition(
+            &external,
+            &CounterLocal { count: 0 },
+            ViewDefinitionInput {
+                frame: frame_identity(),
+                layout_input: app_layout_input(),
+            },
+        );
+        assert_eq!(modal_view.hit_regions.len(), 1);
+        assert!(modal_view.paint_order.allow_overlap);
+
+        let diagnostics = view_definition_contract_diagnostics(&view);
+        assert!(view_definition_has_blocking_contract_diagnostic(
+            &diagnostics
+        ));
+        let overlap = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "view_contract.ambiguous_hit_overlap")
+            .expect("the composed consumer modal tie shape must be refused at pre-flight");
+        assert!(
+            overlap.message.contains("`card.hit`"),
+            "{}",
+            overlap.message
+        );
+        assert!(
+            overlap.message.contains("`modal:hit`"),
+            "{}",
+            overlap.message
+        );
+    }
+
+    // The consumer's NC-3 z-index repair (modal hit region at z 100) is
+    // the legitimate resolution of the same shape: distinct orders admit
+    // cleanly, pinning the guard against false positives on layered
+    // overlaps.
+    #[test]
+    fn composed_app_view_admits_consumer_modal_shape_with_distinct_hit_order() {
+        let widget = modal_tie_app_widget(100);
+        let external = AppExternal;
+        let local = widget.initial_local_state();
+        let view = widget.view_definition(
+            &external,
+            &local,
+            ViewDefinitionInput {
+                frame: frame_identity(),
+                layout_input: app_layout_input(),
+            },
+        );
+
+        let diagnostics = view_definition_contract_diagnostics(&view);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "view_contract.ambiguous_hit_overlap"),
+            "{diagnostics:?}"
+        );
+        assert!(!view_definition_has_blocking_contract_diagnostic(
+            &diagnostics
         ));
     }
 
@@ -17779,6 +19184,7 @@ mod tests {
                     paint_order: 0,
                     traversal_order: 0,
                 },
+                authored_z_order: Some(0),
                 bounds: Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
@@ -17798,6 +19204,7 @@ mod tests {
                     paint_order: 1,
                     traversal_order: 0,
                 },
+                authored_z_order: Some(1),
                 bounds: Rect {
                     origin: Point { x: 60.0, y: 10.0 },
                     size: Size {
@@ -17875,6 +19282,208 @@ mod tests {
                 .iter()
                 .all(|edge| edge.from != wheel_through_id)
         );
+    }
+
+    /// NC-2 (roadmap Phase 6 item 1): the pointer `Occlusion` edges apply
+    /// the same-owner rule of `paint_occlusion_blocks_declared_hit_region`,
+    /// so the graph oracle agrees with repaired dispatch:
+    ///
+    /// * a widget's own opaque layer at the SAME z WITHOUT an authored
+    ///   within-z order never occludes that widget's own hit region (the
+    ///   consumer modal shape — occluder tie-break fields are the defaulted
+    ///   slot ordinal);
+    /// * a FOREIGN opaque layer with the identical order key still occludes
+    ///   (stacking semantics unchanged);
+    /// * a widget's own layer with an AUTHORED within-z order fronting the
+    ///   region's declared `paint_order` still occludes (the authored
+    ///   overlay-card stack, Step 168).
+    #[test]
+    fn dispatch_graph_pointer_occlusion_edges_apply_same_owner_same_z_rule() {
+        let (geometry_index, mut hit_regions, focus_regions, scroll_regions) =
+            dispatch_graph_test_fixture();
+        // Put the front fixture region at the occluders' z so all three
+        // occluders tie with it on z_index: hit-front is (100, 0, 0).
+        hit_regions[1].order = HitRegionOrder {
+            z_index: 100,
+            paint_order: 0,
+            traversal_order: 0,
+        };
+        let overlay_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 200.0,
+                height: 200.0,
+            },
+        };
+        let occlusions = vec![
+            // The modal shape: same owner as hit-front ("graph-root"),
+            // same z 100, defaulted tie-break fields (slot ordinal 7),
+            // NO authored within-z order -> must NOT occlude hit-front.
+            DispatchGraphOcclusionRegion {
+                target: WidgetId::from("graph-root"),
+                address: None,
+                order: HitRegionOrder {
+                    z_index: 100,
+                    paint_order: 7,
+                    traversal_order: 7,
+                },
+                authored_z_order: None,
+                bounds: overlay_bounds,
+                blocks_wheel: true,
+            },
+            // Identical key but FOREIGN owner -> still occludes hit-front.
+            DispatchGraphOcclusionRegion {
+                target: WidgetId::from("graph-foreign-overlay"),
+                address: None,
+                order: HitRegionOrder {
+                    z_index: 100,
+                    paint_order: 7,
+                    traversal_order: 7,
+                },
+                authored_z_order: None,
+                bounds: overlay_bounds,
+                blocks_wheel: true,
+            },
+            // Same owner, same z, but an AUTHORED within-z order fronting
+            // the region's declared paint_order (the overlay-card stack)
+            // -> still occludes hit-front.
+            DispatchGraphOcclusionRegion {
+                target: WidgetId::from("graph-root"),
+                address: None,
+                order: HitRegionOrder {
+                    z_index: 100,
+                    paint_order: 3,
+                    traversal_order: 0,
+                },
+                authored_z_order: Some(3),
+                bounds: overlay_bounds,
+                blocks_wheel: true,
+            },
+        ];
+        let graph = derive_dispatch_graph_with_geometry_index(
+            &WidgetId::from("graph-root"),
+            &geometry_index,
+            &hit_regions,
+            &focus_regions,
+            &scroll_regions,
+            &occlusions,
+        );
+
+        let pointer_occlusion = dispatch_graph_edges(
+            &graph,
+            DispatchGraphEdgeKind::Occlusion,
+            DispatchGraphChannel::Pointer,
+        );
+        let own_unordered_id = "occlusion:graph-root:100:7:7:0";
+        let foreign_id = "occlusion:graph-foreign-overlay:100:7:7:0";
+        let own_authored_id = "occlusion:graph-root:100:3:0:0";
+        assert!(
+            pointer_occlusion
+                .iter()
+                .all(|edge| !(edge.from == own_unordered_id && edge.to == "hit-front")),
+            "a widget's own unordered same-z layer must not occlude its own hit region: {pointer_occlusion:?}"
+        );
+        assert!(
+            pointer_occlusion
+                .iter()
+                .any(|edge| edge.from == foreign_id && edge.to == "hit-front"),
+            "a foreign layer with the identical key still occludes: {pointer_occlusion:?}"
+        );
+        assert!(
+            pointer_occlusion
+                .iter()
+                .any(|edge| edge.from == own_authored_id && edge.to == "hit-front"),
+            "an authored-order own layer fronting the declared paint_order still occludes: {pointer_occlusion:?}"
+        );
+        // All three occluders still front the z-0 back region.
+        for occluder in [own_unordered_id, foreign_id, own_authored_id] {
+            assert!(
+                pointer_occlusion
+                    .iter()
+                    .any(|edge| edge.from == occluder && edge.to == "hit-back"),
+                "different-z regions keep full-key occlusion: {occluder}"
+            );
+        }
+    }
+
+    #[test]
+    fn paint_occlusion_predicate_same_owner_rule() {
+        let owner = WidgetId::from("occlusion-owner");
+        let foreign = WidgetId::from("occlusion-foreign");
+        let region_order = HitRegionOrder {
+            z_index: 100,
+            paint_order: 0,
+            traversal_order: 0,
+        };
+        let slot_poisoned = HitRegionOrder {
+            z_index: 100,
+            paint_order: 7,
+            traversal_order: 7,
+        };
+        // NC-2: same owner, same z, no authored order -> never blocks,
+        // regardless of the defaulted tie-break fields.
+        assert!(!paint_occlusion_blocks_declared_hit_region(
+            &owner,
+            &slot_poisoned,
+            None,
+            &owner,
+            &region_order,
+        ));
+        // Foreign owner with the identical key -> blocks (strictly front).
+        assert!(paint_occlusion_blocks_declared_hit_region(
+            &foreign,
+            &slot_poisoned,
+            None,
+            &owner,
+            &region_order,
+        ));
+        // Same owner, same z, authored order fronting the declared
+        // paint_order -> blocks (the authored overlay-card stack).
+        assert!(paint_occlusion_blocks_declared_hit_region(
+            &owner,
+            &HitRegionOrder {
+                z_index: 100,
+                paint_order: 3,
+                traversal_order: 0,
+            },
+            Some(3),
+            &owner,
+            &region_order,
+        ));
+        // Same owner, same z, authored order EQUAL to the declared
+        // paint_order -> does not block (the region rides its own layer).
+        assert!(!paint_occlusion_blocks_declared_hit_region(
+            &owner,
+            &HitRegionOrder {
+                z_index: 100,
+                paint_order: 0,
+                traversal_order: 5,
+            },
+            Some(0),
+            &owner,
+            &region_order,
+        ));
+        // Same owner at a HIGHER z -> full-key comparison still blocks (a
+        // deliberately fronted own layer covers own lower-z regions).
+        assert!(paint_occlusion_blocks_declared_hit_region(
+            &owner,
+            &HitRegionOrder {
+                z_index: 200,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            None,
+            &owner,
+            &region_order,
+        ));
+        // Equal orders are not front-of each other (foreign tie).
+        assert!(!paint_occlusion_blocks_declared_hit_region(
+            &foreign,
+            &region_order,
+            None,
+            &owner,
+            &region_order,
+        ));
     }
 
     #[test]
@@ -18423,6 +20032,104 @@ mod tests {
         assert_eq!(evidence.resolved_ref, Some("app-declared-font".to_string()));
         assert!(evidence.refusal.is_none());
         assert!(evidence.diagnostics.is_empty());
+    }
+
+    // The measurement-projection channel (roadmap Phase 6 item 3b slice
+    // (iii), NC-4): `SlipwayAppWidget<A>` must forward
+    // `SlipwayLogic::project_text_metrics` to the app hook, and the
+    // default hook must stay a no-op (byte-identical for apps that never
+    // opt in — the provider is not consulted at all).
+    #[test]
+    fn app_widget_forwards_project_text_metrics_to_app_hook() {
+        #[derive(Default)]
+        struct CountingProvider {
+            requests: Vec<String>,
+        }
+
+        impl SlipwayTextMetricProvider for CountingProvider {
+            fn text_metric_source(&self) -> TextMetricSource {
+                TextMetricSource {
+                    provider_id: "counting-provider".to_string(),
+                    backend_id: None,
+                    api_name: "counting".to_string(),
+                    kind: TextMetricSourceKind::OfficialBackendApi,
+                }
+            }
+
+            fn measure_text(&mut self, request: TextMeasurementRequest) -> TextMeasurementReceipt {
+                self.requests.push(request.content.clone());
+                TextMeasurementReceipt::Unsupported {
+                    request,
+                    diagnostics: Vec::new(),
+                }
+            }
+        }
+
+        struct MeasuringApp {
+            inner: TwoCounterApp,
+        }
+
+        impl SlipwayApp for MeasuringApp {
+            type ExternalState = AppExternal;
+            type LocalState = AppLocal;
+            type AppMessage = AppMessage;
+            type Widgets = (CounterWidget, CounterWidget);
+
+            fn id(&self) -> WidgetId {
+                WidgetId::from("measuring-app")
+            }
+
+            fn widgets(&self) -> &Self::Widgets {
+                self.inner.widgets()
+            }
+
+            fn initial_local_state(&self) -> Self::LocalState {
+                AppLocal
+            }
+
+            fn project_text_metrics(
+                &self,
+                _external: &mut Self::ExternalState,
+                metrics: &mut dyn SlipwayTextMetricProvider,
+            ) {
+                let _ = metrics.measure_text(TextMeasurementRequest {
+                    target: WidgetId::from("measuring-app"),
+                    request_id: "badge".to_string(),
+                    content: "measured label".to_string(),
+                    style: TextStyle::plain(),
+                    available_bounds: None,
+                    flow: None,
+                    purposes: vec![TextMeasurementPurpose::IntrinsicSize],
+                });
+            }
+        }
+
+        let widget = SlipwayAppWidget::new(MeasuringApp {
+            inner: TwoCounterApp {
+                widgets: (
+                    CounterWidget {
+                        id: WidgetId::from("one"),
+                        origin_x: 0.0,
+                    },
+                    CounterWidget {
+                        id: WidgetId::from("two"),
+                        origin_x: 32.0,
+                    },
+                ),
+            },
+        });
+        let mut external = AppExternal;
+        let mut provider = CountingProvider::default();
+
+        SlipwayLogic::project_text_metrics(&widget, &mut external, &mut provider);
+        assert_eq!(provider.requests, vec!["measured label".to_string()]);
+
+        // Default no-op: an app that never overrides the hook consults
+        // no provider through the same forwarding path.
+        let default_widget = two_counter_app_widget();
+        let mut untouched = CountingProvider::default();
+        SlipwayLogic::project_text_metrics(&default_widget, &mut external, &mut untouched);
+        assert!(untouched.requests.is_empty());
     }
 
     #[test]
@@ -19352,6 +21059,187 @@ mod tests {
         ));
     }
 
+    // NC-10 deliverability advisory (roadmap Phase 6 item 5): declaring
+    // KeyboardInput with ONLY plain focus regions draws a Warning naming
+    // the iced undeliverability (real ingress and physical control both
+    // reach text-edit focus regions only) — the consumer's Escape-to-close
+    // handler shape. Non-blocking: egui delivers after focus.
+    #[test]
+    fn keyboard_capability_on_plain_focus_region_draws_deliverability_advisory() {
+        let widget = FakeWidget {
+            id: WidgetId::from("root"),
+        };
+        let external = External {
+            child: WidgetId::from("child"),
+        };
+        let local = widget.initial_local_state();
+        let mut view = widget.view_definition(
+            &external,
+            &local,
+            ViewDefinitionInput {
+                frame: frame_identity(),
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(frame_identity().viewport),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: frame_identity().viewport.size,
+                    },
+                },
+            },
+        );
+        view.focus_regions = vec![focus_region_from_focus_capability(
+            &widget,
+            &external,
+            &local,
+            PresentationRegionId::from("root:plain-focus"),
+            None,
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 40.0,
+                    height: 20.0,
+                },
+            }),
+            true,
+        )];
+
+        let diagnostics = view_definition_contract_diagnostics_for_capabilities(
+            &view,
+            &[Capability::FocusInput, Capability::KeyboardInput],
+        );
+
+        let advisory = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "view_contract.keyboard_capability_plain_focus_delivery_limited"
+            })
+            .expect("KeyboardInput on plain-only focus regions draws the advisory");
+        assert_eq!(advisory.severity, DiagnosticSeverity::Warning);
+        // The advisory names the physical-control refusal the author will
+        // otherwise meet cold, and the fixing constructor.
+        assert!(
+            advisory
+                .message
+                .contains("native-physical-control-text-focus-widget-unavailable"),
+            "{}",
+            advisory.message
+        );
+        assert!(
+            advisory
+                .message
+                .contains("text_edit_focus_region_from_capability"),
+            "{}",
+            advisory.message
+        );
+        // Advisory, not admission refusal.
+        assert!(!view_definition_has_blocking_contract_diagnostic(
+            &diagnostics
+        ));
+    }
+
+    // Suppression matrix for the NC-10 advisory: an enabled text-edit
+    // focus region gives keyboard a deliverable target on both visible
+    // backends; FocusInput alone claims no keyboard delivery; regions
+    // missing entirely stay owned by the blocking error.
+    #[test]
+    fn keyboard_deliverability_advisory_is_suppressed_outside_the_audit_shape() {
+        let widget = FakeWidget {
+            id: WidgetId::from("root"),
+        };
+        let external = External {
+            child: WidgetId::from("child"),
+        };
+        let local = widget.initial_local_state();
+        let base_view = widget.view_definition(
+            &external,
+            &local,
+            ViewDefinitionInput {
+                frame: frame_identity(),
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(frame_identity().viewport),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: frame_identity().viewport.size,
+                    },
+                },
+            },
+        );
+        let advisory_code = "view_contract.keyboard_capability_plain_focus_delivery_limited";
+
+        // The FakeWidget base view declares a text-edit focus region:
+        // KeyboardInput has a deliverable target, no advisory.
+        assert!(
+            base_view
+                .focus_regions
+                .iter()
+                .any(|region| region.enabled && region.text_edit.is_some())
+        );
+        let text_edit_diagnostics = view_definition_contract_diagnostics_for_capabilities(
+            &base_view,
+            &[Capability::KeyboardInput, Capability::TextInput],
+        );
+        assert!(
+            !text_edit_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == advisory_code),
+            "{text_edit_diagnostics:?}"
+        );
+
+        // FocusInput alone (no KeyboardInput) on a plain focus region:
+        // nothing claims keyboard delivery, no advisory.
+        let mut plain_view = base_view.clone();
+        plain_view.focus_regions = vec![focus_region_from_focus_capability(
+            &widget,
+            &external,
+            &local,
+            PresentationRegionId::from("root:plain-focus"),
+            None,
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 40.0,
+                    height: 20.0,
+                },
+            }),
+            true,
+        )];
+        let focus_only_diagnostics = view_definition_contract_diagnostics_for_capabilities(
+            &plain_view,
+            &[Capability::FocusInput],
+        );
+        assert!(
+            !focus_only_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == advisory_code),
+            "{focus_only_diagnostics:?}"
+        );
+
+        // No enabled focus region at all: the blocking error owns the
+        // shape; the advisory must not stack on it.
+        let mut missing_view = base_view.clone();
+        missing_view.focus_regions.clear();
+        let missing_diagnostics = view_definition_contract_diagnostics_for_capabilities(
+            &missing_view,
+            &[Capability::KeyboardInput],
+        );
+        assert!(
+            missing_diagnostics.iter().any(|diagnostic| diagnostic.code
+                == "view_contract.focus_capability_missing_focus_region")
+        );
+        assert!(
+            !missing_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == advisory_code),
+            "{missing_diagnostics:?}"
+        );
+    }
+
     #[test]
     fn geometry_refusals_embed_region_id_declared_rect_and_permitted_bounds() {
         // The audit's P4 probe shape (LE-M18): geometry authored in window
@@ -19828,6 +21716,103 @@ mod tests {
         );
     }
 
+    // NC-11 split (roadmap Phase 6 item 5): `allow_overlap` is a PAINT
+    // declaration; it must NOT disarm the hit-ambiguity guard. Before the
+    // split this exact view admitted silently — revert the gate to
+    // `allow_overlap` and this fails.
+    #[test]
+    fn paint_overlap_allowance_does_not_disarm_hit_ambiguity_check() {
+        let widget = FakeWidget {
+            id: WidgetId::from("root"),
+        };
+        let external = External {
+            child: WidgetId::from("child"),
+        };
+        let local = widget.initial_local_state();
+        let mut view = widget.view_definition(
+            &external,
+            &local,
+            ViewDefinitionInput {
+                frame: frame_identity(),
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(frame_identity().viewport),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: frame_identity().viewport.size,
+                    },
+                },
+            },
+        );
+        let mut duplicate = view.hit_regions[0].clone();
+        duplicate.id = PresentationRegionId::from("duplicate");
+        view.hit_regions.push(duplicate);
+        view.paint_order.allow_overlap = true;
+
+        let diagnostics = view_definition_contract_diagnostics(&view);
+
+        let overlap = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "view_contract.ambiguous_hit_overlap")
+            .expect("paint-overlap allowance must not accept hit ambiguity");
+        // The refusal teaches the split: the paint flag is named as NOT
+        // an acceptance, and the explicit acceptance is named.
+        assert!(
+            overlap.message.contains("allow_overlap"),
+            "{}",
+            overlap.message
+        );
+        assert!(
+            overlap.message.contains("allow_ambiguous_hits"),
+            "{}",
+            overlap.message
+        );
+    }
+
+    // The explicit acceptance — and ONLY it — silences the guard.
+    #[test]
+    fn allow_ambiguous_hits_is_the_only_hit_ambiguity_acceptance() {
+        let widget = FakeWidget {
+            id: WidgetId::from("root"),
+        };
+        let external = External {
+            child: WidgetId::from("child"),
+        };
+        let local = widget.initial_local_state();
+        let mut view = widget.view_definition(
+            &external,
+            &local,
+            ViewDefinitionInput {
+                frame: frame_identity(),
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(frame_identity().viewport),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: frame_identity().viewport.size,
+                    },
+                },
+            },
+        );
+        let mut duplicate = view.hit_regions[0].clone();
+        duplicate.id = PresentationRegionId::from("duplicate");
+        view.hit_regions.push(duplicate);
+        view.paint_order.allow_ambiguous_hits = true;
+
+        let diagnostics = view_definition_contract_diagnostics(&view);
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "view_contract.ambiguous_hit_overlap"),
+            "{diagnostics:?}"
+        );
+    }
+
     #[test]
     fn view_contract_reports_paint_overflow_without_blocking_interaction() {
         let widget = FakeWidget {
@@ -19884,5 +21869,234 @@ mod tests {
         assert!(diagnostics.iter().any(|diagnostic| diagnostic.code
             == "view_contract.paint_bounds_outside_layout"
             && diagnostic.severity == DiagnosticSeverity::Warning));
+    }
+
+    /// The NC-13 consumer-app shape (`slipway-test`): a dashboard card
+    /// column ~992 px tall painted in a 640 px window with ZERO scroll
+    /// regions — content the user cannot reach, admitted silently before
+    /// the Phase-6 item-2 advisory landed.
+    fn dashboard_card_column_view() -> ViewDefinition {
+        let target = WidgetId::from("dashboard");
+        let cards = (0..4)
+            .map(|index| PaintOp::Fill {
+                shape: ShapeDeclaration {
+                    id: Some(format!("card-{index}")),
+                    kind: ShapeKind::Rectangle,
+                    bounds: Rect {
+                        origin: Point {
+                            x: 0.0,
+                            y: index as f32 * 248.0,
+                        },
+                        size: Size {
+                            width: 640.0,
+                            height: 248.0,
+                        },
+                    },
+                    path: None,
+                    clip: None,
+                },
+                color: Color {
+                    red: 1.0,
+                    green: 1.0,
+                    blue: 1.0,
+                    alpha: 1.0,
+                },
+            })
+            .collect();
+        ViewDefinition {
+            target: target.clone(),
+            frame: FrameIdentity {
+                surface_id: "surface".to_string(),
+                surface_instance_id: "instance".to_string(),
+                revision: 1,
+                frame_index: 1,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 640.0,
+                        height: 640.0,
+                    },
+                },
+            },
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 640.0,
+                        height: 992.0,
+                    },
+                }),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: cards,
+            paint_order: PaintOrderDeclaration::source_order(target),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn dashboard_page_scroll_region(view: &ViewDefinition) -> ScrollRegionDeclaration {
+        ScrollRegionDeclaration {
+            id: PresentationRegionId::from("dashboard:page-scroll"),
+            target: view.target.clone(),
+            address: None,
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 640.0,
+                    height: 640.0,
+                },
+            }),
+            content_bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 640.0,
+                    height: 992.0,
+                },
+            }),
+            offset: Point { x: 0.0, y: 0.0 },
+            axes: ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            wheel_routing: WheelRouting::NearestScrollable,
+            indicator: ScrollIndicatorMode::Auto,
+            order: HitRegionOrder::default(),
+            virtual_viewport: None,
+            consumption: ScrollConsumptionPolicy::exclusive_wheel(),
+            evidence: Vec::new(),
+            enabled: true,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn content_overflow_without_scroll_region_fires_the_advisory_and_stays_non_blocking() {
+        let view = dashboard_card_column_view();
+        let diagnostics = view_definition_contract_diagnostics(&view);
+        let advisory = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == "view_contract.content_overflow_without_scroll_region"
+            })
+            .expect("uncovered painted overflow draws the advisory");
+        assert_eq!(advisory.severity, DiagnosticSeverity::Warning);
+        // The message carries the overflow distance, both rects, the fixing
+        // helper, and the fixing doc page (NC-13: the advisory must TEACH
+        // the scroll question, not just flag it).
+        assert!(advisory.message.contains("352"), "{}", advisory.message);
+        assert!(
+            advisory.message.contains("(0, 0, 640, 640)"),
+            "{}",
+            advisory.message
+        );
+        assert!(
+            advisory.message.contains("(0, 0, 640, 992)"),
+            "{}",
+            advisory.message
+        );
+        assert!(
+            advisory
+                .message
+                .contains("scroll_region_from_scrollable_capability"),
+            "{}",
+            advisory.message
+        );
+        assert!(
+            advisory.message.contains("api/routing-and-scroll.md"),
+            "{}",
+            advisory.message
+        );
+        // Advisory, NOT a refusal: NC-13 asked for inducement, and a new
+        // blocker would break existing intentionally-clipping apps.
+        assert!(!view_definition_has_blocking_contract_diagnostic(
+            &diagnostics
+        ));
+    }
+
+    #[test]
+    fn covering_enabled_scroll_region_suppresses_the_overflow_advisory() {
+        let mut view = dashboard_card_column_view();
+        view.scroll_regions
+            .push(dashboard_page_scroll_region(&view));
+        let diagnostics = view_definition_contract_diagnostics(&view);
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "view_contract.content_overflow_without_scroll_region"
+            }),
+            "a scroll region whose content_bounds cover the painted extent \
+             is exactly the fix: {diagnostics:?}"
+        );
+
+        // A DISABLED region is not coverage — the user still cannot reach
+        // the overflow.
+        view.scroll_regions[0].enabled = false;
+        let diagnostics = view_definition_contract_diagnostics(&view);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "view_contract.content_overflow_without_scroll_region"
+        }));
+    }
+
+    #[test]
+    fn declared_overflow_bounds_suppress_the_overflow_advisory() {
+        // The Step-210 roaming-overlay pattern: a declared overflow
+        // allowance legitimately exceeds layout and must NOT draw the
+        // advisory (paint outside the allowance is already the
+        // `paint_bounds_outside_overflow_bounds` error).
+        let mut view = dashboard_card_column_view();
+        view.paint_order = PaintOrderDeclaration::source_order(view.target.clone())
+            .with_overflow_bounds(TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 640.0,
+                    height: 992.0,
+                },
+            }));
+        let diagnostics = view_definition_contract_diagnostics(&view);
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "view_contract.content_overflow_without_scroll_region"
+            }),
+            "{diagnostics:?}"
+        );
+        assert!(!diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "view_contract.paint_bounds_outside_overflow_bounds"
+        }));
+    }
+
+    #[test]
+    fn clipped_overflow_suppresses_the_overflow_advisory() {
+        // A group clip that clips the overflow is intentional clipping:
+        // the clipped extent never reaches pixels, so it is not
+        // unreachable content.
+        let mut view = dashboard_card_column_view();
+        let cards = std::mem::take(&mut view.paint);
+        view.paint = vec![PaintOp::Group {
+            id: Some("card-column-clip".to_string()),
+            clip: Some(ClipDeclaration {
+                id: None,
+                bounds: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 640.0,
+                        height: 640.0,
+                    },
+                },
+                path: None,
+            }),
+            ops: cards,
+        }];
+        let diagnostics = view_definition_contract_diagnostics(&view);
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "view_contract.content_overflow_without_scroll_region"
+            }),
+            "{diagnostics:?}"
+        );
     }
 }

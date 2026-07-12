@@ -84,7 +84,19 @@ Important concepts:
 - `SlipwayEventRoutingPolicy` - declares how an event routes through the widget
   tree.
 - `SlipwayEventDispositionPolicy` - declares whether the event is handled,
-  consumed, or propagated.
+  consumed, or propagated. The disposition is consulted BEFORE the handler
+  runs, and it must state exactly what `handle_event` will do.
+- `event_handling_table!` - generates `SlipwayLogic::handle_event` AND
+  `SlipwayEventDispositionPolicy::event_disposition` from one match table.
+
+Authoring rule: write the event handler and its disposition from ONE
+`event_handling_table!` — each arm's pattern+guard is the declared
+handledness, so the declaration cannot drift from the handler (the
+`event_declaration.handler_*` diagnostics in
+[Diagnostics](diagnostics.md) become inexpressible). Hand-write the two
+impls only for capture/bubble-phase declarations or custom propagation,
+building the evidence with `target_event_disposition`; the reference
+example's `internal_logic.rs` models the table form.
 
 Authoring rule: a visual region that should react must have the matching
 declaration. Painting something clickable is not enough.
@@ -105,6 +117,21 @@ Important concepts:
 - `ChildLayoutSeed` and `ChildLayoutPlan` - app/container child layout
   planning.
 - `ChildPlacement` - final child placement and slot identity.
+
+Root rule: a bare `SlipwayAppWidget::new(app)` is the supported root on
+both backends. Core and the backend adapters provide every policy impl the
+root gates require (font resolution delegates to
+`SlipwayApp::resolve_app_font`, default honest refusal), so no delegation
+wrapper around the adapter is ever needed — the reference example's
+`app_runner.rs` runs the bare root on both backends, and the wrapper idiom
+in the internal admission fixture (`AdmissionRuntimeAppWidget`) is
+historical, not a requirement.
+
+Composition caution: nesting a `SlipwayAppWidget` as a CHILD of another
+app compiles and admits, but live press dispatch to the inner app's
+widgets is a known open defect on both backends (2026-07-13). Keep one
+`SlipwayAppWidget` at the root and compose plain widgets or explicit
+container widgets under it.
 
 Authoring rule: an app with N widgets should expose N authored child widgets.
 Do not fake child widgets by painting all children inside one root view.
@@ -185,10 +212,24 @@ visible backend click, wheel, focus, or text operation works.
 
 Important concepts:
 
-- `TextStyle` - explicit font family, size, weight, style, decoration, and
-  baseline.
+- `TextStyle` - explicit font family, size, weight, style, decoration,
+  baseline, alignment (`align_x`/`align_y`), and wrap mode (`wrap`) within
+  the text op's bounds.
 - `TextStyle::plain()` - an explicit Slipway baseline style for tests or simple
   examples.
+- `TextStyle::centered()` / `.with_align_x(TextAlignX::...)` /
+  `.with_align_y(TextAlignY::...)` - declared text alignment: both visible
+  backends anchor the laid-out text within `PaintOp::Text.bounds`.
+  Unspecified = `Start`/`Top`, the historical top-left anchoring. Declare the
+  full control rect and align inside it; do not hand-center labels with
+  estimated character widths.
+- `TextStyle::no_wrap()` / `.with_wrap(TextWrap::...)` - declared per-op
+  wrap mode. Unspecified = `TextWrap::Word`, the historical word wrap at
+  the rect width; `TextWrap::None` keeps the text on one line, clipped at
+  the rect. When geometry must depend on real text size, measure through
+  `SlipwayApp::project_text_metrics` — never estimate character widths.
+  Per-backend honoring, order of operations, and the measurement pattern:
+  [Backend API Map](backends.md), "Text Wrap and Alignment".
 - `PaintOp::styled_text(...)` - the only text paint constructor.
 
 Authoring rule: text paint must carry an explicit `TextStyle`. Slipway does not

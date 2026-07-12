@@ -64,6 +64,16 @@ unless there is a clear reason not to.
 
 ## 4. Run An Authored App
 
+`SlipwayAppWidget::new(app)` alone is the supported root. The adapter
+already carries every root policy the backends require (its font bound is
+satisfied by `SlipwayApp::resolve_app_font`, below) — a hand-written
+delegation wrapper around it is never needed. The reference example runs
+exactly this bare root on both backends
+(`crates/slipway-example-authored/src/app_runner.rs`); the ~160-line
+`AdmissionRuntimeAppWidget` wrapper in the internal admission fixture is
+the pre-Step-209 historical idiom, kept only as back-compat proof — do not
+copy it.
+
 For iced:
 
 ```rust
@@ -136,6 +146,19 @@ matching contract, using the prelude helper that constructs it:
 - overlay or modal ordering: `PaintOrderDeclaration`;
 - child placement: `ChildLayoutPlan` and `ParentLocalRect`;
 - target-owned geometry: `TargetLocalRect`.
+
+Then ask the scrolling question explicitly, for every widget and for the
+composed app: does any content exceed its container or the window? A card
+column taller than the window counts. If yes, declare a covering scroll
+region (`scroll_region_from_scrollable_capability`, `_with_order` when
+regions can overlap — [Routing and scroll](api/routing-and-scroll.md));
+for a page taller than the window, use the app-level page-scroll pattern
+(`SlipwayApp::app_scroll_regions`, modeled at the `PATTERN:` site in
+`crates/slipway-example-authored/src/communication.rs`). Painted content
+with no covering scroll region draws the admission advisory
+`view_contract.content_overflow_without_scroll_region` (warning,
+non-blocking) naming this fix; clipping the overflow is fine only when it
+is intentional.
 
 The helpers require capability-bundle trait bounds. Implement the
 LOAD-BEARING traits by hand and cover every RESERVED bound with one macro

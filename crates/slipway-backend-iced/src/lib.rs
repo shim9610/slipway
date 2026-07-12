@@ -1940,6 +1940,14 @@ where
         self.assembled
             .runtime
             .record_presented_viewport(self.presented_viewport.get());
+        // Measurement projection (Phase 6 item 3b slice (iii), NC-4): on
+        // the same cadence as the viewport projection, hand the app hook
+        // the backend's REAL text layout so authored geometry can size
+        // itself to laid-out text. No-op (and free) for apps that never
+        // override `project_text_metrics`.
+        self.assembled
+            .runtime
+            .project_text_metrics(&mut IcedTextMetricProvider);
     }
 
     pub fn view<'a, Theme, Renderer>(
@@ -2133,6 +2141,13 @@ struct IcedPaintOcclusionRegion {
     target: WidgetId,
     address: Option<WidgetSlotAddress>,
     order: (i32, usize, usize),
+    /// AUTHORED within-z order of the occluding layer's paint unit
+    /// (`slipway_core::paint_unit_authored_z_order`), `None` when the
+    /// tie-break fields of `order` were defaulted from the unit traversal
+    /// (the mounted slot ordinal). Same-owner occlusion comparisons may
+    /// only consult this authored component (NC-2) — see
+    /// `paint_occlusion_blocks_hit_region`.
+    authored_z_order: Option<usize>,
     bounds: Rect,
     /// Resolved wheel-channel opacity for this occluder. `true` (default for an
     /// opaque layer) means the occluder blocks wheel input just like pointer
@@ -3077,6 +3092,7 @@ fn iced_paint_occlusion_regions(units: &[PaintUnit]) -> Vec<IcedPaintOcclusionRe
             &unit.target,
             unit.address.as_ref(),
             paint_unit_sort_key(unit),
+            slipway_core::paint_unit_authored_z_order(unit),
             None,
             &mut regions,
         );
@@ -3246,6 +3262,7 @@ fn collect_iced_paint_occlusion_regions(
     target: &WidgetId,
     address: Option<&WidgetSlotAddress>,
     order: (i32, usize, usize),
+    authored_z_order: Option<usize>,
     clip: Option<Rect>,
     out: &mut Vec<IcedPaintOcclusionRegion>,
 ) {
@@ -3261,6 +3278,7 @@ fn collect_iced_paint_occlusion_regions(
                     target,
                     address,
                     order,
+                    authored_z_order,
                     combine_clip_rects(clip, group_clip.as_ref().map(|clip| clip.bounds)),
                     out,
                 );
@@ -3282,6 +3300,7 @@ fn collect_iced_paint_occlusion_regions(
                         target: target.clone(),
                         address: address.cloned(),
                         order,
+                        authored_z_order,
                         bounds,
                         blocks_wheel: slipway_core::paint_layer_blocks_wheel(
                             *input_transparency,
@@ -3289,7 +3308,15 @@ fn collect_iced_paint_occlusion_regions(
                         ),
                     });
                 }
-                collect_iced_paint_occlusion_regions(ops, target, address, order, active_clip, out);
+                collect_iced_paint_occlusion_regions(
+                    ops,
+                    target,
+                    address,
+                    order,
+                    authored_z_order,
+                    active_clip,
+                    out,
+                );
             }
             PaintOp::Fill { .. } | PaintOp::Stroke { .. } | PaintOp::Text { .. } => {}
         }
@@ -9766,12 +9793,24 @@ fn route_iced_event(
                 });
             }
 
-            if paint_occlusion_at_input_points(presentation, input_points).is_some() {
+            if let Some(occlusion) = paint_occlusion_at_input_points(presentation, input_points) {
+                // No-silence contract (NC-2, roadmap Phase 6 item 1): a
+                // press legitimately blocked by an opaque paint layer with
+                // no reachable hit region must leave inspectable refusal
+                // evidence — the press is consumed (the layer is
+                // pointer-opaque) but never silently.
+                let refusal = blocked_pointer_refusal_evidence(
+                    presentation,
+                    input_points,
+                    occlusion,
+                    slipway_core::PointerEventKind::Press,
+                    Some(pointer_button(*button)),
+                );
                 return Some(IcedRoutedInput {
                     input: None,
                     capture_event: true,
                     request_redraw: focus_changed || hover_changed,
-                    refusal: None,
+                    refusal: Some(refusal),
                 });
             }
 
@@ -9847,7 +9886,8 @@ fn route_iced_event(
             });
 
             let Some(resolved) = hit_region else {
-                if paint_occlusion_at_input_points(presentation, input_points).is_some() {
+                if let Some(occlusion) = paint_occlusion_at_input_points(presentation, input_points)
+                {
                     if foreign_dispatch_hit_blocks_local_input(presentation, input_points) {
                         return Some(IcedRoutedInput {
                             input: None,
@@ -9856,11 +9896,21 @@ fn route_iced_event(
                             refusal: None,
                         });
                     }
+                    // No-silence contract (NC-2): a release consumed by an
+                    // opaque layer with no reachable hit region leaves
+                    // refusal evidence, exactly like the press arm.
+                    let refusal = blocked_pointer_refusal_evidence(
+                        presentation,
+                        input_points,
+                        occlusion,
+                        slipway_core::PointerEventKind::Release,
+                        Some(pointer_button(*button)),
+                    );
                     return Some(IcedRoutedInput {
                         input: None,
                         capture_event: true,
                         request_redraw: hover_changed,
-                        refusal: None,
+                        refusal: Some(refusal),
                     });
                 }
                 return hover_changed.then_some(IcedRoutedInput {
@@ -10914,7 +10964,7 @@ fn hit_region_at_input_points<'a>(
     let Some(occlusion) = paint_occlusion_at_input_points(presentation, points) else {
         return selected;
     };
-    selected.filter(|resolved| !paint_occlusion_blocks_hit_order(occlusion, &resolved.region.order))
+    selected.filter(|resolved| !paint_occlusion_blocks_hit_region(occlusion, resolved.region))
 }
 
 fn select_hit_region_at_input_points<'a>(
@@ -11649,14 +11699,101 @@ fn wheel_blocker_prevents_scroll_dispatch(
         .is_some_and(|blocker| blocker > hit_order_key(&selected_scroll.order))
 }
 
-fn paint_occlusion_blocks_hit_order(
+/// Pointer-channel occlusion filter for a SELECTED hit region: routes
+/// through the shared core predicate so live dispatch and the derived
+/// dispatch graph's occlusion edges cannot drift (NC-2). The same-owner
+/// same-z exemption lives in the core predicate: a widget's own opaque
+/// layer never blocks the hit region that widget declared at the layer's
+/// z_index — the occluder key's tie-break fields are paint-unit values
+/// (slot ordinal), not author-declared `HitRegionOrder` fields, so
+/// comparing them across owners at the same z is meaningless and used to
+/// silently drop every press over an authored opaque overlay.
+fn paint_occlusion_blocks_hit_region(
     occlusion: &IcedPaintOcclusionRegion,
-    hit_order: &HitRegionOrder,
+    region: &HitRegionDeclaration,
 ) -> bool {
-    slipway_core::hit_region_order_is_front_of(
+    slipway_core::paint_occlusion_blocks_declared_hit_region(
+        &occlusion.target,
         &hit_region_order_from_key(occlusion.order),
-        hit_order,
+        occlusion.authored_z_order,
+        &region.target,
+        &region.order,
     )
+}
+
+/// Refusal evidence for a pointer press/release consumed by a
+/// pointer-opaque paint layer with no reachable hit region (the NC-2
+/// no-silence contract extension): names the front occluder and every
+/// containing candidate hit region so the consumed press is diagnosable
+/// from the retained refusal ring (`diagnostics` probe kind) and from the
+/// seam's `post_hoc_diagnosis` attachment instead of vanishing.
+fn blocked_pointer_refusal_evidence(
+    presentation: &IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+    occlusion: &IcedPaintOcclusionRegion,
+    kind: slipway_core::PointerEventKind,
+    button: Option<slipway_core::PointerButton>,
+) -> slipway_core::DeclaredEventDispatchEvidence {
+    let mut candidate_regions: Vec<slipway_core::PresentationRegionId> = presentation
+        .hit_regions
+        .iter()
+        .filter(|region| {
+            region.enabled && region_contains_root_local_point(presentation, region, points.visual)
+        })
+        .map(|region| region.id.clone())
+        .collect();
+    if presentation.dispatch_context.position_space == IcedDispatchPositionSpace::MountedRootLocal {
+        let mounted_point = iced_evidence_root_local_point(presentation, points.dispatch);
+        for region in presentation.dispatch_context.hit_regions.iter() {
+            if region.enabled
+                && slipway_core::declared_region_contains_root_local_point_with_geometry_index(
+                    &presentation.dispatch_context.geometry_index,
+                    &region.target,
+                    region.address.as_ref(),
+                    region.bounds.into_rect(),
+                    mounted_point,
+                )
+                && !candidate_regions.contains(&region.id)
+            {
+                candidate_regions.push(region.id.clone());
+            }
+        }
+    }
+    let blocked_selection = select_hit_region_at_input_points(presentation, points)
+        .map(|resolved| resolved.region.id.clone());
+    let occluder = format!(
+        "the pointer-opaque paint layer of target `{}` (occlusion order z={} paint={} traversal={})",
+        occlusion.target.as_str(),
+        occlusion.order.0,
+        occlusion.order.1,
+        occlusion.order.2,
+    );
+    let refusal_reason = match &blocked_selection {
+        Some(selected) => format!(
+            "pointer {kind:?} (button {button:?}) was consumed by {occluder}, which fronts the selected hit region `{}`; no hit region was reachable at the point",
+            selected.as_str(),
+        ),
+        None => format!(
+            "pointer {kind:?} (button {button:?}) was consumed by {occluder}; no enabled hit region contains the point",
+        ),
+    };
+    slipway_core::DeclaredEventDispatchEvidence {
+        source: EvidenceSource::backend_presented(ICED_BACKEND_ID, "physical-input"),
+        frame: presentation.frame.clone(),
+        kind: DeclaredEventDispatchKind::Pointer,
+        input_position: Some(iced_evidence_root_local_point(
+            presentation,
+            points.dispatch,
+        )),
+        input_position_space: Some(slipway_core::DispatchPositionSpace::Content),
+        candidate_regions,
+        selected_region: None,
+        refusal_reason: Some(refusal_reason),
+        generated_event: None,
+        route: None,
+        capture_event: false,
+        diagnostics: Vec::new(),
+    }
 }
 
 fn hit_region_order_from_key(key: (i32, usize, usize)) -> HitRegionOrder {
@@ -12403,17 +12540,18 @@ fn draw_text_op_with_clip<Renderer>(
             size,
             line_height,
             font,
-            align_x: iced::advanced::text::Alignment::Left,
-            align_y: iced::alignment::Vertical::Top,
+            align_x: iced_text_align_x(style.align_x),
+            align_y: iced_text_align_y(style.align_y),
             shaping: iced::advanced::text::Shaping::default(),
-            wrapping: iced::advanced::text::Wrapping::Word,
+            wrapping: iced_text_wrapping(style.wrap),
         };
-        renderer.fill_text(
-            text,
-            iced_text_position(rect, style),
-            text_color,
-            clip_bounds,
-        );
+        // `fill_text` treats the position as the ALIGNMENT ANCHOR: the
+        // renderer lays the text out, then offsets it by the laid-out
+        // width/height relative to this point (Center subtracts half,
+        // Right/Bottom subtract all — see iced's cached-text pipeline).
+        // Passing the rect edge/center matching the declared alignment
+        // therefore anchors the text within the declared bounds.
+        renderer.fill_text(text, iced_text_anchor(rect, style), text_color, clip_bounds);
         return;
     }
 
@@ -12432,20 +12570,175 @@ fn draw_text_op_with_clip<Renderer>(
         size,
         line_height,
         font,
-        align_x: iced::advanced::text::Alignment::Left,
-        align_y: iced::alignment::Vertical::Top,
+        align_x: iced_text_align_x(style.align_x),
+        align_y: iced_text_align_y(style.align_y),
         shaping: iced::advanced::text::Shaping::default(),
-        wrapping: iced::advanced::text::Wrapping::Word,
+        wrapping: iced_text_wrapping(style.wrap),
     };
     let paragraph =
         <Renderer::Paragraph as iced::advanced::text::Paragraph>::with_spans::<()>(text);
 
-    renderer.fill_paragraph(
-        &paragraph,
-        iced_text_position(rect, style),
-        text_color,
-        clip_bounds,
+    // Unlike `fill_text`, `fill_paragraph` draws the laid-out buffer with
+    // the position as its TOP-LEFT (per-line alignment is already baked
+    // into the buffer). Anchor the block by its measured `min_bounds`
+    // within the declared rect — the same math iced's own text widget
+    // uses (`Rectangle::anchor`), plus the Slipway baseline-shift offset.
+    let position = iced_paragraph_anchor(
+        rect,
+        iced::advanced::text::Paragraph::min_bounds(&paragraph),
+        style,
     );
+    renderer.fill_paragraph(&paragraph, position, text_color, clip_bounds);
+}
+
+/// The declared per-op wrap mode mapped to iced's native `Wrapping`.
+/// `Word` (the unspecified default) keeps the historical hardcoded
+/// `Wrapping::Word` byte-identically; `None` opts the op out of soft
+/// wrapping (explicit `\n` still breaks lines in cosmic-text; the line
+/// clips at the op rect per the existing clip contract). iced's `Glyph`
+/// and `WordOrGlyph` levels are deliberately NOT exposed — egui has no
+/// parity-equivalent mode (ADR-0004).
+fn iced_text_wrapping(wrap: slipway_core::TextWrap) -> iced::advanced::text::Wrapping {
+    match wrap {
+        slipway_core::TextWrap::Word => iced::advanced::text::Wrapping::Word,
+        slipway_core::TextWrap::None => iced::advanced::text::Wrapping::None,
+    }
+}
+
+fn iced_text_align_x(align_x: slipway_core::TextAlignX) -> iced::advanced::text::Alignment {
+    match align_x {
+        // `Alignment::Left`, not `Alignment::Default`: `Default` is
+        // BiDi-aware (right-aligns RTL paragraphs) while the historical
+        // hardcoded behavior was `Left` — keeping `Left` keeps the
+        // unspecified default byte-identical.
+        slipway_core::TextAlignX::Start => iced::advanced::text::Alignment::Left,
+        slipway_core::TextAlignX::Center => iced::advanced::text::Alignment::Center,
+        slipway_core::TextAlignX::End => iced::advanced::text::Alignment::Right,
+    }
+}
+
+fn iced_text_align_y(align_y: slipway_core::TextAlignY) -> iced::alignment::Vertical {
+    match align_y {
+        slipway_core::TextAlignY::Top => iced::alignment::Vertical::Top,
+        slipway_core::TextAlignY::Center => iced::alignment::Vertical::Center,
+        slipway_core::TextAlignY::Bottom => iced::alignment::Vertical::Bottom,
+    }
+}
+
+/// The `fill_text` anchor point for the declared alignment: the rect
+/// edge/midpoint the renderer aligns the laid-out text against
+/// (`Start`/`Top` = the historical top-left anchor, byte-identical), plus
+/// the baseline-shift y offset `iced_text_position` applies.
+fn iced_text_anchor(rect: iced::Rectangle, style: &TextStyle) -> iced::Point {
+    let base = iced_text_position(rect, style);
+    let x = match style.align_x {
+        slipway_core::TextAlignX::Start => base.x,
+        slipway_core::TextAlignX::Center => base.x + rect.width / 2.0,
+        slipway_core::TextAlignX::End => base.x + rect.width,
+    };
+    let y = match style.align_y {
+        slipway_core::TextAlignY::Top => base.y,
+        slipway_core::TextAlignY::Center => base.y + rect.height / 2.0,
+        slipway_core::TextAlignY::Bottom => base.y + rect.height,
+    };
+    iced::Point::new(x, y)
+}
+
+/// The `fill_paragraph` draw position for the declared alignment: the
+/// TOP-LEFT of the measured paragraph block (`min_bounds`) anchored
+/// within the declared rect (`Start`/`Top` = the historical top-left,
+/// byte-identical), plus the baseline-shift y offset.
+fn iced_paragraph_anchor(
+    rect: iced::Rectangle,
+    min_bounds: iced::Size,
+    style: &TextStyle,
+) -> iced::Point {
+    let base = iced_text_position(rect, style);
+    let x = match style.align_x {
+        slipway_core::TextAlignX::Start => base.x,
+        slipway_core::TextAlignX::Center => base.x + (rect.width - min_bounds.width) / 2.0,
+        slipway_core::TextAlignX::End => base.x + rect.width - min_bounds.width,
+    };
+    let y = match style.align_y {
+        slipway_core::TextAlignY::Top => base.y,
+        slipway_core::TextAlignY::Center => base.y + (rect.height - min_bounds.height) / 2.0,
+        slipway_core::TextAlignY::Bottom => base.y + rect.height - min_bounds.height,
+    };
+    iced::Point::new(x, y)
+}
+
+/// The iced backend's REAL paint-text metric provider (roadmap Phase 6
+/// item 3b slice (iii), audit NC-4): measures a [`TextMeasurementRequest`]
+/// through the SAME text pipeline the visible renderer draws with —
+/// `iced_graphics::text::Paragraph` over the global cosmic-text font
+/// system, constructed with the identical font/size/line-height/
+/// alignment/wrapping mapping as `draw_text_op_with_clip` — so the
+/// measured size equals what a `PaintOp::Text` with that style presents.
+/// Injected into `SlipwayLogic::project_text_metrics` via
+/// `SlipwayRuntime::project_text_metrics` on the presented-viewport sync
+/// cadence. `available_bounds: Some(rect)` measures wrapped layout at
+/// that rect's size; `None` measures the intrinsic (unbounded) size.
+/// Receipts are always `Valid` with `line_count` from the real layout
+/// runs; `baseline` is not reported (`None`), never fabricated.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IcedTextMetricProvider;
+
+impl slipway_core::SlipwayTextMetricProvider for IcedTextMetricProvider {
+    fn text_metric_source(&self) -> slipway_core::TextMetricSource {
+        slipway_core::TextMetricSource {
+            provider_id: "slipway-backend-iced.paint-text-metrics".to_string(),
+            backend_id: Some(ICED_BACKEND_ID.to_string()),
+            api_name: "iced_graphics::text::Paragraph::with_text/min_bounds".to_string(),
+            kind: slipway_core::TextMetricSourceKind::OfficialBackendApi,
+        }
+    }
+
+    fn measure_text(
+        &mut self,
+        request: slipway_core::TextMeasurementRequest,
+    ) -> slipway_core::TextMeasurementReceipt {
+        let style = &request.style;
+        let bounds = request
+            .available_bounds
+            .map(|rect| iced::Size::new(rect.size.width.max(0.0), rect.size.height.max(0.0)))
+            .unwrap_or(iced::Size::INFINITE);
+        let text = iced::advanced::Text {
+            content: request.content.as_str(),
+            bounds,
+            size: iced::Pixels(iced_text_font_size(style)),
+            line_height: iced::advanced::text::LineHeight::Relative(1.2),
+            font: iced_font(style),
+            align_x: iced_text_align_x(style.align_x),
+            align_y: iced_text_align_y(style.align_y),
+            shaping: iced::advanced::text::Shaping::default(),
+            wrapping: iced_text_wrapping(style.wrap),
+        };
+        let paragraph = <iced::advanced::graphics::text::Paragraph as iced::advanced::text::Paragraph>::with_text(text);
+        let min_bounds = iced::advanced::text::Paragraph::min_bounds(&paragraph);
+        let line_count = paragraph.buffer().layout_runs().count();
+        let measured = Size {
+            width: min_bounds.width,
+            height: min_bounds.height,
+        };
+        let origin = request
+            .available_bounds
+            .map(|rect| rect.origin)
+            .unwrap_or(Point { x: 0.0, y: 0.0 });
+        slipway_core::TextMeasurementReceipt::Valid(slipway_core::ValidTextMeasurement {
+            source: slipway_core::SlipwayTextMetricProvider::text_metric_source(self),
+            facts: slipway_core::TextMeasurementFacts {
+                measured_size: measured,
+                content_bounds: Rect {
+                    origin,
+                    size: measured,
+                },
+                baseline: None,
+                line_count: Some(line_count),
+                caret_bounds: Vec::new(),
+            },
+            request,
+        })
+    }
 }
 
 fn iced_font(style: &TextStyle) -> iced::Font {
@@ -18418,6 +18711,9 @@ mod tests {
                 strikethrough: true,
             },
             baseline: BaselineShift::Subscript,
+            // Unspecified alignment: the historical top-left anchoring
+            // this test pins (position and clip assertions below).
+            ..TextStyle::plain()
         };
         let op = PaintOp::Text {
             bounds: Rect {
@@ -18469,6 +18765,285 @@ mod tests {
                 height: 24.0,
             }
         );
+    }
+
+    // NC-14 honor path, `fill_text` (undecorated) arm: a declared
+    // Center/Center alignment must reach the renderer as iced
+    // Center/Center AND move the anchor point to the rect's center —
+    // reverting the draw site to the historical hardcoded Left/Top (or to
+    // the top-left anchor) fails these assertions.
+    #[test]
+    fn iced_declared_alignment_maps_and_anchors_fill_text() {
+        let bounds = Rect {
+            origin: Point { x: 10.0, y: 12.0 },
+            size: Size {
+                width: 80.0,
+                height: 24.0,
+            },
+        };
+        let color = test_rgb(20, 30, 40);
+        let centered = PaintOp::styled_text(bounds, "mid", color, TextStyle::plain().centered());
+        let mut renderer = RecordingRenderer::default();
+
+        draw_paint_op(&mut renderer, iced::Point::new(5.0, 6.0), &centered);
+
+        assert_eq!(renderer.text_calls.len(), 1);
+        let draw = &renderer.text_calls[0];
+        assert_eq!(
+            draw.paragraph.align_x,
+            iced::advanced::text::Alignment::Center
+        );
+        assert_eq!(draw.paragraph.align_y, iced::alignment::Vertical::Center);
+        // Anchor = center of the translated rect (15,18)-(95,42).
+        assert_eq!(draw.position, iced::Point::new(55.0, 30.0));
+
+        let end_bottom = PaintOp::styled_text(
+            bounds,
+            "end",
+            color,
+            TextStyle::plain()
+                .with_align_x(slipway_core::TextAlignX::End)
+                .with_align_y(slipway_core::TextAlignY::Bottom),
+        );
+        let mut renderer = RecordingRenderer::default();
+
+        draw_paint_op(&mut renderer, iced::Point::new(5.0, 6.0), &end_bottom);
+
+        assert_eq!(renderer.text_calls.len(), 1);
+        let draw = &renderer.text_calls[0];
+        assert_eq!(
+            draw.paragraph.align_x,
+            iced::advanced::text::Alignment::Right
+        );
+        assert_eq!(draw.paragraph.align_y, iced::alignment::Vertical::Bottom);
+        // Anchor = bottom-right corner of the translated rect.
+        assert_eq!(draw.position, iced::Point::new(95.0, 42.0));
+
+        // Default equivalence: an unspecified alignment must keep the
+        // pre-NC-14 mapping (Left/Top) and the top-left anchor exactly.
+        let default = PaintOp::styled_text(bounds, "plain", color, TextStyle::plain());
+        let mut renderer = RecordingRenderer::default();
+
+        draw_paint_op(&mut renderer, iced::Point::new(5.0, 6.0), &default);
+
+        assert_eq!(renderer.text_calls.len(), 1);
+        let draw = &renderer.text_calls[0];
+        assert_eq!(
+            draw.paragraph.align_x,
+            iced::advanced::text::Alignment::Left
+        );
+        assert_eq!(draw.paragraph.align_y, iced::alignment::Vertical::Top);
+        assert_eq!(draw.position, iced::Point::new(15.0, 18.0));
+    }
+
+    // NC-14 honor path, `fill_paragraph` (decorated) arm: the declared
+    // alignment must be baked into the paragraph (per-line alignment) and
+    // the block anchored by its measured min_bounds. The recording fake
+    // reports min_bounds == bounds, so the anchored top-left equals the
+    // rect top-left here; the mapped alignment fields are the
+    // revert-detectors, and `iced_paragraph_anchor` pins the block math.
+    #[test]
+    fn iced_declared_alignment_reaches_decorated_paragraphs() {
+        let bounds = Rect {
+            origin: Point { x: 10.0, y: 12.0 },
+            size: Size {
+                width: 80.0,
+                height: 24.0,
+            },
+        };
+        let style = TextStyle::plain()
+            .with_decoration(TextDecoration {
+                underline: true,
+                strikethrough: false,
+            })
+            .centered();
+        let op = PaintOp::styled_text(bounds, "mid", test_rgb(20, 30, 40), style);
+        let mut renderer = RecordingRenderer::default();
+
+        draw_paint_op(&mut renderer, iced::Point::new(5.0, 6.0), &op);
+
+        assert!(renderer.text_calls.is_empty());
+        assert_eq!(renderer.paragraphs.len(), 1);
+        let draw = &renderer.paragraphs[0];
+        assert_eq!(
+            draw.paragraph.align_x,
+            iced::advanced::text::Alignment::Center
+        );
+        assert_eq!(draw.paragraph.align_y, iced::alignment::Vertical::Center);
+        // min_bounds == bounds in the fake, so the centered block's
+        // top-left equals the rect top-left.
+        assert_eq!(draw.position, iced::Point::new(15.0, 18.0));
+
+        // The block-anchor math itself, pinned against a measured size
+        // smaller than the rect: a 40x12 block centered in the translated
+        // 80x24 rect at (15,18) starts at (35,24); End/Bottom lands at
+        // (55,30).
+        let rect = iced::Rectangle {
+            x: 15.0,
+            y: 18.0,
+            width: 80.0,
+            height: 24.0,
+        };
+        let min_bounds = iced::Size::new(40.0, 12.0);
+        assert_eq!(
+            iced_paragraph_anchor(rect, min_bounds, &TextStyle::plain().centered()),
+            iced::Point::new(35.0, 24.0)
+        );
+        assert_eq!(
+            iced_paragraph_anchor(
+                rect,
+                min_bounds,
+                &TextStyle::plain()
+                    .with_align_x(slipway_core::TextAlignX::End)
+                    .with_align_y(slipway_core::TextAlignY::Bottom)
+            ),
+            iced::Point::new(55.0, 30.0)
+        );
+        assert_eq!(
+            iced_paragraph_anchor(rect, min_bounds, &TextStyle::plain()),
+            iced::Point::new(15.0, 18.0)
+        );
+    }
+
+    // NC-4 honor path, both draw arms: the declared per-op wrap mode
+    // must reach the iced text construction (`Wrapping::None` on
+    // opt-out), and the unspecified default must keep the historical
+    // hardcoded `Wrapping::Word` byte-identically. Reverting either
+    // `draw_text_op_with_clip` arm to unconditional `Wrapping::Word`
+    // fails the no-wrap assertions.
+    #[test]
+    fn iced_declared_wrap_optout_reaches_both_text_arms() {
+        let bounds = Rect {
+            origin: Point { x: 10.0, y: 12.0 },
+            size: Size {
+                width: 80.0,
+                height: 24.0,
+            },
+        };
+        let color = test_rgb(20, 30, 40);
+
+        // fill_text arm (undecorated).
+        let no_wrap = PaintOp::styled_text(bounds, "single", color, TextStyle::plain().no_wrap());
+        let mut renderer = RecordingRenderer::default();
+        draw_paint_op(&mut renderer, iced::Point::new(5.0, 6.0), &no_wrap);
+        assert_eq!(renderer.text_calls.len(), 1);
+        assert_eq!(
+            renderer.text_calls[0].paragraph.wrapping,
+            iced::advanced::text::Wrapping::None
+        );
+
+        // fill_paragraph arm (decorated).
+        let decorated_no_wrap = PaintOp::styled_text(
+            bounds,
+            "single",
+            color,
+            TextStyle::plain()
+                .with_decoration(TextDecoration {
+                    underline: true,
+                    strikethrough: false,
+                })
+                .no_wrap(),
+        );
+        let mut renderer = RecordingRenderer::default();
+        draw_paint_op(
+            &mut renderer,
+            iced::Point::new(5.0, 6.0),
+            &decorated_no_wrap,
+        );
+        assert!(renderer.text_calls.is_empty());
+        assert_eq!(renderer.paragraphs.len(), 1);
+        assert_eq!(
+            renderer.paragraphs[0].paragraph.wrapping,
+            iced::advanced::text::Wrapping::None
+        );
+
+        // Default equivalence: an unspecified wrap keeps the historical
+        // hardcoded word wrap on both arms.
+        let default = PaintOp::styled_text(bounds, "plain", color, TextStyle::plain());
+        let mut renderer = RecordingRenderer::default();
+        draw_paint_op(&mut renderer, iced::Point::new(5.0, 6.0), &default);
+        assert_eq!(
+            renderer.text_calls[0].paragraph.wrapping,
+            iced::advanced::text::Wrapping::Word
+        );
+        assert_eq!(
+            iced_text_wrapping(slipway_core::TextWrap::Word),
+            iced::advanced::text::Wrapping::Word
+        );
+    }
+
+    // NC-4 measurement path: the backend's paint-text metric provider
+    // measures through the REAL iced text pipeline (cosmic-text via
+    // `iced_graphics::text::Paragraph`), so measured sizes track content
+    // and honor the declared wrap mode. Reverting the provider to any
+    // estimate (or the wrap mapping to unconditional word wrap) fails
+    // the relational assertions.
+    #[test]
+    fn iced_text_metric_provider_measures_real_layout() {
+        let mut provider = IcedTextMetricProvider;
+        let request = |content: &str, style: TextStyle, available: Option<Rect>| {
+            slipway_core::TextMeasurementRequest {
+                target: WidgetId::from("measure-widget"),
+                request_id: "measure".to_string(),
+                content: content.to_string(),
+                style,
+                available_bounds: available,
+                flow: None,
+                purposes: vec![slipway_core::TextMeasurementPurpose::IntrinsicSize],
+            }
+        };
+        let facts = |receipt: slipway_core::TextMeasurementReceipt| match receipt {
+            slipway_core::TextMeasurementReceipt::Valid(valid) => {
+                assert_eq!(
+                    valid.source.kind,
+                    slipway_core::TextMetricSourceKind::OfficialBackendApi
+                );
+                assert_eq!(valid.source.backend_id.as_deref(), Some(ICED_BACKEND_ID));
+                valid.facts
+            }
+            other => panic!("expected a valid receipt from the real layout, got {other:?}"),
+        };
+        use slipway_core::SlipwayTextMetricProvider as _;
+
+        // Intrinsic (unbounded) size: real layout, single line, wider
+        // content measures wider.
+        let short = facts(provider.measure_text(request("short", TextStyle::plain(), None)));
+        assert!(short.measured_size.width > 0.0);
+        assert!(short.measured_size.height > 0.0);
+        assert_eq!(short.line_count, Some(1));
+        let longer = facts(provider.measure_text(request(
+            "a much longer measured label",
+            TextStyle::plain(),
+            None,
+        )));
+        assert!(longer.measured_size.width > short.measured_size.width);
+
+        // Bounded word wrap: a narrow available rect wraps the layout
+        // into multiple lines and grows the measured height.
+        let narrow = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 60.0,
+                height: 200.0,
+            },
+        };
+        let wrapped = facts(provider.measure_text(request(
+            "wrap wrap wrap wrap wrap",
+            TextStyle::plain(),
+            Some(narrow),
+        )));
+        assert!(wrapped.line_count.expect("line count") > 1);
+        assert!(wrapped.measured_size.height > short.measured_size.height);
+
+        // The declared opt-out reaches measurement too: the same content
+        // in the same narrow rect stays on one line.
+        let unwrapped = facts(provider.measure_text(request(
+            "wrap wrap wrap wrap wrap",
+            TextStyle::plain().no_wrap(),
+            Some(narrow),
+        )));
+        assert_eq!(unwrapped.line_count, Some(1));
+        assert!(unwrapped.measured_size.width > narrow.size.width);
     }
 
     #[test]
@@ -22272,6 +22847,7 @@ mod tests {
                 target: overlay,
                 address: Some(overlay_slot),
                 order: (10, 0, 10_000),
+                authored_z_order: Some(0),
                 bounds: Rect {
                     origin: root_origin,
                     size: child_bounds.size,
@@ -23532,6 +24108,7 @@ mod tests {
             target: target.clone(),
             address: None,
             order: (10, 0, 1),
+            authored_z_order: Some(0),
             bounds,
             blocks_wheel: true,
         }];
@@ -23571,9 +24148,19 @@ mod tests {
         );
     }
 
+    // AMENDED at the NC-2 repair (roadmap Phase 6 item 1): the Step-168
+    // absorb pin is now expressed with a FOREIGN front layer. The former
+    // same-owner variant of this shape (a widget's own opaque layer whose
+    // sort key fronted the widget's own same-z hit region only through the
+    // DEFAULTED tie-break fields) is exactly the NC-2 silent modal drop and
+    // now ROUTES — pinned by
+    // `authored_opaque_overlay_routes_press_to_its_own_same_z_hit_region`.
+    // The blocked press also must leave refusal evidence now (the
+    // no-silence contract extension), asserted here.
     #[test]
-    fn front_opaque_explicit_layer_with_higher_traversal_absorbs_lower_hit_region() {
+    fn front_foreign_opaque_layer_with_higher_traversal_absorbs_lower_hit_region_with_refusal() {
         let target = WidgetId::from("overlap-layer-traversal-occlusion-test");
+        let front_overlay = WidgetId::from("overlap-layer-traversal-occlusion-front-overlay");
         let bounds = Rect {
             origin: Point { x: 0.0, y: 0.0 },
             size: Size {
@@ -23631,9 +24218,10 @@ mod tests {
             target.clone(),
         );
         presentation.paint_occlusion_regions = vec![IcedPaintOcclusionRegion {
-            target: target.clone(),
+            target: front_overlay.clone(),
             address: None,
             order: (10, 0, 1),
+            authored_z_order: Some(0),
             bounds,
             blocks_wheel: true,
         }];
@@ -23662,7 +24250,206 @@ mod tests {
         assert!(routed.capture_event);
         assert!(
             routed.input.is_none(),
-            "a lower hit region must not receive input through a front opaque layer"
+            "a lower hit region must not receive input through a front foreign opaque layer"
+        );
+        let refusal = routed
+            .refusal
+            .expect("a blocked press must construct refusal evidence (NC-2 no-silence contract)");
+        assert_eq!(refusal.kind, DeclaredEventDispatchKind::Pointer);
+        assert!(refusal.capture_event.eq(&false));
+        assert!(refusal.selected_region.is_none());
+        assert!(
+            refusal
+                .candidate_regions
+                .contains(&PresentationRegionId::from("lower-hit")),
+            "refusal names the covered candidate region: {:?}",
+            refusal.candidate_regions
+        );
+        let reason = refusal
+            .refusal_reason
+            .as_deref()
+            .expect("blocked-press refusal carries a reason");
+        assert!(
+            reason.contains("overlap-layer-traversal-occlusion-front-overlay"),
+            "refusal reason names the occluding layer's owner: {reason}"
+        );
+
+        // The matching RELEASE over the same occluder is refused with
+        // evidence too — no half of the click may vanish silently.
+        let released = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("front opaque layer absorbs the release");
+        assert!(released.capture_event);
+        assert!(released.input.is_none());
+        let release_refusal = released
+            .refusal
+            .expect("a blocked release must construct refusal evidence (NC-2 no-silence contract)");
+        assert!(
+            release_refusal
+                .refusal_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Release")),
+            "release refusal names the pointer phase"
+        );
+    }
+
+    /// NC-2 regression (roadmap Phase 6 item 1, the naive-consumer audit's
+    /// live modal drop): an authored opaque full-bounds `PaintOp::Layer`
+    /// (z 100, `PaintLayerKey::new` — NO authored within-z order) plus the
+    /// SAME widget's full-bounds hit region declared at z 100 must route a
+    /// press to that hit region, even when the presentation is built at a
+    /// non-zero source order (the mounted slot ordinal that poisons the
+    /// occluder key's defaulted tie-break fields — here ordinal 7, the
+    /// fixture app's modal slot). Revert-and-fail: with the pre-repair
+    /// order-only occlusion comparison the occluder key (100, 7, 7) fronts
+    /// the declared (100, 0, 0) and the press is absorbed without a trace.
+    #[test]
+    fn authored_opaque_overlay_routes_press_to_its_own_same_z_hit_region() {
+        let target = WidgetId::from("nc2-modal-overlay-test");
+        let slot = WidgetSlotAddress::new(target.clone(), 7);
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 300.0,
+                height: 200.0,
+            },
+        };
+        let own_hit = slipway_core::hit_region_from_pointer_capability(
+            &InteractionCapabilityWidget { id: target.clone() },
+            &(),
+            &(),
+            PresentationRegionId::from("nc2-modal-overlay-test:hit"),
+            Some(slot.clone()),
+            TargetLocalRect::new(bounds),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            slipway_core::HitRegionOrder {
+                z_index: 100,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            Some("nc2-modal-overlay-test:hit".to_string()),
+            CursorCapability::Pointer,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let mut paint_order = slipway_core::PaintOrderDeclaration::layer(target.clone(), 100);
+        paint_order.allow_overlap = true;
+        let view = ViewDefinition {
+            target: target.clone(),
+            frame: frame(621),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: vec![PaintOp::Layer {
+                id: Some("nc2-modal-overlay-test:layer".to_string()),
+                key: slipway_core::PaintLayerKey::new(100),
+                input_transparency: slipway_core::PaintInputTransparency::Opaque,
+                wheel_transparency: None,
+                clip: None,
+                ops: vec![PaintOp::Fill {
+                    shape: ShapeDeclaration {
+                        id: Some("nc2-modal-backdrop".to_string()),
+                        kind: ShapeKind::Rectangle,
+                        bounds,
+                        path: None,
+                        clip: None,
+                    },
+                    color: test_rgb(255, 255, 255),
+                }],
+            }],
+            paint_order,
+            hit_regions: vec![own_hit],
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                view,
+                &TestWidget.capabilities(),
+                LayoutInput {
+                    viewport: TargetLocalRect::new(bounds),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: bounds.size,
+                    },
+                },
+                target.clone(),
+                Some(slot),
+                7,
+                Point { x: 0.0, y: 0.0 },
+            );
+
+        // The defect precondition holds: the own layer's occluder key
+        // carries the slot ordinal in its defaulted tie-break fields.
+        assert_eq!(
+            presentation
+                .paint_occlusion_regions
+                .iter()
+                .map(|occlusion| occlusion.order)
+                .collect::<Vec<_>>(),
+            vec![(100, 7, 7)],
+        );
+        assert_eq!(
+            presentation.paint_occlusion_regions[0].authored_z_order,
+            None
+        );
+
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(150.0, 100.0)),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("overlay press resolves");
+
+        assert!(routed.capture_event);
+        assert!(routed.refusal.is_none(), "a routed press is not a refusal");
+        let input = routed
+            .input
+            .expect("the overlay's own same-z hit region receives the press (NC-2)");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("routed press carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("nc2-modal-overlay-test:hit"))
         );
     }
 
@@ -23764,6 +24551,7 @@ mod tests {
             target: overlay.clone(),
             address: Some(overlay_slot),
             order: (10, 0, 10_000),
+            authored_z_order: Some(0),
             bounds,
             blocks_wheel: true,
         }];
@@ -24018,6 +24806,7 @@ mod tests {
             target: panel,
             address: None,
             order: (0, 0, 0),
+            authored_z_order: None,
             bounds,
             blocks_wheel: true,
         }];
@@ -24137,6 +24926,7 @@ mod tests {
             target: overlay,
             address: Some(overlay_slot),
             order: (10, 0, 10_000),
+            authored_z_order: Some(0),
             bounds,
             blocks_wheel: true,
         }];
@@ -24293,6 +25083,7 @@ mod tests {
             target: overlay,
             address: Some(overlay_slot),
             order: (10, 0, 10_000),
+            authored_z_order: Some(0),
             bounds,
             blocks_wheel: false,
         }];

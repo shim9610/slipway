@@ -8,7 +8,8 @@ while staying inside the declared contracts.
 
 This file is the CANONICAL statement of the cross-cutting authoring rules
 (facade/prelude rule, app shape, declarations, style, backend input proof,
-stop-and-report labels); other public pages summarize and defer to it.
+stop-and-report labels and the `GAPS.md` landing zone); other public pages
+summarize and defer to it.
 
 ## First Rule
 
@@ -68,6 +69,12 @@ contract. Each declaration has a prelude helper — the region structs are
   from the final `LayoutOutput` (`scroll_region_from_scrollable_capability`;
   use `_with_order` when regions can overlap — see
   [Routing and scroll](api/routing-and-scroll.md));
+- ask the scroll question explicitly: does any content
+  exceed its container or the window (a card column taller than the window
+  counts)? Then that overflow needs a covering scroll region — the
+  page/root pattern is `SlipwayApp::app_scroll_regions` — or an intentional
+  clip; admission flags uncovered overflow with the
+  `view_contract.content_overflow_without_scroll_region` advisory;
 - overlays/popups need explicit `PaintOrderDeclaration`, overflow bounds when
   they can leave a parent box, and matching hit regions;
 - repeated children need stable slot identity, not just the same child id.
@@ -185,6 +192,22 @@ Use these labels:
   or prove it.
 - `AUTHORING_GAP`: the app did not declare the necessary layout/style/event
   contract.
+
+Reports need a durable landing zone, not chat scroll or stdout. A consuming
+agent records every gap in a `GAPS.md` file at its own project root — one
+section per gap, carrying:
+
+- the label (`PUBLIC_DOC_GAP` / `API_GAP` / `BACKEND_GAP` /
+  `AUTHORING_GAP`);
+- what was needed;
+- what the docs/API provided instead;
+- the workaround taken (or "none — blocked").
+
+Recording a gap does not always mean halting: when a safe workaround exists
+— one that stays inside the declared contracts — record the gap in
+`GAPS.md` and keep working. Stop only when every available workaround is on
+the contract-violating list above (direct state mutation, non-prelude
+internals, fabricated evidence, and the rest).
 
 ## Final Self-Check
 

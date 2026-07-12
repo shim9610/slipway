@@ -1163,6 +1163,25 @@ where
             .project_frame_viewport(&mut self.external, viewport);
     }
 
+    /// Measurement-truth projection
+    /// (`SlipwayLogic::project_text_metrics`): the presenting backend
+    /// calls this with its REAL paint-text metric provider on the same
+    /// cadence as [`Self::record_presented_viewport`]. The widget hook
+    /// may measure text through the provider and mirror the facts into
+    /// external state so paint/handlers/view can size authored geometry
+    /// to laid-out text (roadmap Phase 6 item 3b, audit NC-4 — the
+    /// replacement for estimated character-width ratios). The default
+    /// hook is a no-op, keeping this byte-identical for widgets that do
+    /// not opt in.
+    pub fn project_text_metrics(
+        &mut self,
+        metrics: &mut dyn slipway_core::SlipwayTextMetricProvider,
+    ) {
+        self.slot
+            .widget
+            .project_text_metrics(&mut self.external, metrics);
+    }
+
     /// Registers the visible backend presenting this runtime so status and
     /// diagnostics replies can name it. Idempotent; cheap when unchanged.
     pub fn record_presenting_backend(&mut self, backend_id: &str) {
@@ -6459,6 +6478,7 @@ mod tests {
     #[derive(Clone, Debug, Default, PartialEq)]
     struct ViewportExternal {
         viewport: Option<Rect>,
+        measured_label: Option<Size>,
     }
 
     impl SlipwayWidgetTypes for ViewportProjectionWidget {
@@ -6497,6 +6517,31 @@ mod tests {
 
         fn project_frame_viewport(&self, external: &mut Self::ExternalState, viewport: Rect) {
             external.viewport = Some(viewport);
+        }
+
+        fn project_text_metrics(
+            &self,
+            external: &mut Self::ExternalState,
+            metrics: &mut dyn slipway_core::SlipwayTextMetricProvider,
+        ) {
+            let receipt = metrics.measure_text(slipway_core::TextMeasurementRequest {
+                target: self.id(),
+                request_id: "label".to_string(),
+                content: "measured label".to_string(),
+                style: slipway_core::TextStyle::plain(),
+                available_bounds: None,
+                flow: None,
+                purposes: vec![slipway_core::TextMeasurementPurpose::IntrinsicSize],
+            });
+            external.measured_label = match receipt {
+                slipway_core::TextMeasurementReceipt::Valid(valid) => {
+                    Some(valid.facts.measured_size)
+                }
+                // Honest absence: never fabricate a size from a refused
+                // measurement.
+                slipway_core::TextMeasurementReceipt::Invalid { .. }
+                | slipway_core::TextMeasurementReceipt::Unsupported { .. } => None,
+            };
         }
     }
 
@@ -6554,6 +6599,86 @@ mod tests {
             "the projection hook must receive every recorded viewport"
         );
         assert_eq!(runtime.last_frame_identity().viewport, viewport);
+    }
+
+    // Phase 6 item 3b slice (iii) (NC-4) — the measurement-projection
+    // channel: `SlipwayRuntime::project_text_metrics` must hand the
+    // backend's provider to the widget's `project_text_metrics` hook so
+    // measured facts become ordinary external state; an Invalid receipt
+    // must land as honest absence, never a fabricated size.
+    #[test]
+    fn project_text_metrics_reaches_widget_hook_with_honest_receipts() {
+        struct FixtureProvider {
+            valid: bool,
+        }
+
+        impl slipway_core::SlipwayTextMetricProvider for FixtureProvider {
+            fn text_metric_source(&self) -> slipway_core::TextMetricSource {
+                slipway_core::TextMetricSource {
+                    provider_id: "fixture-provider".to_string(),
+                    backend_id: Some("fixture-backend".to_string()),
+                    api_name: "fixture_measure".to_string(),
+                    kind: slipway_core::TextMetricSourceKind::OfficialBackendApi,
+                }
+            }
+
+            fn measure_text(
+                &mut self,
+                request: slipway_core::TextMeasurementRequest,
+            ) -> slipway_core::TextMeasurementReceipt {
+                if self.valid {
+                    slipway_core::TextMeasurementReceipt::Valid(
+                        slipway_core::ValidTextMeasurement {
+                            source: self.text_metric_source(),
+                            facts: slipway_core::TextMeasurementFacts {
+                                measured_size: Size {
+                                    width: 96.0,
+                                    height: 18.0,
+                                },
+                                content_bounds: Rect {
+                                    origin: Point { x: 0.0, y: 0.0 },
+                                    size: Size {
+                                        width: 96.0,
+                                        height: 18.0,
+                                    },
+                                },
+                                baseline: None,
+                                line_count: Some(1),
+                                caret_bounds: Vec::new(),
+                            },
+                            request,
+                        },
+                    )
+                } else {
+                    slipway_core::TextMeasurementReceipt::Invalid {
+                        request,
+                        reason: slipway_core::InvalidTextMeasurementReason::HardCodedCharacterWidth,
+                        diagnostics: Vec::new(),
+                    }
+                }
+            }
+        }
+
+        let mut runtime =
+            SlipwayRuntime::new(ViewportProjectionWidget, ViewportExternal::default());
+        assert_eq!(runtime.external().measured_label, None);
+
+        runtime.project_text_metrics(&mut FixtureProvider { valid: true });
+        assert_eq!(
+            runtime.external().measured_label,
+            Some(Size {
+                width: 96.0,
+                height: 18.0,
+            }),
+            "a valid receipt's facts must reach external state through the hook"
+        );
+
+        runtime.project_text_metrics(&mut FixtureProvider { valid: false });
+        assert_eq!(
+            runtime.external().measured_label,
+            None,
+            "an invalid receipt must clear the projection, never fabricate a size"
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ use slipway::prelude::*;
 // APIs, deliberately outside ordinary authoring imports.
 use slipway::{
     BackendInputEvent, DeclaredEventDispatchKind, DispatchGraphNodeKind, EvidenceSource,
+    apply_physical_event_handling_declaration, declared_event_handling,
     declared_focus_text_dispatch_evidence, derive_dispatch_graph_for_composed_view,
     resolve_declared_pointer_dispatch_with_evidence, resolve_declared_wheel_dispatch_with_evidence,
 };
@@ -397,7 +398,7 @@ fn composed_app_view_passes_pre_flight_admission() {
 /// shrunken-window case is admissible.
 #[test]
 fn page_region_appears_exactly_when_the_column_exceeds_the_window() {
-    // Tall window: column (590) fits in 640 -> no page region, and the
+    // Tall window: column (614) fits in 640 -> no page region, and the
     // root bounds stretch to the window (the min-height pattern).
     let runtime = app_runtime();
     let view = composed_view(&runtime);
@@ -438,6 +439,53 @@ fn page_region_appears_exactly_when_the_column_exceeds_the_window() {
     assert!(
         !view_definition_has_blocking_contract_diagnostic(&diagnostics),
         "small-window composed pre-flight: {diagnostics:?}"
+    );
+}
+
+/// Phase 6 item 2 (NC-13 inducement): at the shrunken window the composed
+/// app paints a column taller than the window — the app-level PAGE region
+/// is exactly what keeps the `content_overflow_without_scroll_region`
+/// advisory silent, and stripping that one region re-draws it. This pins
+/// the closed loop the roadmap landed: advisory -> routing-and-scroll.md ->
+/// this crate's page-scroll pattern.
+#[test]
+fn page_region_suppresses_the_content_overflow_advisory() {
+    let runtime = app_runtime_with_viewport(600.0, 400.0);
+    let view = composed_view(&runtime);
+    let diagnostics = view_definition_contract_diagnostics_for_capabilities(
+        &view,
+        &runtime.widget().capabilities(),
+    );
+    assert!(
+        !diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "view_contract.content_overflow_without_scroll_region"
+        }),
+        "the page region covers the column overflow: {diagnostics:?}"
+    );
+
+    // Counterfactual: strip the page region AND the composed overflow
+    // allowance. The allowance must go too because the ROAM overlay child's
+    // declared overflow bounds compose into the app view as an allowance
+    // containing the whole root layout, and a declared allowance is the
+    // Step-210 pattern the advisory deliberately stays silent for — a
+    // recorded masking limitation at composed level (Step 217); the
+    // consumer-app shape (no overflow declaration) fires directly.
+    let mut stripped = view;
+    stripped
+        .scroll_regions
+        .retain(|region| region.id != ssot::page_scroll_region_id());
+    stripped.paint_order.allow_overflow_paint = false;
+    stripped.paint_order.overflow_bounds = None;
+    let diagnostics = view_definition_contract_diagnostics_for_capabilities(
+        &stripped,
+        &runtime.widget().capabilities(),
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "view_contract.content_overflow_without_scroll_region"
+        }),
+        "without the page region the overflow is uncovered and must draw \
+         the advisory: {diagnostics:?}"
     );
 }
 
@@ -545,7 +593,7 @@ fn wheel_at_dead_space_scrolls_the_page_and_card_limits_chain_to_it() {
         ssot::PAGE_SCROLL_STEP
     );
 
-    // The page offset clamps to the exact declared travel (590 - 400): at
+    // The page offset clamps to the exact declared travel (614 - 400): at
     // the limit the page region drops out of the candidate pool (no
     // consumer is left for a down-wheel over dead space) instead of
     // black-holing the wheel with an unmovable offset.
@@ -710,6 +758,224 @@ fn overlay_drag_region_tracks_painted_titlebar() {
         overlay_layer_by_id(&view.paint, "authored.overlay:roam").expect("roaming layer painted");
     assert_eq!(roam_pointer, PaintInputTransparency::Opaque);
     assert_eq!(roam_wheel, Some(PaintInputTransparency::PassThrough));
+}
+
+fn text_op_by_content(ops: &[PaintOp], wanted: &str) -> Option<(Rect, TextStyle)> {
+    for op in ops {
+        match op {
+            PaintOp::Text {
+                bounds,
+                content,
+                style,
+                ..
+            } if content == wanted => {
+                return Some((*bounds, style.clone()));
+            }
+            PaintOp::Group { ops, .. } | PaintOp::Layer { ops, .. } => {
+                if let Some(found) = text_op_by_content(ops, wanted) {
+                    return Some(found);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// Declaration-level pin for the declared-text-alignment pattern (NC-14,
+// the ScrollIndicatorMode test convention): the roaming titlebar label
+// declares the FULL titlebar rect as its bounds and `.centered()` for the
+// style — the backends anchor it, no hand-computed insets. Alignment is
+// presentation intent (no `view_contract.*` code guards it), so this pin
+// is the drift guard.
+#[test]
+fn overlay_roam_title_declares_centered_alignment() {
+    let overlay = OverlayWidget;
+    let local = crate::view::OverlayLocal {
+        offset: ssot::overlay_default_offset(),
+        dragging: false,
+        drag_anchor: Point { x: 0.0, y: 0.0 },
+        roam_offset: ssot::overlay_roam_default_offset(),
+        roam_dragging: false,
+        roam_anchor: Point { x: 0.0, y: 0.0 },
+        feed_rows: 0,
+    };
+    let view = widget_view(&overlay, &local, ssot::OVERLAY_CARD_HEIGHT);
+
+    let (bounds, style) = text_op_by_content(&view.paint, "roam me").expect("roam title painted");
+    let roam_titlebar = fill_bounds_by_shape_id(&view.paint, "overlay-roam-titlebar")
+        .expect("roaming titlebar painted");
+    assert_eq!(
+        bounds, roam_titlebar,
+        "the label must declare the FULL titlebar rect, not an inset guess"
+    );
+    assert_eq!(style.align_x, TextAlignX::Center);
+    assert_eq!(style.align_y, TextAlignY::Center);
+
+    // The clamped panel's title keeps the unspecified default — the
+    // historical top-left anchoring (the contrast case).
+    let (_, drag_style) = text_op_by_content(&view.paint, "drag me").expect("drag title painted");
+    assert_eq!(drag_style.align_x, TextAlignX::Start);
+    assert_eq!(drag_style.align_y, TextAlignY::Top);
+}
+
+// Declaration-level pin for the per-op wrap opt-out pattern (NC-4, same
+// convention as the alignment pin above): the input card's CJK label
+// declares a rect NARROWER than its laid-out text and `TextWrap::None`
+// for the style — one line, clipped at the rect, on every presenter.
+// Wrap is presentation intent (no `view_contract.*` code guards it), so
+// this pin is the drift guard.
+#[test]
+fn input_nowrap_label_declares_single_line_contract() {
+    let input = DraftInputWidget;
+    let view = widget_view(
+        &input,
+        &input.initial_local_state(),
+        ssot::INPUT_CARD_HEIGHT,
+    );
+
+    let (bounds, style) =
+        text_op_by_content(&view.paint, ssot::INPUT_NOWRAP_LABEL).expect("no-wrap label painted");
+    assert_eq!(style.wrap, TextWrap::None);
+    assert_eq!(style, ssot::nowrap_label_text());
+    assert_eq!(bounds, ssot::input_nowrap_label_rect(560.0));
+    // The default-contrast case: every other input-card text op keeps the
+    // unspecified word wrap.
+    let (_, header_style) =
+        text_op_by_content(&view.paint, "Draft (click, then type)").expect("header painted");
+    assert_eq!(header_style.wrap, TextWrap::Word);
+}
+
+// The measurement channel end-to-end at the runtime seam (NC-4, slice
+// (iii)): `SlipwayRuntime::project_text_metrics` runs the app hook with
+// the given provider; a VALID receipt becomes `ShowcaseState::window_badge`
+// and the input card sizes the badge rect to the measured label (fill,
+// outline, and centered text over the SAME rect — no character-width
+// ratios anywhere). Refused receipts land as honest absence: no badge
+// ops painted. A fake provider stands in for the backend here; the
+// per-backend providers are pinned in their own suites
+// (`iced_text_metric_provider_measures_real_layout`,
+// `egui_text_metric_provider_measures_real_galley`).
+#[test]
+fn window_badge_is_sized_by_the_projected_measurement() {
+    struct FixtureProvider {
+        valid: bool,
+    }
+
+    impl SlipwayTextMetricProvider for FixtureProvider {
+        fn text_metric_source(&self) -> TextMetricSource {
+            TextMetricSource {
+                provider_id: "authored-test-provider".to_string(),
+                backend_id: Some("authored-test-backend".to_string()),
+                api_name: "fixture_measure".to_string(),
+                kind: TextMetricSourceKind::OfficialBackendApi,
+            }
+        }
+
+        fn measure_text(&mut self, request: TextMeasurementRequest) -> TextMeasurementReceipt {
+            // The hook must measure with the paint op's own style token.
+            assert_eq!(request.style, ssot::badge_text());
+            assert_eq!(request.available_bounds, None);
+            if self.valid {
+                TextMeasurementReceipt::Valid(ValidTextMeasurement {
+                    source: self.text_metric_source(),
+                    facts: TextMeasurementFacts {
+                        measured_size: Size {
+                            width: 43.0,
+                            height: 15.0,
+                        },
+                        content_bounds: Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: Size {
+                                width: 43.0,
+                                height: 15.0,
+                            },
+                        },
+                        baseline: None,
+                        line_count: Some(1),
+                        caret_bounds: Vec::new(),
+                    },
+                    request,
+                })
+            } else {
+                TextMeasurementReceipt::Unsupported {
+                    request,
+                    diagnostics: Vec::new(),
+                }
+            }
+        }
+    }
+
+    let mut runtime = app_runtime();
+    assert_eq!(
+        runtime.external().window_badge,
+        None,
+        "no measurement projected yet -> no badge state"
+    );
+
+    runtime.project_text_metrics(&mut FixtureProvider { valid: true });
+    let badge = runtime
+        .external()
+        .window_badge
+        .clone()
+        .expect("a valid receipt becomes badge state");
+    assert_eq!(
+        badge.text,
+        ssot::window_badge_label(Size {
+            width: FRAME_WIDTH,
+            height: FRAME_HEIGHT,
+        })
+    );
+    assert_eq!(
+        badge.size,
+        Size {
+            width: 43.0,
+            height: 15.0,
+        }
+    );
+
+    // Paint derives the badge rect from the MEASURED size.
+    let input = DraftInputWidget;
+    let view = widget_view_with_state(
+        &input,
+        runtime.external(),
+        &input.initial_local_state(),
+        ssot::INPUT_CARD_HEIGHT,
+    );
+    let expected_rect = ssot::input_badge_rect(
+        560.0,
+        Size {
+            width: 43.0,
+            height: 15.0,
+        },
+    );
+    assert_eq!(
+        expected_rect.size.width,
+        43.0_f32.ceil() + 2.0 * ssot::INPUT_BADGE_PAD_X,
+        "the badge hugs the measured label plus the declared padding"
+    );
+    let badge_fill =
+        fill_bounds_by_shape_id(&view.paint, "input-badge").expect("badge fill painted");
+    assert_eq!(badge_fill, expected_rect);
+    let (label_bounds, label_style) =
+        text_op_by_content(&view.paint, &badge.text).expect("badge label painted");
+    assert_eq!(
+        label_bounds, expected_rect,
+        "the label declares the FULL badge rect and lets `.centered()` anchor it"
+    );
+    assert_eq!(label_style, ssot::badge_text());
+
+    // Honest absence: a refused measurement clears the state and the
+    // badge ops disappear rather than painting a fabricated size.
+    runtime.project_text_metrics(&mut FixtureProvider { valid: false });
+    assert_eq!(runtime.external().window_badge, None);
+    let view = widget_view_with_state(
+        &input,
+        runtime.external(),
+        &input.initial_local_state(),
+        ssot::INPUT_CARD_HEIGHT,
+    );
+    assert!(fill_bounds_by_shape_id(&view.paint, "input-badge").is_none());
 }
 
 // The two drag clamps, contrasted (the copy-source decision surface):
@@ -1503,5 +1769,290 @@ fn text_edit_replaces_the_draft_and_projects_into_the_overlay() {
             .iter()
             .any(|(_, content)| content.contains("draft: hello world")),
         "overlay must project the reduced draft"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sync-by-construction event handling (audit NC-8, ADR-0003)
+// ---------------------------------------------------------------------------
+
+/// The `event_handling_table!` law: for ANY event, the declared
+/// disposition and the actual handler outcome agree — the same
+/// pattern+guard tokens decide both — so the physical-path reconciliation
+/// (`event_declaration.handler_*`, the NC-8 live Error pair) cannot fire.
+/// Returns the agreed handledness so callers can also pin expectations.
+fn declaration_and_handler_agree<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    make_local: impl Fn() -> W::LocalState,
+    event: InputEvent,
+    label: &str,
+) -> bool
+where
+    W: SlipwayLogic + SlipwayEventRoutingPolicy + SlipwayEventDispositionPolicy,
+{
+    let declaration = declared_event_handling(widget, external, &make_local(), &event);
+    let declared = declaration.disposition.final_disposition.handled;
+    let mut local = make_local();
+    let raw = widget.handle_event(external, &mut local, event.clone());
+    assert_eq!(
+        raw.handled, declared,
+        "{label}: handler and declared disposition must agree for {event:?}"
+    );
+    if declared {
+        let outcome = apply_physical_event_handling_declaration(declaration, raw);
+        assert!(
+            !outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.starts_with("event_declaration.handler_")),
+            "{label}: reconciliation mismatch must be impossible: {:?}",
+            outcome.diagnostics
+        );
+    }
+    declared
+}
+
+#[test]
+fn event_tables_declare_exactly_what_the_handlers_do() {
+    let external = ShowcaseState::default();
+
+    // Note list: geometry-free cases pin expected handledness; the press
+    // scan proves agreement at EVERY probed y — on-row and between-row
+    // alike — without duplicating the row math in the test.
+    let list = NoteListWidget;
+    let list_local = || list.initial_local_state();
+    let wheel = |target: WidgetId, delta_y: f32| {
+        InputEvent::Wheel(WheelEvent {
+            target,
+            target_slot: None,
+            region_id: None,
+            delta_x: 0.0,
+            delta_y,
+        })
+    };
+    let press_at = |target: WidgetId, y: f32, primary: bool| {
+        InputEvent::Pointer(PointerEvent {
+            target,
+            target_slot: None,
+            position: Point { x: 24.0, y },
+            target_bounds: None,
+            kind: PointerEventKind::Press,
+            button: Some(PointerButton::Primary),
+            details: PointerDetails {
+                buttons: PointerButtons {
+                    primary,
+                    ..PointerButtons::default()
+                },
+                ..PointerDetails::default()
+            },
+        })
+    };
+    assert!(declaration_and_handler_agree(
+        &list,
+        &external,
+        list_local,
+        wheel(ssot::list_id(), -1.0),
+        "list wheel"
+    ));
+    assert!(!declaration_and_handler_agree(
+        &list,
+        &external,
+        list_local,
+        wheel(ssot::input_id(), -1.0),
+        "list wrong-target wheel"
+    ));
+    assert!(declaration_and_handler_agree(
+        &list,
+        &external,
+        list_local,
+        InputEvent::Focus(FocusEvent {
+            target: ssot::list_id(),
+            target_slot: None,
+            focused: true,
+        }),
+        "list focus"
+    ));
+    let mut on_row = 0;
+    let mut off_row = 0;
+    for step in 0..80 {
+        let y = step as f32 * 10.0;
+        if declaration_and_handler_agree(
+            &list,
+            &external,
+            list_local,
+            press_at(ssot::list_id(), y, true),
+            "list press scan",
+        ) {
+            on_row += 1;
+        } else {
+            off_row += 1;
+        }
+    }
+    assert!(on_row > 0, "the scan must cross at least one declared row");
+    assert!(off_row > 0, "the scan must cross between-row dead space");
+
+    // Draft input: consumes text-edit/text/focus, nothing else.
+    let input = DraftInputWidget;
+    let input_local = || input.initial_local_state();
+    assert!(declaration_and_handler_agree(
+        &input,
+        &external,
+        input_local,
+        InputEvent::TextEdit(TextEditEvent {
+            target: ssot::input_id(),
+            target_slot: None,
+            kind: TextEditKind::InsertText,
+            text: Some("a".to_string()),
+            selection_before: None,
+            selection_after: None,
+        }),
+        "draft text edit"
+    ));
+    assert!(declaration_and_handler_agree(
+        &input,
+        &external,
+        input_local,
+        InputEvent::Text(TextInputEvent {
+            target: ssot::input_id(),
+            target_slot: None,
+            text: "b".to_string(),
+        }),
+        "draft text"
+    ));
+    assert!(!declaration_and_handler_agree(
+        &input,
+        &external,
+        input_local,
+        wheel(ssot::input_id(), -1.0),
+        "draft wheel is not consumed"
+    ));
+
+    // Overlay: the Move guard is the state-dependent disposition the NC-8
+    // drift class got wrong — agreement holds in BOTH drag states.
+    let overlay = OverlayWidget;
+    let overlay_idle = || overlay.initial_local_state();
+    let overlay_dragging = || {
+        let mut local = overlay.initial_local_state();
+        local.dragging = true;
+        local
+    };
+    let move_at = |y: f32, primary: bool| {
+        InputEvent::Pointer(PointerEvent {
+            target: ssot::overlay_id(),
+            target_slot: None,
+            position: Point { x: 30.0, y },
+            target_bounds: None,
+            kind: PointerEventKind::Move,
+            button: None,
+            details: PointerDetails {
+                buttons: PointerButtons {
+                    primary,
+                    ..PointerButtons::default()
+                },
+                ..PointerDetails::default()
+            },
+        })
+    };
+    assert!(declaration_and_handler_agree(
+        &overlay,
+        &external,
+        overlay_idle,
+        press_at(ssot::overlay_id(), 30.0, true),
+        "overlay press"
+    ));
+    assert!(!declaration_and_handler_agree(
+        &overlay,
+        &external,
+        overlay_idle,
+        move_at(40.0, false),
+        "overlay hover move while idle"
+    ));
+    assert!(declaration_and_handler_agree(
+        &overlay,
+        &external,
+        overlay_dragging,
+        move_at(40.0, true),
+        "overlay drag move"
+    ));
+    assert!(declaration_and_handler_agree(
+        &overlay,
+        &external,
+        overlay_idle,
+        wheel(ssot::overlay_id(), -1.0),
+        "overlay feed wheel"
+    ));
+
+    // Nested feed: region-driven scroll — a foreign region id is declared
+    // unhandled by the arm guard, not by a body-side early return.
+    let nested = NestedFeedWidget;
+    let nested_local = || nested.initial_local_state();
+    let scroll_for = |region_id: PresentationRegionId| {
+        InputEvent::Scroll(ScrollEvent {
+            target: ssot::nested_id(),
+            target_slot: None,
+            region_id,
+            offset_x: 0.0,
+            offset_y: 24.0,
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 100.0,
+                },
+            }),
+            content_bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 400.0,
+                },
+            }),
+        })
+    };
+    assert!(declaration_and_handler_agree(
+        &nested,
+        &external,
+        nested_local,
+        wheel(ssot::nested_id(), -1.0),
+        "nested wheel"
+    ));
+    assert!(declaration_and_handler_agree(
+        &nested,
+        &external,
+        nested_local,
+        scroll_for(ssot::nested_outer_region_id()),
+        "nested owned-region scroll"
+    ));
+    assert!(!declaration_and_handler_agree(
+        &nested,
+        &external,
+        nested_local,
+        scroll_for(PresentationRegionId::from("someone-elses-region")),
+        "nested foreign-region scroll"
+    ));
+    let mut nested_on_row = 0;
+    let mut nested_off_row = 0;
+    for step in 0..80 {
+        let y = step as f32 * 10.0;
+        if declaration_and_handler_agree(
+            &nested,
+            &external,
+            nested_local,
+            press_at(ssot::nested_id(), y, true),
+            "nested press scan",
+        ) {
+            nested_on_row += 1;
+        } else {
+            nested_off_row += 1;
+        }
+    }
+    assert!(
+        nested_on_row > 0,
+        "the scan must cross the selectable panel's rows"
+    );
+    assert!(
+        nested_off_row > 0,
+        "the scan must cross non-selectable space"
     );
 }

@@ -3,7 +3,7 @@ use slipway_core::{
     BaselineShift, ClipDeclaration, Color, Diagnostic, DiagnosticSeverity, EvidenceSource,
     FontStyle, FontWeight, FrameIdentity, PaintOp, PathCommand, PathDeclaration, Rect,
     RenderEvidence, RenderPacket, RenderRefusal, ShapeDeclaration, ShapeKind, Size,
-    SlipwayOffscreenRenderer, TextStyle, WidgetId,
+    SlipwayOffscreenRenderer, TextAlignX, TextAlignY, TextStyle, TextWrap, WidgetId,
 };
 use std::fs::{self, File};
 use std::io::BufWriter;
@@ -821,6 +821,99 @@ fn load_first_font(paths: &[&str]) -> Option<DebugFontFace> {
     })
 }
 
+/// One laid-out text line: the characters to draw and the measured ink
+/// width (trailing whitespace excluded) used for the per-line
+/// [`TextAlignX`] anchor.
+struct DebugTextLine {
+    text: String,
+    width: f32,
+}
+
+fn measure_debug_line<F, SF>(scaled: &SF, text: &str) -> f32
+where
+    F: Font,
+    SF: ScaleFont<F>,
+{
+    let mut width = 0.0f32;
+    let mut previous: Option<GlyphId> = None;
+    for ch in text.trim_end().chars() {
+        if ch.is_control() {
+            continue;
+        }
+        let glyph_id = scaled.glyph_id(ch);
+        if let Some(previous_id) = previous {
+            width += scaled.kern(previous_id, glyph_id);
+        }
+        previous = Some(glyph_id);
+        width += scaled.h_advance(glyph_id);
+    }
+    width
+}
+
+/// Lays `content` out into lines the same way the visible backends do:
+/// explicit `\n` always breaks (both wrap modes); [`TextWrap::Word`]
+/// additionally soft-wraps greedily at whitespace against `max_width`
+/// (a single word wider than the rect stays on its own overflowing line
+/// and clips — the cosmic-text `Wrap::Word` rule iced presents);
+/// [`TextWrap::None`] never soft-wraps.
+fn layout_debug_text_lines<F, SF>(
+    scaled: &SF,
+    content: &str,
+    wrap: TextWrap,
+    max_width: f32,
+) -> Vec<DebugTextLine>
+where
+    F: Font,
+    SF: ScaleFont<F>,
+{
+    let mut lines = Vec::new();
+    for hard_line in content.split('\n') {
+        match wrap {
+            TextWrap::None => lines.push(DebugTextLine {
+                text: hard_line.to_string(),
+                width: measure_debug_line(scaled, hard_line),
+            }),
+            TextWrap::Word => {
+                let mut current = String::new();
+                let mut chars = hard_line.chars().peekable();
+                while chars.peek().is_some() {
+                    let mut token = String::new();
+                    let token_is_space = chars.peek().is_some_and(|ch| ch.is_whitespace());
+                    while chars
+                        .peek()
+                        .is_some_and(|ch| ch.is_whitespace() == token_is_space)
+                    {
+                        token.push(chars.next().expect("peeked char"));
+                    }
+                    if token_is_space {
+                        // Whitespace never starts a soft-wrapped line.
+                        if !current.is_empty() {
+                            current.push_str(&token);
+                        }
+                        continue;
+                    }
+                    let has_word = !current.trim_end().is_empty();
+                    let candidate = format!("{current}{token}");
+                    if has_word && measure_debug_line(scaled, &candidate) > max_width {
+                        lines.push(DebugTextLine {
+                            width: measure_debug_line(scaled, &current),
+                            text: current.trim_end().to_string(),
+                        });
+                        current = token;
+                    } else {
+                        current = candidate;
+                    }
+                }
+                lines.push(DebugTextLine {
+                    width: measure_debug_line(scaled, &current),
+                    text: current.trim_end().to_string(),
+                });
+            }
+        }
+    }
+    lines
+}
+
 fn draw_text_glyphs(
     bounds: Rect,
     content: &str,
@@ -831,8 +924,12 @@ fn draw_text_glyphs(
     diagnostics: &mut Vec<Diagnostic>,
     fonts: &DebugFontBook,
 ) {
-    let bounds = pixel_bounds(bounds, viewport).clipped(target);
-    if bounds.x0 >= bounds.x1 || bounds.y0 >= bounds.y1 {
+    // Layout/anchor math uses the UNCLIPPED op rect (the declared bounds
+    // in pixel space, matching the visible backends' anchor rule);
+    // drawing clips to the target-intersected rect.
+    let raw_bounds = pixel_bounds(bounds, viewport);
+    let clip = raw_bounds.clipped(target);
+    if clip.x0 >= clip.x1 || clip.y0 >= clip.y1 {
         return;
     }
 
@@ -846,7 +943,7 @@ fn draw_text_glyphs(
                 text_style_summary(style)
             ),
         ));
-        draw_text_placeholder_fallback(bounds, content, color, style, target);
+        draw_text_placeholder_fallback(clip, content, color, style, target);
         return;
     };
 
@@ -855,61 +952,109 @@ fn draw_text_glyphs(
     let scaled = face.font.as_scaled(scale);
     let baseline_offset = baseline_pixel_offset(style.baseline, font_size) as f32;
     let line_height = (scaled.ascent() - scaled.descent() + scaled.line_gap()).max(font_size);
-    let mut caret = point(
-        bounds.x0 as f32,
-        bounds.y0 as f32 + scaled.ascent() + baseline_offset,
-    );
-    let mut previous: Option<GlyphId> = None;
+    let rect_width = (raw_bounds.x1 - raw_bounds.x0) as f32;
+    let rect_height = (raw_bounds.y1 - raw_bounds.y0) as f32;
+
+    // Wrap first (at the rect width, per the declared mode), then anchor
+    // the wrapped BLOCK vertically and each line horizontally — the same
+    // order of operations both visible backends apply
+    // (docs/public/api/backends.md "Text Wrap and Alignment").
+    let lines = layout_debug_text_lines(&scaled, content, style.wrap, rect_width);
+    let block_height = lines.len() as f32 * line_height;
+    let block_top = raw_bounds.y0 as f32
+        + match style.align_y {
+            TextAlignY::Top => 0.0,
+            TextAlignY::Center => (rect_height - block_height) / 2.0,
+            TextAlignY::Bottom => rect_height - block_height,
+        };
+
     let mut drawn_any = false;
     let mut missing = 0usize;
 
-    for ch in content.chars() {
-        if ch == '\n' {
-            caret.x = bounds.x0 as f32;
-            caret.y += line_height;
-            previous = None;
-            if caret.y > bounds.y1 as f32 + line_height {
-                break;
-            }
-            continue;
-        }
-        if ch.is_control() {
-            continue;
-        }
-
-        let glyph_id = scaled.glyph_id(ch);
-        if let Some(previous_id) = previous {
-            caret.x += scaled.kern(previous_id, glyph_id);
-        }
-        previous = Some(glyph_id);
-
-        let advance = scaled.h_advance(glyph_id);
-        if ch.is_whitespace() {
-            caret.x += advance;
-            continue;
-        }
-        if caret.x > bounds.x1 as f32 {
+    for (line_index, line) in lines.iter().enumerate() {
+        let line_top = block_top + line_index as f32 * line_height;
+        if line_top > clip.y1 as f32 {
             break;
         }
-
-        let glyph = glyph_id.with_scale_and_position(scale, caret);
-        if let Some(outlined) = scaled.outline_glyph(glyph) {
-            let glyph_bounds = outlined.px_bounds();
-            outlined.draw(|x, y, coverage| {
-                blend_coverage_pixel(
-                    target,
-                    bounds,
-                    glyph_bounds.min.x as i32 + x as i32,
-                    glyph_bounds.min.y as i32 + y as i32,
-                    color,
-                    coverage,
-                );
-            });
-            drawn_any = true;
-        } else {
-            missing += 1;
+        if line_top + line_height < clip.y0 as f32 {
+            continue;
         }
-        caret.x += advance;
+        let line_start = raw_bounds.x0 as f32
+            + match style.align_x {
+                TextAlignX::Start => 0.0,
+                TextAlignX::Center => (rect_width - line.width) / 2.0,
+                TextAlignX::End => rect_width - line.width,
+            };
+        let baseline_y = line_top + scaled.ascent() + baseline_offset;
+        let mut caret = point(line_start, baseline_y);
+        let mut previous: Option<GlyphId> = None;
+
+        for ch in line.text.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            let glyph_id = scaled.glyph_id(ch);
+            if let Some(previous_id) = previous {
+                caret.x += scaled.kern(previous_id, glyph_id);
+            }
+            previous = Some(glyph_id);
+
+            let advance = scaled.h_advance(glyph_id);
+            if ch.is_whitespace() {
+                caret.x += advance;
+                continue;
+            }
+            if caret.x > clip.x1 as f32 {
+                break;
+            }
+
+            let glyph = glyph_id.with_scale_and_position(scale, caret);
+            if let Some(outlined) = scaled.outline_glyph(glyph) {
+                let glyph_bounds = outlined.px_bounds();
+                outlined.draw(|x, y, coverage| {
+                    blend_coverage_pixel(
+                        target,
+                        clip,
+                        glyph_bounds.min.x as i32 + x as i32,
+                        glyph_bounds.min.y as i32 + y as i32,
+                        color,
+                        coverage,
+                    );
+                });
+                drawn_any = true;
+            } else {
+                missing += 1;
+            }
+            caret.x += advance;
+        }
+
+        // Decorations follow the REAL laid-out line geometry (start,
+        // width, baseline) so they track alignment and wrap.
+        if line.width > 0.0 {
+            let weight_pixels = font_weight_pixels(style.font_weight);
+            if style.decoration.underline {
+                draw_horizontal_text_line(
+                    clip,
+                    color,
+                    target,
+                    line_start.round() as i32,
+                    (baseline_y + 1.0).round() as i32,
+                    line.width.round() as i32,
+                    weight_pixels,
+                );
+            }
+            if style.decoration.strikethrough {
+                draw_horizontal_text_line(
+                    clip,
+                    color,
+                    target,
+                    line_start.round() as i32,
+                    (baseline_y - scaled.ascent() * 0.33).round() as i32,
+                    line.width.round() as i32,
+                    weight_pixels,
+                );
+            }
+        }
     }
 
     if missing > 0 {
@@ -936,18 +1081,6 @@ fn draw_text_glyphs(
             ),
         ));
     }
-
-    let char_width = scaled.h_advance(scaled.glyph_id('M')).round().max(1.0) as i32;
-    let char_height = line_height.round().max(1.0) as i32;
-    draw_text_decorations(
-        bounds,
-        content,
-        color,
-        style,
-        target,
-        char_width,
-        char_height,
-    );
 }
 
 fn draw_text_placeholder_fallback(
@@ -1824,6 +1957,162 @@ mod tests {
                 .all(|diagnostic| diagnostic.code != "text-placeholder-rasterized")
         );
         assert!(evidence.pixel_hash.is_some());
+    }
+
+    fn ink_bbox(artifact: &DebugRenderArtifact) -> (i32, i32, i32, i32) {
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for y in 0..artifact.height as i32 {
+            for x in 0..artifact.width as i32 {
+                let offset = ((y as u32 * artifact.width + x as u32) * 4) as usize;
+                if artifact.rgba[offset..offset + 4] != [0, 0, 0, 0] {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        assert!(x0 <= x1, "expected ink pixels in the artifact");
+        (x0, y0, x1, y1)
+    }
+
+    fn ink_row_bands(artifact: &DebugRenderArtifact) -> usize {
+        let mut bands = 0;
+        let mut in_band = false;
+        for y in 0..artifact.height as i32 {
+            let row_has_ink = (0..artifact.width as i32).any(|x| {
+                let offset = ((y as u32 * artifact.width + x as u32) * 4) as usize;
+                artifact.rgba[offset..offset + 4] != [0, 0, 0, 0]
+            });
+            if row_has_ink && !in_band {
+                bands += 1;
+            }
+            in_band = row_has_ink;
+        }
+        bands
+    }
+
+    // Declared-alignment honor pin (roadmap Phase 6 item 3b, closing the
+    // Step 216 nonclaim: the CPU renderer used to draw every text op
+    // top-left regardless of the declaration, so offscreen evidence could
+    // not show centering). The anchoring rule must match the visible
+    // backends': the wrapped block anchors vertically, each line anchors
+    // horizontally, within the op rect. Reverting `draw_text_glyphs` to
+    // the top-left caret fails every non-default assertion here.
+    #[test]
+    fn declared_alignment_anchors_ink_within_op_rect() {
+        let op_rect = |style: TextStyle| PaintOp::Text {
+            bounds: Rect {
+                origin: Point { x: 10.0, y: 10.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 40.0,
+                },
+            },
+            content: "mid".to_string(),
+            color: color(0.0, 0.0, 0.0, 1.0),
+            style,
+        };
+        let render = |style: TextStyle, index: u64| {
+            let mut renderer = CpuDebugRenderer::default();
+            let evidence = renderer
+                .render_offscreen(packet(frame(120.0, 60.0, index), vec![op_rect(style)]))
+                .expect("text render succeeds");
+            let artifact = renderer
+                .artifact(evidence.artifact_ref.as_deref().expect("artifact ref"))
+                .expect("artifact stored");
+            ink_bbox(artifact)
+        };
+
+        // Default equivalence: unspecified alignment hugs the top-left.
+        let (dx0, dy0, dx1, dy1) = render(TextStyle::plain(), 30);
+        assert!(dx0 - 10 <= 3, "default ink starts at the left edge: {dx0}");
+        assert!(dy0 - 10 <= 8, "default ink starts at the top: {dy0}");
+
+        // Centered: the ink centroid sits on the rect center both ways.
+        let (cx0, cy0, cx1, cy1) = render(TextStyle::plain().centered(), 31);
+        let ink_center_x = (cx0 + cx1) / 2;
+        let ink_center_y = (cy0 + cy1) / 2;
+        assert!(
+            (ink_center_x - 60).abs() <= 2,
+            "centered ink x-center {ink_center_x} must sit on the rect center 60"
+        );
+        assert!(
+            (ink_center_y - 30).abs() <= 4,
+            "centered ink y-center {ink_center_y} must sit near the rect center 30"
+        );
+        assert!(cx0 > dx0, "centered ink moved right of the default");
+        assert!(cy0 > dy0, "centered ink moved below the default");
+
+        // End/Bottom: the ink hugs the right edge and sits below both
+        // the default and the centered renders.
+        let (ex0, _ey0, ex1, ey1) = render(
+            TextStyle::plain()
+                .with_align_x(slipway_core::TextAlignX::End)
+                .with_align_y(slipway_core::TextAlignY::Bottom),
+            32,
+        );
+        assert!(
+            110 - ex1 <= 3,
+            "end-aligned ink must reach the right edge 110: {ex1}"
+        );
+        assert!(ex0 > cx0, "end ink sits right of centered ink");
+        assert!(ey1 > cy1, "bottom ink sits below centered ink");
+        assert!(ey1 > dy1, "bottom ink sits below default ink");
+        assert!(dx1 < 110, "default ink does not reach the right edge");
+    }
+
+    // Declared wrap opt-out honor pin (NC-4): the default word wrap
+    // breaks a too-wide CJK label into multiple ink rows at the rect
+    // width; `TextWrap::None` keeps ONE row and clips at the rect edge —
+    // matching both visible backends' contract. Reverting the renderer
+    // (or either backend mapping) to unconditional word wrap fails the
+    // single-row assertion.
+    #[test]
+    fn declared_wrap_optout_renders_single_row_where_word_wraps() {
+        let text_in_narrow_rect = |style: TextStyle| PaintOp::Text {
+            bounds: Rect {
+                origin: Point { x: 4.0, y: 4.0 },
+                size: Size {
+                    width: 72.0,
+                    height: 72.0,
+                },
+            },
+            content: "줄바꿈 없는 한국어 라벨".to_string(),
+            color: color(0.0, 0.0, 0.0, 1.0),
+            style,
+        };
+        let render = |style: TextStyle, index: u64| {
+            let mut renderer = CpuDebugRenderer::default();
+            let evidence = renderer
+                .render_offscreen(packet(
+                    frame(96.0, 80.0, index),
+                    vec![text_in_narrow_rect(style)],
+                ))
+                .expect("text render succeeds");
+            let artifact = renderer
+                .artifact(evidence.artifact_ref.as_deref().expect("artifact ref"))
+                .expect("artifact stored");
+            (ink_row_bands(artifact), ink_bbox(artifact))
+        };
+
+        let (word_bands, _) = render(TextStyle::plain(), 33);
+        assert!(
+            word_bands >= 2,
+            "default word wrap must break the label into multiple rows, got {word_bands}"
+        );
+
+        let (none_bands, (_, _, nx1, _)) = render(TextStyle::plain().no_wrap(), 34);
+        assert_eq!(
+            none_bands, 1,
+            "TextWrap::None must keep the label on a single row"
+        );
+        // The single line is wider than the rect and clips AT the rect
+        // edge (x = 4 + 72 = 76, exclusive bbox max 75).
+        assert!(
+            (75 - nx1).abs() <= 1,
+            "no-wrap ink must clip at the rect edge 75: {nx1}"
+        );
     }
 
     #[test]

@@ -3,14 +3,18 @@
 //! Must not inspect or mutate sibling widget state — cross-widget effects
 //! travel as `ShowcaseMessage`s through the reducer in `communication.rs`.
 //!
-//! The `SlipwayEventDispositionPolicy` impls live here too, next to the
-//! `handle_event` bodies they MUST mirror: the framework consults the
-//! declaration BEFORE the handler runs, and a handler that disagrees with
-//! its declaration surfaces
-//! `event_declaration.handler_ignored_declared_handled` /
-//! `event_declaration.handler_handled_declared_unhandled` diagnostics
-//! (docs/public/api/diagnostics.md). Keeping declaration and handler in
-//! one file keeps the two match arms in sight of each other.
+//! Event handling is authored with ONE `event_handling_table!` per widget:
+//! the table generates BOTH `SlipwayLogic::handle_event` and
+//! `SlipwayEventDispositionPolicy::event_disposition`, so each arm's
+//! pattern+guard IS the declared handledness. The framework consults the
+//! declaration BEFORE the handler runs (the backend physical path refuses
+//! declared-unhandled events without calling the handler), and because
+//! both sides expand from the same tokens, the declaration/handler drift
+//! diagnostics `event_declaration.handler_ignored_declared_handled` /
+//! `event_declaration.handler_handled_declared_unhandled`
+//! (docs/public/api/diagnostics.md) are inexpressible in this form —
+//! there is no second hand-written predicate to fall out of sync
+//! (audit NC-8, ADR-0003).
 
 use slipway::prelude::*;
 
@@ -116,7 +120,7 @@ fn message_outcome(
 }
 
 // ---------------------------------------------------------------------------
-// Shared routing/disposition scaffolding
+// Shared routing scaffolding
 // ---------------------------------------------------------------------------
 
 /// Target-phase self-route. The declaration-time capability helpers
@@ -138,91 +142,70 @@ fn target_route(id: WidgetId, event: &InputEvent) -> EventRoutingPolicyDeclarati
     }
 }
 
-/// Single-step target-stage evidence. `handled` must equal what the
-/// widget's `handle_event` will actually do for this event —
-/// declaration/handler drift is a contract violation, not a style issue.
-fn target_disposition(
-    id: WidgetId,
-    event: &InputEvent,
-    route: &EventRoute,
-    handled: bool,
-) -> EventPropagationEvidence {
-    let disposition = EventDisposition {
-        handled,
-        propagate: !handled,
-        default_action_allowed: true,
-    };
-    EventPropagationEvidence {
-        target: id,
-        event: event.clone(),
-        steps: vec![EventPropagationStep {
-            stage: EventPropagationStage::Target,
-            node: route.path.last().cloned(),
-            disposition,
-            emitted_messages: Vec::new(),
-            changes: Vec::new(),
-        }],
-        final_disposition: disposition,
-        diagnostics: Vec::new(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Note list: wheel scrolling, row selection, focus
 // ---------------------------------------------------------------------------
 
-impl SlipwayLogic for NoteListWidget {
-    fn handle_event(
-        &self,
-        _external: &Self::ExternalState,
-        local: &mut Self::LocalState,
-        event: InputEvent,
-    ) -> EventOutcome<Self::AppMessage> {
-        if event.target() != &self.id() {
-            return EventOutcome::ignored();
-        }
-        match event {
+// PATTERN: sync-by-construction event handling. One table generates the
+// handler AND the declared disposition; unmatched events (and events
+// targeted elsewhere) are ignored AND declared unhandled — never add a
+// `_` catch-all arm (it would declare every event kind handled).
+event_handling_table! {
+    impl NoteListWidget {
+        |widget, external, local| match event {
             InputEvent::Wheel(wheel) => {
                 local.scroll_rows =
                     rows_after_wheel(local.scroll_rows, wheel.delta_y, LIST_MAX_SCROLL_ROWS);
-                local_change_outcome(self.id(), "scroll-rows", local.scroll_rows.to_string())
-            }
+                local_change_outcome(widget.id(), "scroll-rows", local.scroll_rows.to_string())
+            },
             InputEvent::Scroll(scroll) => {
                 local.scroll_rows =
                     rows_from_offset(scroll.offset_y, LIST_ROW_STEP, LIST_MAX_SCROLL_ROWS);
-                local_change_outcome(self.id(), "scroll-rows", local.scroll_rows.to_string())
-            }
+                local_change_outcome(widget.id(), "scroll-rows", local.scroll_rows.to_string())
+            },
             // PATTERN: row selection. The pointer position is target-local
             // (the hit region declared PointerEventCoordinateSpace::
             // TargetLocal) and converts back to a row index through the
             // same LIST_* constants that placed the row's paint and hit
-            // region — the MUST-agree discipline in ssot.rs.
-            InputEvent::Pointer(pointer) if pointer.kind == PointerEventKind::Press => {
+            // region — the MUST-agree discipline in ssot.rs. The arm guard
+            // is the declared handledness: a press between rows is
+            // declared unhandled and never reaches the body.
+            InputEvent::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Press
+                    && list_row_at_card_y(
+                        pointer.position.y,
+                        list_offset_y(local.scroll_rows),
+                    )
+                    .is_some() =>
+            {
                 let offset_y = list_offset_y(local.scroll_rows);
                 let Some(row) = list_row_at_card_y(pointer.position.y, offset_y) else {
+                    // Unreachable: the arm guard proved Some with the same
+                    // inputs; honest refusal instead of a panic.
                     return EventOutcome::ignored();
                 };
                 message_outcome(
-                    self.id(),
+                    widget.id(),
                     "select-note",
                     ShowcaseMessage::SelectNote(row),
                     "selected-note",
                     row.to_string(),
                 )
-            }
-            InputEvent::Pointer(pointer) if pointer.kind == PointerEventKind::Release => {
-                let offset_y = list_offset_y(local.scroll_rows);
-                if list_row_at_card_y(pointer.position.y, offset_y).is_some() {
-                    EventOutcome::handled()
-                } else {
-                    EventOutcome::ignored()
-                }
-            }
+            },
+            InputEvent::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Release
+                    && list_row_at_card_y(
+                        pointer.position.y,
+                        list_offset_y(local.scroll_rows),
+                    )
+                    .is_some() =>
+            {
+                EventOutcome::handled()
+            },
             InputEvent::Focus(focus) => {
                 local.focused = focus.focused;
-                local_change_outcome(self.id(), "focused", focus.focused.to_string())
-            }
-            _ => EventOutcome::ignored(),
+                local_change_outcome(widget.id(), "focused", focus.focused.to_string())
+            },
         }
     }
 }
@@ -238,46 +221,13 @@ impl SlipwayEventRoutingPolicy for NoteListWidget {
     }
 }
 
-impl SlipwayEventDispositionPolicy for NoteListWidget {
-    fn event_disposition(
-        &self,
-        _external: &Self::ExternalState,
-        local: &Self::LocalState,
-        event: &InputEvent,
-        route: &EventRoute,
-    ) -> EventPropagationEvidence {
-        // Mirrors handle_event above, arm for arm.
-        let handled = event.target() == &self.id()
-            && match event {
-                InputEvent::Wheel(_) | InputEvent::Scroll(_) | InputEvent::Focus(_) => true,
-                InputEvent::Pointer(pointer) => {
-                    matches!(
-                        pointer.kind,
-                        PointerEventKind::Press | PointerEventKind::Release
-                    ) && list_row_at_card_y(pointer.position.y, list_offset_y(local.scroll_rows))
-                        .is_some()
-                }
-                _ => false,
-            };
-        target_disposition(self.id(), event, route, handled)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Draft input: text editing through declared text-edit routes
 // ---------------------------------------------------------------------------
 
-impl SlipwayLogic for DraftInputWidget {
-    fn handle_event(
-        &self,
-        external: &Self::ExternalState,
-        local: &mut Self::LocalState,
-        event: InputEvent,
-    ) -> EventOutcome<Self::AppMessage> {
-        if event.target() != &self.id() {
-            return EventOutcome::ignored();
-        }
-        match event {
+event_handling_table! {
+    impl DraftInputWidget {
+        |widget, external, local| match event {
             // PATTERN: text editing. The buffer's source of truth is app
             // state (`ShowcaseState::draft`), so an edit is not applied
             // locally — it becomes a ReplaceDraft message and the reducer
@@ -287,29 +237,28 @@ impl SlipwayLogic for DraftInputWidget {
                 local.edit_count += 1;
                 let next = draft_after_edit(&external.draft, edit.kind, edit.text.as_deref());
                 message_outcome(
-                    self.id(),
+                    widget.id(),
                     "replace-draft",
                     ShowcaseMessage::ReplaceDraft(next.clone()),
                     "draft",
                     next,
                 )
-            }
+            },
             InputEvent::Text(text) => {
                 local.edit_count += 1;
                 let next = format!("{}{}", external.draft, text.text);
                 message_outcome(
-                    self.id(),
+                    widget.id(),
                     "replace-draft",
                     ShowcaseMessage::ReplaceDraft(next.clone()),
                     "draft",
                     next,
                 )
-            }
+            },
             InputEvent::Focus(focus) => {
                 local.focused = focus.focused;
-                local_change_outcome(self.id(), "focused", focus.focused.to_string())
-            }
-            _ => EventOutcome::ignored(),
+                local_change_outcome(widget.id(), "focused", focus.focused.to_string())
+            },
         }
     }
 }
@@ -325,38 +274,13 @@ impl SlipwayEventRoutingPolicy for DraftInputWidget {
     }
 }
 
-impl SlipwayEventDispositionPolicy for DraftInputWidget {
-    fn event_disposition(
-        &self,
-        _external: &Self::ExternalState,
-        _local: &Self::LocalState,
-        event: &InputEvent,
-        route: &EventRoute,
-    ) -> EventPropagationEvidence {
-        let handled = event.target() == &self.id()
-            && matches!(
-                event,
-                InputEvent::TextEdit(_) | InputEvent::Text(_) | InputEvent::Focus(_)
-            );
-        target_disposition(self.id(), event, route, handled)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Overlay: titlebar drag + wheel-scrollable feed behind the panel
 // ---------------------------------------------------------------------------
 
-impl SlipwayLogic for OverlayWidget {
-    fn handle_event(
-        &self,
-        external: &Self::ExternalState,
-        local: &mut Self::LocalState,
-        event: InputEvent,
-    ) -> EventOutcome<Self::AppMessage> {
-        if event.target() != &self.id() {
-            return EventOutcome::ignored();
-        }
-        match event {
+event_handling_table! {
+    impl OverlayWidget {
+        |widget, external, local| match event {
             // PATTERN: drag with PointerCaptureIntent::DuringDrag (the hit
             // region in view.rs declares the capture; the runtime keeps
             // Move/Release routed here even when the pointer leaves the
@@ -388,29 +312,32 @@ impl SlipwayLogic for OverlayWidget {
                         x: pointer.position.x - roam_offset.x,
                         y: pointer.position.y - roam_offset.y,
                     };
-                    local_change_outcome(self.id(), "roam-dragging", "true")
+                    local_change_outcome(widget.id(), "roam-dragging", "true")
                 } else if point_in_rect(pointer.position, overlay_titlebar_rect(local.offset)) {
                     local.dragging = true;
                     local.drag_anchor = Point {
                         x: pointer.position.x - local.offset.x,
                         y: pointer.position.y - local.offset.y,
                     };
-                    local_change_outcome(self.id(), "dragging", "true")
+                    local_change_outcome(widget.id(), "dragging", "true")
                 } else {
                     EventOutcome::handled()
                 }
-            }
-            InputEvent::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
-                if !local.dragging && !local.roam_dragging {
-                    return EventOutcome::ignored();
-                }
+            },
+            // The Move guard is the declared disposition: hover moves
+            // while nothing drags are declared unhandled and never reach
+            // the body.
+            InputEvent::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Move
+                    && (local.dragging || local.roam_dragging) =>
+            {
                 if !pointer.details.buttons.primary {
                     // A Move without the primary button means the Release
                     // was lost (e.g. outside the window): stop dragging
                     // instead of warping the panel on the next hover.
                     local.dragging = false;
                     local.roam_dragging = false;
-                    return local_change_outcome(self.id(), "dragging", "false");
+                    return local_change_outcome(widget.id(), "dragging", "false");
                 }
                 let card_width = pointer
                     .target_bounds
@@ -441,7 +368,7 @@ impl SlipwayLogic for OverlayWidget {
                     }
                     local.roam_offset = next;
                     local_change_outcome(
-                        self.id(),
+                        widget.id(),
                         "roam-offset",
                         format!("{:.0},{:.0}", next.x, next.y),
                     )
@@ -453,12 +380,12 @@ impl SlipwayLogic for OverlayWidget {
                     }
                     local.offset = next;
                     local_change_outcome(
-                        self.id(),
+                        widget.id(),
                         "offset",
                         format!("{:.0},{:.0}", next.x, next.y),
                     )
                 }
-            }
+            },
             InputEvent::Pointer(pointer)
                 if matches!(
                     pointer.kind,
@@ -467,8 +394,8 @@ impl SlipwayLogic for OverlayWidget {
             {
                 local.dragging = false;
                 local.roam_dragging = false;
-                local_change_outcome(self.id(), "dragging", "false")
-            }
+                local_change_outcome(widget.id(), "dragging", "false")
+            },
             // The feed behind the overlay panel. A wheel landing here while
             // the cursor is OVER the panel is the wheel-transparency
             // pattern working: the panel layer is pointer-opaque but
@@ -476,17 +403,16 @@ impl SlipwayLogic for OverlayWidget {
             InputEvent::Wheel(wheel) => {
                 local.feed_rows =
                     rows_after_wheel(local.feed_rows, wheel.delta_y, OVERLAY_FEED_MAX_SCROLL_ROWS);
-                local_change_outcome(self.id(), "feed-rows", local.feed_rows.to_string())
-            }
+                local_change_outcome(widget.id(), "feed-rows", local.feed_rows.to_string())
+            },
             InputEvent::Scroll(scroll) => {
                 local.feed_rows = rows_from_offset(
                     scroll.offset_y,
                     OVERLAY_FEED_ROW_STEP,
                     OVERLAY_FEED_MAX_SCROLL_ROWS,
                 );
-                local_change_outcome(self.id(), "feed-rows", local.feed_rows.to_string())
-            }
-            _ => EventOutcome::ignored(),
+                local_change_outcome(widget.id(), "feed-rows", local.feed_rows.to_string())
+            },
         }
     }
 }
@@ -502,39 +428,16 @@ impl SlipwayEventRoutingPolicy for OverlayWidget {
     }
 }
 
-impl SlipwayEventDispositionPolicy for OverlayWidget {
-    fn event_disposition(
-        &self,
-        _external: &Self::ExternalState,
-        local: &Self::LocalState,
-        event: &InputEvent,
-        route: &EventRoute,
-    ) -> EventPropagationEvidence {
-        let handled = event.target() == &self.id()
-            && match event {
-                InputEvent::Pointer(pointer) => match pointer.kind {
-                    PointerEventKind::Press
-                    | PointerEventKind::Release
-                    | PointerEventKind::Cancel => true,
-                    PointerEventKind::Move => local.dragging || local.roam_dragging,
-                    _ => false,
-                },
-                InputEvent::Wheel(_) | InputEvent::Scroll(_) => true,
-                _ => false,
-            };
-        target_disposition(self.id(), event, route, handled)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Nested feed: region-driven wheel handling (chaining decided by routing)
 // + row selection inside the selectable inner panel
 // ---------------------------------------------------------------------------
 
 /// Card-local pointer y -> selectable-panel row, at the CURRENT scroll
-/// state. Shared by handle_event and the disposition mirror below so the
-/// two can never disagree; the math is the ssot inverse, fed with the same
-/// two offsets the paint and hit regions applied this frame.
+/// state. Shared by the table arm's GUARD (the declared disposition) and
+/// its BODY so the two read the same math; the function is the ssot
+/// inverse, fed with the same two offsets the paint and hit regions
+/// applied this frame.
 fn nested_selectable_row_at(
     local: &crate::view::NestedLocal,
     position: Point,
@@ -549,17 +452,9 @@ fn nested_selectable_row_at(
     nested_inner_row_at_card_y(position.y, outer_offset, inner_offset, card_width)
 }
 
-impl SlipwayLogic for NestedFeedWidget {
-    fn handle_event(
-        &self,
-        _external: &Self::ExternalState,
-        local: &mut Self::LocalState,
-        event: InputEvent,
-    ) -> EventOutcome<Self::AppMessage> {
-        if event.target() != &self.id() {
-            return EventOutcome::ignored();
-        }
-        match event {
+event_handling_table! {
+    impl NestedFeedWidget {
+        |widget, external, local| match event {
             // PATTERN: row selection inside a SCROLLED region. The pointer
             // position is target-local (card-local); the row index comes
             // from the ssot inverse that subtracts BOTH current offsets —
@@ -567,34 +462,50 @@ impl SlipwayLogic for NestedFeedWidget {
             // Like the notes list, selection is app state: the click
             // becomes a typed SelectInnerItem message and the reducer is
             // the only writer.
-            InputEvent::Pointer(pointer) if pointer.kind == PointerEventKind::Press => {
+            InputEvent::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Press
+                    && nested_selectable_row_at(
+                        local,
+                        pointer.position,
+                        pointer
+                            .target_bounds
+                            .map(|bounds| bounds.size.width)
+                            .unwrap_or(crate::ssot::CARD_MAX_WIDTH),
+                    )
+                    .is_some() =>
+            {
                 let card_width = pointer
                     .target_bounds
                     .map(|bounds| bounds.size.width)
                     .unwrap_or(crate::ssot::CARD_MAX_WIDTH);
                 let Some(row) = nested_selectable_row_at(local, pointer.position, card_width)
                 else {
+                    // Unreachable: the arm guard proved Some with the same
+                    // inputs; honest refusal instead of a panic.
                     return EventOutcome::ignored();
                 };
                 message_outcome(
-                    self.id(),
+                    widget.id(),
                     "select-inner-item",
                     ShowcaseMessage::SelectInnerItem(row),
                     "selected-inner-item",
                     row.to_string(),
                 )
-            }
-            InputEvent::Pointer(pointer) if pointer.kind == PointerEventKind::Release => {
-                let card_width = pointer
-                    .target_bounds
-                    .map(|bounds| bounds.size.width)
-                    .unwrap_or(crate::ssot::CARD_MAX_WIDTH);
-                if nested_selectable_row_at(local, pointer.position, card_width).is_some() {
-                    EventOutcome::handled()
-                } else {
-                    EventOutcome::ignored()
-                }
-            }
+            },
+            InputEvent::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Release
+                    && nested_selectable_row_at(
+                        local,
+                        pointer.position,
+                        pointer
+                            .target_bounds
+                            .map(|bounds| bounds.size.width)
+                            .unwrap_or(crate::ssot::CARD_MAX_WIDTH),
+                    )
+                    .is_some() =>
+            {
+                EventOutcome::handled()
+            },
             // PATTERN: nested wheel. Which region id arrives here is
             // decided ENTIRELY by the declared routing: every region
             // declares the NearestScrollable default (view.rs), so a wheel
@@ -617,7 +528,7 @@ impl SlipwayLogic for NestedFeedWidget {
                             NESTED_INNER_MAX_SCROLL_ROWS,
                         );
                         local_change_outcome(
-                            self.id(),
+                            widget.id(),
                             "inner-rows",
                             format!("{:?}", local.inner_rows),
                         )
@@ -628,12 +539,22 @@ impl SlipwayLogic for NestedFeedWidget {
                             wheel.delta_y,
                             NESTED_OUTER_MAX_SCROLL_ROWS,
                         );
-                        local_change_outcome(self.id(), "outer-rows", local.outer_rows.to_string())
+                        local_change_outcome(
+                            widget.id(),
+                            "outer-rows",
+                            local.outer_rows.to_string(),
+                        )
                     }
                 }
-            }
-            InputEvent::Scroll(scroll) => {
+            },
+            // A Scroll for a region id this widget does not own is
+            // declared unhandled by the guard (the disposition) instead of
+            // by a body-side early return — same predicate, single source.
+            InputEvent::Scroll(scroll)
+                if nested_region_selector(&scroll.region_id).is_some() =>
+            {
                 let Some(selector) = nested_region_selector(&scroll.region_id) else {
+                    // Unreachable: the arm guard proved Some.
                     return EventOutcome::ignored();
                 };
                 match selector {
@@ -644,7 +565,7 @@ impl SlipwayLogic for NestedFeedWidget {
                             NESTED_INNER_MAX_SCROLL_ROWS,
                         );
                         local_change_outcome(
-                            self.id(),
+                            widget.id(),
                             "inner-rows",
                             format!("{:?}", local.inner_rows),
                         )
@@ -655,11 +576,14 @@ impl SlipwayLogic for NestedFeedWidget {
                             NESTED_OUTER_ROW_STEP,
                             NESTED_OUTER_MAX_SCROLL_ROWS,
                         );
-                        local_change_outcome(self.id(), "outer-rows", local.outer_rows.to_string())
+                        local_change_outcome(
+                            widget.id(),
+                            "outer-rows",
+                            local.outer_rows.to_string(),
+                        )
                     }
                 }
-            }
-            _ => EventOutcome::ignored(),
+            },
         }
     }
 }
@@ -672,39 +596,5 @@ impl SlipwayEventRoutingPolicy for NestedFeedWidget {
         event: &InputEvent,
     ) -> EventRoutingPolicyDeclaration {
         target_route(self.id(), event)
-    }
-}
-
-impl SlipwayEventDispositionPolicy for NestedFeedWidget {
-    fn event_disposition(
-        &self,
-        _external: &Self::ExternalState,
-        local: &Self::LocalState,
-        event: &InputEvent,
-        route: &EventRoute,
-    ) -> EventPropagationEvidence {
-        // Mirrors handle_event above, arm for arm (declaration/handler
-        // drift surfaces `event_declaration.handler_*` diagnostics).
-        let handled = event.target() == &self.id()
-            && match event {
-                InputEvent::Wheel(_) => true,
-                InputEvent::Scroll(scroll) => nested_region_selector(&scroll.region_id).is_some(),
-                InputEvent::Pointer(pointer) => {
-                    matches!(
-                        pointer.kind,
-                        PointerEventKind::Press | PointerEventKind::Release
-                    ) && nested_selectable_row_at(
-                        local,
-                        pointer.position,
-                        pointer
-                            .target_bounds
-                            .map(|bounds| bounds.size.width)
-                            .unwrap_or(crate::ssot::CARD_MAX_WIDTH),
-                    )
-                    .is_some()
-                }
-                _ => false,
-            };
-        target_disposition(self.id(), event, route, handled)
     }
 }

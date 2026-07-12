@@ -28,7 +28,7 @@ subset. The capability-aware variant additionally checks that every declared
 
 ## view_contract: Admission Refusals
 
-Severity is `error` (blocking) for every row except the two marked `warn`.
+Severity is `error` (blocking) for every row except the four marked `warn`.
 
 | Code | Trigger | Fix |
 |------|---------|-----|
@@ -46,12 +46,13 @@ Severity is `error` (blocking) for every row except the two marked `warn`.
 | `view_contract.hit_route_empty` | enabled hit region with an empty route path | let `hit_region_from_pointer_capability` snapshot the route from `SlipwayEventRoutingPolicy` |
 | `view_contract.hit_route_target_missing` | route path does not contain the region target | include the widget id in the `EventRoutingPolicyDeclaration` route path |
 | `view_contract.hit_route_address_mismatch` | region `address` differs from `route.address` | make the routing policy's `route.address` match the declared region address |
-| `view_contract.ambiguous_hit_overlap` | enabled hit regions overlap with identical `HitRegionOrder` | distinct `order` argument of `hit_region_from_pointer_capability`, explicit overlap, or disjoint geometry |
+| `view_contract.ambiguous_hit_overlap` | enabled hit regions overlap with identical `HitRegionOrder` (paint-overlap allowance `allow_overlap` does NOT silence this; only the explicit `PaintOrderDeclaration::allow_ambiguous_hits` acceptance does) | distinct `order` argument of `hit_region_from_pointer_capability`, or disjoint geometry |
 | `view_contract.pointer_capability_missing_hit_region` | `PointerInput`/`HitRegionPresentation` declared, no enabled hit region | declare one via `hit_region_from_pointer_capability` or remove the capability |
 | `view_contract.focus_bounds_invalid` | focus bounds non-finite or negative | fix the `bounds` passed to the focus helpers |
 | `view_contract.focus_bounds_outside_layout` | enabled focus region leaves layout bounds without overflow paint | keep bounds inside layout, or declare overflow bounds |
 | `view_contract.focus_bounds_outside_overflow_bounds` | focus region leaves the declared overflow bounds | grow `overflow_bounds` or shrink the region |
 | `view_contract.focus_capability_missing_focus_region` | `FocusInput`/`KeyboardInput`/`FocusRegionPresentation` declared, no enabled focus region | `focus_region_from_focus_capability` (`text_edit_focus_region_from_capability` for text input) |
+| `view_contract.keyboard_capability_plain_focus_delivery_limited` (warn) | `KeyboardInput` declared with only plain (non-text-edit) focus regions — the iced backend delivers keyboard events to text-edit focus regions only, so the handler is unreachable there (egui delivers after focus); physical control refuses with `native-physical-control-text-focus-widget-unavailable` | `text_edit_focus_region_from_capability` if keyboard must work on every visible backend, or accept egui-only delivery ([Backends](backends.md), "Keyboard Delivery") |
 | `view_contract.text_input_missing_text_edit_focus_region` | `TextInput`/`TextEditRegionPresentation` declared, no enabled text-edit focus region | `text_edit_focus_region_from_capability` or remove `TextInput` |
 | `view_contract.text_edit_buffer_target_mismatch` | text buffer target differs from the focus region target | return the region owner's id from `SlipwayTextBufferPolicy` |
 | `view_contract.text_edit_selection_target_mismatch` | selection target differs from the focus region target | `SlipwayTextSelectionPolicy` must target the region owner |
@@ -82,6 +83,7 @@ Severity is `error` (blocking) for every row except the two marked `warn`.
 | `view_contract.scroll_offset_out_of_range` | offset exceeds `content - viewport` | clamp the offset to the declared travel range |
 | `view_contract.paint_bounds_outside_overflow_bounds` | painted op leaves the declared overflow bounds | grow `overflow_bounds` or move the paint |
 | `view_contract.paint_bounds_outside_layout` (warn) | painted op leaves layout bounds without overflow allowance | paint inside layout, or declare overflow paint |
+| `view_contract.content_overflow_without_scroll_region` (warn) | clip-aware painted content extends beyond the layout/frame viewport and no enabled scroll region's `content_bounds` covers it (declared `overflow_bounds` and clipped groups/layers count as intentional and stay silent) | declare a covering scroll region (`scroll_region_from_scrollable_capability`, `_with_order` for overlap, app-level page pattern `SlipwayApp::app_scroll_regions` — see [Routing and scroll](routing-and-scroll.md)) or clip intentionally |
 
 The geometry rows share one hint: bounds are target-local (origin `0,0`);
 window/parent placement belongs in `ChildPlacement`.
@@ -112,8 +114,8 @@ the evidence. If one appears during app work, the usual causes are a stale
 | Code | Severity | Trigger and fix |
 |------|----------|-----------------|
 | `event_declaration.dispatch_route_mismatch` | error | physical dispatch route differs from the widget's `SlipwayEventRoutingPolicy`; keep the policy deterministic per event |
-| `event_declaration.handler_ignored_declared_handled` | warning (semantic path), error (physical path) | the handler returned `ignored()` but `SlipwayEventDispositionPolicy` declared handled; align the two |
-| `event_declaration.handler_handled_declared_unhandled` | warning (semantic path), error (physical path) | the handler handled an event the disposition declared unhandled; align the two |
+| `event_declaration.handler_ignored_declared_handled` | warning (semantic path), error (physical path) | the handler returned `ignored()` but `SlipwayEventDispositionPolicy` declared handled; author both from one `event_handling_table!` (sync by construction) or align the hand-written disposition |
+| `event_declaration.handler_handled_declared_unhandled` | warning (semantic path), error (physical path) | the handler handled an event the disposition declared unhandled; author both from one `event_handling_table!` (sync by construction) or align the hand-written disposition |
 
 ## event_equivalence: MCP vs Backend Input Comparison
 

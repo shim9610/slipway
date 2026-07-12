@@ -21,8 +21,9 @@ use slipway::prelude::*;
 
 use crate::ssot::{
     CARD_GAP, CARD_MARGIN_X, CARD_MIN_WIDTH, CARD_TOP, DraftInputWidget, LIST_NOTE_COUNT,
-    NestedFeedWidget, NoteListWidget, OverlayWidget, PAGE_SCROLL_STEP, ShowcaseState, app_id,
-    card_height_for, page_max_scroll_y, page_scroll_region_id, rgb,
+    MeasuredLabel, NestedFeedWidget, NoteListWidget, OverlayWidget, PAGE_SCROLL_STEP,
+    ShowcaseState, app_id, badge_text, card_height_for, page_max_scroll_y, page_scroll_region_id,
+    rgb, window_badge_label,
 };
 
 /// Typed child-output -> app-message surface. Every variant names one
@@ -132,6 +133,51 @@ impl SlipwayApp for ShowcaseApp {
     /// `view_definition`, never `paint` or `handle_event`).
     fn project_frame_viewport(&self, external: &mut Self::ExternalState, viewport: Rect) {
         external.viewport = viewport.size;
+    }
+
+    /// PATTERN: measurement-truth projection
+    /// (`SlipwayApp::project_text_metrics`,
+    /// docs/public/api/backends.md "Text Wrap and Alignment"). The
+    /// runtime calls this with the presenting backend's REAL text-metric
+    /// provider on the same cadence as the viewport projection above.
+    /// The window badge label (the live window size — content that
+    /// CHANGES with every resize, so no fixed guess could stay correct)
+    /// is measured with the SAME `badge_text()` style its paint op
+    /// declares; the valid receipt's measured size becomes ordinary
+    /// external state, and the input card sizes the badge rect to it —
+    /// the replacement for the NC-4/NC-14 hand-computed character-width
+    /// ratios. Refused/invalid receipts land as honest absence: no badge,
+    /// never a fabricated size.
+    fn project_text_metrics(
+        &self,
+        external: &mut Self::ExternalState,
+        metrics: &mut dyn SlipwayTextMetricProvider,
+    ) {
+        if external.viewport.width <= 0.0 || external.viewport.height <= 0.0 {
+            // No frame presented yet: nothing truthful to measure.
+            external.window_badge = None;
+            return;
+        }
+        let text = window_badge_label(external.viewport);
+        let receipt = metrics.measure_text(TextMeasurementRequest {
+            target: app_id(),
+            request_id: "authored.app:window-badge".to_string(),
+            content: text.clone(),
+            style: badge_text(),
+            // Intrinsic size: the badge hugs the label, so no wrap width.
+            available_bounds: None,
+            flow: None,
+            purposes: vec![TextMeasurementPurpose::IntrinsicSize],
+        });
+        external.window_badge = match receipt {
+            TextMeasurementReceipt::Valid(valid) => Some(MeasuredLabel {
+                text,
+                size: valid.facts.measured_size,
+            }),
+            TextMeasurementReceipt::Invalid { .. } | TextMeasurementReceipt::Unsupported { .. } => {
+                None
+            }
+        };
     }
 
     /// PATTERN: app-level page scroll — the handler half. The PAGE region
@@ -260,6 +306,11 @@ impl SlipwayApp for ShowcaseApp {
     /// PATTERN: app-level PAGE scroll region — the declaration half
     /// (`SlipwayApp::app_scroll_regions`; the admission stress harness
     /// proves the same root-scroll shape through a runtime wrapper).
+    /// This region is the fix the admission advisory
+    /// `view_contract.content_overflow_without_scroll_region` induces
+    /// (NC-13): painted content taller than the window with no covering
+    /// enabled scroll region draws that warning, naming
+    /// `docs/public/api/routing-and-scroll.md` — which points back here.
     /// Declared ONLY when the card column exceeds the live window:
     /// viewport = the frame viewport, content = the full column, offset
     /// from the app-local state the handler above writes. Indicator mode

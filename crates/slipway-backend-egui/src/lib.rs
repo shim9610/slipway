@@ -1318,6 +1318,14 @@ pub struct EguiPresentedRegion {
     pub target: WidgetId,
     pub address: Option<WidgetSlotAddress>,
     pub paint_sort_key: (i32, usize, usize),
+    /// AUTHORED within-z order of the occluding layer's paint unit
+    /// (`slipway_core::paint_unit_authored_z_order`), only meaningful for
+    /// `EguiPresentedRegionKind::Occlusion` regions; `None` when the sort
+    /// key's tie-break fields were defaulted from the unit traversal (the
+    /// mounted slot ordinal) and for every non-occlusion region. Same-owner
+    /// occlusion comparisons may only consult this authored component
+    /// (NC-2) — see `egui_occlusion_blocks_region`.
+    pub authored_z_order: Option<usize>,
     pub event_target: WidgetId,
     pub event_target_slot: Option<WidgetSlotAddress>,
     pub declared_bounds: Rect,
@@ -1742,6 +1750,28 @@ where
                     }
 
                     let Some(region) = egui_region_at_position(context.regions, *pos) else {
+                        // No-silence contract (NC-2, roadmap Phase 6 item 1)
+                        // — egui parity with the iced press/release arms: a
+                        // press or release consumed by a pointer-opaque
+                        // paint layer with no reachable hit region leaves
+                        // inspectable refusal evidence in the bridge's
+                        // refusal ring, never silence.
+                        if let Some(occlusion) =
+                            egui_occlusion_region_at_position(context.regions, *pos)
+                        {
+                            self.dispatch_refusals
+                                .push(egui_blocked_pointer_refusal_evidence(
+                                    &context,
+                                    occlusion,
+                                    *pos,
+                                    if *pressed {
+                                        PointerEventKind::Press
+                                    } else {
+                                        PointerEventKind::Release
+                                    },
+                                    Some(egui_pointer_button(*button)),
+                                ));
+                        }
                         continue;
                     };
                     if *pressed {
@@ -3265,6 +3295,14 @@ where
         if let Some(viewport) = presented_viewport {
             self.runtime.record_presented_viewport(viewport);
         }
+        // Measurement projection (Phase 6 item 3b slice (iii), NC-4): on
+        // the same cadence as the viewport projection, hand the app hook
+        // the backend's REAL text layout so authored geometry can size
+        // itself to laid-out text. No-op (and free) for apps that never
+        // override `project_text_metrics`.
+        let metrics_ctx = ui.ctx().clone();
+        self.runtime
+            .project_text_metrics(&mut EguiTextMetricProvider::new(&metrics_ctx));
 
         let app_message_apply_start = Instant::now();
         let app_message_count = messages.len();
@@ -5025,11 +5063,15 @@ fn allocate_hit_region(
         region_id: hit.id.clone(),
         target: hit.target.clone(),
         address: hit.address.clone(),
+        // For a HIT region this is the AUTHOR-DECLARED HitRegionOrder, not
+        // a paint-unit allocation key — the occlusion filter
+        // (`egui_occlusion_blocks_region`) relies on that (NC-2).
         paint_sort_key: (
             hit.order.z_index,
             hit.order.paint_order,
             hit.order.traversal_order,
         ),
+        authored_z_order: None,
         event_target: hit
             .route
             .path
@@ -5084,6 +5126,7 @@ fn allocate_focus_region(
         target: focus.target.clone(),
         address: focus.address.clone(),
         paint_sort_key: (0, 0, 0),
+        authored_z_order: None,
         event_target: focus.target.clone(),
         event_target_slot: focus.address.clone(),
         declared_bounds: focus.bounds.into_rect(),
@@ -5259,6 +5302,7 @@ fn allocate_text_edit_region_without_font_policy(
         target: focus.target.clone(),
         address: focus.address.clone(),
         paint_sort_key: (0, 0, 0),
+        authored_z_order: None,
         event_target: focus.target.clone(),
         event_target_slot: focus.address.clone(),
         declared_bounds: focus.bounds.into_rect(),
@@ -5455,6 +5499,7 @@ where
                 scroll.order.paint_order,
                 scroll.order.traversal_order,
             ),
+            authored_z_order: None,
             event_target: scroll.target.clone(),
             event_target_slot: scroll.address.clone(),
             declared_bounds: scroll.viewport.into_rect(),
@@ -5574,6 +5619,7 @@ fn child_response_region(
         target: target.clone(),
         address: Some(slot.clone()),
         paint_sort_key,
+        authored_z_order: None,
         event_target: target,
         event_target_slot: Some(slot),
         declared_bounds: bounds,
@@ -5599,6 +5645,7 @@ fn allocate_paint_occlusion_regions(
     let mut regions = Vec::new();
     for (index, job) in jobs.iter().enumerate() {
         let paint_sort_key = paint_unit_sort_key(&job.unit);
+        let authored_z_order = slipway_core::paint_unit_authored_z_order(&job.unit);
         for (bounds, blocks_wheel) in opaque_layer_bounds(&job.unit.paint) {
             let absolute = egui_rect(job.origin, bounds);
             let clipped = absolute.intersect(job.clip_rect);
@@ -5608,6 +5655,7 @@ fn allocate_paint_occlusion_regions(
                     job,
                     index,
                     paint_sort_key,
+                    authored_z_order,
                     clipped,
                     blocks_wheel,
                 ));
@@ -5622,6 +5670,7 @@ fn paint_occlusion_region(
     job: &EguiPaintJob,
     index: usize,
     paint_sort_key: (i32, usize, usize),
+    authored_z_order: Option<usize>,
     clipped: egui::Rect,
     blocks_wheel: bool,
 ) -> EguiPresentedRegion {
@@ -5648,6 +5697,7 @@ fn paint_occlusion_region(
         target: job.unit.target.clone(),
         address: job.unit.address.clone(),
         paint_sort_key,
+        authored_z_order,
         event_target: job.unit.target.clone(),
         event_target_slot: job.unit.address.clone(),
         declared_bounds: local_rect_from_egui_rect(job.origin, clipped),
@@ -6246,22 +6296,31 @@ fn egui_region_is_child_response(region: &EguiPresentedRegion) -> bool {
         .starts_with("egui-child-response:")
 }
 
+/// Pointer-channel occlusion filter: routes through the shared core
+/// predicate (`paint_occlusion_blocks_declared_hit_region`, NC-2) so both
+/// backends and the derived dispatch graph decide occlusion identically. A
+/// hit region's `paint_sort_key` carries the AUTHOR-DECLARED
+/// `HitRegionOrder` (see `allocate_hit_region`), while an occluder's key is
+/// its paint-unit sort key whose tie-break fields default to the mounted
+/// slot ordinal — comparing those tie-break fields across that space split
+/// is what silently dropped every press over an authored opaque overlay
+/// (the naive-consumer modal). Same-owner comparisons at the region's own
+/// z therefore consult only the occluding layer's AUTHORED within-z order
+/// (`authored_z_order`), which preserves the authored overlay-card stack
+/// (explicit `PaintLayerKey::ordered` fronts a lower declared
+/// `paint_order`) while a widget's own unordered layer never blocks its
+/// own same-z hit region.
 fn egui_occlusion_blocks_region(
     occlusion: &EguiPresentedRegion,
     region: &EguiPresentedRegion,
 ) -> bool {
-    if !slipway_core::hit_region_order_is_front_of(
+    slipway_core::paint_occlusion_blocks_declared_hit_region(
+        &occlusion.target,
         &egui_hit_region_order_from_key(occlusion.paint_sort_key),
+        occlusion.authored_z_order,
+        &region.target,
         &egui_hit_region_order_from_key(region.paint_sort_key),
-    ) {
-        return false;
-    }
-
-    let same_owner = occlusion.target == region.target && occlusion.address == region.address;
-    let same_semantic_layer_key = occlusion.paint_sort_key.0 == region.paint_sort_key.0
-        && occlusion.paint_sort_key.1 == region.paint_sort_key.1;
-
-    !(same_owner && same_semantic_layer_key)
+    )
 }
 
 fn egui_hit_region_order_from_key(key: (i32, usize, usize)) -> HitRegionOrder {
@@ -6773,6 +6832,70 @@ fn egui_backend_captured_pointer_input_event(
     };
 
     Some(BackendInputEvent::declared(event, evidence))
+}
+
+/// Refusal evidence for a pointer press/release consumed by a
+/// pointer-opaque paint layer with no reachable hit region — the egui side
+/// of the NC-2 no-silence contract extension (parity with the iced
+/// `blocked_pointer_refusal_evidence`): names the front occluder and every
+/// containing declared candidate hit region. Retained in the bridge's
+/// refusal ring (`dispatch_refusals` -> the runtime's bounded dispatch
+/// refusal ring), so the consumed press is diagnosable from the
+/// `diagnostics` probe kind and the physical-control reply's
+/// `post_hoc_diagnosis` attachment instead of vanishing.
+fn egui_blocked_pointer_refusal_evidence(
+    context: &EguiInputContext<'_>,
+    occlusion: &EguiPresentedRegion,
+    position: egui::Pos2,
+    kind: PointerEventKind,
+    button: Option<PointerButton>,
+) -> slipway_core::DeclaredEventDispatchEvidence {
+    let view_root_local_position = egui_region_root_local_position(context, occlusion, position);
+    let candidate_regions = context
+        .hit_regions
+        .iter()
+        .filter(|region| {
+            region.enabled
+                && slipway_core::declared_region_contains_root_local_point_with_geometry_index(
+                    context.geometry_index,
+                    &region.target,
+                    region.address.as_ref(),
+                    region.bounds.into_rect(),
+                    view_root_local_position,
+                )
+        })
+        .map(|region| region.id.clone())
+        .collect::<Vec<_>>();
+    let occluder = format!(
+        "the pointer-opaque paint layer of target `{}` (occlusion order z={} paint={} traversal={})",
+        occlusion.target.as_str(),
+        occlusion.paint_sort_key.0,
+        occlusion.paint_sort_key.1,
+        occlusion.paint_sort_key.2,
+    );
+    let refusal_reason = if candidate_regions.is_empty() {
+        format!(
+            "pointer {kind:?} (button {button:?}) was consumed by {occluder}; no enabled hit region contains the point",
+        )
+    } else {
+        format!(
+            "pointer {kind:?} (button {button:?}) was consumed by {occluder}, which fronts every candidate hit region at the point; no hit region was reachable",
+        )
+    };
+    slipway_core::DeclaredEventDispatchEvidence {
+        source: EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
+        frame: context.frame.clone(),
+        kind: DeclaredEventDispatchKind::Pointer,
+        input_position: Some(view_root_local_position),
+        input_position_space: Some(slipway_core::DispatchPositionSpace::Content),
+        candidate_regions,
+        selected_region: None,
+        refusal_reason: Some(refusal_reason),
+        generated_event: None,
+        route: None,
+        capture_event: false,
+        diagnostics: Vec::new(),
+    }
 }
 
 /// Maps a view-local wheel cursor into root content / dispatch space through
@@ -8127,7 +8250,12 @@ fn paint_text(
         style,
         rect.width().max(0.0),
     ));
-    let position = egui_text_position(rect, style);
+    // The galley's `halign` (set from the declared `align_x` in
+    // `egui_text_layout_job`) makes the position's x an alignment ANCHOR
+    // (left edge / center / right edge per row); vertical anchoring is
+    // caller-side, from the galley's measured height. `Start`/`Top` keeps
+    // the historical `egui_text_position` top-left byte-identically.
+    let position = egui_text_anchor(rect, style, galley.size());
 
     clipped.galley(position, Arc::clone(&galley), text_color);
 }
@@ -8140,12 +8268,124 @@ fn egui_text_layout_job(
 ) -> egui::text::LayoutJob {
     let mut job =
         egui::text::LayoutJob::simple_format(content.to_string(), egui_text_format(color, style));
-    job.wrap.max_width = if wrap_width.is_finite() && wrap_width > 0.0 {
-        wrap_width
-    } else {
-        f32::INFINITY
+    job.halign = egui_text_halign(style.align_x);
+    // The declared per-op wrap mode (NC-4): `Word` (the unspecified
+    // default) keeps the historical wrap-at-rect-width byte-identically;
+    // `None` turns soft wrapping off entirely (`max_width = INFINITY` is
+    // egui's documented opt-out — explicit `\n` still breaks rows) and
+    // the row clips at the op rect per the existing clip contract.
+    // egui's `break_anywhere` glyph-level option is deliberately NOT
+    // exposed — iced has no parity-equivalent word-first mode (ADR-0004).
+    job.wrap.max_width = match style.wrap {
+        slipway_core::TextWrap::Word if wrap_width.is_finite() && wrap_width > 0.0 => wrap_width,
+        slipway_core::TextWrap::Word | slipway_core::TextWrap::None => f32::INFINITY,
     };
     job
+}
+
+fn egui_text_halign(align_x: slipway_core::TextAlignX) -> egui::Align {
+    match align_x {
+        // `Align::LEFT` is the `LayoutJob` default — `Start` stays
+        // byte-identical to the pre-alignment layout.
+        slipway_core::TextAlignX::Start => egui::Align::LEFT,
+        slipway_core::TextAlignX::Center => egui::Align::Center,
+        slipway_core::TextAlignX::End => egui::Align::RIGHT,
+    }
+}
+
+/// The galley draw position for the declared alignment: x is the row
+/// anchor matching the galley's `halign` (rect left edge / center /
+/// right edge), y anchors the measured galley block within the rect
+/// (`Top` = the historical `egui_text_position`, byte-identical), plus
+/// the baseline-shift y offset that function applies.
+fn egui_text_anchor(rect: egui::Rect, style: &TextStyle, galley_size: egui::Vec2) -> egui::Pos2 {
+    let base = egui_text_position(rect, style);
+    let x = match style.align_x {
+        slipway_core::TextAlignX::Start => base.x,
+        slipway_core::TextAlignX::Center => rect.center().x,
+        slipway_core::TextAlignX::End => rect.right(),
+    };
+    let y = match style.align_y {
+        slipway_core::TextAlignY::Top => base.y,
+        slipway_core::TextAlignY::Center => base.y + (rect.height() - galley_size.y) / 2.0,
+        slipway_core::TextAlignY::Bottom => base.y + rect.height() - galley_size.y,
+    };
+    egui::pos2(x, y)
+}
+
+/// The egui backend's REAL paint-text metric provider (roadmap Phase 6
+/// item 3b slice (iii), audit NC-4): lays the requested content out
+/// through the SAME galley pipeline the visible painter draws with —
+/// `egui_text_layout_job` (identical font/size/halign/wrap mapping as
+/// `paint_text`) laid out by the live `egui::Context`'s fonts — so the
+/// measured size equals what a `PaintOp::Text` with that style presents.
+/// Injected into `SlipwayLogic::project_text_metrics` via
+/// `SlipwayRuntime::project_text_metrics` on the presented-viewport sync
+/// cadence. `available_bounds: Some(rect)` measures wrapped layout at
+/// that rect's width; `None` measures the intrinsic (unbounded) size.
+/// Receipts are always `Valid` with `line_count` from the real galley
+/// rows; `baseline` is not reported (`None`), never fabricated.
+pub struct EguiTextMetricProvider<'a> {
+    ctx: &'a egui::Context,
+}
+
+impl<'a> EguiTextMetricProvider<'a> {
+    pub fn new(ctx: &'a egui::Context) -> Self {
+        Self { ctx }
+    }
+}
+
+impl slipway_core::SlipwayTextMetricProvider for EguiTextMetricProvider<'_> {
+    fn text_metric_source(&self) -> slipway_core::TextMetricSource {
+        slipway_core::TextMetricSource {
+            provider_id: "slipway-backend-egui.paint-text-metrics".to_string(),
+            backend_id: Some(EGUI_BACKEND_ID.to_string()),
+            api_name: "egui::Context::fonts_mut/FontsView::layout_job".to_string(),
+            kind: slipway_core::TextMetricSourceKind::OfficialBackendApi,
+        }
+    }
+
+    fn measure_text(
+        &mut self,
+        request: slipway_core::TextMeasurementRequest,
+    ) -> slipway_core::TextMeasurementReceipt {
+        let wrap_width = request
+            .available_bounds
+            .map(|rect| rect.size.width.max(0.0))
+            .unwrap_or(f32::INFINITY);
+        // Color does not affect galley geometry; the job is otherwise the
+        // exact shape `paint_text` submits for the same style.
+        let job = egui_text_layout_job(
+            &request.content,
+            egui::Color32::WHITE,
+            &request.style,
+            wrap_width,
+        );
+        let galley = self.ctx.fonts_mut(|fonts| fonts.layout_job(job));
+        let size = galley.size();
+        let measured = Size {
+            width: size.x,
+            height: size.y,
+        };
+        let origin = request
+            .available_bounds
+            .map(|rect| rect.origin)
+            .unwrap_or(Point { x: 0.0, y: 0.0 });
+        slipway_core::TextMeasurementReceipt::Valid(slipway_core::ValidTextMeasurement {
+            source: slipway_core::SlipwayTextMetricProvider::text_metric_source(self),
+            facts: slipway_core::TextMeasurementFacts {
+                measured_size: measured,
+                content_bounds: Rect {
+                    origin,
+                    size: measured,
+                },
+                baseline: None,
+                line_count: Some(galley.rows.len()),
+                caret_bounds: Vec::new(),
+            },
+            request,
+        })
+    }
 }
 
 fn egui_text_format(color: egui::Color32, style: &TextStyle) -> egui::text::TextFormat {
@@ -9654,6 +9894,7 @@ mod tests {
             target: WidgetId::from(id),
             address: None,
             paint_sort_key: (0, 0, 0),
+            authored_z_order: None,
             event_target: WidgetId::from(id),
             event_target_slot: None,
             declared_bounds: slipway_test_rect(rect),
@@ -9717,6 +9958,7 @@ mod tests {
                 target: WidgetId::from("child"),
                 address: None,
                 paint_sort_key: (0, 0, 0),
+                authored_z_order: None,
                 event_target: WidgetId::from("child"),
                 event_target_slot: None,
                 declared_bounds: Rect {
@@ -11494,6 +11736,11 @@ mod tests {
             higher_occlusion.target = owner;
             higher_occlusion.address = address;
             higher_occlusion.paint_sort_key = (10, 3, 0);
+            // The higher paint_order is EXPLICIT (an authored
+            // `PaintLayerKey::ordered` within-z order) — that is what this
+            // test pins; an unordered same-owner layer no longer blocks
+            // (NC-2, next test).
+            higher_occlusion.authored_z_order = Some(3);
             let regions = vec![lower_hit, higher_occlusion];
 
             assert!(
@@ -11501,6 +11748,178 @@ mod tests {
                 "same owner/address must not bypass a higher explicit paint_order"
             );
         });
+    }
+
+    /// NC-2 regression (roadmap Phase 6 item 1) on the egui side: the
+    /// consumer modal shape. The widget's own opaque layer occluder carries
+    /// the paint-unit sort key whose tie-break fields defaulted to the
+    /// MOUNTED SLOT ORDINAL (here 7) with NO authored within-z order, while
+    /// the widget's own hit region carries its author-declared
+    /// `HitRegionOrder` (z 100, 0, 0) — exactly what `allocate_hit_region`
+    /// and `paint_occlusion_region` produce for an authored opaque overlay
+    /// mounted as the 8th child. The press must route to the hit region.
+    /// Revert-and-fail: the pre-repair same-owner exemption required exact
+    /// key.1 equality (7 != 0), so the overlay was occluded by itself.
+    #[test]
+    fn own_unordered_opaque_layer_does_not_block_same_z_declared_hit_region() {
+        egui::__run_test_ui(|ui| {
+            let rect = egui_test_rect(0.0, 0.0, 120.0, 80.0);
+            let owner = WidgetId::from("nc2-egui-modal-overlay");
+            let address = Some(WidgetSlotAddress::new(owner.clone(), 7));
+            let mut hit_region = test_presented_region(
+                ui,
+                "nc2-egui-modal-overlay-hit",
+                EguiPresentedRegionKind::Hit,
+                rect,
+                egui::Sense::click(),
+                CursorCapability::Pointer,
+            );
+            hit_region.target = owner.clone();
+            hit_region.address = address.clone();
+            // The author-declared order (allocate_hit_region stores the
+            // declared HitRegionOrder for hit regions).
+            hit_region.paint_sort_key = (100, 0, 0);
+            let mut occlusion = test_presented_region(
+                ui,
+                "nc2-egui-modal-overlay-occlusion",
+                EguiPresentedRegionKind::Occlusion,
+                rect,
+                egui::Sense::hover(),
+                CursorCapability::Default,
+            );
+            occlusion.target = owner;
+            occlusion.address = address;
+            // The paint-unit key of `PaintLayerKey::new(100)` mounted at
+            // slot ordinal 7: defaulted tie-break fields, no authored
+            // within-z order.
+            occlusion.paint_sort_key = (100, 7, 7);
+            occlusion.authored_z_order = None;
+            let regions = vec![occlusion, hit_region];
+
+            let selected = egui_region_at_position(&regions, egui::pos2(20.0, 12.0))
+                .expect("the overlay's own same-z hit region receives the press (NC-2)");
+            assert_eq!(selected.region_id.as_str(), "nc2-egui-modal-overlay-hit");
+        });
+    }
+
+    /// NC-2 no-silence contract, egui parity arm (roadmap Phase 6 item 1):
+    /// a press — and its release — consumed by a pointer-opaque paint layer
+    /// with NO reachable hit region must leave refusal evidence in the
+    /// bridge's refusal ring, never silence. Mirrors the iced press/release
+    /// occlusion arms (`blocked_pointer_refusal_evidence`). Revert-and-fail:
+    /// before the repair the blocked pointer event hit the bare
+    /// `else { continue; }` in `input_events` and vanished without a trace.
+    #[test]
+    fn blocked_pointer_press_over_opaque_layer_records_refusal_evidence() {
+        let ctx = egui::Context::default();
+        let mut bridge = DefaultEguiBridge::new();
+
+        let frame = FrameIdentity {
+            surface_id: "egui-test".to_string(),
+            surface_instance_id: "nc2-blocked-press".to_string(),
+            revision: 1,
+            frame_index: 1,
+            viewport: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 160.0,
+                    height: 120.0,
+                },
+            },
+        };
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(frame.viewport),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let covered_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 160.0,
+                height: 120.0,
+            },
+        };
+
+        for (pressed, phase) in [(true, "Press"), (false, "Release")] {
+            let input = egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos: egui::pos2(20.0, 20.0),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            };
+            let mut produced: Vec<BackendInputEvent> = Vec::new();
+            let _ = ctx.run_ui(input, |ui| {
+                let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+                // A declared hit region genuinely covers the point — the
+                // refusal must name it as a candidate.
+                let hit_regions = vec![test_hit_region(
+                    "covered-hit",
+                    WidgetId::from("covered"),
+                    covered_bounds,
+                    0,
+                )];
+                // The only PRESENTED region at the point is a foreign
+                // opaque layer's occlusion region fronting everything.
+                let mut occlusion = test_presented_region(
+                    ui,
+                    "nc2-blocking-overlay-occlusion",
+                    EguiPresentedRegionKind::Occlusion,
+                    egui_test_rect(0.0, 0.0, 160.0, 120.0),
+                    egui::Sense::hover(),
+                    CursorCapability::Default,
+                );
+                occlusion.target = WidgetId::from("blocking-overlay");
+                occlusion.paint_sort_key = (10, 0, 0);
+                occlusion.authored_z_order = Some(0);
+                let regions = vec![occlusion];
+                let context = EguiInputContext {
+                    ui,
+                    widget_id: WidgetId::from("root"),
+                    frame: &frame,
+                    rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                    layout: &layout,
+                    geometry_index: &geometry_index,
+                    hit_regions: &hit_regions,
+                    focus_regions: &[],
+                    scroll_regions: &[],
+                    response: &regions[0].response,
+                    regions: &regions,
+                    native_physical_operation: None,
+                };
+                produced = EguiSlipwayBridge::<ProbeWidget>::input_events(&mut bridge, context);
+            });
+            assert!(
+                produced.is_empty(),
+                "{phase}: the blocked pointer event produces no backend input: {produced:?}"
+            );
+            let refusals = bridge.take_dispatch_refusals();
+            assert_eq!(
+                refusals.len(),
+                1,
+                "{phase}: exactly one refusal is retained (NC-2 no-silence contract): {refusals:?}"
+            );
+            let refusal = &refusals[0];
+            assert_eq!(refusal.kind, DeclaredEventDispatchKind::Pointer);
+            assert!(refusal.selected_region.is_none());
+            assert!(
+                refusal
+                    .candidate_regions
+                    .contains(&PresentationRegionId::from("covered-hit")),
+                "{phase}: refusal names the covered candidate region: {:?}",
+                refusal.candidate_regions
+            );
+            let reason = refusal
+                .refusal_reason
+                .as_deref()
+                .expect("blocked-pointer refusal carries a reason");
+            assert!(
+                reason.contains("blocking-overlay") && reason.contains(phase),
+                "{phase}: refusal names the occluding layer's owner and the pointer phase: {reason}"
+            );
+        }
     }
 
     #[test]
@@ -17039,6 +17458,7 @@ mod tests {
                 target: overlay.clone(),
                 address: hit_regions[0].address.clone(),
                 paint_sort_key: (12, 12, 12),
+                authored_z_order: None,
                 event_target: overlay.clone(),
                 event_target_slot: hit_regions[0].address.clone(),
                 declared_bounds: hit_regions[0].bounds.into_rect(),
@@ -17112,6 +17532,8 @@ mod tests {
                 strikethrough: true,
             },
             baseline: BaselineShift::Superscript,
+            // Unspecified alignment: the historical top-left anchoring.
+            ..TextStyle::plain()
         };
         let format = egui_text_format(egui::Color32::WHITE, &style);
 
@@ -17148,6 +17570,212 @@ mod tests {
         assert_eq!(format.valign, egui::Align::BOTTOM);
         assert_eq!(job.text, "plain");
         assert_eq!(job.wrap.max_width, 42.0);
+        // Default equivalence (NC-14): unspecified alignment keeps the
+        // LayoutJob default halign and the historical top-left position.
+        assert_eq!(job.halign, egui::Align::LEFT);
+        let rect = egui::Rect::from_min_size(egui::pos2(15.0, 18.0), egui::vec2(80.0, 24.0));
+        assert_eq!(
+            egui_text_anchor(rect, &style, egui::vec2(40.0, 12.0)),
+            egui_text_position(rect, &style)
+        );
+    }
+
+    // NC-4 honor path on egui: the declared per-op wrap mode must reach
+    // the layout job — `TextWrap::None` turns the wrap width off
+    // (`max_width = INFINITY`, egui's documented opt-out) while the
+    // unspecified default keeps the historical wrap-at-rect-width
+    // byte-identically. Reverting `egui_text_layout_job` to the
+    // unconditional rect-width wrap fails the no-wrap assertion.
+    #[test]
+    fn egui_declared_wrap_optout_disables_wrap_width() {
+        let default_job =
+            egui_text_layout_job("plain", egui::Color32::BLACK, &TextStyle::plain(), 42.0);
+        assert_eq!(default_job.wrap.max_width, 42.0);
+
+        let no_wrap_job = egui_text_layout_job(
+            "single line",
+            egui::Color32::BLACK,
+            &TextStyle::plain().no_wrap(),
+            42.0,
+        );
+        assert_eq!(no_wrap_job.wrap.max_width, f32::INFINITY);
+    }
+
+    // NC-4 measurement path: the backend's paint-text metric provider
+    // measures through the REAL egui galley pipeline (the same layout
+    // job `paint_text` submits), so measured sizes track content and
+    // honor the declared wrap mode. Reverting the provider to any
+    // estimate (or the wrap mapping to unconditional word wrap) fails
+    // the relational assertions.
+    #[test]
+    fn egui_text_metric_provider_measures_real_galley() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let inner_ctx = ui.ctx().clone();
+            let mut provider = EguiTextMetricProvider::new(&inner_ctx);
+            let request = |content: &str, style: TextStyle, available: Option<Rect>| {
+                slipway_core::TextMeasurementRequest {
+                    target: WidgetId::from("measure-widget"),
+                    request_id: "measure".to_string(),
+                    content: content.to_string(),
+                    style,
+                    available_bounds: available,
+                    flow: None,
+                    purposes: vec![slipway_core::TextMeasurementPurpose::IntrinsicSize],
+                }
+            };
+            let facts = |receipt: slipway_core::TextMeasurementReceipt| match receipt {
+                slipway_core::TextMeasurementReceipt::Valid(valid) => {
+                    assert_eq!(
+                        valid.source.kind,
+                        slipway_core::TextMetricSourceKind::OfficialBackendApi
+                    );
+                    assert_eq!(valid.source.backend_id.as_deref(), Some(EGUI_BACKEND_ID));
+                    valid.facts
+                }
+                other => panic!("expected a valid receipt from the real galley, got {other:?}"),
+            };
+            use slipway_core::SlipwayTextMetricProvider as _;
+
+            // Intrinsic (unbounded) size: real galley, single row, wider
+            // content measures wider.
+            let short = facts(provider.measure_text(request("short", TextStyle::plain(), None)));
+            assert!(short.measured_size.width > 0.0);
+            assert!(short.measured_size.height > 0.0);
+            assert_eq!(short.line_count, Some(1));
+            let longer = facts(provider.measure_text(request(
+                "a much longer measured label",
+                TextStyle::plain(),
+                None,
+            )));
+            assert!(longer.measured_size.width > short.measured_size.width);
+
+            // Bounded word wrap: a narrow available rect wraps the galley
+            // into multiple rows and grows the measured height.
+            let narrow = Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 60.0,
+                    height: 200.0,
+                },
+            };
+            let wrapped = facts(provider.measure_text(request(
+                "wrap wrap wrap wrap wrap",
+                TextStyle::plain(),
+                Some(narrow),
+            )));
+            assert!(wrapped.line_count.expect("line count") > 1);
+            assert!(wrapped.measured_size.height > short.measured_size.height);
+
+            // The declared opt-out reaches measurement too: the same
+            // content in the same narrow rect stays on one row.
+            let unwrapped = facts(provider.measure_text(request(
+                "wrap wrap wrap wrap wrap",
+                TextStyle::plain().no_wrap(),
+                Some(narrow),
+            )));
+            assert_eq!(unwrapped.line_count, Some(1));
+            assert!(unwrapped.measured_size.width > narrow.size.width);
+        });
+    }
+
+    // NC-14 honor path on egui: a declared alignment must reach the real
+    // egui output shape — the galley is laid out with the mapped halign
+    // and positioned at the alignment anchor within the declared rect.
+    // Reverting `paint_text` to the historical hardcoded top-left fails
+    // both the halign and the position assertions.
+    #[test]
+    fn egui_declared_center_alignment_anchors_galley_in_bounds() {
+        let bounds = Rect {
+            origin: Point { x: 10.0, y: 12.0 },
+            size: Size {
+                width: 80.0,
+                height: 24.0,
+            },
+        };
+        let style = TextStyle::plain().centered();
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(200.0, 100.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                paint_text(
+                    ui.painter(),
+                    egui::pos2(5.0, 6.0),
+                    bounds,
+                    "mid",
+                    test_rgb(20, 30, 40),
+                    &style,
+                );
+            },
+        );
+
+        let (pos, galley) = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((text.pos, Arc::clone(&text.galley))),
+                _ => None,
+            })
+            .expect("painted text reaches the egui output shapes");
+        assert_eq!(galley.job.halign, egui::Align::Center);
+        // Horizontal anchor = the translated rect's center x; with halign
+        // Center each galley row is centered around it.
+        let rect = egui::Rect::from_min_size(egui::pos2(15.0, 18.0), egui::vec2(80.0, 24.0));
+        assert_eq!(pos.x, rect.center().x);
+        // Vertical anchor = the measured galley block centered in the rect.
+        let expected_y = rect.top() + (rect.height() - galley.size().y) / 2.0;
+        assert!(
+            (pos.y - expected_y).abs() < 0.01,
+            "galley y {} must center the block (expected {expected_y})",
+            pos.y
+        );
+        assert!(galley.size().y > 0.0, "galley must have laid-out rows");
+
+        // End/Bottom: anchor x = right edge; block bottom = rect bottom.
+        let style = TextStyle::plain()
+            .with_align_x(slipway_core::TextAlignX::End)
+            .with_align_y(slipway_core::TextAlignY::Bottom);
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(200.0, 100.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                paint_text(
+                    ui.painter(),
+                    egui::pos2(5.0, 6.0),
+                    bounds,
+                    "end",
+                    test_rgb(20, 30, 40),
+                    &style,
+                );
+            },
+        );
+        let (pos, galley) = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((text.pos, Arc::clone(&text.galley))),
+                _ => None,
+            })
+            .expect("painted text reaches the egui output shapes");
+        assert_eq!(galley.job.halign, egui::Align::RIGHT);
+        assert_eq!(pos.x, rect.right());
+        let expected_y = rect.bottom() - galley.size().y;
+        assert!(
+            (pos.y - expected_y).abs() < 0.01,
+            "galley y {} must bottom-anchor the block (expected {expected_y})",
+            pos.y
+        );
     }
 
     #[test]

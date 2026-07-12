@@ -98,6 +98,21 @@ either, report `PUBLIC_DOC_GAP` with the missing public operation. Private
 project notes and old evaluation crates stay out of bounds; public docs are
 the authority for user-side app authoring.
 
+## Where Gap Reports Land
+
+Gap reports go in a file, not into chat scroll: record every
+`PUBLIC_DOC_GAP` / `API_GAP` / `BACKEND_GAP` (and `AUTHORING_GAP`) in a
+`GAPS.md` at your own project root — one section per gap: the label, what
+was needed, what the docs/API provided instead, and the workaround taken
+(or "none — blocked").
+
+A recorded gap is not always a stop: when a safe workaround exists — one
+that stays inside the declared contracts — record the gap in `GAPS.md` and
+keep working. Stop only when every available workaround would violate a
+contract. The labels, the stop conditions, and the canonical statement of
+this convention live in the
+[LLM contract checklist](llm-contract-checklist.md).
+
 ## Do Not Do This
 
 - Do not collapse a dashboard into one root widget that paints and routes

@@ -466,7 +466,7 @@ impl SlipwayView for DraftInputWidget {
 
     fn paint(
         &self,
-        _external: &Self::ExternalState,
+        external: &Self::ExternalState,
         local: &Self::LocalState,
         layout: &LayoutOutput,
     ) -> Vec<PaintOp> {
@@ -493,6 +493,39 @@ impl SlipwayView for DraftInputWidget {
         // value/caret/selection presentation (its font comes from the
         // typography policy below). Painting the value again double-draws
         // it under the native control.
+
+        // PATTERN: measurement-sized element (docs/public/api/backends.md
+        // "Text Wrap and Alignment"). The badge rect derives from the
+        // MEASURED label size the `project_text_metrics` hook wrote
+        // (communication.rs) — with the SAME `badge_text()` style this op
+        // declares — so the badge hugs its label at every window size
+        // with NO character-width guessing (the NC-4/NC-14 anti-pattern).
+        // `None` = no valid measurement yet: the badge is honestly absent
+        // rather than painted at a fabricated size.
+        if let Some(badge) = &external.window_badge {
+            let badge_rect = ssot::input_badge_rect(bounds.size.width, badge.size);
+            ops.push(fill("input-badge", badge_rect, rgb(224, 231, 255)));
+            ops.push(stroke("input-badge-outline", badge_rect, accent(), 1.0));
+            ops.push(PaintOp::styled_text(
+                badge_rect,
+                badge.text.clone(),
+                overlay_title_ink(),
+                ssot::badge_text(),
+            ));
+        }
+
+        // PATTERN: per-op wrap opt-out (docs/public/api/backends.md "Text
+        // Wrap and Alignment"). The CJK label's rect is deliberately
+        // narrower than the laid-out text; `.no_wrap()` (TextWrap::None,
+        // via ssot::nowrap_label_text) keeps it on ONE line, clipped at
+        // the rect edge. Unset wrap = word wrap at the rect width — the
+        // NC-4 shape that force-wrapped the consumer's CJK headers.
+        ops.push(PaintOp::styled_text(
+            ssot::input_nowrap_label_rect(bounds.size.width),
+            ssot::INPUT_NOWRAP_LABEL.to_string(),
+            muted(),
+            ssot::nowrap_label_text(),
+        ));
         ops
     }
 
@@ -996,17 +1029,17 @@ impl SlipwayView for OverlayWidget {
             fill("overlay-roam-bg", roam_panel, rgb(255, 251, 235)),
             stroke("overlay-roam-outline", roam_panel, rgb(217, 119, 6), 1.5),
             fill("overlay-roam-titlebar", roam_titlebar, rgb(254, 243, 199)),
+            // PATTERN: declared text alignment (docs/public/api/backends.md
+            // "Text Wrap and Alignment"). Declare the FULL control rect
+            // (the whole titlebar) as the text op's bounds and let
+            // `.centered()` anchor the label inside it on both backends —
+            // do not shrink the rect with hand-computed insets from
+            // estimated glyph widths (the NC-14 anti-pattern: the guess
+            // drifts off-center wherever it is wrong). Unspecified
+            // alignment = the historical top-left anchoring (see the
+            // clamped panel's title above).
             PaintOp::styled_text(
-                Rect {
-                    origin: Point {
-                        x: roam_titlebar.origin.x + 8.0,
-                        y: roam_titlebar.origin.y + 2.0,
-                    },
-                    size: Size {
-                        width: roam_titlebar.size.width - 16.0,
-                        height: 12.0,
-                    },
-                },
+                roam_titlebar,
                 if local.roam_dragging {
                     "roaming…"
                 } else {
@@ -1014,7 +1047,7 @@ impl SlipwayView for OverlayWidget {
                 }
                 .to_string(),
                 rgb(146, 64, 14),
-                row_text(),
+                row_text().centered(),
             ),
             PaintOp::styled_text(
                 Rect {

@@ -93,14 +93,21 @@ pub mod prelude {
     //!     }
     //! }
     //!
-    //! impl SlipwayLogic for Panel {
-    //!     fn handle_event(
-    //!         &self,
-    //!         _external: &Self::ExternalState,
-    //!         _local: &mut Self::LocalState,
-    //!         _event: InputEvent,
-    //!     ) -> EventOutcome<Self::AppMessage> {
-    //!         EventOutcome::ignored()
+    //! // One table generates BOTH `SlipwayLogic::handle_event` and
+    //! // `SlipwayEventDispositionPolicy::event_disposition`: each arm's
+    //! // pattern+guard IS the declared handledness, so declaration/handler
+    //! // drift (the `event_declaration.handler_*` diagnostics) is
+    //! // inexpressible in this form. Unmatched events are ignored AND
+    //! // declared unhandled — never write a `_` catch-all arm.
+    //! event_handling_table! {
+    //!     impl Panel {
+    //!         |widget, external, local| match event {
+    //!             InputEvent::Pointer(pointer)
+    //!                 if pointer.kind == PointerEventKind::Press =>
+    //!             {
+    //!                 EventOutcome::handled()
+    //!             },
+    //!         }
     //!     }
     //! }
     //!
@@ -128,7 +135,14 @@ pub mod prelude {
     //!             layout.bounds.into_rect(),
     //!             "panel",
     //!             Color { red: 0.1, green: 0.1, blue: 0.1, alpha: 1.0 },
-    //!             TextStyle::plain(),
+    //!             // Declared text alignment (NC-14): anchored within the
+    //!             // op's bounds; unspecified = the historical top-left.
+    //!             // Declared wrap opt-out (NC-4): one line, clipped at
+    //!             // the rect; unspecified = word wrap (TextWrap::Word).
+    //!             TextStyle::plain()
+    //!                 .with_align_x(TextAlignX::Center)
+    //!                 .with_align_y(TextAlignY::Center)
+    //!                 .no_wrap(),
     //!         );
     //!         // Pointer-opaque but wheel-transparent overlay layer.
     //!         vec![
@@ -162,35 +176,6 @@ pub mod prelude {
     //!                 phase: EventRoutePhase::Target,
     //!             },
     //!             capture: Vec::new(),
-    //!             diagnostics: Vec::new(),
-    //!         }
-    //!     }
-    //! }
-    //!
-    //! impl SlipwayEventDispositionPolicy for Panel {
-    //!     fn event_disposition(
-    //!         &self,
-    //!         _external: &Self::ExternalState,
-    //!         _local: &Self::LocalState,
-    //!         event: &InputEvent,
-    //!         route: &EventRoute,
-    //!     ) -> EventPropagationEvidence {
-    //!         let disposition = EventDisposition {
-    //!             handled: true,
-    //!             propagate: false,
-    //!             default_action_allowed: true,
-    //!         };
-    //!         EventPropagationEvidence {
-    //!             target: self.id(),
-    //!             event: event.clone(),
-    //!             steps: vec![EventPropagationStep {
-    //!                 stage: EventPropagationStage::Target,
-    //!                 node: route.path.last().cloned(),
-    //!                 disposition,
-    //!                 emitted_messages: Vec::new(),
-    //!                 changes: Vec::new(),
-    //!             }],
-    //!             final_disposition: disposition,
     //!             diagnostics: Vec::new(),
     //!         }
     //!     }
@@ -379,13 +364,16 @@ pub mod prelude {
         SlipwayScrollableContainerCapability, SlipwayTextInputCapability,
     };
     // Load-bearing routing, disposition, and scroll policies
-    // (docs/public/api/routing-and-scroll.md).
+    // (docs/public/api/routing-and-scroll.md). `target_event_disposition`
+    // builds the standard single-step target-phase evidence for
+    // hand-written disposition impls.
     pub use slipway_core::{
         EventDisposition, EventPropagationEvidence, EventPropagationStage, EventPropagationStep,
         EventRoute, EventRoutePhase, EventRoutingPolicyDeclaration, ScrollAxes,
         ScrollBehaviorPolicyDeclaration, ScrollConsumptionPolicy, ScrollIndicatorMode,
         SlipwayEventDispositionPolicy, SlipwayEventRoutingPolicy, SlipwayScrollBehaviorPolicy,
         SlipwayWheelRoutingPolicy, WheelRouting, WheelRoutingPolicyDeclaration,
+        target_event_disposition,
     };
     // Text-input policy traits and their declaration types (consumed by
     // text_edit_focus_region_from_capability).
@@ -425,10 +413,22 @@ pub mod prelude {
         TextMeasurementCachePolicyDeclaration, TextMeasurementPolicyDeclaration,
         TextSelectionRange, TextViewport, TextWrapMode,
     };
-    // Paint, layering, and explicit text style (checklist "Style Rules").
+    // The paint-text measurement channel (`SlipwayApp::project_text_metrics`
+    // / `SlipwayLogic::project_text_metrics`, roadmap Phase 6 item 3b):
+    // authors build requests, match receipts, and read the measured facts —
+    // never estimate character widths (docs/public/api/backends.md "Text
+    // Wrap and Alignment").
+    pub use slipway_core::{
+        InvalidTextMeasurementReason, TextMeasurementFacts, TextMeasurementPurpose,
+        TextMeasurementReceipt, TextMeasurementRequest, TextMetricSource, TextMetricSourceKind,
+        ValidTextMeasurement,
+    };
+    // Paint, layering, and explicit text style (checklist "Style Rules"),
+    // including the declared text alignment enums and the per-op wrap
+    // declaration (docs/public/api/backends.md "Text Wrap and Alignment").
     pub use slipway_core::{
         BaselineShift, Color, FontStyle, FontWeight, PaintInputTransparency, PaintLayerKey,
-        PaintOp, TextDecoration, TextStyle,
+        PaintOp, TextAlignX, TextAlignY, TextDecoration, TextStyle, TextWrap,
     };
     // Pre-flight admission check (docs/public/api/diagnostics.md).
     pub use slipway_core::{
@@ -436,6 +436,12 @@ pub mod prelude {
         view_definition_contract_diagnostics_for_capabilities,
         view_definition_has_blocking_contract_diagnostic,
     };
+    // Generates `SlipwayLogic::handle_event` AND
+    // `SlipwayEventDispositionPolicy::event_disposition` from ONE match
+    // table — declared handledness cannot drift from handler behavior
+    // (the `event_declaration.handler_*` diagnostics; audit NC-8,
+    // ADR-0003). The taught authoring form for both traits.
+    pub use slipway_core::event_handling_table;
     // Satisfies every RESERVED capability-bundle bound with the documented
     // empty defaults; see the macro doc for the trait list.
     pub use slipway_core::reserved_policy_defaults;
