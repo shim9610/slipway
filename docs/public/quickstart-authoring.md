@@ -3,9 +3,8 @@
 Use this page when you are writing a Slipway app. This is the authoring path,
 not an architecture investigation path.
 
-If this page and the linked public docs do not tell you how to continue, report
-`PUBLIC_DOC_GAP` with the missing operation. Do not inspect private planning
-docs, old evaluation crates, or repository history to guess the intended API.
+If the public docs do not tell you how to continue, report `PUBLIC_DOC_GAP`;
+do not guess the API from private notes, old crates, or repository history.
 
 ## 1. Add Slipway
 
@@ -15,8 +14,8 @@ Prefer `cargo add`:
 cargo add slipway --git https://github.com/shim9610/slipway.git --features iced
 ```
 
-Use `--features egui` for the egui backend. Use `--features all-backends` only
-when the task explicitly needs both backend adapters.
+Use `--features egui` for egui, or `--features all-backends` only when the
+task genuinely needs both backend adapters.
 
 ## 2. Import The Facade
 
@@ -42,19 +41,26 @@ src/
   app_runner.rs
 ```
 
-Each file has one job:
+This is exactly the module map of the reference example
+`crates/slipway-example-authored` — the designated copy source; start
+from it (every pattern site there carries a `PATTERN:` comment). Each
+file has one job, shown concretely in the example:
 
-- `ssot.rs`: app data, ids, stable semantic source state.
-- `internal_logic.rs`: behavior inside one widget instance.
+- `ssot.rs`: app data, ids, capabilities, design tokens, and the shared
+  geometry constants that paint, hit, and pointer math MUST agree on.
+- `internal_logic.rs`: behavior inside one widget instance (the example's
+  four `SlipwayLogic` impls).
 - `communication.rs`: app messages, reducers, and widget-to-widget
-  coordination.
-- `view.rs`: layout, paint, hit, focus, scroll, text, order, overflow, and
-  responsive declarations.
-- `app_runner.rs`: runtime assembly, backend selection, and debug startup.
+  coordination (`ShowcaseMessage`, `apply_messages`, the `SlipwayApp`
+  composition).
+- `view.rs`: layout, paint, hit, focus, scroll, text, order, overflow,
+  and responsive declarations, plus `reserved_policy_defaults!`.
+- `app_runner.rs`: runtime assembly, backend selection, and debug startup
+  (`--iced`/`--egui` driving the same authored modules).
 
-Do not start with one large root surface. If the source UI has a sidebar,
-filters, cards, chart, table, modal, or scroll area, those should become
-separate authored widget identities unless there is a clear reason not to.
+Do not start with one large root surface: sidebars, filters, cards, charts,
+tables, modals, and scroll areas become separate authored widget identities
+unless there is a clear reason not to.
 
 ## 4. Run An Authored App
 
@@ -96,8 +102,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`apply_messages` is the app reducer. It receives messages emitted by widget
-logic and updates the external app state:
+The egui root's font bound is satisfied by `SlipwayApp::resolve_app_font`,
+whose default refuses honestly (`app-font-resolution-refused`) and the
+backend falls back to its own fonts; override it only to declare a real
+font source ([IME and Korean text input](api/ime.md)).
+
+`apply_messages` is the app reducer: it receives widget-emitted messages and
+updates the external app state:
 
 ```rust
 fn apply_messages(state: &mut MyExternalState, messages: Vec<MyMessage>) {
@@ -110,19 +121,36 @@ fn apply_messages(state: &mut MyExternalState, messages: Vec<MyMessage>) {
 ## 5. Declare Interaction, Do Not Only Paint It
 
 A painted shape is not interactive by itself. The view must also declare the
-matching contract:
+matching contract, using the prelude helper that constructs it:
 
-- clickable or hoverable region: `HitRegionDeclaration`;
-- focusable or text-edit region: `FocusRegionDeclaration`;
-- wheel or overflow region: `ScrollRegionDeclaration`;
+- clickable or hoverable region: `HitRegionDeclaration`
+  (`hit_region_from_pointer_capability`);
+- focusable or text-edit region: `FocusRegionDeclaration`
+  (`focus_region_from_focus_capability`, or
+  `text_edit_focus_region_from_capability` for text input);
+- wheel or overflow region: `ScrollRegionDeclaration`
+  (`scroll_region_from_scrollable_capability`, or the `_with_order` variant
+  when regions can overlap — see
+  [Routing and scroll](api/routing-and-scroll.md));
 - text editing support: text-edit declarations and command support;
 - overlay or modal ordering: `PaintOrderDeclaration`;
 - child placement: `ChildLayoutPlan` and `ParentLocalRect`;
 - target-owned geometry: `TargetLocalRect`.
 
-If an element should react to pointer, wheel, focus, keyboard, or text input,
-missing declarations are an authoring bug or a missing public API contract.
-Do not replace them with direct state mutation.
+The helpers require capability-bundle trait bounds. Implement the
+LOAD-BEARING traits by hand and cover every RESERVED bound with one macro
+call, `reserved_policy_defaults!(MyWidget);` — do not write real logic in
+RESERVED traits, it is a silent no-op (see
+[Trait surface](api/trait-surface.md)).
+
+Validate before launching a window: run
+`view_definition_contract_diagnostics_for_capabilities` in a unit test and
+assert no blocking diagnostics. Every refusal code is cataloged with its
+trigger and fix in the [Diagnostics catalog](api/diagnostics.md).
+
+If an element should react to input, a missing declaration is an authoring
+bug or a missing public API contract; do not replace it with direct state
+mutation.
 
 ## 6. Use MCP From The Running Backend
 
@@ -143,25 +171,18 @@ Send line-delimited JSON-RPC requests to that address. Common calls:
 {"jsonrpc":"2.0","id":"shot-1","method":"tools/call","params":{"name":"slipway.debug.screenshot","arguments":{"frame":"current"}}}
 ```
 
-```json
-{"jsonrpc":"2.0","id":"click-1","method":"tools/call","params":{"name":"slipway.debug.physical_control","arguments":{"frame":"current","operation":{"type":"pointer","phase":"press","position":{"x":120.0,"y":80.0},"button":"primary","device":"mouse"}}}}
-```
+The full tool surface is in [Debug MCP](api/debug-mcp.md).
 
 For visual parity work, always compare the current visible frame identity:
+`surface_id + surface_instance_id + revision + frame_index + viewport`.
 
-```text
-surface_id + surface_instance_id + revision + frame_index + viewport
-```
-
-If MCP returns success but the visible backend does not change in the same way,
-that is a framework/debug evidence gap or backend adapter bug, not proof of
-success.
+If MCP returns success but the visible backend does not change in the same
+way, that is an evidence gap or backend adapter bug, not proof of success.
 
 ## 7. When Mirroring A Web UI
 
 Use the source web UI only to derive component boundaries, state, layout,
-overflow, responsive behavior, and interaction states. Slipway is not a CSS
-engine or automatic converter.
+overflow, responsiveness, and interaction states; Slipway is not a CSS engine.
 
 For each source component, write down:
 
@@ -174,6 +195,5 @@ For each source component, write down:
 - hit/focus/scroll/text declarations;
 - MCP checks for resize, scroll, click, focus, and text input.
 
-Then implement the smallest missing declarations needed for that source UI.
-Do not implement a general browser layout engine, CSS parser, or one-off
-canvas surface for the whole page.
+Then implement the smallest missing declarations for that source UI; do not
+build a general browser layout engine, CSS parser, or whole-page canvas.

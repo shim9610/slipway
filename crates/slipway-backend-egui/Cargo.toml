@@ -14,3 +14,6 @@ winit = { version = "0.30.13", default-features = false }
 
 [dev-dependencies]
 slipway-debug-bridge = { version = "0.1.1", path = "../slipway-debug-bridge" }
+
+[lints]
+workspace = true

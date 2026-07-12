@@ -12,3 +12,6 @@ slipway-core = { version = "0.1.1", path = "../slipway-core" }
 slipway-debug-bridge = { version = "0.1.1", path = "../slipway-debug-bridge" }
 slipway-debug-mcp = { version = "0.1.1", path = "../slipway-debug-mcp" }
 slipway-debug-renderer = { version = "0.1.1", path = "../slipway-debug-renderer" }
+
+[lints]
+workspace = true

@@ -1,9 +1,9 @@
 ﻿use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
 use slipway_core::{
-    BaselineShift, Color, Diagnostic, DiagnosticSeverity, EvidenceSource, FontStyle, FontWeight,
-    FrameIdentity, PaintOp, PathCommand, PathDeclaration, Rect, RenderEvidence, RenderPacket,
-    RenderRefusal, ShapeDeclaration, ShapeKind, Size, SlipwayOffscreenRenderer, TextStyle,
-    WidgetId,
+    BaselineShift, ClipDeclaration, Color, Diagnostic, DiagnosticSeverity, EvidenceSource,
+    FontStyle, FontWeight, FrameIdentity, PaintOp, PathCommand, PathDeclaration, Rect,
+    RenderEvidence, RenderPacket, RenderRefusal, ShapeDeclaration, ShapeKind, Size,
+    SlipwayOffscreenRenderer, TextStyle, WidgetId,
 };
 use std::fs::{self, File};
 use std::io::BufWriter;
@@ -261,6 +261,7 @@ struct RasterTarget {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    clip_stack: Vec<PixelBounds>,
 }
 
 impl RasterTarget {
@@ -274,6 +275,7 @@ impl RasterTarget {
             width,
             height,
             rgba,
+            clip_stack: Vec::new(),
         }
     }
 
@@ -281,9 +283,29 @@ impl RasterTarget {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
         }
+        if self
+            .clip_stack
+            .last()
+            .is_some_and(|clip| !clip.contains(x, y))
+        {
+            return;
+        }
         let offset = ((y as u32 * self.width + x as u32) * 4) as usize;
         let source = color_to_rgba(color);
         blend_rgba(&mut self.rgba[offset..offset + 4], source);
+    }
+
+    fn with_clip<R>(&mut self, clip: PixelBounds, f: impl FnOnce(&mut Self) -> R) -> R {
+        let effective = self
+            .clip_stack
+            .last()
+            .copied()
+            .map(|current| current.intersect(clip))
+            .unwrap_or(clip);
+        self.clip_stack.push(effective);
+        let result = f(self);
+        self.clip_stack.pop();
+        result
     }
 }
 
@@ -296,13 +318,17 @@ fn render_op(
 ) {
     match op {
         PaintOp::Fill { shape, color } => {
-            fill_shape(shape, *color, viewport, target, diagnostics, fonts)
+            with_optional_clip(shape.clip.as_ref(), viewport, target, |target| {
+                fill_shape(shape, *color, viewport, target, diagnostics, fonts)
+            })
         }
         PaintOp::Stroke {
             shape,
             color,
             width,
-        } => stroke_shape(shape, *color, *width, viewport, target, diagnostics, fonts),
+        } => with_optional_clip(shape.clip.as_ref(), viewport, target, |target| {
+            stroke_shape(shape, *color, *width, viewport, target, diagnostics, fonts)
+        }),
         PaintOp::Text {
             bounds,
             content,
@@ -318,11 +344,27 @@ fn render_op(
             diagnostics,
             fonts,
         ),
-        PaintOp::Group { ops, .. } | PaintOp::Layer { ops, .. } => {
-            for child in ops {
-                render_op(child, viewport, target, diagnostics, fonts);
-            }
+        PaintOp::Group { clip, ops, .. } | PaintOp::Layer { clip, ops, .. } => {
+            with_optional_clip(clip.as_ref(), viewport, target, |target| {
+                for child in ops {
+                    render_op(child, viewport, target, diagnostics, fonts);
+                }
+            });
         }
+    }
+}
+
+fn with_optional_clip<R>(
+    clip: Option<&ClipDeclaration>,
+    viewport: &Rect,
+    target: &mut RasterTarget,
+    f: impl FnOnce(&mut RasterTarget) -> R,
+) -> R {
+    if let Some(clip) = clip {
+        let bounds = pixel_bounds(clip.bounds, viewport).clipped(target);
+        target.with_clip(bounds, f)
+    } else {
+        f(target)
     }
 }
 
@@ -1168,6 +1210,19 @@ impl PixelBounds {
             y1: self.y1.clamp(0, target.height as i32),
         }
     }
+
+    fn intersect(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.max(other.x0),
+            y0: self.y0.max(other.y0),
+            x1: self.x1.min(other.x1),
+            y1: self.y1.min(other.y1),
+        }
+    }
+
+    fn contains(self, x: i32, y: i32) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
 }
 
 fn pixel_bounds(rect: Rect, viewport: &Rect) -> PixelBounds {
@@ -1426,6 +1481,17 @@ mod tests {
         }
     }
 
+    fn clip(id: &str, x: f32, y: f32, width: f32, height: f32) -> ClipDeclaration {
+        ClipDeclaration {
+            id: Some(id.to_string()),
+            bounds: Rect {
+                origin: Point { x, y },
+                size: Size { width, height },
+            },
+            path: None,
+        }
+    }
+
     fn color(red: f32, green: f32, blue: f32, alpha: f32) -> Color {
         Color {
             red,
@@ -1572,6 +1638,49 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.code != "text-placeholder-rasterized")
         );
+    }
+
+    #[test]
+    fn group_layer_and_shape_clips_limit_debug_pixels() {
+        let mut renderer = CpuDebugRenderer::default();
+        let evidence = renderer
+            .render_offscreen(packet(
+                frame(20.0, 20.0, 23),
+                vec![
+                    PaintOp::Group {
+                        id: Some("group-clip".to_string()),
+                        clip: Some(clip("group-clip", 0.0, 0.0, 5.0, 20.0)),
+                        ops: vec![PaintOp::Fill {
+                            shape: rect("group-fill", 0.0, 0.0, 20.0, 20.0),
+                            color: color(1.0, 0.0, 0.0, 1.0),
+                        }],
+                    },
+                    PaintOp::Layer {
+                        id: Some("layer-clip".to_string()),
+                        key: slipway_core::PaintLayerKey::ordered(1, 0),
+                        input_transparency: slipway_core::PaintInputTransparency::Opaque,
+                        wheel_transparency: None,
+                        clip: Some(clip("layer-clip", 10.0, 0.0, 5.0, 20.0)),
+                        ops: vec![PaintOp::Fill {
+                            shape: rect("layer-fill", 0.0, 0.0, 20.0, 20.0),
+                            color: color(0.0, 1.0, 0.0, 1.0),
+                        }],
+                    },
+                    PaintOp::Fill {
+                        shape: ShapeDeclaration {
+                            clip: Some(clip("shape-clip", 15.0, 0.0, 5.0, 20.0)),
+                            ..rect("shape-fill", 0.0, 0.0, 20.0, 20.0)
+                        },
+                        color: color(0.0, 0.0, 1.0, 1.0),
+                    },
+                ],
+            ))
+            .expect("render succeeds");
+        let artifact = renderer
+            .artifact(evidence.artifact_ref.as_deref().expect("artifact ref"))
+            .expect("artifact stored");
+
+        assert_eq!(non_clear_pixels(artifact), 300);
     }
 
     #[test]

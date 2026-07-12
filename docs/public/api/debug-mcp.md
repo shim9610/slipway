@@ -8,8 +8,11 @@ when configured.
 
 Use MCP to ask a running Slipway app for request-scoped evidence:
 
-- status and admission checks;
-- topology, state, layout, view-definition, paint, and diagnostic probes;
+- status and admission checks (refusal codes are cataloged in
+  [Diagnostics](diagnostics.md));
+- topology, state, layout, view-definition, paint, and diagnostic probes
+  (the dispatch-graph probe is described in
+  [Routing and scroll](routing-and-scroll.md));
 - request-scoped render or screenshot evidence;
 - pointer, wheel, focus, text, keyboard, command, and resize controls where the
   active backend supports them;

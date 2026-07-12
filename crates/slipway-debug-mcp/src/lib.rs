@@ -945,7 +945,7 @@ fn default_tools() -> Vec<Value> {
         ),
         render_tool_schema(
             TOOL_SCREENSHOT,
-            "Alias slipway.debug.render for explicit screenshot capture requests.",
+            "Render the app's declared paint offscreen from the current declarations (alias of slipway.debug.render); NOT a framebuffer capture of the presented window pixels.",
         ),
         tool_schema(
             TOOL_CONTROL,
@@ -957,7 +957,7 @@ fn default_tools() -> Vec<Value> {
         ),
         tool_schema(
             TOOL_RESIZE,
-            "Request a viewport resize for a frame identity.",
+            "Request a viewport resize for a frame identity. No backend currently performs native resizes; the runtime refuses with `resize-unsupported` and the viewport is unchanged.",
         ),
     ]
 }
@@ -1156,6 +1156,12 @@ fn status_summary(status: &DebugStatus) -> Value {
     json!({
         "admitted": status.admitted,
         "detail": status.detail,
+        "revision": status.revision,
+        "backend_id": status.backend_id,
+        "trace_buffer_depth": status.trace_buffer_depth,
+        "trace_buffer_capacity": status.trace_buffer_capacity,
+        "refused_debug_replies": status.refused_debug_replies,
+        "unhandled_backend_input_traces": status.unhandled_backend_input_traces,
     })
 }
 
@@ -1245,6 +1251,10 @@ fn dispatch_evidence_summary(evidence: &DeclaredEventDispatchEvidence) -> Value 
         "frame": frame_json(&evidence.frame),
         "kind": declared_dispatch_kind_name(evidence.kind),
         "input_position": evidence.input_position.map(point_json),
+        "input_position_space": evidence.input_position_space.map(|space| match space {
+            slipway_core::DispatchPositionSpace::Content => "content",
+            slipway_core::DispatchPositionSpace::Viewport => "viewport",
+        }),
         "candidate_regions": evidence
             .candidate_regions
             .iter()
@@ -1434,6 +1444,84 @@ fn probe_product_summary(product: &ProbeProduct) -> Value {
             "has_overflow_policy": layout.overflow_policy.is_some(),
             "has_scroll_policy": layout.scroll.is_some(),
         }),
+        ProbeProduct::DispatchGraph(probe) => json!({
+            "kind": "dispatch_graph",
+            "target": probe.target.as_str(),
+            "frame": frame_json(&probe.frame),
+            "graph": dispatch_graph_summary(&probe.graph),
+        }),
+    }
+}
+
+fn dispatch_graph_summary(graph: &slipway_core::DispatchGraph) -> Value {
+    json!({
+        "target": graph.target.as_str(),
+        "nodes": graph
+            .nodes
+            .iter()
+            .map(dispatch_graph_node_summary)
+            .collect::<Vec<_>>(),
+        "edges": graph
+            .edges
+            .iter()
+            .map(dispatch_graph_edge_summary)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn dispatch_graph_node_summary(node: &slipway_core::DispatchGraphNode) -> Value {
+    json!({
+        "id": node.id.as_str(),
+        "kind": dispatch_graph_node_kind_name(node.kind),
+        "target": node.target.as_str(),
+        "address": node.address.as_ref().map(widget_slot_json),
+        "bounds": rect_json(&node.bounds),
+        "order": {
+            "z_index": node.order.z_index,
+            "paint_order": node.order.paint_order,
+            "traversal_order": node.order.traversal_order,
+        },
+        "enabled": node.enabled,
+        "capture": node.capture.map(|capture| format!("{capture:?}")),
+        "consumes_wheel": node.consumes_wheel,
+        "blocks_pointer": node.blocks_pointer,
+        "blocks_wheel": node.blocks_wheel,
+    })
+}
+
+fn dispatch_graph_edge_summary(edge: &slipway_core::DispatchGraphEdge) -> Value {
+    json!({
+        "kind": dispatch_graph_edge_kind_name(edge.kind),
+        "channel": dispatch_graph_channel_name(edge.channel),
+        "from": edge.from.as_str(),
+        "to": edge.to.as_str(),
+    })
+}
+
+fn dispatch_graph_node_kind_name(kind: slipway_core::DispatchGraphNodeKind) -> &'static str {
+    match kind {
+        slipway_core::DispatchGraphNodeKind::Hit => "hit",
+        slipway_core::DispatchGraphNodeKind::Focus => "focus",
+        slipway_core::DispatchGraphNodeKind::Scroll => "scroll",
+        slipway_core::DispatchGraphNodeKind::Occlusion => "occlusion",
+    }
+}
+
+fn dispatch_graph_edge_kind_name(kind: slipway_core::DispatchGraphEdgeKind) -> &'static str {
+    match kind {
+        slipway_core::DispatchGraphEdgeKind::HitOrder => "hit_order",
+        slipway_core::DispatchGraphEdgeKind::Occlusion => "occlusion",
+        slipway_core::DispatchGraphEdgeKind::Capture => "capture",
+        slipway_core::DispatchGraphEdgeKind::Chaining => "chaining",
+        slipway_core::DispatchGraphEdgeKind::FocusRoute => "focus_route",
+    }
+}
+
+fn dispatch_graph_channel_name(channel: slipway_core::DispatchGraphChannel) -> &'static str {
+    match channel {
+        slipway_core::DispatchGraphChannel::Pointer => "pointer",
+        slipway_core::DispatchGraphChannel::Wheel => "wheel",
+        slipway_core::DispatchGraphChannel::FocusRouted => "focus_routed",
     }
 }
 
@@ -1818,6 +1906,7 @@ fn parse_probe_kind(kind: &str) -> Result<ProbeKind, RpcError> {
         "view_definition" | "viewDefinition" | "ViewDefinition" => Ok(ProbeKind::ViewDefinition),
         "render_packet" | "renderPacket" | "RenderPacket" => Ok(ProbeKind::RenderPacket),
         "render_evidence" | "renderEvidence" | "RenderEvidence" => Ok(ProbeKind::RenderEvidence),
+        "dispatch_graph" | "dispatchGraph" | "DispatchGraph" => Ok(ProbeKind::DispatchGraph),
         _ => Err(RpcError::invalid_params(format!(
             "unsupported probe kind `{kind}`"
         ))),
@@ -2395,6 +2484,61 @@ mod tests {
         parse_frame(&frame_json_value()).expect("test frame parses")
     }
 
+    #[test]
+    fn dispatch_graph_probe_kind_parses_and_serializes_nodes_and_edges() {
+        assert_eq!(
+            parse_probe_kind("dispatch_graph").expect("snake case parses"),
+            ProbeKind::DispatchGraph
+        );
+        assert_eq!(
+            parse_probe_kind("dispatchGraph").expect("camel case parses"),
+            ProbeKind::DispatchGraph
+        );
+
+        let frame = frame();
+        let probe = slipway_core::DispatchGraphProbe {
+            target: slipway_core::WidgetId::from("graph-root"),
+            frame: frame.clone(),
+            graph: slipway_core::DispatchGraph {
+                target: slipway_core::WidgetId::from("graph-root"),
+                nodes: vec![slipway_core::DispatchGraphNode {
+                    id: "hit-a".to_string(),
+                    kind: slipway_core::DispatchGraphNodeKind::Hit,
+                    target: slipway_core::WidgetId::from("graph-root"),
+                    address: None,
+                    bounds: frame.viewport,
+                    order: slipway_core::HitRegionOrder::default(),
+                    enabled: true,
+                    capture: Some(slipway_core::PointerCaptureIntent::DuringDrag),
+                    consumes_wheel: None,
+                    blocks_pointer: None,
+                    blocks_wheel: None,
+                }],
+                edges: vec![slipway_core::DispatchGraphEdge {
+                    kind: slipway_core::DispatchGraphEdgeKind::Occlusion,
+                    channel: slipway_core::DispatchGraphChannel::Wheel,
+                    from: "occlusion:graph-root:10:0:0:0".to_string(),
+                    to: "scroll-root".to_string(),
+                }],
+            },
+        };
+
+        let summary = probe_product_summary(&ProbeProduct::DispatchGraph(probe));
+        assert_eq!(summary["kind"], "dispatch_graph");
+        assert_eq!(summary["target"], "graph-root");
+        assert_eq!(summary["frame"]["frame_index"], 11);
+        assert_eq!(summary["graph"]["nodes"][0]["id"], "hit-a");
+        assert_eq!(summary["graph"]["nodes"][0]["kind"], "hit");
+        assert_eq!(summary["graph"]["nodes"][0]["capture"], "DuringDrag");
+        assert_eq!(summary["graph"]["edges"][0]["kind"], "occlusion");
+        assert_eq!(summary["graph"]["edges"][0]["channel"], "wheel");
+        assert_eq!(
+            summary["graph"]["edges"][0]["from"],
+            "occlusion:graph-root:10:0:0:0"
+        );
+        assert_eq!(summary["graph"]["edges"][0]["to"], "scroll-root");
+    }
+
     fn request(id: Value, method: &str, params: Value) -> Value {
         json!({
             "jsonrpc": "2.0",
@@ -2511,6 +2655,12 @@ mod tests {
                     DebugReplyProduct::Status(DebugStatus {
                         admitted: true,
                         detail: "fake handler ready".to_string(),
+                        revision: 3,
+                        backend_id: Some("fake-backend".to_string()),
+                        trace_buffer_depth: 1,
+                        trace_buffer_capacity: 32,
+                        refused_debug_replies: 2,
+                        unhandled_backend_input_traces: 4,
                     })
                 }
                 slipway_debug_bridge::DebugCommandKind::Probe { request, .. } => {
@@ -2701,6 +2851,45 @@ mod tests {
             assert_eq!(schema["required"], json!(["frame"]));
             assert_eq!(schema["properties"]["target"]["type"], "string");
         }
+    }
+
+    #[test]
+    fn tools_list_describes_screenshot_and_resize_honestly() {
+        let server = DebugMcpServer::new(DebugMcpConfig::default());
+        let mut handler = FakeHandler::default();
+        let response = server
+            .handle_message(
+                request(json!("tools"), "tools/list", json!({})),
+                &mut handler,
+            )
+            .expect("tools/list has response");
+
+        let tools = response["result"]["tools"].as_array().expect("tools array");
+        let screenshot = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_SCREENSHOT)
+            .expect("screenshot tool exists");
+        let description = screenshot["description"]
+            .as_str()
+            .expect("screenshot description");
+        assert!(
+            description.contains("declared paint offscreen"),
+            "screenshot description must say it renders declarations: {description}"
+        );
+        assert!(
+            description.contains("NOT a framebuffer capture"),
+            "screenshot description must deny framebuffer capture: {description}"
+        );
+
+        let resize = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_RESIZE)
+            .expect("resize tool exists");
+        let description = resize["description"].as_str().expect("resize description");
+        assert!(
+            description.contains("resize-unsupported"),
+            "resize description must state the refusal contract: {description}"
+        );
     }
 
     #[test]
@@ -2966,6 +3155,12 @@ mod tests {
         assert_eq!(payload["admitted"], true);
         assert_eq!(payload["product_kind"], "status");
         assert_eq!(payload["product"]["detail"], "fake handler ready");
+        assert_eq!(payload["product"]["revision"], 3);
+        assert_eq!(payload["product"]["backend_id"], "fake-backend");
+        assert_eq!(payload["product"]["trace_buffer_depth"], 1);
+        assert_eq!(payload["product"]["trace_buffer_capacity"], 32);
+        assert_eq!(payload["product"]["refused_debug_replies"], 2);
+        assert_eq!(payload["product"]["unhandled_backend_input_traces"], 4);
         assert_eq!(payload["frame"], frame_json(&frame()));
     }
 

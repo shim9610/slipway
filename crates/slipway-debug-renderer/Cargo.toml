@@ -9,3 +9,6 @@ repository.workspace = true
 ab_glyph = "0.2.32"
 png = "0.18.1"
 slipway-core = { version = "0.1.1", path = "../slipway-core" }
+
+[lints]
+workspace = true

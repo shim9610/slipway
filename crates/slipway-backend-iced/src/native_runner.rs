@@ -3,6 +3,7 @@ use super::*;
 use iced::advanced::Renderer as _;
 use iced::advanced::graphics::Compositor as _;
 use iced::advanced::graphics::Viewport;
+use iced::advanced::graphics::compositor;
 use iced::advanced::mouse;
 use iced::advanced::renderer;
 use iced::advanced::text::{self, Paragraph as _, Renderer as _};
@@ -122,6 +123,7 @@ struct NativeIcedWindow {
     ime_trace: bool,
     redraw_at: Option<Instant>,
     presented_frames: u64,
+    pressed_mouse_buttons: u8,
     theme: iced::Theme,
     style: renderer::Style,
 }
@@ -289,7 +291,10 @@ where
         let create_window_start = Instant::now();
         let mut window_settings = iced::window::Settings::default();
         window_settings.size = iced::Size::new(1024.0, 768.0);
-        let scale_factor = 1.0;
+        // Program-level zoom for `window_attributes`, not monitor DPI:
+        // iced_winit passes `Program::scale_factor` (default 1.0) here and
+        // winit itself applies the monitor DPI to the logical size.
+        let program_scale_factor = 1.0;
         let title = self.app.title();
         let window_start = Instant::now();
         let window = Arc::new(
@@ -297,12 +302,16 @@ where
                 .create_window(iced_winit::conversion::window_attributes(
                     window_settings,
                     &title,
-                    scale_factor,
+                    program_scale_factor,
                     None,
                     None,
                 ))
                 .map_err(|error| iced::Error::WindowCreationFailed(Box::new(error)))?,
         );
+        // Windows emits ScaleFactorChanged only on DPI *changes* after
+        // creation, so the initial viewport must read the created window's
+        // scale factor the same way `queue_resize` does (f32 cast parity).
+        let scale_factor = window.scale_factor() as f32;
         self.frame_timing
             .record("iced.create_window.window", window_start.elapsed(), 1, None);
         window.set_title(&title);
@@ -411,6 +420,7 @@ where
             ime_trace: self.ime_trace,
             redraw_at: None,
             presented_frames: 0,
+            pressed_mouse_buttons: 0,
             theme,
             style: renderer::Style {
                 text_color: base.text_color,
@@ -529,19 +539,26 @@ where
         for message in messages {
             if let SlipwayIcedRuntimeMessage::PreeditStyle(style) = message {
                 self.apply_preedit_style(style);
+                should_redraw = true;
                 continue;
             }
             let update = self.app.update_without_debug_drain(message);
-            should_redraw = true;
-            if update.debug_error.is_some() {
-                should_redraw = true;
-            }
+            should_redraw |= self.update_requires_redraw(&update);
         }
         if should_redraw {
             if let Some(window) = self.window.as_ref() {
                 window.raw.request_redraw();
             }
         }
+    }
+
+    fn update_requires_redraw(&self, update: &SlipwayIcedRuntimeAppUpdate) -> bool {
+        let trace_requires_redraw = self
+            .app
+            .runtime()
+            .last_backend_input_trace()
+            .is_some_and(|trace| !trace.changes.is_empty() || !trace.emitted_messages.is_empty());
+        iced_runtime_update_requires_redraw(update, trace_requires_redraw)
     }
 
     fn apply_preedit_style_messages(&mut self, messages: &[SlipwayIcedRuntimeMessage]) {
@@ -565,24 +582,15 @@ where
         let Some(window) = self.window.as_mut() else {
             return;
         };
-        if interaction == window.mouse_interaction {
-            return;
-        }
-        if let Some(icon) = iced_winit::conversion::mouse_interaction(interaction) {
-            window.raw.set_cursor_visible(true);
-            window.raw.set_cursor(icon);
-        } else {
-            window.raw.set_cursor_visible(false);
-        }
-        window.mouse_interaction = interaction;
+        apply_window_mouse_interaction(window, interaction);
     }
 
-    fn redraw(&mut self) {
+    fn redraw(&mut self) -> RedrawFrameFlow {
         let timing_start = Instant::now();
         let timing_viewport = self.window.as_ref().map(iced_timing_viewport);
         let cursor = self.cursor();
         let Some(window) = self.window.as_mut() else {
-            return;
+            return RedrawFrameFlow::Continue;
         };
         let presented_frame_before = window.presented_frames;
         let cache = std::mem::replace(&mut window.cache, user_interface::Cache::new());
@@ -606,18 +614,23 @@ where
         draw_window_preedit(window);
         let preedit_elapsed = preedit_start.elapsed();
         let base = window.theme.base();
+        let raw = window.raw.clone();
         let present_start = Instant::now();
         let present_result = window.compositor.present(
             &mut window.renderer,
             &mut window.surface,
             &window.viewport,
             base.background_color,
-            || {},
+            || raw.pre_present_notify(),
         );
         let present_elapsed = present_start.elapsed();
-        if present_result.is_ok() {
-            window.presented_frames += 1;
-        }
+        let present_recovery = match present_result {
+            Ok(()) => {
+                window.presented_frames += 1;
+                None
+            }
+            Err(error) => Some(recover_window_from_present_error(window, error)),
+        };
         let presented_frame_after = window.presented_frames;
         let _ = window;
         self.frame_timing.record(
@@ -668,6 +681,223 @@ where
             presented_frame_before as usize,
             timing_viewport,
         );
+        if present_recovery.is_some() {
+            self.frame_timing
+                .record("iced.present_error", Duration::ZERO, 1, timing_viewport);
+        }
+        if present_recovery == Some(PresentErrorRecovery::Exit) {
+            RedrawFrameFlow::Exit
+        } else {
+            RedrawFrameFlow::Continue
+        }
+    }
+
+    /// Runs one `WindowEvent::RedrawRequested` frame with iced 0.14's frame
+    /// protocol: the synthetic `window::Event::RedrawRequested` tick shares
+    /// one `UserInterface::build` with the draw, mirroring iced_winit's
+    /// update-then-draw redraw handler. The pending-queue safety-net drain
+    /// (Step 181) runs first through `dispatch_pending_iced_events`, one
+    /// slice at a time with message application in between, so the tick's
+    /// build never stamps dispatch evidence against a frame revision that an
+    /// earlier queued event's message is about to bump (see
+    /// `pending_dispatch_slices`); the tick then observes the post-apply
+    /// state on a fresh build. Messages emitted by the tick update itself
+    /// are rare; they take the existing message-application flow and accept
+    /// the one extra rebuild that flow implies.
+    fn redraw_requested_frame(&mut self) -> RedrawFrameFlow {
+        self.dispatch_pending_iced_events();
+        let timing_viewport = self.window.as_ref().map(iced_timing_viewport);
+        let cursor = self.cursor();
+        let redraw_event =
+            iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now()));
+        let events = [redraw_event.clone()];
+        let event_count = events.len();
+        let Some(window) = self.window.as_mut() else {
+            return RedrawFrameFlow::Continue;
+        };
+        let presented_frame_before = window.presented_frames;
+        let cache = std::mem::replace(&mut window.cache, user_interface::Cache::new());
+        let view_start = Instant::now();
+        let element = self.app.view::<iced::Theme, iced::Renderer>();
+        let view_elapsed = view_start.elapsed();
+        let build_start = Instant::now();
+        let mut user_interface = UserInterface::build(
+            element,
+            window.viewport.logical_size(),
+            cache,
+            &mut window.renderer,
+        );
+        let build_elapsed = build_start.elapsed();
+
+        let update_start = Instant::now();
+        let mut messages = Vec::new();
+        let (mut state, _statuses) = user_interface.update(
+            &events,
+            cursor,
+            &mut window.renderer,
+            &mut window.clipboard,
+            &mut messages,
+        );
+        let mut redraw_updates_delivered = 1;
+        // iced_winit re-ticks the same interface when a redraw update
+        // invalidated layout without messages, so relayout-armed widgets
+        // (for example scrollable viewport notification) observe the fresh
+        // layout in the same frame; the bound matches iced_winit's
+        // three-update cap.
+        while should_re_tick_redraw_update(
+            messages.is_empty(),
+            state.has_layout_changed(),
+            redraw_updates_delivered,
+        ) {
+            let (next_state, _statuses) = user_interface.update(
+                std::slice::from_ref(&redraw_event),
+                cursor,
+                &mut window.renderer,
+                &mut window.clipboard,
+                &mut messages,
+            );
+            state = next_state;
+            redraw_updates_delivered += 1;
+        }
+        let update_elapsed = update_start.elapsed();
+        trace_iced_events_for_ime(window.ime_trace, &events);
+        let (mouse_interaction, input_method, redraw_request) = match state {
+            user_interface::State::Updated {
+                mouse_interaction,
+                input_method,
+                redraw_request,
+                ..
+            } => (
+                Some(mouse_interaction),
+                Some(input_method),
+                Some(redraw_request),
+            ),
+            user_interface::State::Outdated => (None, None, None),
+        };
+
+        if !messages.is_empty() {
+            window.cache = user_interface.into_cache();
+            let _ = window;
+            self.apply_preedit_style_messages(&messages);
+            if let Some(input_method) = input_method {
+                if let Some(window) = self.window.as_mut() {
+                    request_window_input_method(window, input_method);
+                }
+            }
+            if let Some(redraw_request) = redraw_request {
+                if let Some(window) = self.window.as_mut() {
+                    request_window_redraw(window, redraw_request);
+                }
+            }
+            if let Some(mouse_interaction) = mouse_interaction {
+                self.update_mouse_interaction(mouse_interaction);
+            }
+            self.record_iced_update_message_counts(&messages, timing_viewport);
+            self.frame_timing
+                .record("iced.update", update_elapsed, event_count, timing_viewport);
+            self.process_messages(messages);
+            // The accepted extra rebuild: the presented frame must reflect
+            // the state the applied messages just produced.
+            return self.redraw();
+        }
+
+        let draw_present_start = Instant::now();
+        let draw_start = Instant::now();
+        user_interface.draw(&mut window.renderer, &window.theme, &window.style, cursor);
+        let draw_elapsed = draw_start.elapsed();
+        window.cache = user_interface.into_cache();
+        if let Some(input_method) = input_method {
+            request_window_input_method(window, input_method);
+        }
+        if let Some(redraw_request) = redraw_request {
+            request_window_redraw(window, redraw_request);
+        }
+        if let Some(mouse_interaction) = mouse_interaction {
+            apply_window_mouse_interaction(window, mouse_interaction);
+        }
+        let has_preedit = window.preedit.is_some();
+        let preedit_start = Instant::now();
+        draw_window_preedit(window);
+        let preedit_elapsed = preedit_start.elapsed();
+        let base = window.theme.base();
+        let raw = window.raw.clone();
+        let present_start = Instant::now();
+        let present_result = window.compositor.present(
+            &mut window.renderer,
+            &mut window.surface,
+            &window.viewport,
+            base.background_color,
+            || raw.pre_present_notify(),
+        );
+        let present_elapsed = present_start.elapsed();
+        let present_recovery = match present_result {
+            Ok(()) => {
+                window.presented_frames += 1;
+                None
+            }
+            Err(error) => Some(recover_window_from_present_error(window, error)),
+        };
+        let presented_frame_after = window.presented_frames;
+        let _ = window;
+        self.frame_timing
+            .record("iced.update", update_elapsed, event_count, timing_viewport);
+        self.frame_timing.record(
+            "iced.redraw.frame_index",
+            Duration::ZERO,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.draw",
+            draw_elapsed,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.preedit_draw",
+            preedit_elapsed,
+            usize::from(has_preedit),
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.present",
+            present_elapsed,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.view",
+            view_elapsed,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.build",
+            build_elapsed,
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.presented_frame_count",
+            Duration::ZERO,
+            presented_frame_after as usize,
+            timing_viewport,
+        );
+        self.frame_timing.record(
+            "iced.draw_present",
+            draw_present_start.elapsed(),
+            presented_frame_before as usize,
+            timing_viewport,
+        );
+        if present_recovery.is_some() {
+            self.frame_timing
+                .record("iced.present_error", Duration::ZERO, 1, timing_viewport);
+        }
+        if present_recovery == Some(PresentErrorRecovery::Exit) {
+            RedrawFrameFlow::Exit
+        } else {
+            RedrawFrameFlow::Continue
+        }
     }
 
     fn handle_window_event(
@@ -745,6 +975,20 @@ where
                     window.cursor_position = None;
                 }
             }
+            WindowEvent::MouseInput { state, .. } => {
+                if let Some(window) = self.window.as_mut() {
+                    match state {
+                        ElementState::Pressed => {
+                            window.pressed_mouse_buttons =
+                                window.pressed_mouse_buttons.saturating_add(1);
+                        }
+                        ElementState::Released => {
+                            window.pressed_mouse_buttons =
+                                window.pressed_mouse_buttons.saturating_sub(1);
+                        }
+                    }
+                }
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 if let Some(window) = self.window.as_mut() {
                     window.modifiers = modifiers.state();
@@ -769,18 +1013,11 @@ where
                     return;
                 }
                 self.apply_pending_resize(false);
-                self.dispatch_pending_iced_events();
-                if self
-                    .window
-                    .as_ref()
-                    .is_some_and(should_dispatch_redraw_event_update)
-                {
-                    let messages = self.dispatch_iced_events(&[iced::Event::Window(
-                        iced::window::Event::RedrawRequested(Instant::now()),
-                    )]);
-                    self.process_messages(messages);
-                }
-                self.redraw();
+                // iced 0.14 frame protocol: every RedrawRequested delivers
+                // the synthetic redraw event to the widget tree; the pending
+                // safety-net drain (Step 181) merges into the same single
+                // UserInterface build/update as the draw.
+                let flow = self.redraw_requested_frame();
                 let timing_viewport = self.window.as_ref().map(iced_timing_viewport);
                 self.frame_timing.record(
                     "iced.redraw_requested",
@@ -788,31 +1025,50 @@ where
                     pending_event_count,
                     timing_viewport,
                 );
+                if flow == RedrawFrameFlow::Exit {
+                    event_loop.exit();
+                }
                 return;
             }
             _ => {}
         }
 
-        let Some(window) = self.window.as_ref() else {
+        let Some((scale_factor, modifiers)) = self
+            .window
+            .as_ref()
+            .map(|window| (window.viewport.scale_factor(), window.modifiers))
+        else {
             return;
         };
-        if let Some(event) = iced_winit::conversion::window_event(
-            event,
-            window.viewport.scale_factor(),
-            window.modifiers,
-        ) {
-            self.pending_iced_events.push(event);
+        if let Some(event) = iced_winit::conversion::window_event(event, scale_factor, modifiers) {
+            let is_cursor_moved = is_iced_cursor_moved_event(&event);
+            let is_wheel_scrolled = is_iced_wheel_event(&event);
+            self.queue_pending_iced_event(event);
             if self.pending_resize.is_none() {
-                self.dispatch_pending_iced_events();
-                if let Some(window) = self.window.as_ref() {
-                    window.raw.request_redraw();
+                if is_cursor_moved {
+                    if let Some(window) = self.window.as_ref() {
+                        window.raw.request_redraw();
+                    }
+                } else if is_wheel_scrolled {
+                    // Wheel ticks stay queued so a same-iteration OS burst can
+                    // coalesce into one pending event. `about_to_wait` runs
+                    // after the OS event batch and dispatches the queue this
+                    // iteration, then requests the redraw, so wheel latency
+                    // stays within the same event-loop iteration.
+                } else {
+                    self.dispatch_pending_iced_events();
+                    if let Some(window) = self.window.as_ref() {
+                        window.raw.request_redraw();
+                    }
                 }
             } else if self
                 .window
                 .as_ref()
                 .is_some_and(|window| window.presented_frames == 0)
             {
-                window.raw.request_redraw();
+                if let Some(window) = self.window.as_ref() {
+                    window.raw.request_redraw();
+                }
             }
         }
     }
@@ -963,13 +1219,45 @@ where
             )));
     }
 
+    fn queue_pending_iced_event(&mut self, event: iced::Event) {
+        let is_wheel_scrolled = is_iced_wheel_event(&event);
+        let coalesced = push_coalesced_pending_iced_event(&mut self.pending_iced_events, event);
+        if coalesced {
+            let viewport = self.window.as_ref().map(iced_timing_viewport);
+            let kind = if is_wheel_scrolled {
+                "iced.wheel_scrolled_coalesced"
+            } else {
+                "iced.cursor_moved_coalesced"
+            };
+            self.frame_timing.record(kind, Duration::ZERO, 1, viewport);
+        }
+    }
+
     fn dispatch_pending_iced_events(&mut self) {
         if self.pending_iced_events.is_empty() {
             return;
         }
         let events = std::mem::take(&mut self.pending_iced_events);
-        let messages = self.dispatch_iced_events(&events);
-        self.process_messages(messages);
+        // Sequencing contract: every runtime message carries dispatch
+        // evidence stamped with the frame revision of the
+        // `UserInterface::build` that produced it, and a handled message
+        // bumps that revision when applied. Flushing the whole queue through
+        // one build/update let a queued wheel share a slice with a later
+        // press or captured drag move; applying the wheel's message first
+        // made the pointer message's evidence one revision stale, so the
+        // runtime refused it (BACKEND_INPUT_DISPATCH_EVIDENCE_FRAME_MISMATCH)
+        // and the grab/click was silently dropped until the next full
+        // rebuild. Dispatching slice by slice — applying each slice's
+        // messages before the next slice is built — restores the baseline
+        // per-cycle ordering. Adjacent coalescing (Step 181) already
+        // collapses cursor and wheel bursts, so the common queue holds one
+        // event and still costs exactly one build. The debug-MCP physical
+        // injection path keeps its own per-event dispatch in
+        // `dispatch_native_physical_events` for evidence fidelity.
+        for slice in pending_dispatch_slices(events) {
+            let messages = self.dispatch_iced_events(&slice);
+            self.process_messages(messages);
+        }
     }
 
     fn pump_mcp(&mut self) {
@@ -998,6 +1286,9 @@ where
         let Some(pending) = self.pending_mcp.take() else {
             return;
         };
+        self.app
+            .runtime_mut()
+            .record_presenting_backend(ICED_BACKEND_ID);
         let lease = match self.app.runtime_mut().take_debug_command_lease() {
             Ok(Some(lease)) => lease,
             Ok(None) | Err(_) => {
@@ -1013,11 +1304,14 @@ where
                 .runtime
                 .complete_debug_command_lease_with_app_reducer(lease, &mut app.apply_app_messages);
             let _ = pending.try_finish_and_respond();
+            let _ = self.frame_timing.flush_to_file();
             return;
         };
         let product = self.run_native_physical_control(&command, operation);
+        self.refresh_visible_ui_cache_after_physical_control();
         let _ = lease.complete(product);
         let _ = pending.try_finish_and_respond();
+        let _ = self.frame_timing.flush_to_file();
         if let Some(window) = self.window.as_ref() {
             window.raw.request_redraw();
         }
@@ -1043,11 +1337,14 @@ where
                 ));
             }
             DebugPhysicalControl::Scroll {
-                selector,
-                offset_x,
-                offset_y,
+                selector: _,
+                offset_x: _,
+                offset_y: _,
             } => {
-                return self.run_native_scroll_control(command, selector, *offset_x, *offset_y);
+                return native_physical_control_error(NativePhysicalControlUnsupported::new(
+                    "native-physical-control-scroll-unsupported",
+                    "iced absolute scroll offsets are not physical-equivalent evidence because iced exposes them as widget operations, not as native winit input; use wheel so success is proven by backend-presented scroll input",
+                ));
             }
             DebugPhysicalControl::Text { selector, text } => {
                 return self.run_native_text_control(command, selector, text);
@@ -1112,14 +1409,25 @@ where
                 dispatch_evidence: None,
             });
         }
-        let messages = self.dispatch_iced_events(&events);
+        let messages = self.dispatch_native_physical_events(&events);
         let mut backend_inputs = Vec::new();
+        let mut refusals = Vec::new();
         let mut remaining = Vec::new();
         for message in messages {
             match message {
                 SlipwayIcedRuntimeMessage::BackendInput(input) => backend_inputs.push(input),
+                SlipwayIcedRuntimeMessage::DispatchRefusal(evidence) => refusals.push(evidence),
                 other => remaining.push(other),
             }
+        }
+        // Retain routing-level refusal evidence (audit finding MF-H3)
+        // regardless of the match outcome: the injected events were the only
+        // events dispatched, so every captured refusal belongs to this
+        // operation.
+        for refusal in &refusals {
+            self.app
+                .runtime_mut()
+                .record_dispatch_refusal_for_backend(refusal.clone(), ICED_BACKEND_ID);
         }
 
         let matched = backend_inputs
@@ -1136,11 +1444,21 @@ where
             None => {
                 let Some(focus_input) = self.pointer_press_focus_input_after_native_update(command)
                 else {
-                    return DebugReplyProduct::Error(DebugFailure {
-                        code: "native-physical-control-produced-no-backend-input".to_string(),
-                        message: "the synthesized iced native event reached UserInterface::update but produced no backend-presented input evidence matching the requested physical operation".to_string(),
-                        dispatch_evidence: None,
-                    });
+                    // Error-path half-apply repair (audit finding MF-M18):
+                    // the synthesized events already ran through
+                    // UserInterface::update above, so the real input path
+                    // would process every non-input runtime message they
+                    // produced. Refusing the MCP command must not silently
+                    // drop those messages — process them exactly as the
+                    // real path would. Non-matching backend inputs are NOT
+                    // applied: applying input the command failed to prove
+                    // would make the refusal reply lie about runtime state.
+                    let withheld_backend_inputs = backend_inputs.len();
+                    self.process_messages(remaining);
+                    return DebugReplyProduct::Error(native_physical_no_match_failure(
+                        refusals.pop(),
+                        withheld_backend_inputs,
+                    ));
                 };
                 focus_input
             }
@@ -1156,6 +1474,17 @@ where
         );
         self.process_messages(remaining);
         product
+    }
+
+    fn dispatch_native_physical_events(
+        &mut self,
+        events: &[iced::Event],
+    ) -> Vec<SlipwayIcedRuntimeMessage> {
+        let mut messages = Vec::new();
+        for event in events {
+            messages.extend(self.dispatch_iced_events(std::slice::from_ref(event)));
+        }
+        messages
     }
 
     fn pointer_press_focus_input_after_native_update(
@@ -1229,57 +1558,6 @@ where
             return native_physical_control_error(unsupported);
         }
         let backend_input = backend_native_focus_input_event(&presentation, &region, focused);
-        self.app
-            .handle_backend_presented_physical_control(command.clone(), backend_input)
-    }
-
-    fn run_native_scroll_control(
-        &mut self,
-        command: &DebugCommand,
-        selector: &slipway_debug_bridge::DebugPhysicalControlDeclarationSelector,
-        offset_x: f32,
-        offset_y: f32,
-    ) -> DebugReplyProduct {
-        let presentation = match self.current_visible_presentation() {
-            Ok(presentation) => presentation,
-            Err(unsupported) => return native_physical_control_error(unsupported),
-        };
-        let Some(region) =
-            scroll_region_for_native_physical_selector(&presentation, selector).cloned()
-        else {
-            return native_physical_control_error(NativePhysicalControlUnsupported::new(
-                "native-physical-control-scroll-region-not-found",
-                "the current iced visible presentation has no enabled scroll region matching the physical control selector",
-            ));
-        };
-        if !region.axes.horizontal && offset_x != 0.0 {
-            return native_physical_control_error(NativePhysicalControlUnsupported::new(
-                "native-physical-control-scroll-horizontal-disabled",
-                "the selected iced scroll region does not declare horizontal scrolling",
-            ));
-        }
-        if !region.axes.vertical && offset_y != 0.0 {
-            return native_physical_control_error(NativePhysicalControlUnsupported::new(
-                "native-physical-control-scroll-vertical-disabled",
-                "the selected iced scroll region does not declare vertical scrolling",
-            ));
-        }
-        let mut operation = iced::advanced::widget::operation::scrollable::scroll_to(
-            iced_scrollable_id(&region),
-            iced::advanced::widget::operation::scrollable::AbsoluteOffset {
-                x: Some(offset_x.max(0.0)),
-                y: Some(offset_y.max(0.0)),
-            },
-        );
-        if let Err(unsupported) = self.operate_visible_ui(&mut operation) {
-            return native_physical_control_error(unsupported);
-        }
-        let backend_input = backend_native_scroll_input_event(
-            &presentation,
-            &region,
-            offset_x.max(0.0),
-            offset_y.max(0.0),
-        );
         self.app
             .handle_backend_presented_physical_control(command.clone(), backend_input)
     }
@@ -1511,6 +1789,13 @@ where
         Ok(())
     }
 
+    fn refresh_visible_ui_cache_after_physical_control(&mut self) {
+        // Iced stores native widget state such as Scrollable offsets in the
+        // UI cache. Replacing it here makes the next physical-control probe
+        // dispatch against a freshly-built top-of-scroll tree instead of the
+        // backend-presented state the previous wheel event just produced.
+    }
+
     fn physical_control_events(
         &mut self,
         operation: &DebugPhysicalControl,
@@ -1531,10 +1816,68 @@ where
                 );
                 window.cursor_position = Some(physical);
             }
+            // Mirror the real path's WindowEvent::ModifiersChanged
+            // bookkeeping (audit finding MF-M18): a real key event is
+            // preceded by a ModifiersChanged reflecting the declared
+            // modifier state, and subsequent window-event conversion reads
+            // that side-state. Without the mirror, seam keyboard input
+            // interleaved with real input diverges from pure-real behavior.
+            DebugPhysicalControl::Keyboard { modifiers, .. } => {
+                window.modifiers = winit_modifiers_state_from_slipway(*modifiers);
+            }
             _ => {}
         }
-        iced_events_for_native_physical_operation(operation, scale_factor, window.modifiers)
+        let events =
+            iced_events_for_native_physical_operation(operation, scale_factor, window.modifiers)?;
+        // Mirror the real path's WindowEvent::MouseInput bookkeeping (audit
+        // finding MF-M18) for the seam-synthesized MouseInput this plan
+        // contains: `pressed_mouse_buttons` gates the real path's
+        // cursor-only deferral, so a seam press followed by real cursor
+        // motion must observe the same side-state a real press leaves.
+        window.pressed_mouse_buttons =
+            seam_pressed_mouse_buttons_after(window.pressed_mouse_buttons, operation);
+        Ok(events)
     }
+}
+
+/// Side-state mirror for seam-synthesized MouseInput (audit finding
+/// MF-M18): returns the `pressed_mouse_buttons` count after the given
+/// physical operation, matching the real winit path's
+/// `WindowEvent::MouseInput` bookkeeping (`Pressed` saturating-adds,
+/// `Released` saturating-subs, everything else leaves the count alone).
+fn seam_pressed_mouse_buttons_after(pressed: u8, operation: &DebugPhysicalControl) -> u8 {
+    match operation {
+        DebugPhysicalControl::Pointer {
+            kind: slipway_core::PointerEventKind::Press,
+            ..
+        } => pressed.saturating_add(1),
+        DebugPhysicalControl::Pointer {
+            kind: slipway_core::PointerEventKind::Release,
+            ..
+        } => pressed.saturating_sub(1),
+        _ => pressed,
+    }
+}
+
+/// Maps declared Slipway modifiers onto the winit `ModifiersState` the real
+/// ingress path tracks via `WindowEvent::ModifiersChanged` (audit finding
+/// MF-M18), so seam keyboard operations leave the same modifier side-state
+/// a real modifier sequence would.
+fn winit_modifiers_state_from_slipway(modifiers: slipway_core::Modifiers) -> ModifiersState {
+    let mut state = ModifiersState::empty();
+    if modifiers.shift {
+        state |= ModifiersState::SHIFT;
+    }
+    if modifiers.control {
+        state |= ModifiersState::CONTROL;
+    }
+    if modifiers.alt {
+        state |= ModifiersState::ALT;
+    }
+    if modifiers.meta {
+        state |= ModifiersState::SUPER;
+    }
+    state
 }
 
 #[derive(Debug)]
@@ -1557,6 +1900,57 @@ fn native_physical_control_error(
         message: unsupported.message.to_string(),
         dispatch_evidence: None,
     })
+}
+
+/// Builds the seam no-match refusal (audit findings MF-M18 + MF-H5).
+///
+/// The message states that the synthesized events WERE dispatched — the
+/// widget tree already updated before backend-input matching, so cursor,
+/// hover, scroll, and focus side effects may have advanced even though the
+/// operation is refused — and how many non-matching backend input messages
+/// were withheld from the runtime. When routing constructed refusal
+/// evidence for the operation, it is attached under the distinct
+/// `post_hoc_diagnosis` source label so the agent can see WHY the operation
+/// was dead (position, candidates, reason) without ever confusing the
+/// diagnosis with real dispatch evidence.
+fn native_physical_no_match_failure(
+    refusal: Option<slipway_core::DeclaredEventDispatchEvidence>,
+    withheld_backend_inputs: usize,
+) -> DebugFailure {
+    let diagnosis = refusal.map(|mut refusal| {
+        refusal.source = slipway_core::EvidenceSource::post_hoc_diagnosis(
+            ICED_BACKEND_ID,
+            "physical-control-no-match",
+        );
+        refusal
+    });
+    let dispatched = format!(
+        "the synthesized iced native events were dispatched through UserInterface::update before matching — native widget state (cursor, hover, scroll, focus) may have advanced, and non-input runtime messages were still processed to preserve real-input semantics — but no backend-presented input evidence matched the requested physical operation; {withheld_backend_inputs} non-matching backend input message(s) were withheld from the runtime"
+    );
+    let message = match &diagnosis {
+        Some(diagnosis) => format!(
+            "{dispatched}; a post-hoc dispatch diagnosis (source label `{}`) is attached: {}; candidates=[{}]",
+            slipway_core::EVIDENCE_SOURCE_POST_HOC_DIAGNOSIS,
+            diagnosis
+                .refusal_reason
+                .as_deref()
+                .unwrap_or("dispatch refused without a recorded reason"),
+            diagnosis
+                .candidate_regions
+                .iter()
+                .map(|region| region.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        None => format!(
+            "{dispatched}; no routing-level refusal evidence was constructed for it — probe the `diagnostics` kind for retained refusals"
+        ),
+    };
+    DebugFailure {
+        code: "native-physical-control-produced-no-backend-input".to_string(),
+        message,
+        dispatch_evidence: diagnosis,
+    }
 }
 
 pub(super) fn iced_events_for_native_physical_operation(
@@ -1800,12 +2194,35 @@ where
             }
         }
         self.apply_pending_resize(true);
-        self.dispatch_pending_iced_events();
+        let pending_cursor_only = should_defer_pending_cursor_only(
+            &self.pending_iced_events,
+            self.window
+                .as_ref()
+                .map_or(0, |window| window.pressed_mouse_buttons),
+        );
+        let dispatched_pending_input = !pending_cursor_only && !self.pending_iced_events.is_empty();
+        if !pending_cursor_only {
+            self.dispatch_pending_iced_events();
+        }
+        let has_pending_cursor_only = pending_cursor_only && !self.pending_iced_events.is_empty();
         let Some(window) = self.window.as_mut() else {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
         if window.presented_frames == 0 {
+            window.raw.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        if has_pending_cursor_only {
+            window.raw.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        if dispatched_pending_input {
+            // Queued semantic input (wheel included) was flushed at this
+            // iteration boundary; keep the previous immediate-flush contract
+            // of one redraw request after dispatch.
             window.raw.request_redraw();
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
@@ -2097,23 +2514,240 @@ fn trace_ime(trace: bool, message: impl std::fmt::Display) {
     }
 }
 
-fn request_window_redraw(window: &mut NativeIcedWindow, request: iced::window::RedrawRequest) {
-    match request {
-        iced::window::RedrawRequest::NextFrame => {
-            window.redraw_at = None;
-            window.raw.request_redraw();
-        }
-        iced::window::RedrawRequest::At(at) => {
-            if window.redraw_at.is_none_or(|scheduled| at < scheduled) {
-                window.redraw_at = Some(at);
+fn iced_runtime_update_requires_redraw(
+    update: &SlipwayIcedRuntimeAppUpdate,
+    trace_requires_redraw: bool,
+) -> bool {
+    if update.debug_error.is_some() {
+        return true;
+    }
+    match update.runtime_update.as_ref() {
+        Some(SlipwayIcedRuntimeUpdate::Input {
+            handled,
+            applied_messages,
+            diagnostics,
+        }) => {
+            if !*handled {
+                return !diagnostics.is_empty();
             }
+            *applied_messages > 0 || !diagnostics.is_empty() || trace_requires_redraw
         }
-        iced::window::RedrawRequest::Wait => {}
+        Some(SlipwayIcedRuntimeUpdate::DrainDebug) => update.debug_replies_drained > 0,
+        Some(SlipwayIcedRuntimeUpdate::Noop) | None => false,
     }
 }
 
-fn should_dispatch_redraw_event_update(window: &NativeIcedWindow) -> bool {
-    window.ime_composing || window.ime_state.is_some() || window.preedit.is_some()
+fn request_window_redraw(window: &mut NativeIcedWindow, request: iced::window::RedrawRequest) {
+    match redraw_request_action(request, window.redraw_at) {
+        RedrawRequestAction::RequestNow => {
+            window.redraw_at = None;
+            window.raw.request_redraw();
+        }
+        RedrawRequestAction::ScheduleAt(at) => {
+            window.redraw_at = Some(at);
+        }
+        RedrawRequestAction::Keep => {}
+    }
+}
+
+/// How the runner honors the `window::RedrawRequest` a `UserInterface::update`
+/// returns, mirroring iced_winit's `Window::request_redraw`: `NextFrame`
+/// requests an immediate winit redraw, `At(_)` goes through the
+/// `redraw_at`/`ControlFlow::WaitUntil` machinery in `about_to_wait`, and
+/// `Wait` requests nothing so widget redraw ticks cannot become a repaint
+/// storm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedrawRequestAction {
+    RequestNow,
+    ScheduleAt(Instant),
+    Keep,
+}
+
+fn redraw_request_action(
+    request: iced::window::RedrawRequest,
+    scheduled_redraw_at: Option<Instant>,
+) -> RedrawRequestAction {
+    match request {
+        iced::window::RedrawRequest::NextFrame => RedrawRequestAction::RequestNow,
+        iced::window::RedrawRequest::At(at) => {
+            if scheduled_redraw_at.is_none_or(|scheduled| at < scheduled) {
+                RedrawRequestAction::ScheduleAt(at)
+            } else {
+                RedrawRequestAction::Keep
+            }
+        }
+        iced::window::RedrawRequest::Wait => RedrawRequestAction::Keep,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RedrawFrameFlow {
+    Continue,
+    Exit,
+}
+
+/// Splits a drained pending-input queue (Step 181) into the event slices a
+/// flush dispatches, in queue order. Each slice gets its own
+/// `UserInterface::build`/`update`, and the messages it emits are applied to
+/// the runtime before the next slice is dispatched.
+///
+/// One slice per event is the only correct split: `UserInterface::update`
+/// collects messages for a whole slice without attributing them to
+/// individual events, so any batching can stamp a later event's dispatch
+/// evidence with a frame revision that an earlier event's message is about
+/// to bump — the runtime then refuses the later input with
+/// `BACKEND_INPUT_DISPATCH_EVIDENCE_FRAME_MISMATCH` and a press or captured
+/// drag move is silently dropped. Adjacent coalescing already collapses
+/// wheel and cursor bursts into single events, so the common flush is one
+/// slice and keeps the single-build fast path.
+fn pending_dispatch_slices(events: Vec<iced::Event>) -> Vec<Vec<iced::Event>> {
+    events.into_iter().map(|event| vec![event]).collect()
+}
+
+/// iced_winit re-runs the redraw update on the same interface when it
+/// invalidated layout without emitting messages, capped at three updates per
+/// frame; messages instead break out to the message-application flow.
+fn should_re_tick_redraw_update(
+    messages_is_empty: bool,
+    has_layout_changed: bool,
+    redraw_updates_delivered: usize,
+) -> bool {
+    const MAX_REDRAW_EVENT_UPDATES_PER_FRAME: usize = 3;
+    messages_is_empty
+        && has_layout_changed
+        && redraw_updates_delivered < MAX_REDRAW_EVENT_UPDATES_PER_FRAME
+}
+
+/// The recovery action for a failed `Compositor::present`, matching the
+/// iced_winit reference: `OutOfMemory` is unrecoverable (the runner exits the
+/// event loop like fatal window creation), `Lost` recreates the surface,
+/// `Outdated` reconfigures it, and `Timeout`/`Other` retry on the next frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentErrorRecovery {
+    Exit,
+    RecreateSurface,
+    ReconfigureSurface,
+    RetryNextFrame,
+}
+
+fn present_error_recovery(error: &compositor::SurfaceError) -> PresentErrorRecovery {
+    match error {
+        compositor::SurfaceError::OutOfMemory => PresentErrorRecovery::Exit,
+        compositor::SurfaceError::Lost => PresentErrorRecovery::RecreateSurface,
+        compositor::SurfaceError::Outdated => PresentErrorRecovery::ReconfigureSurface,
+        compositor::SurfaceError::Timeout | compositor::SurfaceError::Other => {
+            PresentErrorRecovery::RetryNextFrame
+        }
+    }
+}
+
+fn recover_window_from_present_error(
+    window: &mut NativeIcedWindow,
+    error: compositor::SurfaceError,
+) -> PresentErrorRecovery {
+    let recovery = present_error_recovery(&error);
+    let PhysicalSize { width, height } = window.surface_physical_size;
+    match recovery {
+        PresentErrorRecovery::Exit => {
+            eprintln!("[slipway-iced] unrecoverable surface present error: {error}");
+        }
+        PresentErrorRecovery::RecreateSurface => {
+            eprintln!("[slipway-iced] surface present error: {error}; recreating the surface");
+            window.surface = window
+                .compositor
+                .create_surface(window.raw.clone(), width, height);
+            window.raw.request_redraw();
+        }
+        PresentErrorRecovery::ReconfigureSurface => {
+            eprintln!("[slipway-iced] surface present error: {error}; reconfiguring the surface");
+            window
+                .compositor
+                .configure_surface(&mut window.surface, width, height);
+            window.raw.request_redraw();
+        }
+        PresentErrorRecovery::RetryNextFrame => {
+            eprintln!("[slipway-iced] surface present error: {error}; retrying next frame");
+            window.raw.request_redraw();
+        }
+    }
+    recovery
+}
+
+fn apply_window_mouse_interaction(window: &mut NativeIcedWindow, interaction: mouse::Interaction) {
+    if interaction == window.mouse_interaction {
+        return;
+    }
+    if let Some(icon) = iced_winit::conversion::mouse_interaction(interaction) {
+        window.raw.set_cursor_visible(true);
+        window.raw.set_cursor(icon);
+    } else {
+        window.raw.set_cursor_visible(false);
+    }
+    window.mouse_interaction = interaction;
+}
+
+fn push_coalesced_pending_iced_event(events: &mut Vec<iced::Event>, event: iced::Event) -> bool {
+    if is_iced_cursor_moved_event(&event)
+        && let Some(last) = events.last_mut()
+        && is_iced_cursor_moved_event(last)
+    {
+        *last = event;
+        true
+    } else if let iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) = &event
+        && let Some(iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta: last_delta })) =
+            events.last_mut()
+        && let Some(summed) = summed_same_variant_scroll_delta(*last_delta, *delta)
+    {
+        *last_delta = summed;
+        true
+    } else {
+        events.push(event);
+        false
+    }
+}
+
+fn summed_same_variant_scroll_delta(
+    previous: iced::mouse::ScrollDelta,
+    next: iced::mouse::ScrollDelta,
+) -> Option<iced::mouse::ScrollDelta> {
+    match (previous, next) {
+        (
+            iced::mouse::ScrollDelta::Lines {
+                x: previous_x,
+                y: previous_y,
+            },
+            iced::mouse::ScrollDelta::Lines { x, y },
+        ) => Some(iced::mouse::ScrollDelta::Lines {
+            x: previous_x + x,
+            y: previous_y + y,
+        }),
+        (
+            iced::mouse::ScrollDelta::Pixels {
+                x: previous_x,
+                y: previous_y,
+            },
+            iced::mouse::ScrollDelta::Pixels { x, y },
+        ) => Some(iced::mouse::ScrollDelta::Pixels {
+            x: previous_x + x,
+            y: previous_y + y,
+        }),
+        _ => None,
+    }
+}
+
+fn is_iced_cursor_moved_event(event: &iced::Event) -> bool {
+    matches!(
+        event,
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved { .. })
+    )
+}
+
+fn pending_iced_events_are_cursor_only(events: &[iced::Event]) -> bool {
+    !events.is_empty() && events.iter().all(is_iced_cursor_moved_event)
+}
+
+fn should_defer_pending_cursor_only(events: &[iced::Event], _pressed_mouse_buttons: u8) -> bool {
+    pending_iced_events_are_cursor_only(events)
 }
 
 fn debug_pointer_button(button: DebugPointerButton) -> MouseButton {
@@ -2128,6 +2762,24 @@ fn debug_pointer_button(button: DebugPointerButton) -> MouseButton {
 mod tests {
     use super::*;
     use slipway_debug_bridge::DebugPhysicalControlDeclarationSelector;
+
+    fn cursor_moved_event(x: f32, y: f32) -> iced::Event {
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: iced::Point::new(x, y),
+        })
+    }
+
+    fn wheel_lines_event(x: f32, y: f32) -> iced::Event {
+        iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x, y },
+        })
+    }
+
+    fn wheel_pixels_event(x: f32, y: f32) -> iced::Event {
+        iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Pixels { x, y },
+        })
+    }
 
     #[test]
     fn iced_native_physical_text_uses_ime_commit_event() {
@@ -2175,6 +2827,176 @@ mod tests {
         ));
     }
 
+    fn pointer_operation(kind: slipway_core::PointerEventKind) -> DebugPhysicalControl {
+        DebugPhysicalControl::Pointer {
+            position: Point { x: 4.0, y: 4.0 },
+            kind,
+            button: Some(DebugPointerButton::Primary),
+            details: slipway_core::PointerDetails::default(),
+            pointer_is_pressed: matches!(kind, slipway_core::PointerEventKind::Press),
+        }
+    }
+
+    #[test]
+    fn seam_pointer_press_and_release_mirror_pressed_mouse_button_bookkeeping() {
+        // MF-M18: the seam must leave the same `pressed_mouse_buttons`
+        // side-state the real WindowEvent::MouseInput path leaves.
+        let pressed = seam_pressed_mouse_buttons_after(
+            0,
+            &pointer_operation(slipway_core::PointerEventKind::Press),
+        );
+        assert_eq!(pressed, 1);
+        let released = seam_pressed_mouse_buttons_after(
+            pressed,
+            &pointer_operation(slipway_core::PointerEventKind::Release),
+        );
+        assert_eq!(released, 0);
+        // Saturates like the real path instead of underflowing.
+        assert_eq!(
+            seam_pressed_mouse_buttons_after(
+                0,
+                &pointer_operation(slipway_core::PointerEventKind::Release)
+            ),
+            0
+        );
+        // Moves and non-pointer operations leave the count alone.
+        assert_eq!(
+            seam_pressed_mouse_buttons_after(
+                1,
+                &pointer_operation(slipway_core::PointerEventKind::Move)
+            ),
+            1
+        );
+        assert_eq!(
+            seam_pressed_mouse_buttons_after(
+                1,
+                &DebugPhysicalControl::Wheel {
+                    position: Point { x: 4.0, y: 4.0 },
+                    delta_x: 0.0,
+                    delta_y: 1.0,
+                }
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn seam_keyboard_modifiers_map_to_winit_modifiers_state() {
+        // MF-M18: seam keyboard operations mirror the real path's
+        // ModifiersChanged side-state.
+        assert_eq!(
+            winit_modifiers_state_from_slipway(slipway_core::Modifiers::default()),
+            ModifiersState::empty()
+        );
+        let full = winit_modifiers_state_from_slipway(slipway_core::Modifiers {
+            shift: true,
+            control: true,
+            alt: true,
+            meta: true,
+        });
+        assert_eq!(
+            full,
+            ModifiersState::SHIFT
+                | ModifiersState::CONTROL
+                | ModifiersState::ALT
+                | ModifiersState::SUPER
+        );
+        assert_eq!(
+            winit_modifiers_state_from_slipway(slipway_core::Modifiers {
+                shift: false,
+                control: true,
+                alt: false,
+                meta: false,
+            }),
+            ModifiersState::CONTROL
+        );
+    }
+
+    #[test]
+    fn seam_no_match_failure_states_events_were_dispatched() {
+        // MF-M18: the no-match refusal must admit the half-applied reality
+        // instead of implying nothing happened.
+        let failure = native_physical_no_match_failure(None, 2);
+        assert_eq!(
+            failure.code,
+            "native-physical-control-produced-no-backend-input"
+        );
+        assert!(
+            failure.message.contains("events were dispatched"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure
+                .message
+                .contains("2 non-matching backend input message(s) were withheld"),
+            "{}",
+            failure.message
+        );
+        assert!(failure.dispatch_evidence.is_none());
+    }
+
+    #[test]
+    fn seam_no_match_failure_attaches_post_hoc_diagnosis() {
+        let refusal = slipway_core::DeclaredEventDispatchEvidence {
+            source: slipway_core::EvidenceSource::backend_presented(
+                ICED_BACKEND_ID,
+                "physical-input",
+            ),
+            frame: FrameIdentity {
+                surface_id: "test-surface".to_string(),
+                surface_instance_id: "test-instance".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+            },
+            kind: DeclaredEventDispatchKind::Wheel,
+            input_position: Some(Point { x: 4.0, y: 4.0 }),
+            input_position_space: Some(slipway_core::DispatchPositionSpace::Content),
+            candidate_regions: vec![PresentationRegionId::from("dead-region")],
+            selected_region: None,
+            refusal_reason: Some("wheel found no scrollable consumer".to_string()),
+            generated_event: None,
+            route: None,
+            capture_event: false,
+            diagnostics: Vec::new(),
+        };
+
+        let failure = native_physical_no_match_failure(Some(refusal), 0);
+
+        let diagnosis = failure
+            .dispatch_evidence
+            .as_ref()
+            .expect("no-match failure attaches the post-hoc diagnosis");
+        assert_eq!(
+            diagnosis.source.label(),
+            slipway_core::EVIDENCE_SOURCE_POST_HOC_DIAGNOSIS
+        );
+        assert!(
+            failure.message.contains("events were dispatched"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure
+                .message
+                .contains("wheel found no scrollable consumer"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains("dead-region"),
+            "{}",
+            failure.message
+        );
+    }
+
     #[test]
     fn iced_native_physical_text_edit_delete_uses_keyboard_event() {
         let events = iced_events_for_native_physical_operation(
@@ -2199,5 +3021,460 @@ mod tests {
                 ..
             })]
         ));
+    }
+
+    #[test]
+    fn pending_iced_events_coalesce_adjacent_cursor_moves() {
+        let mut events = Vec::new();
+
+        assert!(!push_coalesced_pending_iced_event(
+            &mut events,
+            cursor_moved_event(10.0, 20.0),
+        ));
+        assert!(push_coalesced_pending_iced_event(
+            &mut events,
+            cursor_moved_event(30.0, 40.0),
+        ));
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position })
+                if *position == iced::Point::new(30.0, 40.0)
+        ));
+    }
+
+    #[test]
+    fn pending_iced_events_preserve_button_boundaries_between_cursor_moves() {
+        let mut events = Vec::new();
+
+        push_coalesced_pending_iced_event(&mut events, cursor_moved_event(10.0, 20.0));
+        push_coalesced_pending_iced_event(
+            &mut events,
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+        );
+        assert!(!push_coalesced_pending_iced_event(
+            &mut events,
+            cursor_moved_event(30.0, 40.0),
+        ));
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position })
+                if *position == iced::Point::new(10.0, 20.0)
+        ));
+        assert!(matches!(
+            events[1],
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))
+        ));
+        assert!(matches!(
+            &events[2],
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position })
+                if *position == iced::Point::new(30.0, 40.0)
+        ));
+    }
+
+    #[test]
+    fn pending_iced_events_preserve_wheel_boundary_after_cursor_move() {
+        let mut events = Vec::new();
+
+        push_coalesced_pending_iced_event(&mut events, cursor_moved_event(10.0, 20.0));
+        push_coalesced_pending_iced_event(
+            &mut events,
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+        );
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position })
+                if *position == iced::Point::new(10.0, 20.0)
+        ));
+        assert!(matches!(
+            events[1],
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. })
+        ));
+    }
+
+    #[test]
+    fn pending_iced_events_coalesce_adjacent_same_variant_wheel_events_by_summation() {
+        let mut events = Vec::new();
+
+        assert!(!push_coalesced_pending_iced_event(
+            &mut events,
+            wheel_lines_event(1.0, -1.0),
+        ));
+        assert!(push_coalesced_pending_iced_event(
+            &mut events,
+            wheel_lines_event(0.5, -2.0),
+        ));
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x, y },
+            }) if *x == 1.5 && *y == -3.0
+        ));
+
+        let mut events = Vec::new();
+
+        assert!(!push_coalesced_pending_iced_event(
+            &mut events,
+            wheel_pixels_event(2.0, -24.0),
+        ));
+        assert!(push_coalesced_pending_iced_event(
+            &mut events,
+            wheel_pixels_event(-1.0, -16.0),
+        ));
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x, y },
+            }) if *x == 1.0 && *y == -40.0
+        ));
+    }
+
+    #[test]
+    fn pending_iced_events_never_merge_lines_and_pixels_wheel_deltas() {
+        let mut events = Vec::new();
+
+        assert!(!push_coalesced_pending_iced_event(
+            &mut events,
+            wheel_lines_event(0.0, -1.0),
+        ));
+        assert!(!push_coalesced_pending_iced_event(
+            &mut events,
+            wheel_pixels_event(0.0, -24.0),
+        ));
+        assert!(!push_coalesced_pending_iced_event(
+            &mut events,
+            wheel_lines_event(0.0, -2.0),
+        ));
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x, y },
+            }) if *x == 0.0 && *y == -1.0
+        ));
+        assert!(matches!(
+            &events[1],
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x, y },
+            }) if *x == 0.0 && *y == -24.0
+        ));
+        assert!(matches!(
+            &events[2],
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x, y },
+            }) if *x == 0.0 && *y == -2.0
+        ));
+    }
+
+    #[test]
+    fn pending_iced_events_never_merge_wheel_events_across_cursor_move_boundary() {
+        let mut events = Vec::new();
+
+        push_coalesced_pending_iced_event(&mut events, wheel_lines_event(0.0, -1.0));
+        push_coalesced_pending_iced_event(&mut events, cursor_moved_event(10.0, 20.0));
+        assert!(!push_coalesced_pending_iced_event(
+            &mut events,
+            wheel_lines_event(0.0, -2.0),
+        ));
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x, y },
+            }) if *x == 0.0 && *y == -1.0
+        ));
+        assert!(matches!(
+            &events[1],
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position })
+                if *position == iced::Point::new(10.0, 20.0)
+        ));
+        assert!(matches!(
+            &events[2],
+            iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x, y },
+            }) if *x == 0.0 && *y == -2.0
+        ));
+    }
+
+    #[test]
+    fn pending_wheel_events_flush_at_the_current_iteration_boundary_not_the_next_redraw() {
+        let mut events = Vec::new();
+        push_coalesced_pending_iced_event(&mut events, wheel_lines_event(0.0, -1.0));
+
+        assert!(
+            !should_defer_pending_cursor_only(&events, 0),
+            "a queued wheel event must dispatch in the same about_to_wait cycle instead of \
+             deferring to the next redraw like the cursor-only storm path"
+        );
+
+        let mut events = Vec::new();
+        push_coalesced_pending_iced_event(&mut events, cursor_moved_event(10.0, 20.0));
+        assert!(should_defer_pending_cursor_only(&events, 0));
+        push_coalesced_pending_iced_event(&mut events, wheel_lines_event(0.0, -1.0));
+
+        assert!(
+            !should_defer_pending_cursor_only(&events, 0),
+            "a mixed [cursor-move..., wheel] queue must not be treated as cursor-only \
+             deferrable; it must dispatch at the current about_to_wait boundary"
+        );
+    }
+
+    #[test]
+    fn pending_iced_events_cursor_only_requires_deferred_frame_flush() {
+        let mut events = Vec::new();
+
+        assert!(!pending_iced_events_are_cursor_only(&events));
+        push_coalesced_pending_iced_event(&mut events, cursor_moved_event(10.0, 20.0));
+        assert!(pending_iced_events_are_cursor_only(&events));
+        push_coalesced_pending_iced_event(
+            &mut events,
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+        );
+        assert!(!pending_iced_events_are_cursor_only(&events));
+    }
+
+    #[test]
+    fn pending_cursor_moves_defer_to_next_redraw_even_while_mouse_button_is_pressed() {
+        let mut events = Vec::new();
+        push_coalesced_pending_iced_event(&mut events, cursor_moved_event(10.0, 20.0));
+
+        assert!(should_defer_pending_cursor_only(&events, 0));
+        assert!(
+            should_defer_pending_cursor_only(&events, 1),
+            "drag cursor movement must be coalesced to the next redraw so raw input rate cannot force more than one drag update per visible frame"
+        );
+    }
+
+    #[test]
+    fn pending_dispatch_slices_flush_a_coalesced_wheel_burst_as_one_single_build_slice() {
+        let mut pending = Vec::new();
+        push_coalesced_pending_iced_event(&mut pending, wheel_lines_event(0.0, -1.0));
+        push_coalesced_pending_iced_event(&mut pending, wheel_lines_event(0.0, -2.0));
+
+        let slices = pending_dispatch_slices(pending);
+
+        assert_eq!(
+            slices.len(),
+            1,
+            "a coalesced wheel burst is a single queued event and must keep the \
+             single-build flush fast path"
+        );
+        assert!(matches!(
+            slices[0].as_slice(),
+            [iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x, y },
+            })] if *x == 0.0 && *y == -3.0
+        ));
+    }
+
+    #[test]
+    fn pending_dispatch_slices_never_share_a_build_between_a_wheel_and_a_later_press() {
+        let mut pending = Vec::new();
+        push_coalesced_pending_iced_event(&mut pending, wheel_lines_event(0.0, -1.0));
+        push_coalesced_pending_iced_event(
+            &mut pending,
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+        );
+
+        let slices = pending_dispatch_slices(pending);
+
+        assert_eq!(
+            slices.len(),
+            2,
+            "a queued wheel must dispatch and apply its message before a later press is \
+             built: sharing one build stamps the press evidence with the pre-wheel frame \
+             revision, and the runtime refuses it as \
+             BACKEND_INPUT_DISPATCH_EVIDENCE_FRAME_MISMATCH (silently dropped drag grab)"
+        );
+        assert!(matches!(
+            slices[0].as_slice(),
+            [iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. })]
+        ));
+        assert!(matches!(
+            slices[1].as_slice(),
+            [iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Left
+            ))]
+        ));
+    }
+
+    #[test]
+    fn pending_dispatch_slices_keep_coalesced_cursor_moves_as_one_single_build_slice() {
+        let mut pending = Vec::new();
+        push_coalesced_pending_iced_event(&mut pending, cursor_moved_event(10.0, 20.0));
+        push_coalesced_pending_iced_event(&mut pending, cursor_moved_event(30.0, 40.0));
+
+        let slices = pending_dispatch_slices(pending);
+
+        assert_eq!(
+            slices.len(),
+            1,
+            "coalesced cursor moves collapse to one queued event, so the cursor-storm \
+             flush keeps its one-build behavior"
+        );
+        assert!(matches!(
+            slices[0].as_slice(),
+            [iced::Event::Mouse(iced::mouse::Event::CursorMoved { position })]
+                if *position == iced::Point::new(30.0, 40.0)
+        ));
+    }
+
+    #[test]
+    fn pending_dispatch_slices_yield_one_slice_per_event_preserving_queue_order() {
+        // Strict per-event slicing is intentional, not an implementation
+        // detail: iced's `UserInterface::update` gathers messages across the
+        // whole slice with no per-event attribution, so the flush cannot know
+        // which event produced a message and therefore cannot batch "until
+        // the first message-producing event". The only split that guarantees
+        // every message is applied before the next event's dispatch evidence
+        // is stamped is one slice per queued event, in queue order.
+        let mut pending = Vec::new();
+        push_coalesced_pending_iced_event(&mut pending, cursor_moved_event(10.0, 20.0));
+        push_coalesced_pending_iced_event(
+            &mut pending,
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+        );
+        push_coalesced_pending_iced_event(&mut pending, wheel_lines_event(0.0, -1.0));
+        push_coalesced_pending_iced_event(&mut pending, cursor_moved_event(30.0, 40.0));
+        let queued = pending.clone();
+
+        let slices = pending_dispatch_slices(pending);
+
+        assert_eq!(
+            slices.len(),
+            queued.len(),
+            "one dispatch slice per queued event"
+        );
+        for (slice, event) in slices.iter().zip(queued.iter()) {
+            assert_eq!(slice.len(), 1);
+            assert_eq!(format!("{:?}", slice[0]), format!("{event:?}"));
+        }
+    }
+
+    #[test]
+    fn redraw_update_re_ticks_only_for_message_free_layout_changes_with_reference_bound() {
+        assert!(should_re_tick_redraw_update(true, true, 1));
+        assert!(should_re_tick_redraw_update(true, true, 2));
+        assert!(
+            !should_re_tick_redraw_update(true, true, 3),
+            "iced_winit caps consecutive redraw updates at three per frame"
+        );
+        assert!(
+            !should_re_tick_redraw_update(false, true, 1),
+            "messages break the re-tick loop and take the message-application flow"
+        );
+        assert!(!should_re_tick_redraw_update(true, false, 1));
+    }
+
+    #[test]
+    fn redraw_request_honoring_matches_iced_winit_schedule_semantics() {
+        let now = Instant::now();
+        let earlier = now + Duration::from_millis(4);
+        let later = now + Duration::from_millis(16);
+
+        assert_eq!(
+            redraw_request_action(iced::window::RedrawRequest::NextFrame, None),
+            RedrawRequestAction::RequestNow
+        );
+        assert_eq!(
+            redraw_request_action(iced::window::RedrawRequest::NextFrame, Some(later)),
+            RedrawRequestAction::RequestNow
+        );
+        assert_eq!(
+            redraw_request_action(iced::window::RedrawRequest::At(earlier), None),
+            RedrawRequestAction::ScheduleAt(earlier)
+        );
+        assert_eq!(
+            redraw_request_action(iced::window::RedrawRequest::At(earlier), Some(later)),
+            RedrawRequestAction::ScheduleAt(earlier)
+        );
+        assert_eq!(
+            redraw_request_action(iced::window::RedrawRequest::At(later), Some(earlier)),
+            RedrawRequestAction::Keep,
+            "a later At request must not push back an earlier scheduled wakeup"
+        );
+        assert_eq!(
+            redraw_request_action(iced::window::RedrawRequest::Wait, None),
+            RedrawRequestAction::Keep,
+            "Wait must request nothing so redraw ticks cannot self-sustain a repaint storm"
+        );
+        assert_eq!(
+            redraw_request_action(iced::window::RedrawRequest::Wait, Some(earlier)),
+            RedrawRequestAction::Keep
+        );
+    }
+
+    #[test]
+    fn present_error_recovery_matches_the_iced_winit_reference_actions() {
+        assert_eq!(
+            present_error_recovery(&compositor::SurfaceError::OutOfMemory),
+            PresentErrorRecovery::Exit
+        );
+        assert_eq!(
+            present_error_recovery(&compositor::SurfaceError::Lost),
+            PresentErrorRecovery::RecreateSurface
+        );
+        assert_eq!(
+            present_error_recovery(&compositor::SurfaceError::Outdated),
+            PresentErrorRecovery::ReconfigureSurface
+        );
+        assert_eq!(
+            present_error_recovery(&compositor::SurfaceError::Timeout),
+            PresentErrorRecovery::RetryNextFrame
+        );
+        assert_eq!(
+            present_error_recovery(&compositor::SurfaceError::Other),
+            PresentErrorRecovery::RetryNextFrame
+        );
+    }
+
+    #[test]
+    fn handled_input_without_state_or_message_change_does_not_request_redraw() {
+        let update = SlipwayIcedRuntimeAppUpdate {
+            runtime_update: Some(SlipwayIcedRuntimeUpdate::Input {
+                handled: true,
+                applied_messages: 0,
+                diagnostics: Vec::new(),
+            }),
+            debug_replies_drained: 0,
+            debug_error: None,
+        };
+
+        assert!(!iced_runtime_update_requires_redraw(&update, false));
+        assert!(iced_runtime_update_requires_redraw(&update, true));
+    }
+
+    #[test]
+    fn input_redraw_gate_preserves_messages_diagnostics_and_debug_errors() {
+        let with_message = SlipwayIcedRuntimeAppUpdate {
+            runtime_update: Some(SlipwayIcedRuntimeUpdate::Input {
+                handled: true,
+                applied_messages: 1,
+                diagnostics: Vec::new(),
+            }),
+            debug_replies_drained: 0,
+            debug_error: None,
+        };
+        assert!(iced_runtime_update_requires_redraw(&with_message, false));
+
+        let with_error = SlipwayIcedRuntimeAppUpdate {
+            runtime_update: Some(SlipwayIcedRuntimeUpdate::Noop),
+            debug_replies_drained: 0,
+            debug_error: Some("debug failed".to_string()),
+        };
+        assert!(iced_runtime_update_requires_redraw(&with_error, false));
     }
 }

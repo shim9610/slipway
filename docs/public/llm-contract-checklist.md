@@ -2,9 +2,13 @@
 
 Read this before writing or modifying a Slipway app.
 
-Slipway is an authoring contract system for LLM workers. It is not a widget
-catalog, not a CSS engine, and not an automatic Svelte compiler. Your job is to
-write the concrete app while staying inside the declared contracts.
+Slipway is an authoring contract system for LLM workers — not a widget
+catalog, CSS engine, or automatic Svelte compiler. Write the concrete app
+while staying inside the declared contracts.
+
+This file is the CANONICAL statement of the cross-cutting authoring rules
+(facade/prelude rule, app shape, declarations, style, backend input proof,
+stop-and-report labels); other public pages summarize and defer to it.
 
 ## First Rule
 
@@ -13,6 +17,12 @@ Use the public facade and the ordinary authoring surface:
 ```rust
 use slipway::prelude::*;
 ```
+
+The prelude covers the whole ordinary authoring surface: the widget trio,
+every declaration type in "What Must Be Declared" below, the capability
+helpers that construct them, the load-bearing policy traits, `TextStyle`,
+`reserved_policy_defaults!`, and the pre-flight admission check — enforced
+by a doctest on `slipway::prelude` authoring a widget from it alone.
 
 Do not start with `use slipway::*`. The facade root exposes low-level extension
 and backend/provider APIs for special cases. If a type is not in the prelude,
@@ -29,8 +39,9 @@ pause and classify the need:
 
 ## Required App Shape
 
-Split the app into explicit roles. Equivalent names are fine only if the role
-is obvious.
+Split the app into explicit roles — modeled file-for-file by the reference
+example `crates/slipway-example-authored` (the designated copy source).
+Equivalent names are fine only if the role is obvious.
 
 - `ssot.rs`: source-of-truth data, design tokens, stable ids, source UI data.
 - `internal_logic.rs`: widget-local state transitions.
@@ -44,18 +55,29 @@ state mutation, and event route are hidden inside one large root widget.
 ## What Must Be Declared
 
 If the UI shows a thing that can be interacted with, declare the matching
-contract:
+contract. Each declaration has a prelude helper — the region structs are
+`#[non_exhaustive]` and cannot be built by struct literal:
 
-- pointer behavior needs a `HitRegionDeclaration`;
-- focus and text input need a `FocusRegionDeclaration` and text-edit command
-  declarations;
+- pointer behavior needs a `HitRegionDeclaration`
+  (`hit_region_from_pointer_capability`);
+- focus and text input need a `FocusRegionDeclaration`
+  (`focus_region_from_focus_capability`, or
+  `text_edit_focus_region_from_capability` with text-edit command
+  declarations for text input);
 - scrollable content needs a `ScrollRegionDeclaration` derived after layout
-  from the final `LayoutOutput`;
+  from the final `LayoutOutput` (`scroll_region_from_scrollable_capability`;
+  use `_with_order` when regions can overlap — see
+  [Routing and scroll](api/routing-and-scroll.md));
 - overlays/popups need explicit `PaintOrderDeclaration`, overflow bounds when
   they can leave a parent box, and matching hit regions;
 - repeated children need stable slot identity, not just the same child id.
 
-Painting a shape or text is never enough to make it interactive.
+Painting a shape or text is never enough to make it interactive. Every row
+above has a marked `PATTERN:` site in
+`crates/slipway-example-authored/src/view.rs`: note-list row hit regions,
+plain list focus, the draft-input text edit, list/nested scroll regions
+with `_with_order`, the pointer-opaque wheel-transparent overlay layer,
+and stable row slot identity.
 
 ## Coordinate Rules
 
@@ -64,8 +86,7 @@ Use the coordinate type that matches the owner:
 - `TargetLocalRect`: local to the widget that owns the declaration;
 - `ParentLocalRect`: placement of a child in the parent;
 - provider surface bounds, dirty regions, hit points, and snapshots are
-  target-local unless a backend-specific wrapper explicitly documents another
-  coordinate space.
+  target-local unless a backend wrapper documents another coordinate space.
 
 Do not manually construct parent-mounted child paths inside a child view. The
 app/backend mounting pass owns the final `WidgetSlotAddress`.
@@ -76,14 +97,13 @@ Backend theme/defaults are not Slipway style authority.
 
 - text paint must use `PaintOp::styled_text(...)`;
 - text paint must carry an explicit `TextStyle`;
-- `TextStyle::plain()` is an explicit baseline for simple examples/tests, not
-  a hidden default;
+- `TextStyle::plain()` is an explicit baseline for tests, not a hidden default;
 - production apps should put reusable design tokens in their own style module;
 - override specific style fields near the call site when a state variant needs
   a small change.
 
-If visual parity depends on a font, color, border, selection color, or preedit
-style, declare it. Do not assume iced or egui defaults match the source UI.
+If visual parity depends on a font, color, border, selection, or preedit
+style, declare it; do not assume iced or egui defaults match the source UI.
 
 ## Backend Input Proof
 
@@ -100,19 +120,18 @@ Physical-equivalent success requires all of these to line up:
   current visible `ViewDefinition`;
 - the event was handled through declared logic.
 
-`SlipwayRuntime::apply_input_event(...)` is semantic direct control. It can be
-useful for debug or tests, but it is not proof that a visible click, wheel,
-focus, text, or command works.
+`SlipwayRuntime::apply_input_event(...)` is semantic direct control — useful
+for debug/tests, never proof that a visible click, wheel, focus, text, or
+command works.
 
 ## Backend Choice
 
 Backend switching is typed repair, not magic translation.
 
 - backend-neutral app code should not mention iced or egui;
-- backend-specific native wrappers may mention that backend, and only that
-  backend;
-- if switching from iced to egui fails to compile because a backend-specific
-  wrapper is missing, fix the wrapper or declare unsupported behavior;
+- backend-specific native wrappers may mention that backend, and only it;
+- if a backend switch fails to compile because a backend-specific wrapper is
+  missing, fix the wrapper or declare unsupported behavior;
 - do not hide backend-specific behavior behind neutral-looking app code.
 
 ## Provider And Native Wrapper Rule
@@ -120,28 +139,33 @@ Backend switching is typed repair, not magic translation.
 Provider surfaces and native wrappers are escape hatches, not parity shortcuts.
 
 Use them only when the worker already owns a renderer or backend widget that
-must be inserted. The wrapper still has to expose enough identity, layout,
-event, debug, and unsupported evidence for Slipway to inspect it.
+must be inserted; the wrapper still exposes enough identity, layout, event,
+debug, and unsupported evidence for Slipway to inspect it.
 
-If a provider cannot report target-local bounds, hit evidence, snapshot
-evidence, or unsupported diagnostics, do not claim it satisfies visual/debug
-parity.
+If a provider cannot report target-local bounds, hit/snapshot evidence, or
+unsupported diagnostics, do not claim it satisfies visual/debug parity.
 
 ## Debug MCP Rule
 
-MCP evidence is useful only when it exercises the same visible backend path a
-user would rely on.
+MCP evidence counts only when it exercises the same visible backend path a
+user relies on.
 
 - status/probe evidence can describe current topology and state;
 - screenshot/render evidence must use the requested frame/viewport identity;
 - physical-control evidence must complete through backend-presented traces;
 - semantic direct control must be labeled as semantic/debug, not physical.
 
-If MCP says success but a visible user operation would not work, classify that
-as a framework/backend bug or missing physical path. Do not paper over it in
-app code.
+If MCP says success but a visible user operation would not work, classify it
+as a framework/backend bug or missing physical path; do not paper over it.
 
 ## When To Stop And Report
+
+Two checks come before any gap report: an admission refusal is not a doc gap
+(every code has a documented trigger and fix in the
+[Diagnostics catalog](api/diagnostics.md) — read its row and the message
+first), and a missing contract detail is not a doc gap until the retrieval
+route is exhausted (rustdoc and the `slipway-core` source, per
+[Finding the full contract](api/README.md)).
 
 Stop and report instead of inventing a workaround when:
 

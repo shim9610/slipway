@@ -5,3 +5,9 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+trybuild = "1.0.117"

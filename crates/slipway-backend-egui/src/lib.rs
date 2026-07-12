@@ -5,8 +5,8 @@ use slipway_core::{
     CapabilityProfileKind, ChangeEvidence, ChildPlacement, CursorCapability,
     DeclaredEventDispatchKind, Diagnostic, EmittedMessageEvidence, EventOutcome, EvidenceSource,
     FocusRegionDeclaration, FocusTraversalMember, FontResolutionRequest, FontStyle, FontWeight,
-    FrameIdentity, HitRegionDeclaration, HitTestInput, InputEvent, KeyEventKind, KeyLocation,
-    KeyboardDetails, KeyboardEvent, LayoutConstraints, LayoutInput, LayoutIntentProbe,
+    FrameIdentity, HitRegionDeclaration, HitRegionOrder, HitTestInput, InputEvent, KeyEventKind,
+    KeyLocation, KeyboardDetails, KeyboardEvent, LayoutConstraints, LayoutInput, LayoutIntentProbe,
     LayoutOutput, Modifiers, PaintInputTransparency, PaintOp, PaintOrderMode, PaintUnit,
     PathCommand, PathDeclaration, Point, PointerButton, PointerButtons, PointerCaptureIntent,
     PointerDetails, PointerDeviceKind, PointerEventCoordinateSpace, PointerEventKind,
@@ -27,8 +27,8 @@ use slipway_core::{
     TextMeasurementEvidence, TextSelectionRange, TextStyle, TopologyNode, TopologyProbe,
     UnsupportedCapabilityEvidence, ViewDefinition, ViewDefinitionInput, WidgetId, WidgetSlot,
     WidgetSlotAddress, expand_paint_unit_layers, paint_unit_sort_key,
-    scroll_region_from_scrollable_capability, text_edit_focus_region_from_capability,
-    view_definition_contract_diagnostics_for_capabilities,
+    scroll_region_from_scrollable_capability, scroll_region_from_scrollable_capability_with_order,
+    text_edit_focus_region_from_capability, view_definition_contract_diagnostics_for_capabilities,
     view_definition_has_blocking_contract_diagnostic,
 };
 use slipway_debug_bridge::{
@@ -56,6 +56,58 @@ pub struct EguiBackendAdmission;
 
 pub fn egui_backend_admission() -> EguiBackendAdmission {
     EguiBackendAdmission
+}
+
+/// Derives the ADR-0002 B1 dispatch graph through egui's presentation
+/// pipeline: the same view assembly and scroll-region normalization the
+/// visible widget path applies before dispatch
+/// (`normalize_egui_visible_scroll_regions`), occlusion inputs composed
+/// through the shared core collector (the declared analogue of egui's
+/// per-widget paint-occlusion allocation, which resolves the wheel channel
+/// through the same `paint_layer_blocks_wheel` filter), then the shared core
+/// builder (`slipway_core::derive_dispatch_graph_with_geometry_index`)
+/// derives nodes and edges. Read-only: nothing consumes the returned graph
+/// for dispatch.
+pub fn egui_dispatch_graph_for_widget<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    layout_input: LayoutInput,
+    frame_seed: Option<&FrameIdentity>,
+) -> slipway_core::DispatchGraph
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let target = widget.id();
+    let frame = frame_seed.cloned().unwrap_or_else(|| FrameIdentity {
+        surface_id: "egui-visible".to_string(),
+        surface_instance_id: target.as_str().to_string(),
+        revision: 0,
+        frame_index: 0,
+        viewport: layout_input.viewport.into_rect(),
+    });
+    let mut view = widget.visible_backend_view_definition(
+        external,
+        local,
+        ViewDefinitionInput {
+            frame,
+            layout_input,
+        },
+    );
+    let occlusions = slipway_core::dispatch_graph_occlusion_regions_for_composed_view(
+        widget, external, local, &view,
+    );
+    let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+    normalize_egui_visible_scroll_regions(&mut view, &geometry_index);
+
+    slipway_core::derive_dispatch_graph_with_geometry_index(
+        &view.target,
+        &geometry_index,
+        &view.hit_regions,
+        &view.focus_regions,
+        &view.scroll_regions,
+        &occlusions,
+    )
 }
 
 impl EguiBackendAdmission {
@@ -1143,6 +1195,25 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn egui_scroll_region_from_capability_with_order<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    layout: &LayoutOutput,
+    region_id: Option<PresentationRegionId>,
+    address: Option<WidgetSlotAddress>,
+    enabled: bool,
+    order: HitRegionOrder,
+) -> ScrollRegionDeclaration
+where
+    W: SlipwayEguiScrollableContainerBackendWidget,
+{
+    scroll_region_from_scrollable_capability_with_order(
+        widget, external, local, layout, region_id, address, enabled, order,
+    )
+}
+
 pub trait SlipwayEguiBackendWidget: SlipwayAuthoredWidget + SlipwayEguiBackendChildWidget {}
 
 impl<W> SlipwayEguiBackendWidget for W where W: SlipwayAuthoredWidget + SlipwayEguiBackendChildWidget
@@ -1231,6 +1302,13 @@ pub struct EguiScrollRegionState {
     pub egui_offset: Point,
     pub content_size: Size,
     pub inner_rect: Rect,
+    /// ABSOLUTE track/thumb rects of the declared indicator painted for
+    /// this region this frame (Step 212, interactive indicators): `None`
+    /// when no indicator is painted (`Hidden` mode or no vertical
+    /// overflow). Computed by `declared_scroll_indicator_geometry` — the
+    /// same source the painter uses — at allocation time, so the input
+    /// path's hit surface always matches the pixels.
+    pub indicator: Option<(egui::Rect, egui::Rect)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1251,6 +1329,14 @@ pub struct EguiPresentedRegion {
     pub enabled: bool,
     pub text_edit_change: Option<EguiTextEditChange>,
     pub scroll_state: Option<EguiScrollRegionState>,
+    /// Resolved wheel-channel opacity, only meaningful for
+    /// `EguiPresentedRegionKind::Occlusion` regions. `true` (the default for an
+    /// opaque layer) means the occluder blocks wheel input like pointer input;
+    /// `false` means the layer was authored wheel-pass-through, so it still
+    /// occludes the pointer but lets the wheel reach the scroll region behind
+    /// it. Derived via `slipway_core::paint_layer_blocks_wheel`. Non-occlusion
+    /// regions set `true` and never consult this field.
+    pub blocks_wheel: bool,
 }
 
 /// Egui-facing context used to translate Slipway paint declarations into egui paint calls.
@@ -1289,11 +1375,48 @@ pub trait EguiSlipwayBridge<W: SlipwayAuthoredWidget> {
 
     fn visible_admission_refused(&mut self, _admission: BackendParityAdmission) {}
 
+    /// Drains the refused admissions this bridge retained so the caller can
+    /// feed them into the runtime diagnostics surface. Bridges that do not
+    /// retain refused admissions return an empty list.
+    fn drain_refused_admissions(&mut self) -> Vec<BackendParityAdmission> {
+        Vec::new()
+    }
+
+    /// Drains the no-consumer dispatch refusal evidence this bridge retained
+    /// (audit finding MF-H3) so the caller can feed it into the runtime's
+    /// bounded refusal ring. Bridges that do not retain refusals return an
+    /// empty list.
+    fn drain_dispatch_refusals(&mut self) -> Vec<slipway_core::DeclaredEventDispatchEvidence> {
+        Vec::new()
+    }
+
     fn wants_observation(&mut self) -> bool {
         false
     }
 
     fn observe(&mut self, _context: EguiObservationContext) {}
+}
+
+/// Backend-internal capture for a declared-indicator thumb drag
+/// (Step 212). Deliberately NOT a declared hit region injected into the
+/// author's view: the indicator is backend presentation, so its hit
+/// surface lives in the bridge, invisible to authored hit-region
+/// resolution and to admission. The drag maps track-space pointer travel
+/// back to a declared offset and synthesizes `InputEvent::Scroll` through
+/// the same declared scroll machinery the offset-sync path uses.
+#[derive(Debug)]
+struct EguiIndicatorDragState {
+    region_id: PresentationRegionId,
+    /// Absolute y of the press that started the drag.
+    press_y: f32,
+    /// Offset anchor at press time; cumulative pointer travel maps from
+    /// here so per-frame offset quantization by the author's handler
+    /// cannot feed back into the mapping.
+    start_offset_y: f32,
+    /// Track travel (track height minus thumb height) captured at press.
+    track_travel: f32,
+    /// Declared travel (content minus viewport) captured at press.
+    max_offset: f32,
 }
 
 #[derive(Debug, Default)]
@@ -1303,7 +1426,14 @@ pub struct DefaultEguiBridge {
     focused_target: Option<WidgetId>,
     hovered_region: Option<PresentationRegionId>,
     pointer_capture_region: Option<PresentationRegionId>,
+    /// Button that began the active pointer capture. Captured (held) moves carry
+    /// no per-event button from egui, so this is threaded into the move's
+    /// pointer details to preserve the held-button state drag handlers require.
+    pointer_capture_button: Option<egui::PointerButton>,
+    /// Active declared-indicator thumb drag (backend-internal capture).
+    indicator_drag: Option<EguiIndicatorDragState>,
     refused_admissions: Vec<BackendParityAdmission>,
+    dispatch_refusals: Vec<slipway_core::DeclaredEventDispatchEvidence>,
 }
 
 impl DefaultEguiBridge {
@@ -1321,6 +1451,10 @@ impl DefaultEguiBridge {
 
     pub fn take_refused_admissions(&mut self) -> Vec<BackendParityAdmission> {
         std::mem::take(&mut self.refused_admissions)
+    }
+
+    pub fn take_dispatch_refusals(&mut self) -> Vec<slipway_core::DeclaredEventDispatchEvidence> {
+        std::mem::take(&mut self.dispatch_refusals)
     }
 }
 
@@ -1451,6 +1585,30 @@ where
         for event in &raw_input.events {
             match event {
                 egui::Event::PointerMoved(position) => {
+                    // Active declared-indicator thumb drag (Step 212): the
+                    // captured thumb follows the pointer; every move
+                    // synthesizes a declared Scroll event (the same
+                    // machinery as the offset-sync path above).
+                    if let Some(drag) = self.indicator_drag.as_ref() {
+                        let region = egui_region_by_id(context.regions, &drag.region_id);
+                        match region {
+                            Some(region) => {
+                                let offset_y = egui_indicator_drag_offset(drag, position.y);
+                                if let Some(event) =
+                                    egui_indicator_scroll_event_for_offset(region, offset_y)
+                                    && let Some(event) =
+                                        egui_scroll_backend_input_event(&context, region, event)
+                                {
+                                    events.push(event);
+                                }
+                            }
+                            None => {
+                                // The dragged region left the view.
+                                self.indicator_drag = None;
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(captured) = self
                         .pointer_capture_region
                         .as_ref()
@@ -1462,7 +1620,7 @@ where
                             *position,
                             PointerEventKind::Move,
                             None,
-                            egui_pointer_details(raw_input.modifiers, None),
+                            egui_pointer_details(raw_input.modifiers, self.pointer_capture_button),
                             true,
                         ) {
                             events.push(event);
@@ -1528,6 +1686,38 @@ where
                     pressed,
                     ..
                 } => {
+                    if !*pressed && self.indicator_drag.take().is_some() {
+                        // End of a declared-indicator drag: consume the
+                        // release; the declared offset already tracks the
+                        // last drag move.
+                        continue;
+                    }
+                    // A primary press on a painted indicator track/thumb is
+                    // claimed by the backend (Step 212): thumb press ->
+                    // captured drag; track press -> JUMP-TO-POSITION (the
+                    // thumb centers on the click and the press keeps
+                    // dragging from there). Points covered by a fronting
+                    // authored region (overlay panel occlusion or a
+                    // fronting hit region) are refused inside the helper,
+                    // so pointer selection agrees with visible stacking.
+                    if *pressed
+                        && *button == egui::PointerButton::Primary
+                        && let Some((drag, jump)) =
+                            egui_indicator_press_interaction(context.regions, *pos)
+                    {
+                        if let Some(offset_y) = jump
+                            && let Some(region) =
+                                egui_region_by_id(context.regions, &drag.region_id)
+                            && let Some(event) =
+                                egui_indicator_scroll_event_for_offset(region, offset_y)
+                            && let Some(event) =
+                                egui_scroll_backend_input_event(&context, region, event)
+                        {
+                            events.push(event);
+                        }
+                        self.indicator_drag = Some(drag);
+                        continue;
+                    }
                     if !*pressed {
                         if let Some(captured) = self
                             .pointer_capture_region
@@ -1546,6 +1736,7 @@ where
                                 events.push(event);
                             }
                             self.pointer_capture_region = None;
+                            self.pointer_capture_button = None;
                             continue;
                         }
                     }
@@ -1583,6 +1774,7 @@ where
                             )
                         {
                             self.pointer_capture_region = Some(region.region_id.clone());
+                            self.pointer_capture_button = Some(*button);
                         }
                         events.push(event);
                     }
@@ -1616,6 +1808,8 @@ where
                         }
                     }
                     self.pointer_capture_region = None;
+                    self.pointer_capture_button = None;
+                    self.indicator_drag = None;
                     self.hovered_region = None;
                 }
                 egui::Event::Text(text)
@@ -1740,9 +1934,13 @@ where
                     let Some(position) = raw_input.hover_pos else {
                         continue;
                     };
-                    if let Some(event) =
-                        egui_backend_wheel_input_event(&context, position, delta.x, delta.y)
-                    {
+                    if let Some(event) = egui_backend_wheel_input_event(
+                        &context,
+                        position,
+                        delta.x,
+                        delta.y,
+                        &mut self.dispatch_refusals,
+                    ) {
                         events.push(event);
                     }
                 }
@@ -1838,6 +2036,14 @@ where
         } else {
             self.refused_admissions.push(admission);
         }
+    }
+
+    fn drain_refused_admissions(&mut self) -> Vec<BackendParityAdmission> {
+        self.take_refused_admissions()
+    }
+
+    fn drain_dispatch_refusals(&mut self) -> Vec<slipway_core::DeclaredEventDispatchEvidence> {
+        self.take_dispatch_refusals()
     }
 
     fn wants_observation(&mut self) -> bool {
@@ -2720,6 +2926,10 @@ where
     root_scroll_offset: egui::Vec2,
     frame_timing: VisibleFrameTimingRecorder,
     native_create_started_at: Option<Instant>,
+    /// Most recent dispatch refusal drained THIS frame (None when the frame
+    /// drained none). Feeds the post-hoc diagnosis attached to the no-match
+    /// physical-control failure (audit finding MF-H5).
+    last_frame_dispatch_refusal: Option<slipway_core::DeclaredEventDispatchEvidence>,
 }
 
 enum PendingEguiNativePhysicalControl {
@@ -2749,6 +2959,7 @@ where
             root_scroll_offset: egui::Vec2::ZERO,
             frame_timing: VisibleFrameTimingRecorder::from_env("egui"),
             native_create_started_at: None,
+            last_frame_dispatch_refusal: None,
         }
     }
 
@@ -2800,6 +3011,7 @@ where
     }
 
     pub fn drain_debug_pending(&mut self) -> (usize, Option<String>) {
+        self.runtime.record_presenting_backend(EGUI_BACKEND_ID);
         match self.runtime.drain_live_debug_turn_with_app_reducer(
             SlipwayRuntimeDrainBudget::default(),
             &mut self.on_messages,
@@ -2816,6 +3028,7 @@ where
         &mut self,
         raw_input: &mut egui::RawInput,
     ) -> (usize, Option<String>) {
+        self.runtime.record_presenting_backend(EGUI_BACKEND_ID);
         let mut drained = 0usize;
         loop {
             let pending = match self.pending_native_physical.take() {
@@ -3081,6 +3294,15 @@ where
             backend_trace_count,
             timing_viewport,
         );
+        for admission in self.bridge.drain_refused_admissions() {
+            self.runtime.record_backend_admission(&admission);
+        }
+        let drained_refusals = self.bridge.drain_dispatch_refusals();
+        self.last_frame_dispatch_refusal = drained_refusals.last().cloned();
+        for refusal in drained_refusals {
+            self.runtime
+                .record_dispatch_refusal_for_backend(refusal, EGUI_BACKEND_ID);
+        }
         if root_wheel_delta != egui::Vec2::ZERO && !handled_wheel {
             self.root_scroll_offset = clamp_egui_root_scroll_offset(
                 self.root_scroll_offset - root_wheel_delta,
@@ -3175,10 +3397,51 @@ where
             return;
         };
 
+        // Post-hoc diagnosis (MF-H5): when this frame's routing constructed
+        // refusal evidence for the same operation kind, attach it under the
+        // distinct `post_hoc_diagnosis` source label so the agent can see WHY
+        // the operation produced no trace (dead point / at-limit, with
+        // position, candidates, and reason) without ever confusing the
+        // diagnosis with real dispatch evidence.
+        let diagnosis = self
+            .last_frame_dispatch_refusal
+            .as_ref()
+            .filter(|refusal| {
+                let DebugCommandKind::PhysicalControl { operation, .. } = &lease.command().kind
+                else {
+                    return false;
+                };
+                physical_operation_matches_refusal_kind(operation, refusal.kind)
+            })
+            .cloned()
+            .map(|mut refusal| {
+                refusal.source = EvidenceSource::post_hoc_diagnosis(
+                    EGUI_BACKEND_ID,
+                    "physical-control-no-match",
+                );
+                refusal
+            });
+        let message = match &diagnosis {
+            Some(diagnosis) => format!(
+                "egui RawInput received the requested physical operation, but the visible backend produced no matching backend-presented trace in this frame; a post-hoc dispatch diagnosis (source label `{}`) is attached: {}; candidates=[{}]",
+                slipway_core::EVIDENCE_SOURCE_POST_HOC_DIAGNOSIS,
+                diagnosis
+                    .refusal_reason
+                    .as_deref()
+                    .unwrap_or("dispatch refused without a recorded reason"),
+                diagnosis
+                    .candidate_regions
+                    .iter()
+                    .map(|region| region.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            None => "egui RawInput received the requested physical operation, but the visible backend produced no matching backend-presented trace in this frame; no routing-level refusal evidence was constructed for it — probe the `diagnostics` kind for retained refusals".to_string(),
+        };
         let product = DebugReplyProduct::Error(DebugFailure {
             code: "native-physical-control-no-backend-trace".to_string(),
-            message: "egui RawInput received the requested physical operation, but the visible backend produced no matching backend-presented trace in this frame".to_string(),
-            dispatch_evidence: None,
+            message,
+            dispatch_evidence: diagnosis,
         });
         let _ = lease.complete(product);
         let _ = pending.try_finish_and_respond();
@@ -3195,6 +3458,40 @@ where
         };
         Some(operation)
     }
+}
+
+/// True when a retained dispatch refusal's kind corresponds to the physical
+/// operation that produced no backend trace, so a stale refusal from an
+/// unrelated input is never attached as that operation's diagnosis.
+fn physical_operation_matches_refusal_kind(
+    operation: &DebugPhysicalControl,
+    kind: DeclaredEventDispatchKind,
+) -> bool {
+    matches!(
+        (operation, kind),
+        (
+            DebugPhysicalControl::Pointer { .. },
+            DeclaredEventDispatchKind::Pointer
+        ) | (
+            DebugPhysicalControl::Wheel { .. },
+            DeclaredEventDispatchKind::Wheel
+        ) | (
+            DebugPhysicalControl::Scroll { .. },
+            DeclaredEventDispatchKind::Scroll
+        ) | (
+            DebugPhysicalControl::Focus { .. },
+            DeclaredEventDispatchKind::Focus
+        ) | (
+            DebugPhysicalControl::Text { .. } | DebugPhysicalControl::TextEdit { .. },
+            DeclaredEventDispatchKind::Text
+        ) | (
+            DebugPhysicalControl::Keyboard { .. },
+            DeclaredEventDispatchKind::Keyboard
+        ) | (
+            DebugPhysicalControl::Command { .. },
+            DeclaredEventDispatchKind::Command
+        )
+    )
 }
 
 impl<W, B, F> eframe::App for SlipwayEguiRuntimeApp<W, B, F>
@@ -4749,6 +5046,7 @@ fn allocate_hit_region(
         enabled: hit.enabled,
         text_edit_change: None,
         scroll_state: None,
+        blocks_wheel: true,
     }
 }
 
@@ -4797,6 +5095,7 @@ fn allocate_focus_region(
         enabled: focus.enabled,
         text_edit_change: None,
         scroll_state: None,
+        blocks_wheel: true,
     }
 }
 
@@ -4971,6 +5270,7 @@ fn allocate_text_edit_region_without_font_policy(
         enabled: focus.enabled,
         text_edit_change,
         scroll_state: None,
+        blocks_wheel: true,
     }
 }
 
@@ -5099,18 +5399,26 @@ where
         child_assembly.regions.len(),
     );
     let indicator_start = Instant::now();
-    child_assembly
-        .scroll_indicators
-        .push(EguiScrollIndicatorPaint {
-            viewport_rect,
-            scroll: scroll.clone(),
-            offset: scroll_offset,
-        });
+    // Declared-indicator honor (Step 210, `ScrollIndicatorMode`): `Hidden`
+    // never queues indicator paint; `Auto` and `Visible` queue it and
+    // `paint_declared_scroll_indicator` applies the geometric conditions
+    // (vertical axis, content taller than viewport) — byte-identical to the
+    // pre-control behavior for `Auto`.
+    let indicator_queued = scroll.indicator != slipway_core::ScrollIndicatorMode::Hidden;
+    if indicator_queued {
+        child_assembly
+            .scroll_indicators
+            .push(EguiScrollIndicatorPaint {
+                viewport_rect,
+                scroll: scroll.clone(),
+                offset: scroll_offset,
+            });
+    }
     push_egui_frame_timing(
         &mut timing_samples,
         "egui.widget.presentation_regions.scroll.indicator",
         indicator_start.elapsed(),
-        1,
+        usize::from(indicator_queued),
     );
 
     let state_start = Instant::now();
@@ -5121,6 +5429,13 @@ where
         inner_rect: Rect {
             origin: egui_position(viewport_rect.min, view_origin),
             size: scroll.viewport.size,
+        },
+        // Interactive-indicator hit geometry: present exactly when the
+        // indicator paint was queued above (same gate, same geometry fn).
+        indicator: if indicator_queued {
+            declared_scroll_indicator_geometry(viewport_rect, scroll, scroll_offset)
+        } else {
+            None
         },
     };
     push_egui_frame_timing(
@@ -5151,6 +5466,7 @@ where
             enabled: scroll.enabled,
             text_edit_change: None,
             scroll_state: Some(scroll_state),
+            blocks_wheel: true,
         }),
         child_assembly,
     }
@@ -5272,6 +5588,7 @@ fn child_response_region(
         enabled: true,
         text_edit_change: None,
         scroll_state: None,
+        blocks_wheel: true,
     }
 }
 
@@ -5282,7 +5599,7 @@ fn allocate_paint_occlusion_regions(
     let mut regions = Vec::new();
     for (index, job) in jobs.iter().enumerate() {
         let paint_sort_key = paint_unit_sort_key(&job.unit);
-        for bounds in opaque_layer_bounds(&job.unit.paint) {
+        for (bounds, blocks_wheel) in opaque_layer_bounds(&job.unit.paint) {
             let absolute = egui_rect(job.origin, bounds);
             let clipped = absolute.intersect(job.clip_rect);
             if clipped.is_positive() {
@@ -5292,6 +5609,7 @@ fn allocate_paint_occlusion_regions(
                     index,
                     paint_sort_key,
                     clipped,
+                    blocks_wheel,
                 ));
             }
         }
@@ -5305,6 +5623,7 @@ fn paint_occlusion_region(
     index: usize,
     paint_sort_key: (i32, usize, usize),
     clipped: egui::Rect,
+    blocks_wheel: bool,
 ) -> EguiPresentedRegion {
     let region_id = PresentationRegionId::from(format!(
         "egui-paint-occlusion:{}:{}:{}:{}",
@@ -5340,20 +5659,28 @@ fn paint_occlusion_region(
         enabled: true,
         text_edit_change: None,
         scroll_state: None,
+        blocks_wheel,
     }
 }
 
-fn opaque_layer_bounds(ops: &[PaintOp]) -> Vec<Rect> {
+/// Each opaque layer's absorb bounds paired with its resolved wheel-channel
+/// opacity (`true` = blocks the wheel, `false` = authored wheel-pass-through).
+fn opaque_layer_bounds(ops: &[PaintOp]) -> Vec<(Rect, bool)> {
     let mut bounds = Vec::new();
     collect_opaque_layer_bounds(ops, None, &mut bounds);
     bounds
 }
 
-fn collect_opaque_layer_bounds(ops: &[PaintOp], clip: Option<Rect>, bounds: &mut Vec<Rect>) {
+fn collect_opaque_layer_bounds(
+    ops: &[PaintOp],
+    clip: Option<Rect>,
+    bounds: &mut Vec<(Rect, bool)>,
+) {
     for op in ops {
         match op {
             PaintOp::Layer {
                 input_transparency,
+                wheel_transparency,
                 clip: layer_clip,
                 ops,
                 ..
@@ -5363,7 +5690,13 @@ fn collect_opaque_layer_bounds(ops: &[PaintOp], clip: Option<Rect>, bounds: &mut
                 if *input_transparency == PaintInputTransparency::Opaque
                     && let Some(bound) = paint_ops_visible_bounds(ops, next_clip)
                 {
-                    bounds.push(bound);
+                    bounds.push((
+                        bound,
+                        slipway_core::paint_layer_blocks_wheel(
+                            *input_transparency,
+                            *wheel_transparency,
+                        ),
+                    ));
                 }
                 collect_opaque_layer_bounds(ops, next_clip, bounds);
             }
@@ -5642,19 +5975,26 @@ fn rects_intersect(a: Rect, b: Rect) -> bool {
     a_min_x < b_max_x && a_max_x > b_min_x && a_min_y < b_max_y && a_max_y > b_min_y
 }
 
-fn paint_declared_scroll_indicator(
-    ui: &egui::Ui,
+/// Track and thumb of the declared indicator this backend draws for
+/// `scroll`, in ABSOLUTE egui coordinates — `None` when the geometric
+/// conditions (vertical axis, content taller than viewport) do not hold.
+/// THE single geometry source for the indicator: the painter
+/// (`paint_declared_scroll_indicator`) and the interactive
+/// thumb-drag/track-click input path (`DefaultEguiBridge::input_events`,
+/// Step 212, via the geometry stashed on `EguiScrollRegionState`) both
+/// use it, so the pixels and the hit surface cannot diverge.
+fn declared_scroll_indicator_geometry(
     viewport_rect: egui::Rect,
     scroll: &ScrollRegionDeclaration,
     offset: Point,
-) {
+) -> Option<(egui::Rect, egui::Rect)> {
     if !scroll.axes.vertical {
-        return;
+        return None;
     }
     let content_height = scroll.content_bounds.size.height.max(0.0);
     let viewport_height = scroll.viewport.size.height.max(0.0);
     if content_height <= viewport_height || viewport_height <= 0.0 {
-        return;
+        return None;
     }
 
     let track_width = 4.0;
@@ -5674,6 +6014,19 @@ fn paint_declared_scroll_indicator(
         egui::pos2(track.left(), top),
         egui::vec2(track.width(), thumb_height),
     );
+    Some((track, thumb))
+}
+
+fn paint_declared_scroll_indicator(
+    ui: &egui::Ui,
+    viewport_rect: egui::Rect,
+    scroll: &ScrollRegionDeclaration,
+    offset: Point,
+) {
+    let Some((track, thumb)) = declared_scroll_indicator_geometry(viewport_rect, scroll, offset)
+    else {
+        return;
+    };
 
     ui.painter().rect_filled(
         track,
@@ -5897,7 +6250,10 @@ fn egui_occlusion_blocks_region(
     occlusion: &EguiPresentedRegion,
     region: &EguiPresentedRegion,
 ) -> bool {
-    if occlusion.paint_sort_key <= region.paint_sort_key {
+    if !slipway_core::hit_region_order_is_front_of(
+        &egui_hit_region_order_from_key(occlusion.paint_sort_key),
+        &egui_hit_region_order_from_key(region.paint_sort_key),
+    ) {
         return false;
     }
 
@@ -5908,6 +6264,14 @@ fn egui_occlusion_blocks_region(
     !(same_owner && same_semantic_layer_key)
 }
 
+fn egui_hit_region_order_from_key(key: (i32, usize, usize)) -> HitRegionOrder {
+    HitRegionOrder {
+        z_index: key.0,
+        paint_order: key.1,
+        traversal_order: key.2,
+    }
+}
+
 fn egui_region_by_id<'a>(
     regions: &'a [EguiPresentedRegion],
     id: &PresentationRegionId,
@@ -5915,6 +6279,110 @@ fn egui_region_by_id<'a>(
     regions
         .iter()
         .find(|region| region.enabled && &region.region_id == id)
+}
+
+/// Press resolution for the declared indicators (Step 212): when the
+/// press point lands on a painted track, returns the backend-internal
+/// drag capture to start — anchored at the current offset for a THUMB
+/// press, or at the jumped offset (with `Some(jumped)` to emit) for a
+/// TRACK press (jump-to-position). Geometry comes from the
+/// `EguiScrollRegionState::indicator` rects stashed at allocation time by
+/// the same function that painted the indicator. Points covered by a
+/// FRONTING authored region (an opaque overlay layer's occlusion region
+/// or a hit region stacked above the indicator's scroll region) are
+/// refused, so pointer selection agrees with the visible stacking.
+fn egui_indicator_press_interaction(
+    regions: &[EguiPresentedRegion],
+    pos: egui::Pos2,
+) -> Option<(EguiIndicatorDragState, Option<f32>)> {
+    let (region, track, thumb) = regions
+        .iter()
+        .filter(|region| region.enabled && region.kind == EguiPresentedRegionKind::Scroll)
+        .filter_map(|region| {
+            let (track, thumb) = region.scroll_state.as_ref()?.indicator?;
+            track.contains(pos).then_some((region, track, thumb))
+        })
+        .max_by_key(|(region, _, _)| region.paint_sort_key)?;
+    if egui_indicator_press_blocked(regions, pos, region.paint_sort_key) {
+        return None;
+    }
+    let state = region.scroll_state.as_ref()?;
+    let track_travel = (track.height() - thumb.height()).max(0.0);
+    let max_offset = (state.content_size.height - state.inner_rect.size.height).max(0.0);
+    if track_travel <= 0.0 || max_offset <= 0.0 {
+        return None;
+    }
+    if thumb.contains(pos) {
+        return Some((
+            EguiIndicatorDragState {
+                region_id: region.region_id.clone(),
+                press_y: pos.y,
+                start_offset_y: state.egui_offset.y.clamp(0.0, max_offset),
+                track_travel,
+                max_offset,
+            },
+            None,
+        ));
+    }
+    let jumped = ((pos.y - track.top() - thumb.height() / 2.0) / track_travel * max_offset)
+        .clamp(0.0, max_offset);
+    Some((
+        EguiIndicatorDragState {
+            region_id: region.region_id.clone(),
+            press_y: pos.y,
+            start_offset_y: jumped,
+            track_travel,
+            max_offset,
+        },
+        Some(jumped),
+    ))
+}
+
+/// One drag step of an active indicator capture: cumulative pointer
+/// travel from the press anchor maps through the track-to-content ratio
+/// captured at press time, clamped to the declared travel.
+fn egui_indicator_drag_offset(drag: &EguiIndicatorDragState, pointer_y: f32) -> f32 {
+    (drag.start_offset_y + (pointer_y - drag.press_y) * drag.max_offset / drag.track_travel)
+        .clamp(0.0, drag.max_offset)
+}
+
+fn egui_indicator_press_blocked(
+    regions: &[EguiPresentedRegion],
+    pos: egui::Pos2,
+    indicator_key: (i32, usize, usize),
+) -> bool {
+    regions.iter().any(|region| {
+        region.enabled
+            && region.paint_sort_key > indicator_key
+            && matches!(
+                region.kind,
+                EguiPresentedRegionKind::Occlusion | EguiPresentedRegionKind::Hit
+            )
+            && region.response.interact_rect.contains(pos)
+    })
+}
+
+/// The raw Scroll event an indicator interaction emits for `region` at
+/// `offset_y`; `egui_scroll_backend_input_event` then rewrites the
+/// declared fields and attaches the dispatch evidence — the same path the
+/// offset-sync events take.
+fn egui_indicator_scroll_event_for_offset(
+    region: &EguiPresentedRegion,
+    offset_y: f32,
+) -> Option<InputEvent> {
+    let state = region.scroll_state.as_ref()?;
+    Some(InputEvent::Scroll(ScrollEvent {
+        target: region.target.clone(),
+        target_slot: region.address.clone(),
+        region_id: region.region_id.clone(),
+        offset_x: state.egui_offset.x,
+        offset_y,
+        viewport: TargetLocalRect::new(state.inner_rect),
+        content_bounds: TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: state.content_size,
+        }),
+    }))
 }
 
 fn egui_region_requires_stateful_pointer_capture(
@@ -6122,6 +6590,27 @@ fn egui_occlusion_region_at_position(
         .max_by_key(|region| region.paint_sort_key)
 }
 
+/// Topmost occlusion that blocks the WHEEL channel at `position`.
+///
+/// Wheel-specific variant of [`egui_occlusion_region_at_position`]: occluders
+/// authored wheel-pass-through (`blocks_wheel == false`) are excluded, so the
+/// wheel reaches the scroll region behind them while the pointer path (which
+/// uses [`egui_occlusion_region_at_position`]) still treats them as occluders.
+fn egui_wheel_occlusion_region_at_position(
+    regions: &[EguiPresentedRegion],
+    position: egui::Pos2,
+) -> Option<&EguiPresentedRegion> {
+    regions
+        .iter()
+        .filter(|region| {
+            region.enabled
+                && region.kind == EguiPresentedRegionKind::Occlusion
+                && region.blocks_wheel
+                && region.response.interact_rect.contains(position)
+        })
+        .max_by_key(|region| region.paint_sort_key)
+}
+
 #[cfg(test)]
 fn egui_region_position(region: &EguiPresentedRegion, position: egui::Pos2) -> Point {
     match region.event_coordinate_space {
@@ -6269,6 +6758,7 @@ fn egui_backend_captured_pointer_input_event(
         frame: context.frame.clone(),
         kind: DeclaredEventDispatchKind::Pointer,
         input_position: Some(view_root_local_position),
+        input_position_space: Some(slipway_core::DispatchPositionSpace::Content),
         candidate_regions,
         selected_region: Some(hit.id.clone()),
         refusal_reason: None,
@@ -6285,15 +6775,116 @@ fn egui_backend_captured_pointer_input_event(
     Some(BackendInputEvent::declared(event, evidence))
 }
 
+/// Maps a view-local wheel cursor into root content / dispatch space through
+/// the presented region under the cursor, so a wheel and a press at the same
+/// visual cursor resolve to the same content-space coordinate. A region's
+/// scrolled visual origin (`target_origin`) versus its content-space rect
+/// (from the geometry index) encodes every ancestor scroll offset, so after the
+/// root scrolls a wheel over a nested region still reaches that region (the
+/// Step 190 E1 win). Falls back to the plain view-local mapping when no region
+/// covers the cursor.
+fn egui_wheel_dispatch_position(context: &EguiInputContext<'_>, position: egui::Pos2) -> Point {
+    match egui_region_at_position(context.regions, position) {
+        Some(region) => egui_region_root_local_position(context, region, position),
+        None => egui_view_root_local_position(position, context.rect.min, context.frame),
+    }
+}
+
+/// The visible-viewport wheel point: the raw cursor mapped to the top-level view
+/// origin plus `frame.viewport.origin`, with NO per-region scroll translation.
+/// Core wheel-owner selection tests each scroll region's declared viewport rect
+/// at its UN-scrolled geometry position, so a native-scrolled ancestor scroll
+/// region (e.g. the root scroll) is only reachable through this point once its
+/// own offset has pushed the content-space dispatch point past its viewport
+/// band. The `frame.viewport.origin` term keeps this fallback in the same
+/// root-local frame family as the primary path (`egui_view_root_local_position`
+/// adds it too); omitting it left the fallback point in a third, unpinned space
+/// (audit finding MF-M1).
+fn egui_wheel_visible_viewport_position(
+    context: &EguiInputContext<'_>,
+    position: egui::Pos2,
+) -> Point {
+    egui_view_root_local_position(position, context.rect.min, context.frame)
+}
+
+fn egui_wheel_select_consumer<'a>(
+    context: &'a EguiInputContext<'_>,
+    point: Point,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<&'a ScrollRegionDeclaration> {
+    slipway_core::select_declared_wheel_consumer_at_root_local_point_with_geometry_index(
+        context.geometry_index,
+        context.scroll_regions,
+        point,
+        delta_x,
+        delta_y,
+    )
+}
+
+/// True when `owner`'s presented viewport sits at its un-scrolled geometry
+/// position, i.e. no ancestor scroll displaces it (the root/native scroll). Only
+/// such an owner may claim a wheel through the visible-viewport point; a nested
+/// content region displaced by an ancestor scroll must not act as a fixed
+/// window-band phantom owner through that point.
+fn egui_wheel_owner_is_undisplaced_ancestor(
+    context: &EguiInputContext<'_>,
+    owner: &ScrollRegionDeclaration,
+) -> bool {
+    let Some(presented) = egui_presented_scroll_region_by_id(context.regions, &owner.id) else {
+        return false;
+    };
+    let target_rect = context
+        .geometry_index
+        .target_rect_for_region_address(&owner.target, owner.address.as_ref());
+    let expected = egui_point(context.rect.min, target_rect.origin);
+    const TOLERANCE: f32 = 0.5;
+    (presented.target_origin.x - expected.x).abs() <= TOLERANCE
+        && (presented.target_origin.y - expected.y).abs() <= TOLERANCE
+}
+
+/// Chooses the root-local position to resolve a wheel at, mirroring the iced
+/// contract (`iced_wheel_dispatch_root_local_position`). Prefers the
+/// content-space dispatch point so nested content owners under an ancestor
+/// scroll stay reachable (Step 190 E1). When that point selects NO consumer,
+/// falls back to the visible-viewport point ONLY if it selects an un-displaced
+/// ancestor scroll region.
+///
+/// Without the fallback, once an ancestor (root) scroll has advanced far enough
+/// that `cursor + ancestor_offset` leaves the ancestor viewport band, the
+/// content-space dispatch point exceeds every scroll region's un-scrolled
+/// viewport rect, the core resolve returns None, and the wheel goes silently
+/// dead ("freezes" mid-scroll) even though the visible cursor still sits inside
+/// the scrollable root -- the Step 190 E1 mapping regression that this repairs.
+fn egui_wheel_resolve_position(
+    context: &EguiInputContext<'_>,
+    position: egui::Pos2,
+    delta_x: f32,
+    delta_y: f32,
+) -> (Point, slipway_core::DispatchPositionSpace) {
+    let dispatch_point = egui_wheel_dispatch_position(context, position);
+    if egui_wheel_select_consumer(context, dispatch_point, delta_x, delta_y).is_some() {
+        return (dispatch_point, slipway_core::DispatchPositionSpace::Content);
+    }
+    let visual_point = egui_wheel_visible_viewport_position(context, position);
+    if let Some(owner) = egui_wheel_select_consumer(context, visual_point, delta_x, delta_y)
+        && egui_wheel_owner_is_undisplaced_ancestor(context, owner)
+    {
+        return (visual_point, slipway_core::DispatchPositionSpace::Viewport);
+    }
+    (dispatch_point, slipway_core::DispatchPositionSpace::Content)
+}
+
 fn egui_backend_wheel_input_event(
     context: &EguiInputContext<'_>,
     position: egui::Pos2,
     delta_x: f32,
     delta_y: f32,
+    refusals: &mut Vec<slipway_core::DeclaredEventDispatchEvidence>,
 ) -> Option<BackendInputEvent> {
-    let view_root_local_position =
-        egui_view_root_local_position(position, context.rect.min, context.frame);
-    let (dispatch, evidence) =
+    let (view_root_local_position, position_space) =
+        egui_wheel_resolve_position(context, position, delta_x, delta_y);
+    let (dispatch, mut evidence) =
         slipway_core::resolve_declared_wheel_dispatch_with_evidence_and_geometry_index(
             EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
             context.frame.clone(),
@@ -6303,9 +6894,15 @@ fn egui_backend_wheel_input_event(
             delta_x,
             delta_y,
         );
-    let dispatch = dispatch?;
+    evidence.input_position_space = Some(position_space);
+    let Some(dispatch) = dispatch else {
+        // No consumer (dead point / at-limit): retain the already-constructed
+        // refusal evidence instead of dropping it (audit finding MF-H3).
+        refusals.push(evidence);
+        return None;
+    };
 
-    if let Some(occlusion) = egui_occlusion_region_at_position(context.regions, position) {
+    if let Some(occlusion) = egui_wheel_occlusion_region_at_position(context.regions, position) {
         let selected_key =
             egui_presented_scroll_region_by_id(context.regions, &dispatch.selected_region)
                 .map(|region| region.paint_sort_key)
@@ -6322,7 +6919,19 @@ fn egui_backend_wheel_input_event(
                             )
                         })
                 });
-        if selected_key.is_none_or(|key| occlusion.paint_sort_key > key) {
+        if selected_key.is_none_or(|key| {
+            slipway_core::hit_region_order_is_front_of(
+                &egui_hit_region_order_from_key(occlusion.paint_sort_key),
+                &egui_hit_region_order_from_key(key),
+            )
+        }) {
+            // Occluded wheel: the dispatch resolved but a front wheel-blocking
+            // paint layer swallowed it — retain that as a refusal too (MF-H3).
+            evidence.refusal_reason = Some(format!(
+                "declared wheel consumer `{}` is occluded by a front wheel-blocking paint layer",
+                dispatch.selected_region.as_str()
+            ));
+            refusals.push(evidence);
             return None;
         }
     }
@@ -6446,12 +7055,21 @@ fn egui_scroll_backend_input_event(
         scroll.viewport = selected_region.viewport;
         scroll.content_bounds = selected_region.content_bounds;
     }
-    let evidence = slipway_core::declared_scroll_dispatch_evidence(
+    let evidence = slipway_core::declared_scroll_dispatch_evidence_at_position(
         EvidenceSource::backend_presented(EGUI_BACKEND_ID, "native-scroll"),
         context.frame.clone(),
         context.scroll_regions,
         Some(selected_region),
         event.clone(),
+        Some(
+            slipway_core::declared_region_root_local_rect_with_geometry_index(
+                context.geometry_index,
+                &selected_region.target,
+                selected_region.address.as_ref(),
+                selected_region.viewport.into_rect(),
+            )
+            .origin,
+        ),
     );
     Some(BackendInputEvent::declared(event, evidence))
 }
@@ -7644,10 +8262,10 @@ mod tests {
     use slipway_core::{
         BaselineShift, CaretGeometryEvidence, CaretSet, CommandEvent, EventRoute, EventRoutePhase,
         FontResolutionEvidence, FontStyle, FontWeight, FrameIdentity, HitRegionOrder,
-        ImeCompositionPolicyDeclaration, Point, Rect, ScrollAxes, ScrollConsumptionPolicy,
-        ScrollEvent, Size, SlipwayLogic, SlipwaySsot, SlipwayView, SlipwayWidgetListVisitor,
-        SlipwayWidgetTypes, TextBufferSnapshot, TextDecoration, TextSelectionPolicyDeclaration,
-        TextStyle, WheelRouting,
+        ImeCompositionPolicyDeclaration, Point, Rect, ScrollAxes, ScrollConsumptionPolicy, Size,
+        SlipwayLogic, SlipwaySsot, SlipwayView, SlipwayWidgetListVisitor, SlipwayWidgetTypes,
+        TextBufferSnapshot, TextDecoration, TextSelectionPolicyDeclaration, TextStyle,
+        WheelRouting,
     };
     use slipway_debug_bridge::{
         DebugCommand, DebugPhysicalControl, DebugReplyProduct, MessageDisposition,
@@ -7656,21 +8274,6 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq)]
     struct ProbeWidget {
-        id: WidgetId,
-    }
-
-    #[derive(Clone, Debug, PartialEq)]
-    struct MoveProbeWidget {
-        id: WidgetId,
-    }
-
-    #[derive(Clone, Debug, PartialEq)]
-    struct HoverProbeWidget {
-        id: WidgetId,
-    }
-
-    #[derive(Clone, Debug, PartialEq)]
-    struct CancelProbeWidget {
         id: WidgetId,
     }
 
@@ -7730,26 +8333,6 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FocusedKeyboardBridge {
-        emitted: bool,
-    }
-
-    #[derive(Default)]
-    struct FocusedCommandBridge {
-        emitted: bool,
-    }
-
-    #[derive(Default)]
-    struct FocusedTextEditBridge {
-        emitted: bool,
-    }
-
-    #[derive(Default)]
-    struct ScrollBridge {
-        emitted: bool,
-    }
-
-    #[derive(Default)]
     struct DirectCommandBridge {
         emitted: bool,
     }
@@ -7800,268 +8383,6 @@ mod tests {
                 .into_iter()
                 .map(|kind| declared_egui_probe_pointer_input(&context, kind))
                 .collect()
-        }
-
-        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
-
-        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
-            outcome
-                .emitted_messages
-                .into_iter()
-                .map(|message| message.message)
-                .collect()
-        }
-    }
-
-    impl EguiSlipwayBridge<FocusedProbeWidget> for FocusedKeyboardBridge {
-        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
-            LayoutInput {
-                viewport: TargetLocalRect::new(Rect {
-                    origin: Point { x: 0.0, y: 0.0 },
-                    size: Size {
-                        width: 100.0,
-                        height: 40.0,
-                    },
-                }),
-                constraints: LayoutConstraints {
-                    min: Size {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    max: Size {
-                        width: 100.0,
-                        height: 40.0,
-                    },
-                },
-            }
-        }
-
-        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
-            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
-        }
-
-        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
-            if self.emitted {
-                return Vec::new();
-            }
-            self.emitted = true;
-            let Some(region) = context
-                .regions
-                .iter()
-                .find(|region| region.kind == EguiPresentedRegionKind::TextEdit)
-            else {
-                return Vec::new();
-            };
-            let event = InputEvent::Keyboard(KeyboardEvent {
-                target: region.event_target.clone(),
-                target_slot: region.event_target_slot.clone(),
-                key: "Enter".to_string(),
-                kind: KeyEventKind::Press,
-                modifiers: slipway_core::Modifiers::default(),
-                details: KeyboardDetails::default(),
-            });
-            vec![egui_focus_backend_input_event(
-                &context,
-                region,
-                DeclaredEventDispatchKind::Keyboard,
-                event,
-            )]
-        }
-
-        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
-
-        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
-            outcome
-                .emitted_messages
-                .into_iter()
-                .map(|message| message.message)
-                .collect()
-        }
-    }
-
-    impl EguiSlipwayBridge<FocusedProbeWidget> for FocusedCommandBridge {
-        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
-            LayoutInput {
-                viewport: TargetLocalRect::new(Rect {
-                    origin: Point { x: 0.0, y: 0.0 },
-                    size: Size {
-                        width: 100.0,
-                        height: 40.0,
-                    },
-                }),
-                constraints: LayoutConstraints {
-                    min: Size {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    max: Size {
-                        width: 100.0,
-                        height: 40.0,
-                    },
-                },
-            }
-        }
-
-        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
-            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
-        }
-
-        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
-            if self.emitted {
-                return Vec::new();
-            }
-            self.emitted = true;
-            let Some(region) = context
-                .regions
-                .iter()
-                .find(|region| region.kind == EguiPresentedRegionKind::TextEdit)
-            else {
-                return Vec::new();
-            };
-            let event = InputEvent::Command(CommandEvent {
-                target: region.event_target.clone(),
-                target_slot: region.event_target_slot.clone(),
-                command: "submit".to_string(),
-                payload_ref: Some("payload-1".to_string()),
-                source: None,
-            });
-            vec![egui_focus_backend_input_event(
-                &context,
-                region,
-                DeclaredEventDispatchKind::Command,
-                event,
-            )]
-        }
-
-        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
-
-        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
-            outcome
-                .emitted_messages
-                .into_iter()
-                .map(|message| message.message)
-                .collect()
-        }
-    }
-
-    impl EguiSlipwayBridge<FocusedProbeWidget> for FocusedTextEditBridge {
-        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
-            LayoutInput {
-                viewport: TargetLocalRect::new(Rect {
-                    origin: Point { x: 0.0, y: 0.0 },
-                    size: Size {
-                        width: 100.0,
-                        height: 40.0,
-                    },
-                }),
-                constraints: LayoutConstraints {
-                    min: Size {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    max: Size {
-                        width: 100.0,
-                        height: 40.0,
-                    },
-                },
-            }
-        }
-
-        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
-            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
-        }
-
-        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
-            if self.emitted {
-                return Vec::new();
-            }
-            self.emitted = true;
-            let Some(region) = context
-                .regions
-                .iter()
-                .find(|region| region.kind == EguiPresentedRegionKind::TextEdit)
-            else {
-                return Vec::new();
-            };
-            let event = InputEvent::TextEdit(TextEditEvent {
-                target: region.event_target.clone(),
-                target_slot: region.event_target_slot.clone(),
-                kind: TextEditKind::ReplaceBuffer,
-                text: Some("abc".to_string()),
-                selection_before: None,
-                selection_after: None,
-            });
-            vec![egui_focus_backend_input_event(
-                &context,
-                region,
-                DeclaredEventDispatchKind::Text,
-                event,
-            )]
-        }
-
-        fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
-
-        fn messages(&mut self, outcome: EventOutcome<ProbeMessage>) -> Vec<ProbeMessage> {
-            outcome
-                .emitted_messages
-                .into_iter()
-                .map(|message| message.message)
-                .collect()
-        }
-    }
-
-    impl EguiSlipwayBridge<ScrollProbeWidget> for ScrollBridge {
-        fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
-            LayoutInput {
-                viewport: TargetLocalRect::new(Rect {
-                    origin: Point { x: 0.0, y: 0.0 },
-                    size: Size {
-                        width: 100.0,
-                        height: 40.0,
-                    },
-                }),
-                constraints: LayoutConstraints {
-                    min: Size {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    max: Size {
-                        width: 100.0,
-                        height: 40.0,
-                    },
-                },
-            }
-        }
-
-        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
-            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
-        }
-
-        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
-            if self.emitted {
-                return Vec::new();
-            }
-            self.emitted = true;
-            let Some(region) = context.scroll_regions.first() else {
-                return Vec::new();
-            };
-            let event = InputEvent::Scroll(ScrollEvent {
-                target: region.target.clone(),
-                target_slot: region.address.clone(),
-                region_id: region.id.clone(),
-                offset_x: 0.0,
-                offset_y: 24.0,
-                viewport: region.viewport,
-                content_bounds: region.content_bounds,
-            });
-            let evidence = slipway_core::declared_scroll_dispatch_evidence(
-                EvidenceSource::backend_presented(EGUI_BACKEND_ID, "native-scroll"),
-                context.frame.clone(),
-                context.scroll_regions,
-                Some(region),
-                event.clone(),
-            );
-            vec![BackendInputEvent::declared(event, evidence)]
         }
 
         fn paint(&mut self, _context: EguiPaintContext<'_>, _ops: &[PaintOp]) {}
@@ -8437,9 +8758,6 @@ mod tests {
 
     impl_egui_test_leaf_children!(
         ProbeWidget,
-        MoveProbeWidget,
-        HoverProbeWidget,
-        CancelProbeWidget,
         FocusedProbeWidget,
         ScrollProbeWidget,
         UnsupportedClipWidget,
@@ -8857,7 +9175,7 @@ mod tests {
             &self,
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
-            _wheel: &slipway_core::WheelEvent,
+            _region: &slipway_core::PresentationRegionId,
         ) -> slipway_core::WheelRoutingPolicyDeclaration {
             slipway_core::WheelRoutingPolicyDeclaration {
                 target: self.id.clone(),
@@ -8972,30 +9290,6 @@ mod tests {
         }
     }
 
-    impl MoveProbeWidget {
-        fn new(id: &str) -> Self {
-            Self {
-                id: WidgetId::from(id),
-            }
-        }
-    }
-
-    impl HoverProbeWidget {
-        fn new(id: &str) -> Self {
-            Self {
-                id: WidgetId::from(id),
-            }
-        }
-    }
-
-    impl CancelProbeWidget {
-        fn new(id: &str) -> Self {
-            Self {
-                id: WidgetId::from(id),
-            }
-        }
-    }
-
     impl FocusedProbeWidget {
         fn new(id: &str) -> Self {
             Self {
@@ -9084,23 +9378,6 @@ mod tests {
         )
     }
 
-    fn physical_pointer_phase_message(
-        id: &str,
-        frame: &FrameIdentity,
-        x: f32,
-        y: f32,
-        phase: &str,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"pointer","phase":"{}","position":{{"x":{},"y":{}}},"device":"mouse"}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            phase,
-            x,
-            y,
-        )
-    }
-
     fn physical_keyboard_message(
         id: &str,
         frame: &FrameIdentity,
@@ -9113,40 +9390,6 @@ mod tests {
             frame_json(frame),
             target,
             key,
-        )
-    }
-
-    fn physical_text_edit_message(
-        id: &str,
-        frame: &FrameIdentity,
-        target: &str,
-        edit_kind: &str,
-        text: &str,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"text_edit","target":"{}","edit_kind":"{}","text":"{}"}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            target,
-            edit_kind,
-            text,
-        )
-    }
-
-    fn physical_command_message(
-        id: &str,
-        frame: &FrameIdentity,
-        target: &str,
-        command: &str,
-        payload_ref: &str,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"command","target":"{}","command":"{}","payload_ref":"{}"}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            target,
-            command,
-            payload_ref,
         )
     }
 
@@ -9235,14 +9478,6 @@ mod tests {
             egui::Shape::Rect(rect) if rect.fill == color => Some(shape.clip_rect),
             _ => None,
         })
-    }
-
-    fn probe_event_message(id: &str, frame: &FrameIdentity) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.probe","arguments":{{"frame":{},"kinds":["event"],"event_trace_limit":2}}}}}}"#,
-            id,
-            frame_json(frame),
-        )
     }
 
     fn test_hit_region(
@@ -9436,6 +9671,7 @@ mod tests {
             enabled: true,
             text_edit_change: None,
             scroll_state: None,
+            blocks_wheel: true,
         }
     }
 
@@ -9504,6 +9740,7 @@ mod tests {
                 enabled: true,
                 text_edit_change: None,
                 scroll_state: None,
+                blocks_wheel: true,
             };
             let regions = vec![region];
             let context = EguiInputContext {
@@ -9636,6 +9873,7 @@ mod tests {
                     height: 50.0,
                 },
             },
+            indicator: None,
         }
     }
 
@@ -9903,6 +10141,7 @@ mod tests {
                         height: 100.0,
                     },
                 },
+                indicator: None,
             });
 
             let mut inner = test_presented_region(
@@ -9928,6 +10167,7 @@ mod tests {
                         height: 100.0,
                     },
                 },
+                indicator: None,
             });
 
             let regions = vec![outer, inner];
@@ -9941,6 +10181,215 @@ mod tests {
                 egui_wheel_region_at_position(&regions, egui::pos2(20.0, 20.0), 0.0, 4.0)
                     .expect("inner scroll owner can still move in the opposite direction");
             assert_eq!(selected_up.region_id.as_str(), "inner-scroll");
+        });
+    }
+
+    // --- Step 212: interactive declared indicators (thumb drag + track jump) ---
+    // Parity fixture with the iced `declared_indicator_routed_view` tests:
+    // viewport (0,0,200,100), content 300, offset 40.
+
+    fn indicator_test_declaration() -> ScrollRegionDeclaration {
+        let target = WidgetId::from("declared-indicator-target");
+        ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("declared-indicator-region"),
+            target.clone(),
+            Some(WidgetSlotAddress::new(target, 0)),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 100.0,
+                },
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 300.0,
+                },
+            }),
+            Point { x: 0.0, y: 40.0 },
+            ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            WheelRouting::NearestScrollable,
+            HitRegionOrder::default(),
+            ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        )
+    }
+
+    fn indicator_test_region(ui: &mut egui::Ui) -> (EguiPresentedRegion, egui::Rect, egui::Rect) {
+        let rect = egui_test_rect(0.0, 0.0, 200.0, 100.0);
+        let scroll = indicator_test_declaration();
+        let offset = Point { x: 0.0, y: 40.0 };
+        let (track, thumb) = declared_scroll_indicator_geometry(rect, &scroll, offset)
+            .expect("the fixture region paints an indicator");
+        let mut region = test_presented_region(
+            ui,
+            "declared-indicator-region",
+            EguiPresentedRegionKind::Scroll,
+            rect,
+            egui::Sense::hover(),
+            CursorCapability::Default,
+        );
+        region.scroll_state = Some(EguiScrollRegionState {
+            declared_offset: offset,
+            egui_offset: offset,
+            content_size: Size {
+                width: 200.0,
+                height: 300.0,
+            },
+            inner_rect: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 100.0,
+                },
+            },
+            indicator: Some((track, thumb)),
+        });
+        (region, track, thumb)
+    }
+
+    // REVERT-AND-FAIL for the interactive-indicator seam: reverting the
+    // press handling (`egui_indicator_press_interaction`) makes the thumb
+    // press resolve to nothing and this test fails.
+    #[test]
+    fn declared_indicator_thumb_press_starts_drag_and_track_click_jumps() {
+        egui::__run_test_ui(|ui| {
+            let (region, track, thumb) = indicator_test_region(ui);
+            let regions = vec![region];
+
+            // Thumb press: backend-internal drag anchored at the current
+            // offset, nothing jumped.
+            let thumb_center = thumb.center();
+            let (drag, jump) = egui_indicator_press_interaction(&regions, thumb_center)
+                .expect("a thumb press must be claimed by the indicator");
+            assert_eq!(jump, None);
+            assert_eq!(drag.start_offset_y, 40.0);
+            assert_eq!(
+                drag.region_id,
+                PresentationRegionId::from("declared-indicator-region")
+            );
+
+            // Drag down 30px: the offset advances by the track-to-content
+            // ratio, clamped to the declared travel.
+            let expected = 40.0 + 30.0 * drag.max_offset / drag.track_travel;
+            let offset = egui_indicator_drag_offset(&drag, thumb_center.y + 30.0);
+            assert!(
+                (offset - expected.min(drag.max_offset)).abs() < 0.5,
+                "drag must map track travel to the declared offset: got {offset}, expected {expected}"
+            );
+
+            // Track click at the bottom: JUMP-TO-POSITION clamps to the max
+            // offset (the documented semantics; the press keeps dragging
+            // from the jumped anchor).
+            let (drag, jump) = egui_indicator_press_interaction(
+                &regions,
+                egui::pos2(track.center().x, track.bottom() - 2.0),
+            )
+            .expect("a track press must be claimed by the indicator");
+            assert_eq!(jump, Some(200.0));
+            assert_eq!(drag.start_offset_y, 200.0);
+        });
+    }
+
+    // The synthesized hit surface must not collide with authored content
+    // stacked ABOVE the indicator's region: a fronting opaque layer
+    // (occlusion region) owns its pixels — the overlay-panel case.
+    #[test]
+    fn declared_indicator_press_defers_to_fronting_occlusion_region() {
+        egui::__run_test_ui(|ui| {
+            let (region, _track, thumb) = indicator_test_region(ui);
+            let mut occluder = test_presented_region(
+                ui,
+                "covering-panel",
+                EguiPresentedRegionKind::Occlusion,
+                egui_test_rect(180.0, 0.0, 20.0, 100.0),
+                egui::Sense::hover(),
+                CursorCapability::Default,
+            );
+            occluder.paint_sort_key = (10, 0, 0);
+            let thumb_center = thumb.center();
+            let regions = vec![region, occluder];
+            assert!(
+                egui_indicator_press_interaction(&regions, thumb_center).is_none(),
+                "a press under an opaque fronting layer must not start an indicator drag"
+            );
+        });
+    }
+
+    // The drag emits a declared Scroll event through the same evidence
+    // path as the offset sync: the declared region is selected and the
+    // synthesized offset is carried.
+    #[test]
+    fn declared_indicator_drag_synthesizes_declared_scroll_event() {
+        egui::__run_test_ui(|ui| {
+            let frame = FrameIdentity {
+                surface_id: "egui-test".to_string(),
+                surface_instance_id: "indicator-drag".to_string(),
+                revision: 1,
+                frame_index: 1,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 200.0,
+                        height: 100.0,
+                    },
+                },
+            };
+            let layout = LayoutOutput {
+                bounds: TargetLocalRect::new(frame.viewport),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+            let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+            let scroll_regions = vec![indicator_test_declaration()];
+            let (region, _track, thumb) = indicator_test_region(ui);
+            let regions = vec![region];
+            let context = EguiInputContext {
+                ui,
+                widget_id: WidgetId::from("root"),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &[],
+                focus_regions: &[],
+                scroll_regions: &scroll_regions,
+                response: &regions[0].response,
+                regions: &regions,
+                native_physical_operation: None,
+            };
+
+            let (drag, _) = egui_indicator_press_interaction(&regions, thumb.center())
+                .expect("thumb press claimed");
+            let offset_y = egui_indicator_drag_offset(&drag, thumb.center().y + 30.0);
+            let event = egui_indicator_scroll_event_for_offset(&regions[0], offset_y)
+                .expect("scroll event built");
+            let input = egui_scroll_backend_input_event(&context, &regions[0], event)
+                .expect("declared scroll input synthesized");
+            let evidence = input
+                .dispatch_evidence
+                .as_ref()
+                .expect("indicator drag carries dispatch evidence");
+            assert_eq!(
+                evidence.selected_region,
+                Some(PresentationRegionId::from("declared-indicator-region"))
+            );
+            let InputEvent::Scroll(scroll) = input.event else {
+                panic!("expected a Scroll event");
+            };
+            assert_eq!(
+                scroll.region_id,
+                PresentationRegionId::from("declared-indicator-region")
+            );
+            assert!(
+                (scroll.offset_y - offset_y).abs() < f32::EPSILON,
+                "the synthesized event must carry the drag-computed offset"
+            );
         });
     }
 
@@ -10030,8 +10479,14 @@ mod tests {
                 native_physical_operation: None,
             };
 
-            let event = egui_backend_wheel_input_event(&context, egui::pos2(20.0, 20.0), 0.0, -4.0)
-                .expect("outer receives wheel when inner is at bottom");
+            let event = egui_backend_wheel_input_event(
+                &context,
+                egui::pos2(20.0, 20.0),
+                0.0,
+                -4.0,
+                &mut Vec::new(),
+            )
+            .expect("outer receives wheel when inner is at bottom");
             let evidence = event
                 .dispatch_evidence
                 .as_ref()
@@ -10039,6 +10494,11 @@ mod tests {
             assert_eq!(
                 evidence.selected_region,
                 Some(PresentationRegionId::from("outer-scroll"))
+            );
+            assert_eq!(
+                evidence.input_position_space,
+                Some(slipway_core::DispatchPositionSpace::Content),
+                "the content dispatch branch must annotate its space"
             );
             let InputEvent::Wheel(wheel) = event.event else {
                 panic!("expected wheel event");
@@ -10055,12 +10515,833 @@ mod tests {
                 scroll_regions: &scroll_regions,
                 ..context
             };
+            let mut refusals = Vec::new();
             assert!(
-                egui_backend_wheel_input_event(&context, egui::pos2(20.0, 20.0), 0.0, -4.0)
-                    .is_none(),
+                egui_backend_wheel_input_event(
+                    &context,
+                    egui::pos2(20.0, 20.0),
+                    0.0,
+                    -4.0,
+                    &mut refusals
+                )
+                .is_none(),
                 "no Slipway wheel is generated when every containing scroll owner is at boundary"
             );
+            // MF-H3: the at-boundary wheel must leave its refusal evidence
+            // instead of vanishing without a trace.
+            assert_eq!(refusals.len(), 1);
+            let refusal = &refusals[0];
+            assert_eq!(refusal.selected_region, None);
+            assert_eq!(
+                refusal.refusal_reason.as_deref(),
+                Some("no enabled scroll region accepted the physical wheel position")
+            );
+            assert_eq!(
+                refusal.candidate_regions,
+                vec![
+                    PresentationRegionId::from("outer-scroll"),
+                    PresentationRegionId::from("inner-scroll"),
+                ],
+                "containing-but-at-limit regions stay listed as candidates"
+            );
+            assert!(refusal.input_position.is_some());
+            assert!(refusal.input_position_space.is_some());
         });
+    }
+
+    #[test]
+    fn backend_wheel_event_honors_declared_self_first_outer_scroll() {
+        // Mirror of `backend_wheel_event_uses_declared_boundary_bubbling`,
+        // but the back outer region declares SelfFirst while the fronter
+        // inner region is consumable: the backend wheel path must select the
+        // SelfFirst outer region even though the inner would win by order
+        // (ADR-0002 B2 routed through the shared core selector).
+        egui::__run_test_ui(|ui| {
+            let target = WidgetId::from("scroll");
+            let frame = FrameIdentity {
+                surface_id: "egui-test".to_string(),
+                surface_instance_id: "wheel-self-first".to_string(),
+                revision: 1,
+                frame_index: 1,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+            };
+            let layout = LayoutOutput {
+                bounds: TargetLocalRect::new(frame.viewport),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+            let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+            let mut outer_scroll = test_scroll_region(target.clone(), frame.viewport);
+            outer_scroll.id = PresentationRegionId::from("outer-scroll");
+            outer_scroll.address = None;
+            outer_scroll.content_bounds = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 300.0,
+                },
+            });
+            outer_scroll.offset = Point { x: 0.0, y: 0.0 };
+            outer_scroll.axes = ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            };
+            outer_scroll.order = HitRegionOrder::default();
+            outer_scroll.consumption = ScrollConsumptionPolicy::exclusive_wheel();
+            let mut inner_scroll = outer_scroll.clone();
+            inner_scroll.id = PresentationRegionId::from("inner-scroll");
+            inner_scroll.wheel_routing = WheelRouting::NearestScrollable;
+            inner_scroll.order = HitRegionOrder {
+                z_index: 1,
+                paint_order: 0,
+                traversal_order: 0,
+            };
+            outer_scroll.wheel_routing = WheelRouting::SelfFirst;
+            let scroll_regions = vec![outer_scroll, inner_scroll];
+
+            let rect = egui_test_rect(0.0, 0.0, 100.0, 100.0);
+            let mut outer_region = test_presented_region(
+                ui,
+                "outer-scroll",
+                EguiPresentedRegionKind::Scroll,
+                rect,
+                egui::Sense::hover(),
+                CursorCapability::Default,
+            );
+            outer_region.paint_sort_key = (0, 0, 0);
+            let mut inner_region = test_presented_region(
+                ui,
+                "inner-scroll",
+                EguiPresentedRegionKind::Scroll,
+                rect,
+                egui::Sense::hover(),
+                CursorCapability::Default,
+            );
+            inner_region.paint_sort_key = (1, 0, 0);
+            let regions = vec![outer_region, inner_region];
+            let context = EguiInputContext {
+                ui,
+                widget_id: WidgetId::from("root"),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &[],
+                focus_regions: &[],
+                scroll_regions: &scroll_regions,
+                response: &regions[0].response,
+                regions: &regions,
+                native_physical_operation: None,
+            };
+
+            // Both regions contain the cursor and can consume delta_y = -4
+            // (offset 0 of 200 max). The default would pick the fronter
+            // inner region; SelfFirst overrides the order key.
+            let event = egui_backend_wheel_input_event(
+                &context,
+                egui::pos2(20.0, 20.0),
+                0.0,
+                -4.0,
+                &mut Vec::new(),
+            )
+            .expect("SelfFirst outer region consumes the wheel");
+            let evidence = event
+                .dispatch_evidence
+                .as_ref()
+                .expect("declared wheel evidence");
+            assert_eq!(
+                evidence.selected_region,
+                Some(PresentationRegionId::from("outer-scroll"))
+            );
+            let InputEvent::Wheel(wheel) = event.event else {
+                panic!("expected wheel event");
+            };
+            assert_eq!(
+                wheel.region_id,
+                Some(PresentationRegionId::from("outer-scroll"))
+            );
+            assert_eq!(wheel.target, target);
+        });
+    }
+
+    #[test]
+    fn wheel_transparent_occlusion_reaches_scroll_region_while_opaque_absorbs() {
+        egui::__run_test_ui(|ui| {
+            let target = WidgetId::from("scroll");
+            let frame = FrameIdentity {
+                surface_id: "egui-test".to_string(),
+                surface_instance_id: "wheel-transparency".to_string(),
+                revision: 1,
+                frame_index: 1,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 100.0,
+                    },
+                },
+            };
+            let layout = LayoutOutput {
+                bounds: TargetLocalRect::new(frame.viewport),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+            let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+            let mut scroll = test_scroll_region(target.clone(), frame.viewport);
+            scroll.id = PresentationRegionId::from("root-scroll");
+            scroll.address = None;
+            scroll.content_bounds = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 300.0,
+                },
+            });
+            scroll.offset = Point { x: 0.0, y: 0.0 };
+            scroll.axes = ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            };
+            scroll.wheel_routing = WheelRouting::NearestScrollable;
+            scroll.order = HitRegionOrder::default();
+            scroll.consumption = ScrollConsumptionPolicy::exclusive_wheel();
+            let scroll_regions = vec![scroll];
+
+            let rect = egui_test_rect(0.0, 0.0, 100.0, 100.0);
+            let mut scroll_region = test_presented_region(
+                ui,
+                "root-scroll",
+                EguiPresentedRegionKind::Scroll,
+                rect,
+                egui::Sense::hover(),
+                CursorCapability::Default,
+            );
+            scroll_region.paint_sort_key = (0, 0, 0);
+            // A front (higher-key) opaque overlay occlusion over the scroll.
+            let mut opaque_occlusion = test_presented_region(
+                ui,
+                "overlay-occlusion",
+                EguiPresentedRegionKind::Occlusion,
+                rect,
+                egui::Sense::hover(),
+                CursorCapability::Default,
+            );
+            opaque_occlusion.paint_sort_key = (10, 0, 0);
+            assert!(
+                opaque_occlusion.blocks_wheel,
+                "an occlusion derived from a default-opaque layer blocks the wheel"
+            );
+            // Same overlay authored wheel-pass-through: still a pointer occluder
+            // (kind stays Occlusion) but the wheel channel is transparent.
+            let mut wheel_transparent_occlusion = opaque_occlusion.clone();
+            wheel_transparent_occlusion.blocks_wheel = false;
+
+            // Default-opaque overlay ABSORBS the wheel (no dispatch produced).
+            let opaque_regions = vec![scroll_region.clone(), opaque_occlusion];
+            let opaque_context = EguiInputContext {
+                ui,
+                widget_id: WidgetId::from("root"),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &[],
+                focus_regions: &[],
+                scroll_regions: &scroll_regions,
+                response: &opaque_regions[0].response,
+                regions: &opaque_regions,
+                native_physical_operation: None,
+            };
+            let mut occlusion_refusals = Vec::new();
+            assert!(
+                egui_backend_wheel_input_event(
+                    &opaque_context,
+                    egui::pos2(20.0, 20.0),
+                    0.0,
+                    -4.0,
+                    &mut occlusion_refusals
+                )
+                .is_none(),
+                "a front default-opaque overlay must still absorb the wheel"
+            );
+            // MF-H3 (occlusion arm): the absorbed wheel must leave refusal
+            // evidence naming the would-be consumer and the occluder cause.
+            assert_eq!(occlusion_refusals.len(), 1);
+            let occlusion_refusal = &occlusion_refusals[0];
+            assert_eq!(
+                occlusion_refusal.selected_region,
+                Some(PresentationRegionId::from("root-scroll"))
+            );
+            assert!(
+                occlusion_refusal.refusal_reason.as_deref().is_some_and(
+                    |reason| reason.contains("occluded by a front wheel-blocking paint layer")
+                ),
+                "the refusal reason names the occluder: {:?}",
+                occlusion_refusal.refusal_reason
+            );
+
+            // Wheel-transparent overlay lets the wheel REACH the scroll region.
+            let through_regions = vec![scroll_region, wheel_transparent_occlusion];
+            let through_context = EguiInputContext {
+                ui,
+                widget_id: WidgetId::from("root"),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &[],
+                focus_regions: &[],
+                scroll_regions: &scroll_regions,
+                response: &through_regions[0].response,
+                regions: &through_regions,
+                native_physical_operation: None,
+            };
+            let event = egui_backend_wheel_input_event(
+                &through_context,
+                egui::pos2(20.0, 20.0),
+                0.0,
+                -4.0,
+                &mut Vec::new(),
+            )
+            .expect("a wheel-transparent overlay must let the scroll region behind consume it");
+            let evidence = event
+                .dispatch_evidence
+                .as_ref()
+                .expect("declared wheel evidence");
+            assert_eq!(
+                evidence.selected_region,
+                Some(PresentationRegionId::from("root-scroll"))
+            );
+        });
+    }
+
+    #[test]
+    fn backend_wheel_dispatch_position_follows_scrolled_region_like_pointer() {
+        egui::__run_test_ui(|ui| {
+            // Content/dispatch space is 100x400. The root has scrolled down by
+            // 200, so the nested list (content y[200,300]) is shown at view-local
+            // y[0,100]. Its presented region carries the scrolled visual origin,
+            // exactly the offset source the pointer path already uses.
+            let frame = FrameIdentity {
+                surface_id: "egui-test".to_string(),
+                surface_instance_id: "wheel-scrolled-region".to_string(),
+                revision: 1,
+                frame_index: 1,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 400.0,
+                    },
+                },
+            };
+            // The list target sits at content-space y[200,300] (the geometry the
+            // scrolled layout produced), while it is painted at view-local
+            // y[0,100].
+            let layout = LayoutOutput {
+                bounds: TargetLocalRect::new(frame.viewport),
+                child_placements: vec![ChildPlacement {
+                    child: WidgetId::from("list-scroll"),
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 200.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 100.0,
+                        },
+                    }),
+                    local_state_slot: None,
+                }],
+                diagnostics: Vec::new(),
+            };
+            let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+
+            let mut root_scroll = test_scroll_region(WidgetId::from("root"), frame.viewport);
+            root_scroll.id = PresentationRegionId::from("root-scroll");
+            root_scroll.address = None;
+            root_scroll.viewport = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 400.0,
+                },
+            });
+            root_scroll.content_bounds = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 800.0,
+                },
+            });
+            root_scroll.offset = Point { x: 0.0, y: 0.0 };
+            root_scroll.axes = ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            };
+            root_scroll.wheel_routing = WheelRouting::NearestScrollable;
+            root_scroll.order = HitRegionOrder::default();
+            root_scroll.consumption = ScrollConsumptionPolicy::exclusive_wheel();
+            root_scroll.enabled = true;
+
+            let mut list_scroll = root_scroll.clone();
+            list_scroll.id = PresentationRegionId::from("list-scroll");
+            list_scroll.target = WidgetId::from("list-scroll");
+            list_scroll.viewport = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 100.0,
+                },
+            });
+            list_scroll.content_bounds = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 400.0,
+                },
+            });
+            list_scroll.order = HitRegionOrder {
+                z_index: 1,
+                paint_order: 0,
+                traversal_order: 0,
+            };
+
+            let scroll_regions = vec![root_scroll, list_scroll];
+            // The list's presented region is painted at view-local y[0,100]
+            // (`target_origin`), while its content rect (from the geometry index)
+            // is at y[200,300]. That difference encodes the root scroll offset.
+            let list_region = test_presented_region(
+                ui,
+                "list-scroll",
+                EguiPresentedRegionKind::Scroll,
+                egui_test_rect(0.0, 0.0, 100.0, 100.0),
+                egui::Sense::click_and_drag(),
+                CursorCapability::Default,
+            );
+            let regions = vec![list_region];
+            let context = EguiInputContext {
+                ui,
+                widget_id: WidgetId::from("root"),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &[],
+                focus_regions: &[],
+                scroll_regions: &scroll_regions,
+                response: &regions[0].response,
+                regions: &regions,
+                native_physical_operation: None,
+            };
+
+            // The wheel maps its view-local cursor through the region under it
+            // (like the pointer path), so (20, 50) view-local becomes (20, 250)
+            // in content/dispatch space.
+            assert_eq!(
+                egui_wheel_dispatch_position(&context, egui::pos2(20.0, 50.0)),
+                Point { x: 20.0, y: 250.0 },
+                "wheel dispatch must map through the scrolled region, not stay view-local"
+            );
+
+            let event = egui_backend_wheel_input_event(
+                &context,
+                egui::pos2(20.0, 50.0),
+                0.0,
+                -4.0,
+                &mut Vec::new(),
+            )
+            .expect("scrolled wheel resolves to the visually shown nested list");
+            let evidence = event
+                .dispatch_evidence
+                .as_ref()
+                .expect("declared wheel evidence");
+            assert_eq!(
+                evidence.selected_region,
+                Some(PresentationRegionId::from("list-scroll")),
+                "wheel over the nested list's visual position must route to the list, not the root"
+            );
+            assert_eq!(
+                evidence.input_position,
+                Some(Point { x: 20.0, y: 250.0 }),
+                "wheel dispatch position must include the scroll offset the region encodes"
+            );
+            assert_eq!(
+                evidence.input_position_space,
+                Some(slipway_core::DispatchPositionSpace::Content),
+                "the content dispatch branch must annotate its space"
+            );
+            let InputEvent::Wheel(wheel) = event.event else {
+                panic!("expected wheel event");
+            };
+            assert_eq!(
+                wheel.region_id,
+                Some(PresentationRegionId::from("list-scroll"))
+            );
+
+            // Contrast: with no region under the cursor the wheel falls back to
+            // the plain view-local mapping (20, 50), which only the root scroll
+            // region contains -- the pre-fix behaviour that misrouted the wheel.
+            let no_region: Vec<EguiPresentedRegion> = Vec::new();
+            let fallback_context = EguiInputContext {
+                regions: &no_region,
+                ..context
+            };
+            assert_eq!(
+                egui_wheel_dispatch_position(&fallback_context, egui::pos2(20.0, 50.0)),
+                Point { x: 20.0, y: 50.0 }
+            );
+            let event = egui_backend_wheel_input_event(
+                &fallback_context,
+                egui::pos2(20.0, 50.0),
+                0.0,
+                -4.0,
+                &mut Vec::new(),
+            )
+            .expect("fallback wheel resolves to the root scroll region");
+            assert_eq!(
+                event
+                    .dispatch_evidence
+                    .as_ref()
+                    .expect("declared wheel evidence")
+                    .selected_region,
+                Some(PresentationRegionId::from("root-scroll"))
+            );
+        });
+    }
+
+    #[test]
+    fn backend_wheel_root_chaining_survives_ancestor_scroll_past_viewport_band() {
+        // Regression for the sustained-wheel FREEZE exposed by the Step 190 E1
+        // content-space wheel mapping. The visible root scroll owns a 400-tall
+        // viewport over 1000-tall content and has already scrolled down by 200.
+        // The cursor sits low in the window (view-local y 380) over a nested
+        // panel that the root scroll has displaced upward, so the content-space
+        // dispatch point maps to y 580 -- past the root's un-scrolled viewport
+        // band [0,400]. Core wheel-owner selection tests declared viewport rects
+        // at their un-scrolled geometry positions, so no scroll region contains
+        // y 580 and the raw content point yields no consumer: that is the dead
+        // wheel the user hit ("works a few notches, then freezes"). The repair
+        // falls back to the visible-viewport point (y 380), which the
+        // un-displaced root scroll still contains, so root chaining continues.
+        egui::__run_test_ui(|ui| {
+            let frame = FrameIdentity {
+                surface_id: "egui-test".to_string(),
+                surface_instance_id: "wheel-freeze".to_string(),
+                revision: 1,
+                frame_index: 1,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 400.0,
+                    },
+                },
+            };
+            // The nested panel target sits at content-space y[500,650] but is
+            // painted (target_origin) at view-local y[300,450] -- the 200 gap is
+            // the ancestor root scroll offset.
+            let layout = LayoutOutput {
+                bounds: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 1000.0,
+                    },
+                }),
+                child_placements: vec![ChildPlacement {
+                    child: WidgetId::from("panel"),
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 500.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 150.0,
+                        },
+                    }),
+                    local_state_slot: None,
+                }],
+                diagnostics: Vec::new(),
+            };
+            let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+
+            let mut root_scroll = test_scroll_region(
+                WidgetId::from("root"),
+                Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 400.0,
+                    },
+                },
+            );
+            root_scroll.id = PresentationRegionId::from("root-scroll");
+            root_scroll.address = None;
+            root_scroll.viewport = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 400.0,
+                },
+            });
+            root_scroll.content_bounds = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 1000.0,
+                },
+            });
+            root_scroll.offset = Point { x: 0.0, y: 200.0 };
+            root_scroll.axes = ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            };
+            let scroll_regions = vec![root_scroll];
+
+            // The root scroll is presented at its un-scrolled viewport position
+            // (target_origin == view origin), so it is an undisplaced ancestor.
+            let root_region = test_presented_region(
+                ui,
+                "root-scroll",
+                EguiPresentedRegionKind::Scroll,
+                egui_test_rect(0.0, 0.0, 100.0, 400.0),
+                egui::Sense::hover(),
+                CursorCapability::Default,
+            );
+            // The nested panel is presented displaced (view-local y[300,450]).
+            let mut panel_region = test_presented_region(
+                ui,
+                "panel",
+                EguiPresentedRegionKind::Hit,
+                egui_test_rect(0.0, 300.0, 100.0, 150.0),
+                egui::Sense::click_and_drag(),
+                CursorCapability::Default,
+            );
+            panel_region.paint_sort_key = (1, 0, 0);
+            let regions = vec![root_region, panel_region];
+            let context = EguiInputContext {
+                ui,
+                widget_id: WidgetId::from("root"),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &[],
+                focus_regions: &[],
+                scroll_regions: &scroll_regions,
+                response: &regions[0].response,
+                regions: &regions,
+                native_physical_operation: None,
+            };
+
+            // The content-space dispatch point drifts past the root viewport band
+            // and no scroll owner accepts it -- the freeze (pre-fix dead wheel).
+            assert_eq!(
+                egui_wheel_dispatch_position(&context, egui::pos2(20.0, 380.0)),
+                Point { x: 20.0, y: 580.0 },
+                "cursor over the ancestor-displaced panel maps to content y 580"
+            );
+            assert!(
+                egui_wheel_select_consumer(&context, Point { x: 20.0, y: 580.0 }, 0.0, -4.0)
+                    .is_none(),
+                "content point past the root viewport band has no wheel owner (the freeze)"
+            );
+
+            // The repaired resolve position falls back to the visible-viewport
+            // point, which the undisplaced root scroll still owns.
+            let event = egui_backend_wheel_input_event(
+                &context,
+                egui::pos2(20.0, 380.0),
+                0.0,
+                -4.0,
+                &mut Vec::new(),
+            )
+            .expect(
+                "sustained wheel must keep chaining to the root after the ancestor scroll \
+                     pushes the content point past the viewport band (no freeze)",
+            );
+            let evidence = event
+                .dispatch_evidence
+                .as_ref()
+                .expect("declared wheel evidence");
+            assert_eq!(
+                evidence.selected_region,
+                Some(PresentationRegionId::from("root-scroll")),
+                "the wheel resolves to the root scroll owner via the visible-viewport point"
+            );
+            assert_eq!(
+                evidence.input_position,
+                Some(Point { x: 20.0, y: 380.0 }),
+                "the repaired resolve position is the visible-viewport point, not the drifted \
+                 content point"
+            );
+            assert_eq!(
+                evidence.input_position_space,
+                Some(slipway_core::DispatchPositionSpace::Viewport),
+                "the visible-viewport fallback branch must annotate its space"
+            );
+            let InputEvent::Wheel(wheel) = event.event else {
+                panic!("expected wheel event");
+            };
+            assert_eq!(
+                wheel.region_id,
+                Some(PresentationRegionId::from("root-scroll"))
+            );
+
+            // MF-M1 fallback-origin fix: the visible-viewport point must add
+            // `frame.viewport.origin` exactly like the primary path
+            // (`egui_view_root_local_position`) so both wheel branches live in
+            // the same root-local frame family.
+            let mut origin_frame = frame.clone();
+            origin_frame.viewport.origin = Point { x: 8.0, y: 40.0 };
+            let origin_context = EguiInputContext {
+                frame: &origin_frame,
+                ..context
+            };
+            assert_eq!(
+                egui_wheel_visible_viewport_position(&origin_context, egui::pos2(20.0, 380.0)),
+                Point { x: 28.0, y: 420.0 },
+                "the fallback point must include frame.viewport.origin"
+            );
+        });
+    }
+
+    #[test]
+    fn captured_drag_move_preserves_pressed_primary_button() {
+        let ctx = egui::Context::default();
+        let mut bridge = DefaultEguiBridge::new();
+
+        let frame = FrameIdentity {
+            surface_id: "egui-test".to_string(),
+            surface_instance_id: "captured-drag".to_string(),
+            revision: 1,
+            frame_index: 1,
+            viewport: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 160.0,
+                    height: 120.0,
+                },
+            },
+        };
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(frame.viewport),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let drag_bounds = Rect {
+            origin: Point { x: 8.0, y: 8.0 },
+            size: Size {
+                width: 40.0,
+                height: 24.0,
+            },
+        };
+
+        // Pass 1: a primary press inside the drag handle begins the capture.
+        let press_input = egui::RawInput {
+            events: vec![egui::Event::PointerButton {
+                pos: egui::pos2(20.0, 20.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(press_input, |ui| {
+            let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+            let mut hit = test_hit_region("drag-hit", WidgetId::from("drag"), drag_bounds, 0);
+            hit.capture = PointerCaptureIntent::DuringDrag;
+            let hit_regions = vec![hit];
+            let region = test_presented_region(
+                ui,
+                "drag-hit",
+                EguiPresentedRegionKind::Hit,
+                egui_test_rect(8.0, 8.0, 40.0, 24.0),
+                egui::Sense::click_and_drag(),
+                CursorCapability::Grab,
+            );
+            let regions = vec![region];
+            let context = EguiInputContext {
+                ui,
+                widget_id: WidgetId::from("root"),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &hit_regions,
+                focus_regions: &[],
+                scroll_regions: &[],
+                response: &regions[0].response,
+                regions: &regions,
+                native_physical_operation: None,
+            };
+            let _ = EguiSlipwayBridge::<ProbeWidget>::input_events(&mut bridge, context);
+        });
+
+        assert!(
+            bridge.pointer_capture_region.is_some(),
+            "primary press on a drag handle must begin the stateful pointer capture"
+        );
+        assert_eq!(
+            bridge.pointer_capture_button,
+            Some(egui::PointerButton::Primary),
+            "the capture must remember the button that started the drag"
+        );
+
+        // Pass 2: a captured move (pointer leaves the handle bounds) must still
+        // carry the held primary button so shared drag handlers do not cancel.
+        let move_input = egui::RawInput {
+            events: vec![egui::Event::PointerMoved(egui::pos2(140.0, 96.0))],
+            ..Default::default()
+        };
+        let mut produced: Vec<BackendInputEvent> = Vec::new();
+        let _ = ctx.run_ui(move_input, |ui| {
+            let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+            let mut hit = test_hit_region("drag-hit", WidgetId::from("drag"), drag_bounds, 0);
+            hit.capture = PointerCaptureIntent::DuringDrag;
+            let hit_regions = vec![hit];
+            let region = test_presented_region(
+                ui,
+                "drag-hit",
+                EguiPresentedRegionKind::Hit,
+                egui_test_rect(8.0, 8.0, 40.0, 24.0),
+                egui::Sense::click_and_drag(),
+                CursorCapability::Grab,
+            );
+            let regions = vec![region];
+            let context = EguiInputContext {
+                ui,
+                widget_id: WidgetId::from("root"),
+                frame: &frame,
+                rect: egui_rect(egui::pos2(0.0, 0.0), frame.viewport),
+                layout: &layout,
+                geometry_index: &geometry_index,
+                hit_regions: &hit_regions,
+                focus_regions: &[],
+                scroll_regions: &[],
+                response: &regions[0].response,
+                regions: &regions,
+                native_physical_operation: None,
+            };
+            produced = EguiSlipwayBridge::<ProbeWidget>::input_events(&mut bridge, context);
+        });
+
+        let move_pointer = produced
+            .iter()
+            .find_map(|event| match &event.event {
+                InputEvent::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                    Some(pointer)
+                }
+                _ => None,
+            })
+            .expect("captured drag move must produce a pointer Move input");
+        assert!(
+            move_pointer.details.buttons.primary,
+            "captured drag move must preserve the pressed primary button state"
+        );
     }
 
     #[test]
@@ -11204,533 +12485,6 @@ mod tests {
                 self.children.1.id()
             };
             WidgetSlotAddress::new(self.id(), 0).child(child, index)
-        }
-    }
-
-    impl SlipwayWidgetTypes for MoveProbeWidget {
-        type ExternalState = ();
-        type LocalState = usize;
-        type AppMessage = ProbeMessage;
-    }
-
-    impl SlipwaySsot for MoveProbeWidget {
-        fn id(&self) -> WidgetId {
-            self.id.clone()
-        }
-
-        fn capabilities(&self) -> Vec<Capability> {
-            vec![Capability::PointerInput, Capability::Paint]
-        }
-
-        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
-            TopologyNode::leaf(self.id.clone())
-        }
-
-        fn unsupported(&self) -> Vec<Diagnostic> {
-            Vec::new()
-        }
-    }
-
-    impl SlipwayLogic for MoveProbeWidget {
-        fn handle_event(
-            &self,
-            _external: &Self::ExternalState,
-            local: &mut Self::LocalState,
-            event: InputEvent,
-        ) -> EventOutcome<Self::AppMessage> {
-            match event {
-                InputEvent::Pointer(pointer)
-                    if pointer.target == self.id
-                        && pointer.kind == slipway_core::PointerEventKind::Move =>
-                {
-                    *local += 1;
-                    EventOutcome::message(self.id.clone(), "routed", ProbeMessage::Routed)
-                }
-                _ => EventOutcome::ignored(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventRoutingPolicy for MoveProbeWidget {
-        fn event_routing_policy(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-        ) -> slipway_core::EventRoutingPolicyDeclaration {
-            let id = self.id();
-            let address = event.target_slot().cloned();
-            let path = address
-                .as_ref()
-                .map(|address| address.path.clone())
-                .unwrap_or_else(|| vec![id.clone()]);
-            slipway_core::EventRoutingPolicyDeclaration {
-                target: id.clone(),
-                event_target: event.target().clone(),
-                route: slipway_core::EventRoute {
-                    route_id: Some("egui.probe.move.route".to_string()),
-                    address,
-                    path,
-                    phase: slipway_core::EventRoutePhase::Target,
-                },
-                capture: Vec::new(),
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventDispositionPolicy for MoveProbeWidget {
-        fn event_disposition(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-            _route: &slipway_core::EventRoute,
-        ) -> slipway_core::EventPropagationEvidence {
-            let id = self.id();
-            let handled = matches!(
-                event,
-                slipway_core::InputEvent::Pointer(pointer)
-                    if pointer.target == id
-                        && pointer.kind == slipway_core::PointerEventKind::Move
-            );
-            let disposition = slipway_core::EventDisposition {
-                handled,
-                propagate: !handled,
-                default_action_allowed: true,
-            };
-            slipway_core::EventPropagationEvidence {
-                target: id.clone(),
-                event: event.clone(),
-                steps: vec![slipway_core::EventPropagationStep {
-                    stage: slipway_core::EventPropagationStage::Target,
-                    node: Some(id),
-                    disposition,
-                    emitted_messages: Vec::new(),
-                    changes: Vec::new(),
-                }],
-                final_disposition: disposition,
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl SlipwayView for MoveProbeWidget {
-        fn initial_local_state(&self) -> Self::LocalState {
-            ProbeWidget::new(self.id.as_str()).initial_local_state()
-        }
-
-        fn layout(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: LayoutInput,
-        ) -> LayoutOutput {
-            ProbeWidget::new(self.id.as_str()).layout(external, local, input)
-        }
-
-        fn paint(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            layout: &LayoutOutput,
-        ) -> Vec<PaintOp> {
-            ProbeWidget::new(self.id.as_str()).paint(external, local, layout)
-        }
-
-        fn observe_state(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-        ) -> Vec<StateObservation> {
-            ProbeWidget::new(self.id.as_str()).observe_state(external, local)
-        }
-    }
-
-    impl SlipwayViewDefinition for MoveProbeWidget {
-        fn view_definition(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: ViewDefinitionInput,
-        ) -> ViewDefinition {
-            ProbeWidget::new(self.id.as_str()).view_definition(external, local, input)
-        }
-    }
-
-    impl SlipwayFontResolutionPolicy for MoveProbeWidget {
-        fn resolve_font(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            request: FontResolutionRequest,
-        ) -> FontResolutionEvidence {
-            ProbeWidget::new(self.id.as_str()).resolve_font(external, local, request)
-        }
-    }
-
-    impl SlipwayLayoutIntent for MoveProbeWidget {
-        fn layout_intent(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: &LayoutInput,
-        ) -> LayoutIntentProbe {
-            ProbeWidget::new(self.id.as_str()).layout_intent(external, local, input)
-        }
-    }
-
-    impl SlipwayWidgetTypes for HoverProbeWidget {
-        type ExternalState = ();
-        type LocalState = usize;
-        type AppMessage = ProbeMessage;
-    }
-
-    impl SlipwaySsot for HoverProbeWidget {
-        fn id(&self) -> WidgetId {
-            self.id.clone()
-        }
-
-        fn capabilities(&self) -> Vec<Capability> {
-            vec![Capability::PointerInput, Capability::Paint]
-        }
-
-        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
-            TopologyNode::leaf(self.id.clone())
-        }
-
-        fn unsupported(&self) -> Vec<Diagnostic> {
-            Vec::new()
-        }
-    }
-
-    impl SlipwayLogic for HoverProbeWidget {
-        fn handle_event(
-            &self,
-            _external: &Self::ExternalState,
-            local: &mut Self::LocalState,
-            event: InputEvent,
-        ) -> EventOutcome<Self::AppMessage> {
-            match event {
-                InputEvent::Pointer(pointer)
-                    if pointer.target == self.id
-                        && matches!(
-                            pointer.kind,
-                            slipway_core::PointerEventKind::Enter
-                                | slipway_core::PointerEventKind::Leave
-                        ) =>
-                {
-                    *local += 1;
-                    EventOutcome::message(self.id.clone(), "hovered", ProbeMessage::Routed)
-                }
-                _ => EventOutcome::ignored(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventRoutingPolicy for HoverProbeWidget {
-        fn event_routing_policy(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-        ) -> slipway_core::EventRoutingPolicyDeclaration {
-            let id = self.id();
-            let address = event.target_slot().cloned();
-            let path = address
-                .as_ref()
-                .map(|address| address.path.clone())
-                .unwrap_or_else(|| vec![id.clone()]);
-            slipway_core::EventRoutingPolicyDeclaration {
-                target: id.clone(),
-                event_target: event.target().clone(),
-                route: slipway_core::EventRoute {
-                    route_id: Some("egui.probe.hover.route".to_string()),
-                    address,
-                    path,
-                    phase: slipway_core::EventRoutePhase::Target,
-                },
-                capture: Vec::new(),
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventDispositionPolicy for HoverProbeWidget {
-        fn event_disposition(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-            _route: &slipway_core::EventRoute,
-        ) -> slipway_core::EventPropagationEvidence {
-            let id = self.id();
-            let handled = matches!(
-                event,
-                slipway_core::InputEvent::Pointer(pointer)
-                    if pointer.target == id
-                        && matches!(
-                            pointer.kind,
-                            slipway_core::PointerEventKind::Enter
-                                | slipway_core::PointerEventKind::Leave
-                        )
-            );
-            let disposition = slipway_core::EventDisposition {
-                handled,
-                propagate: !handled,
-                default_action_allowed: true,
-            };
-            slipway_core::EventPropagationEvidence {
-                target: id.clone(),
-                event: event.clone(),
-                steps: vec![slipway_core::EventPropagationStep {
-                    stage: slipway_core::EventPropagationStage::Target,
-                    node: Some(id),
-                    disposition,
-                    emitted_messages: Vec::new(),
-                    changes: Vec::new(),
-                }],
-                final_disposition: disposition,
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl SlipwayView for HoverProbeWidget {
-        fn initial_local_state(&self) -> Self::LocalState {
-            ProbeWidget::new(self.id.as_str()).initial_local_state()
-        }
-
-        fn layout(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: LayoutInput,
-        ) -> LayoutOutput {
-            ProbeWidget::new(self.id.as_str()).layout(external, local, input)
-        }
-
-        fn paint(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            layout: &LayoutOutput,
-        ) -> Vec<PaintOp> {
-            ProbeWidget::new(self.id.as_str()).paint(external, local, layout)
-        }
-
-        fn observe_state(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-        ) -> Vec<StateObservation> {
-            ProbeWidget::new(self.id.as_str()).observe_state(external, local)
-        }
-    }
-
-    impl SlipwayViewDefinition for HoverProbeWidget {
-        fn view_definition(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: ViewDefinitionInput,
-        ) -> ViewDefinition {
-            ProbeWidget::new(self.id.as_str()).view_definition(external, local, input)
-        }
-    }
-
-    impl SlipwayFontResolutionPolicy for HoverProbeWidget {
-        fn resolve_font(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            request: FontResolutionRequest,
-        ) -> FontResolutionEvidence {
-            ProbeWidget::new(self.id.as_str()).resolve_font(external, local, request)
-        }
-    }
-
-    impl SlipwayLayoutIntent for HoverProbeWidget {
-        fn layout_intent(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: &LayoutInput,
-        ) -> LayoutIntentProbe {
-            ProbeWidget::new(self.id.as_str()).layout_intent(external, local, input)
-        }
-    }
-
-    impl SlipwayWidgetTypes for CancelProbeWidget {
-        type ExternalState = ();
-        type LocalState = usize;
-        type AppMessage = ProbeMessage;
-    }
-
-    impl SlipwaySsot for CancelProbeWidget {
-        fn id(&self) -> WidgetId {
-            self.id.clone()
-        }
-
-        fn capabilities(&self) -> Vec<Capability> {
-            vec![Capability::PointerInput, Capability::Paint]
-        }
-
-        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
-            TopologyNode::leaf(self.id.clone())
-        }
-
-        fn unsupported(&self) -> Vec<Diagnostic> {
-            Vec::new()
-        }
-    }
-
-    impl SlipwayLogic for CancelProbeWidget {
-        fn handle_event(
-            &self,
-            _external: &Self::ExternalState,
-            local: &mut Self::LocalState,
-            event: InputEvent,
-        ) -> EventOutcome<Self::AppMessage> {
-            match event {
-                InputEvent::Pointer(pointer)
-                    if pointer.target == self.id
-                        && pointer.kind == slipway_core::PointerEventKind::Cancel =>
-                {
-                    *local += 1;
-                    EventOutcome::message(self.id.clone(), "cancelled", ProbeMessage::Routed)
-                }
-                _ => EventOutcome::ignored(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventRoutingPolicy for CancelProbeWidget {
-        fn event_routing_policy(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-        ) -> slipway_core::EventRoutingPolicyDeclaration {
-            let id = self.id();
-            let address = event.target_slot().cloned();
-            let path = address
-                .as_ref()
-                .map(|address| address.path.clone())
-                .unwrap_or_else(|| vec![id.clone()]);
-            slipway_core::EventRoutingPolicyDeclaration {
-                target: id.clone(),
-                event_target: event.target().clone(),
-                route: slipway_core::EventRoute {
-                    route_id: Some("egui.probe.cancel.route".to_string()),
-                    address,
-                    path,
-                    phase: slipway_core::EventRoutePhase::Target,
-                },
-                capture: Vec::new(),
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventDispositionPolicy for CancelProbeWidget {
-        fn event_disposition(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-            _route: &slipway_core::EventRoute,
-        ) -> slipway_core::EventPropagationEvidence {
-            let id = self.id();
-            let handled = matches!(
-                event,
-                slipway_core::InputEvent::Pointer(pointer)
-                    if pointer.target == id
-                        && pointer.kind == slipway_core::PointerEventKind::Cancel
-            );
-            let disposition = slipway_core::EventDisposition {
-                handled,
-                propagate: !handled,
-                default_action_allowed: true,
-            };
-            slipway_core::EventPropagationEvidence {
-                target: id.clone(),
-                event: event.clone(),
-                steps: vec![slipway_core::EventPropagationStep {
-                    stage: slipway_core::EventPropagationStage::Target,
-                    node: Some(id),
-                    disposition,
-                    emitted_messages: Vec::new(),
-                    changes: Vec::new(),
-                }],
-                final_disposition: disposition,
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl SlipwayView for CancelProbeWidget {
-        fn initial_local_state(&self) -> Self::LocalState {
-            ProbeWidget::new(self.id.as_str()).initial_local_state()
-        }
-
-        fn layout(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: LayoutInput,
-        ) -> LayoutOutput {
-            ProbeWidget::new(self.id.as_str()).layout(external, local, input)
-        }
-
-        fn paint(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            layout: &LayoutOutput,
-        ) -> Vec<PaintOp> {
-            ProbeWidget::new(self.id.as_str()).paint(external, local, layout)
-        }
-
-        fn observe_state(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-        ) -> Vec<StateObservation> {
-            ProbeWidget::new(self.id.as_str()).observe_state(external, local)
-        }
-    }
-
-    impl SlipwayViewDefinition for CancelProbeWidget {
-        fn view_definition(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: ViewDefinitionInput,
-        ) -> ViewDefinition {
-            ProbeWidget::new(self.id.as_str()).view_definition(external, local, input)
-        }
-    }
-
-    impl SlipwayFontResolutionPolicy for CancelProbeWidget {
-        fn resolve_font(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            request: FontResolutionRequest,
-        ) -> FontResolutionEvidence {
-            ProbeWidget::new(self.id.as_str()).resolve_font(external, local, request)
-        }
-    }
-
-    impl SlipwayLayoutIntent for CancelProbeWidget {
-        fn layout_intent(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: &LayoutInput,
-        ) -> LayoutIntentProbe {
-            ProbeWidget::new(self.id.as_str()).layout_intent(external, local, input)
         }
     }
 
@@ -13777,6 +14531,501 @@ mod tests {
         );
     }
 
+    // --- Step 210: declared scroll-indicator control (ScrollIndicatorMode) ---
+    // Fixture: a CANVAS-PAINTED (routed, no child placements) declared
+    // scroll region — ScrollProbeWidget's own view. Egui's presentation
+    // path allocates every declared region through
+    // `allocate_scroll_region_with_skips`, so the declared mode gates the
+    // indicator queue there.
+    fn declared_indicator_canvas_output(
+        indicator: slipway_core::ScrollIndicatorMode,
+    ) -> (bool, egui::FullOutput) {
+        let widget = ScrollProbeWidget {
+            id: WidgetId::from("declared-indicator-probe"),
+        };
+        let local = widget.initial_local_state();
+        let mut view = widget.view_definition(
+            &(),
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test".to_string(),
+                    surface_instance_id: "test".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+                layout_input: LayoutInput {
+                    viewport: TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    }),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: Size {
+                            width: 100.0,
+                            height: 80.0,
+                        },
+                    },
+                },
+            },
+        );
+        for region in &mut view.scroll_regions {
+            *region = region.clone().with_scroll_indicator(indicator);
+        }
+        assert!(
+            view.layout.child_placements.is_empty(),
+            "fixture must stay canvas-painted (no child placements)"
+        );
+
+        let mut allocated_scroll_region = false;
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(100.0, 80.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let (surface_rect, _root_response) =
+                    ui.allocate_exact_size(egui::vec2(100.0, 80.0), egui::Sense::hover());
+                let child_slots = authored_child_slots(&widget, &(), &local);
+                let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+                let mut child_assembly = EguiChildAssembly::default();
+                let regions = allocate_presentation_regions(
+                    ui,
+                    &widget,
+                    &(),
+                    &local,
+                    surface_rect.min,
+                    &view,
+                    &geometry_index,
+                    &child_slots,
+                    &mut child_assembly,
+                    None,
+                );
+                allocated_scroll_region = regions
+                    .iter()
+                    .any(|region| region.kind == EguiPresentedRegionKind::Scroll);
+                paint_declared_scroll_indicators(ui, &mut child_assembly.scroll_indicators);
+            },
+        );
+        (allocated_scroll_region, output)
+    }
+
+    // Auto = byte-identical pre-control behavior: the canvas-painted
+    // overflowing region gets an indicator on egui's presentation path
+    // (the control case the Hidden test contrasts against).
+    #[test]
+    fn declared_indicator_auto_paints_for_canvas_painted_region() {
+        let (allocated, output) =
+            declared_indicator_canvas_output(slipway_core::ScrollIndicatorMode::Auto);
+        assert!(allocated);
+        assert!(
+            rect_fill_shape_index(&output, declared_scroll_indicator_track_color()).is_some(),
+            "Auto must keep the pre-control indicator for a canvas-painted region"
+        );
+        assert!(rect_fill_shape_index(&output, declared_scroll_indicator_thumb_color()).is_some());
+    }
+
+    // Revert-and-fail guard: if the Hidden honor in
+    // `allocate_scroll_region_with_skips` is reverted, the indicator
+    // reappears and this test fails. Scrolling/wheel routing must stay
+    // intact (the scroll region is still allocated).
+    #[test]
+    fn declared_indicator_hidden_suppresses_indicator_but_keeps_scroll_region() {
+        let (allocated, output) =
+            declared_indicator_canvas_output(slipway_core::ScrollIndicatorMode::Hidden);
+        assert!(
+            allocated,
+            "Hidden is a visual control only; the scroll region must still allocate"
+        );
+        assert!(
+            rect_fill_shape_index(&output, declared_scroll_indicator_track_color()).is_none(),
+            "Hidden must never paint an indicator track"
+        );
+        assert!(
+            rect_fill_shape_index(&output, declared_scroll_indicator_thumb_color()).is_none(),
+            "Hidden must never paint an indicator thumb"
+        );
+    }
+
+    #[test]
+    fn declared_indicator_visible_paints_for_canvas_painted_region() {
+        let (allocated, output) =
+            declared_indicator_canvas_output(slipway_core::ScrollIndicatorMode::Visible);
+        assert!(allocated);
+        assert!(
+            rect_fill_shape_index(&output, declared_scroll_indicator_track_color()).is_some(),
+            "Visible must paint the indicator for a geometrically sensible region"
+        );
+        assert!(rect_fill_shape_index(&output, declared_scroll_indicator_thumb_color()).is_some());
+    }
+
+    // Step 211 upgrade (composed-level, position-aware): the Step 210 egui
+    // fixture pinned ONE region per view, while the composed reference
+    // example declares OVERLAPPING regions with distinct per-region modes on
+    // one child (outer Auto + inner-0 Visible + inner-1 Hidden — the nested
+    // card). This drives the live allocation path with that exact shape and
+    // asserts indicator PLACEMENT in the real egui output shapes: the
+    // Visible inner paints its indicator inside ITS viewport, the Hidden
+    // inner paints none inside its viewport, and the Auto outer keeps its
+    // own at the band's right edge.
+    #[test]
+    fn declared_indicator_modes_gate_per_region_in_nested_card_view() {
+        let widget = ScrollProbeWidget {
+            id: WidgetId::from("authored.nested"),
+        };
+        let local = widget.initial_local_state();
+        let card = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 560.0,
+                height: 176.0,
+            },
+        };
+        let outer_band = Rect {
+            origin: Point { x: 0.0, y: 28.0 },
+            size: Size {
+                width: 560.0,
+                height: 136.0,
+            },
+        };
+        let inner_viewport = |panel: usize| Rect {
+            origin: Point {
+                x: 12.0,
+                y: 46.0 + panel as f32 * 76.0,
+            },
+            size: Size {
+                width: 536.0,
+                height: 42.0,
+            },
+        };
+        let region = |id: &str, viewport: Rect, content_height: f32, index: usize| {
+            ScrollRegionDeclaration::explicit(
+                PresentationRegionId::from(id),
+                widget.id.clone(),
+                Some(WidgetSlotAddress::new(widget.id.clone(), 0)),
+                TargetLocalRect::new(viewport),
+                TargetLocalRect::new(Rect {
+                    origin: viewport.origin,
+                    size: Size {
+                        width: viewport.size.width,
+                        height: content_height,
+                    },
+                }),
+                Point { x: 0.0, y: 0.0 },
+                slipway_core::ScrollAxes {
+                    horizontal: false,
+                    vertical: true,
+                },
+                slipway_core::WheelRouting::NearestScrollable,
+                HitRegionOrder {
+                    z_index: if index == 0 { 0 } else { 1 },
+                    paint_order: index,
+                    traversal_order: index,
+                },
+                slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+                true,
+            )
+        };
+        let view = ViewDefinition {
+            target: widget.id.clone(),
+            frame: FrameIdentity {
+                surface_id: "test".to_string(),
+                surface_instance_id: "test".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: card,
+            },
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(card),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![
+                region("authored.nested:outer", outer_band, 152.0, 0),
+                region("authored.nested:inner-0", inner_viewport(0), 112.0, 1)
+                    .with_scroll_indicator(slipway_core::ScrollIndicatorMode::Visible),
+                region("authored.nested:inner-1", inner_viewport(1), 112.0, 2)
+                    .with_scroll_indicator(slipway_core::ScrollIndicatorMode::Hidden),
+            ],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let mut surface_min = egui::Pos2::ZERO;
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 220.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let (surface_rect, _root_response) =
+                    ui.allocate_exact_size(egui::vec2(560.0, 176.0), egui::Sense::hover());
+                surface_min = surface_rect.min;
+                let child_slots = authored_child_slots(&widget, &(), &local);
+                let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+                let mut child_assembly = EguiChildAssembly::default();
+                let _ = allocate_presentation_regions(
+                    ui,
+                    &widget,
+                    &(),
+                    &local,
+                    surface_rect.min,
+                    &view,
+                    &geometry_index,
+                    &child_slots,
+                    &mut child_assembly,
+                    None,
+                );
+                paint_declared_scroll_indicators(ui, &mut child_assembly.scroll_indicators);
+            },
+        );
+
+        let to_screen = |rect: Rect| {
+            egui::Rect::from_min_size(
+                egui::pos2(surface_min.x + rect.origin.x, surface_min.y + rect.origin.y),
+                egui::vec2(rect.size.width, rect.size.height),
+            )
+        };
+        let thumb_rects: Vec<egui::Rect> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect) if rect.fill == declared_scroll_indicator_thumb_color() => {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .collect();
+        let inner_0 = to_screen(inner_viewport(0));
+        let inner_1 = to_screen(inner_viewport(1));
+        let outer = to_screen(outer_band);
+        assert!(
+            thumb_rects.iter().any(|rect| inner_0.contains_rect(*rect)),
+            "the Visible inner region must paint its indicator thumb inside its own viewport: {thumb_rects:?} vs {inner_0:?}"
+        );
+        assert!(
+            !thumb_rects.iter().any(|rect| rect.intersects(inner_1)),
+            "the Hidden inner region must paint no indicator inside its viewport: {thumb_rects:?}"
+        );
+        assert!(
+            thumb_rects.iter().any(|rect| outer.contains_rect(*rect)
+                && !inner_0.contains_rect(*rect)
+                && !inner_1.intersects(*rect)),
+            "the Auto outer region must keep its own indicator at the band edge: {thumb_rects:?}"
+        );
+    }
+
+    // Step 211 (composed-level pointer routing): egui resolves the pointer
+    // press by the COMBINED presented-region order (hit AND scroll regions
+    // compete by paint_sort_key), so a clickable row declared UNDER its own
+    // scroll region's z is unreachable — the press resolves to the scroll
+    // region and produces no pointer dispatch (the live
+    // `native-physical-control-no-backend-trace` finding on the reference
+    // example's nested rows). This pins the working declaration shape: a
+    // row hit region that FRONTS the scroll region it sits on wins the
+    // press, and documents the combined-order rule with the losing shape.
+    #[test]
+    fn pointer_press_over_scrolled_row_resolves_to_the_fronting_row_hit_region() {
+        let widget = ScrollProbeWidget {
+            id: WidgetId::from("authored.nested"),
+        };
+        let local = widget.initial_local_state();
+        let card = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 560.0,
+                height: 176.0,
+            },
+        };
+        let inner_viewport = Rect {
+            origin: Point { x: 12.0, y: 46.0 },
+            size: Size {
+                width: 536.0,
+                height: 42.0,
+            },
+        };
+        let row_rect = Rect {
+            origin: Point { x: 20.0, y: 60.0 },
+            size: Size {
+                width: 520.0,
+                height: 12.0,
+            },
+        };
+        let address = Some(WidgetSlotAddress::new(widget.id.clone(), 0));
+        let scroll_region = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("authored.nested:inner-0"),
+            widget.id.clone(),
+            address.clone(),
+            TargetLocalRect::new(inner_viewport),
+            TargetLocalRect::new(Rect {
+                origin: inner_viewport.origin,
+                size: Size {
+                    width: inner_viewport.size.width,
+                    height: 112.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 1,
+                paint_order: 1,
+                traversal_order: 1,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let row_region = |z_index: i32| {
+            slipway_core::hit_region_from_pointer_capability(
+                &widget,
+                &(),
+                &local,
+                PresentationRegionId::from("authored.nested:panel0-row-1"),
+                address.clone(),
+                TargetLocalRect::new(row_rect),
+                slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                HitRegionOrder {
+                    z_index,
+                    paint_order: 1,
+                    traversal_order: 1,
+                },
+                Some("authored.nested:panel0-row-1".to_string()),
+                CursorCapability::Pointer,
+                true,
+                PointerCaptureIntent::OnPress,
+            )
+        };
+        let view_for = |row_z: i32| ViewDefinition {
+            target: widget.id.clone(),
+            frame: FrameIdentity {
+                surface_id: "test".to_string(),
+                surface_instance_id: "test".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: card,
+            },
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(card),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id.clone()),
+            hit_regions: vec![row_region(row_z)],
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll_region.clone()],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let selected_region_id_for = |row_z: i32| {
+            let view = view_for(row_z);
+            let mut selected: Option<String> = None;
+            let ctx = egui::Context::default();
+            // Two frames with the REAL pointer hovering the row point: the
+            // live selection runs with pointer response authority
+            // (`hovered`/`contains_pointer`), which needs the widgets of a
+            // previous frame — a hoverless single frame falls back to the
+            // geometry branch and hides the live behavior.
+            let mut surface_min = egui::Pos2::ZERO;
+            for evaluate in [false, true] {
+                let events = if evaluate {
+                    vec![egui::Event::PointerMoved(egui::pos2(
+                        surface_min.x + 60.0,
+                        surface_min.y + 66.0,
+                    ))]
+                } else {
+                    Vec::new()
+                };
+                let _ = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(600.0, 220.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let (surface_rect, _root_response) =
+                            ui.allocate_exact_size(egui::vec2(560.0, 176.0), egui::Sense::hover());
+                        surface_min = surface_rect.min;
+                        let child_slots = authored_child_slots(&widget, &(), &local);
+                        let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+                        let mut child_assembly = EguiChildAssembly::default();
+                        let regions = allocate_presentation_regions(
+                            ui,
+                            &widget,
+                            &(),
+                            &local,
+                            surface_rect.min,
+                            &view,
+                            &geometry_index,
+                            &child_slots,
+                            &mut child_assembly,
+                            None,
+                        );
+                        if evaluate {
+                            // The same point, inside the row (and so inside
+                            // the scroll region's viewport).
+                            let point =
+                                egui::pos2(surface_rect.min.x + 60.0, surface_rect.min.y + 66.0);
+                            selected = egui_region_at_position(&regions, point)
+                                .map(|region| region.region_id.as_str().to_string());
+                        }
+                    },
+                );
+            }
+            selected.expect("a presented region resolves at the row point")
+        };
+
+        // The working declaration: the row FRONTS its scroll region (z 2 >
+        // z 1) and wins the pointer press.
+        let fronting = selected_region_id_for(2);
+        assert!(
+            fronting.contains("panel0-row-1"),
+            "a row hit region fronting its scroll region must win the pointer press; got {fronting}"
+        );
+        // The combined-order rule, documented: a row UNDER the scroll
+        // region's z loses the press to the scroll region (which emits no
+        // pointer dispatch — the unreachable-row failure shape).
+        let under = selected_region_id_for(0);
+        assert!(
+            under.contains("inner-0"),
+            "a row under its scroll region's z loses the press to the scroll region; got {under}"
+        );
+    }
+
     #[test]
     fn egui_explicit_layer_paints_above_later_normal_sibling_in_output_shapes() {
         let layered_color = test_rgb(220, 38, 38);
@@ -15807,6 +17056,7 @@ mod tests {
                 enabled: true,
                 text_edit_change: None,
                 scroll_state: None,
+                blocks_wheel: true,
             };
             let regions = vec![region];
             let context = EguiInputContext {
@@ -17087,903 +18337,136 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_keyboard_input_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
-            SlipwayRuntime::new(FocusedProbeWidget::new("egui.focused"), ()),
-            FocusedKeyboardBridge::default(),
-            move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+    fn seam_wheel_and_real_ingress_wheel_share_dispatch_and_result_identity() {
+        // MF-M9 port to the current seam, headless: the seam side drives the
+        // REAL egui physical-control path (runtime MCP submit ->
+        // raw_input_hook injection -> full frame -> backend-presented trace
+        // completion); the real side feeds the same hand-built egui events a
+        // real OS wheel delivers through egui_winit. Both sides run one
+        // dispatch frame from identical fresh apps, and the runtime
+        // event_equivalence comparator must report dispatch AND result
+        // identity match. The seam trace clone is relabeled `debug_mcp` only
+        // to select its role in the comparator's pair contract; declared
+        // dispatch identity ignores the evidence source by contract.
+        let real_events = vec![
+            egui::Event::PointerMoved(egui::pos2(1.0, 1.0)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 7.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
             },
-        );
+        ];
 
-        egui::__run_test_ui(|ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
-            .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records focused keyboard frame");
-        assert_eq!(*app.runtime().local_state(), 8);
-        assert_eq!(applied.get(), 1);
-
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
-            .submit(physical_keyboard_message(
-                "egui-shell-keyboard",
-                &backend_frame,
-                "egui.focused",
-                "Enter",
-            ))
-            .expect("runtime MCP physical keyboard request queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical keyboard response sent");
-
-        assert_eq!(*app.runtime().local_state(), 9);
-        assert_eq!(applied.get(), 2);
-
-        let probe_handle = client
-            .submit(probe_event_message(
-                "egui-shell-keyboard-events",
-                &backend_frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload.matches(r#""selected_region":"text-focus""#).count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend keyboard input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_text_edit_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
-            SlipwayRuntime::new(FocusedProbeWidget::new("egui.focused"), ()),
-            FocusedTextEditBridge::default(),
-            move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
-            },
-        );
-
-        egui::__run_test_ui(|ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
-            .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records focused text-edit frame");
-        assert_eq!(*app.runtime().local_state(), 8);
-        assert_eq!(applied.get(), 1);
-
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
-            .submit(physical_text_edit_message(
-                "egui-shell-text-edit",
-                &backend_frame,
-                "egui.focused",
-                "replace_buffer",
-                "abc",
-            ))
-            .expect("runtime MCP physical text-edit request queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical text-edit response sent");
-
-        assert_eq!(*app.runtime().local_state(), 9);
-        assert_eq!(applied.get(), 2);
-
-        let probe_handle = client
-            .submit(probe_event_message(
-                "egui-shell-text-edit-events",
-                &backend_frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload.matches(r#""selected_region":"text-focus""#).count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""summary":"text_edit:ReplaceBuffer""#),
-            "probe must preserve egui text-edit shape: {payload}"
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend text-edit input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_pointer_move_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
-            SlipwayRuntime::new(MoveProbeWidget::new("one"), ()),
-            DefaultEguiBridge::new(),
-            move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
-            },
-        );
-
-        let ctx = egui::Context::default();
-        let raw_input = egui::RawInput {
-            events: vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
-            ..egui::RawInput::default()
-        };
-        let _ = ctx.run_ui(raw_input, |ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
-            .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records pointer move frame");
-        assert_eq!(*app.runtime().local_state(), 8);
-        assert_eq!(applied.get(), 1);
-
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
-            .submit(physical_pointer_phase_message(
-                "egui-shell-move",
-                &backend_frame,
-                1.0,
-                1.0,
-                "move",
-            ))
-            .expect("runtime MCP physical pointer move request queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical pointer move response sent");
-
-        assert_eq!(*app.runtime().local_state(), 9);
-        assert_eq!(applied.get(), 2);
-
-        let probe_handle = client
-            .submit(probe_event_message(
-                "egui-shell-move-events",
-                &backend_frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert!(payload.matches(r#""kind":"event""#).count() >= 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert!(payload.matches(r#""selected_region":"probe-hit""#).count() >= 4);
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend pointer move share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_pointer_enter_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
-            SlipwayRuntime::new(HoverProbeWidget::new("one"), ()),
-            DefaultEguiBridge::new(),
-            move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
-            },
-        );
-
-        let ctx = egui::Context::default();
-        let raw_input = egui::RawInput {
-            events: vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
-            ..egui::RawInput::default()
-        };
-        let _ = ctx.run_ui(raw_input, |ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
-            .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records pointer enter frame");
-        assert_eq!(*app.runtime().local_state(), 8);
-        assert_eq!(applied.get(), 1);
-
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
-            .submit(physical_pointer_phase_message(
-                "egui-shell-enter",
-                &backend_frame,
-                1.0,
-                1.0,
-                "enter",
-            ))
-            .expect("runtime MCP physical pointer enter request queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical pointer enter response sent");
-
-        assert_eq!(*app.runtime().local_state(), 9);
-        assert_eq!(applied.get(), 2);
-
-        let probe_handle = client
-            .submit(probe_event_message(
-                "egui-shell-enter-events",
-                &backend_frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert!(payload.matches(r#""kind":"event""#).count() >= 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend pointer enter share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_pointer_leave_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
-            SlipwayRuntime::new(HoverProbeWidget::new("one"), ()),
-            DefaultEguiBridge::new(),
-            move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
-            },
-        );
-
-        let ctx = egui::Context::default();
-        let raw_input = egui::RawInput {
-            events: vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
-            ..egui::RawInput::default()
-        };
-        let _ = ctx.run_ui(raw_input, |ui| {
-            app.render_ui(ui);
-        });
-        assert_eq!(*app.runtime().local_state(), 8);
-        assert_eq!(applied.get(), 1);
-
-        let raw_input = egui::RawInput {
-            events: vec![egui::Event::PointerMoved(egui::pos2(-10.0, -10.0))],
-            ..egui::RawInput::default()
-        };
-        let _ = ctx.run_ui(raw_input, |ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
-            .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records pointer leave frame");
-        assert_eq!(*app.runtime().local_state(), 9);
-        assert_eq!(applied.get(), 2);
-
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
-            .submit(physical_pointer_phase_message(
-                "egui-shell-leave",
-                &backend_frame,
-                0.5,
-                0.5,
-                "leave",
-            ))
-            .expect("runtime MCP physical pointer leave request queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical pointer leave response sent");
-
-        assert_eq!(*app.runtime().local_state(), 10);
-        assert_eq!(applied.get(), 3);
-
-        let probe_handle = client
-            .submit(probe_event_message(
-                "egui-shell-leave-events",
-                &backend_frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert!(payload.matches(r#""kind":"event""#).count() >= 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend pointer leave share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_pointer_cancel_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
-            SlipwayRuntime::new(CancelProbeWidget::new("one"), ()),
-            DefaultEguiBridge::new(),
-            move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
-            },
-        );
-
-        let ctx = egui::Context::default();
-        let raw_input = egui::RawInput {
-            events: vec![egui::Event::PointerMoved(egui::pos2(1.0, 1.0))],
-            ..egui::RawInput::default()
-        };
-        let _ = ctx.run_ui(raw_input, |ui| {
-            app.render_ui(ui);
-        });
-        assert_eq!(*app.runtime().local_state(), 7);
-        assert_eq!(applied.get(), 0);
-
-        let raw_input = egui::RawInput {
-            events: vec![egui::Event::PointerGone],
-            ..egui::RawInput::default()
-        };
-        let _ = ctx.run_ui(raw_input, |ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
-            .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records pointer cancel frame");
-        assert_eq!(*app.runtime().local_state(), 8);
-        assert_eq!(applied.get(), 1);
-
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
-            .submit(physical_pointer_phase_message(
-                "egui-shell-cancel",
-                &backend_frame,
-                0.5,
-                0.5,
-                "cancel",
-            ))
-            .expect("runtime MCP physical pointer cancel request queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical pointer cancel response sent");
-
-        assert_eq!(*app.runtime().local_state(), 9);
-        assert_eq!(applied.get(), 2);
-
-        let probe_handle = client
-            .submit(probe_event_message(
-                "egui-shell-cancel-events",
-                &backend_frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert!(payload.matches(r#""kind":"event""#).count() >= 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert!(
-            payload.contains(r#""summary":"pointer:Cancel""#),
-            "event probe must expose pointer cancel generated events: {payload}"
-        );
-        assert!(
-            payload.contains(r#""kind":"Cancel""#),
-            "event probe must expose pointer cancel kind: {payload}"
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend pointer cancel share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_wheel_input_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
+        // Real-ingress side.
+        let native_applied = Rc::new(Cell::new(0usize));
+        let native_applied_for_reducer = Rc::clone(&native_applied);
+        let mut native_app = SlipwayEguiRuntimeApp::new(
             SlipwayRuntime::new(ScrollProbeWidget::new("egui.scroll"), ()),
             DefaultEguiBridge::new(),
             move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
+                native_applied_for_reducer.set(native_applied_for_reducer.get() + messages.len());
             },
         );
-
-        let ctx = egui::Context::default();
-        let raw_input = egui::RawInput {
-            events: vec![
-                egui::Event::PointerMoved(egui::pos2(1.0, 1.0)),
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, 7.0),
-                    phase: egui::TouchPhase::Move,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ],
-            ..egui::RawInput::default()
-        };
-        let _ = ctx.run_ui(raw_input, |ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
+        let native_ctx = egui::Context::default();
+        // Warm-up frame: records the presented viewport so both apps enter
+        // their dispatch frame with the same frame identity.
+        let _ = native_ctx.run_ui(egui::RawInput::default(), |ui| native_app.render_ui(ui));
+        let _ = native_ctx.run_ui(
+            egui::RawInput {
+                events: real_events.clone(),
+                ..egui::RawInput::default()
+            },
+            |ui| native_app.render_ui(ui),
+        );
+        let native_trace = native_app
             .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records wheel frame");
-        assert_eq!(*app.runtime().local_state(), 9);
-        assert_eq!(applied.get(), 2);
+            .backend_input_traces()
+            .find(|trace| matches!(trace.input.event, InputEvent::Wheel(_)))
+            .cloned()
+            .expect("real ingress wheel records a backend input trace");
 
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
+        // Seam side: the full current physical-control path, headless.
+        let seam_applied = Rc::new(Cell::new(0usize));
+        let seam_applied_for_reducer = Rc::clone(&seam_applied);
+        let mut seam_app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ScrollProbeWidget::new("egui.scroll"), ()),
+            DefaultEguiBridge::new(),
+            move |_, messages: Vec<ProbeMessage>| {
+                seam_applied_for_reducer.set(seam_applied_for_reducer.get() + messages.len());
+            },
+        );
+        let seam_ctx = egui::Context::default();
+        let _ = seam_ctx.run_ui(egui::RawInput::default(), |ui| seam_app.render_ui(ui));
+        let frame = seam_app.runtime().last_frame_identity();
+        let physical_handle = seam_app
+            .runtime()
+            .runtime_mcp_client_clone()
             .submit(physical_wheel_message(
-                "egui-shell-wheel",
-                &backend_frame,
+                "egui-seam-wheel-equivalence",
+                &frame,
                 1.0,
                 1.0,
                 0.0,
                 7.0,
             ))
             .expect("runtime MCP physical wheel request queued");
-        let (drained, error) = app.drain_debug_pending();
+        let mut raw_input = egui::RawInput::default();
+        let (drained, error) =
+            seam_app.inject_pending_native_physical_into_raw_input(&mut raw_input);
         assert_eq!(drained, 1);
         assert_eq!(error, None);
-        physical_handle
+        assert_eq!(
+            raw_input.events, real_events,
+            "the seam must inject exactly the egui events real OS ingress delivers"
+        );
+        let _ = seam_ctx.run_ui(raw_input, |ui| seam_app.render_ui(ui));
+        let response = physical_handle
             .recv()
             .expect("transport response arrives")
             .expect("physical wheel response sent");
-
-        assert_eq!(*app.runtime().local_state(), 10);
-        assert_eq!(applied.get(), 3);
-
-        let probe_handle = client
-            .submit(probe_event_message(
-                "egui-shell-wheel-events",
-                &backend_frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
         let payload = response["result"]["content"][0]["text"]
             .as_str()
             .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"wheel""#).count(), 4, "{payload}");
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
         assert!(
-            payload.contains(r#""selected_region":"scroll-region""#),
-            "{payload}"
+            payload.contains(r#""mode":"physical_equivalent""#),
+            "seam reply must be a physical-equivalent control trace: {payload}"
         );
         assert!(
-            !payload.contains("backend_input.dispatch_evidence_event_mismatch"),
-            "native scroll side effect must stay declaration-consistent: {payload}"
+            payload.contains(r#""handled":true"#),
+            "seam wheel must be handled: {payload}"
         );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend wheel input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_scroll_input_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
-            SlipwayRuntime::new(ScrollProbeWidget::new("egui.scroll"), ()),
-            ScrollBridge::default(),
-            move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
-            },
-        );
-
-        egui::__run_test_ui(|ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
+        let seam_trace = seam_app
             .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records scroll frame");
-        assert_eq!(*app.runtime().local_state(), 8);
-        assert_eq!(applied.get(), 1);
+            .backend_input_traces()
+            .find(|trace| matches!(trace.input.event, InputEvent::Wheel(_)))
+            .cloned()
+            .expect("seam wheel records a backend input trace");
 
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
-            .submit(physical_scroll_message(
-                "egui-shell-scroll",
-                &backend_frame,
-                "egui.scroll",
-                0.0,
-                24.0,
-            ))
-            .expect("runtime MCP physical scroll request queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical scroll response sent");
-
-        assert_eq!(*app.runtime().local_state(), 9);
-        assert_eq!(applied.get(), 2);
-
-        let probe_handle = client
-            .submit(probe_event_message(
-                "egui-shell-scroll-events",
-                &backend_frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
+        // The equivalence bar: same state effect and comparator-proven
+        // dispatch/result identity.
         assert_eq!(
-            payload
-                .matches(r#""selected_region":"scroll-region""#)
-                .count(),
-            4
+            native_app.runtime().local_state(),
+            seam_app.runtime().local_state(),
+            "seam and real wheel must leave identical widget state"
         );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend scroll input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_command_input_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
-            SlipwayRuntime::new(FocusedProbeWidget::new("egui.focused"), ()),
-            FocusedCommandBridge::default(),
-            move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
-            },
-        );
-
-        egui::__run_test_ui(|ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
-            .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records focused command frame");
-        assert_eq!(*app.runtime().local_state(), 8);
-        assert_eq!(applied.get(), 1);
-
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
-            .submit(physical_command_message(
-                "egui-shell-command",
-                &backend_frame,
-                "egui.focused",
-                "submit",
-                "payload-1",
-            ))
-            .expect("runtime MCP physical command request queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical command response sent");
-
-        assert_eq!(*app.runtime().local_state(), 9);
-        assert_eq!(applied.get(), 2);
-
-        let probe_handle = client
-            .submit(probe_event_message(
-                "egui-shell-command-events",
-                &backend_frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
+        assert_eq!(native_applied.get(), seam_applied.get());
+        let mut mcp_side = seam_trace.clone();
+        if let Some(evidence) = mcp_side.input.dispatch_evidence.as_mut() {
+            evidence.source = EvidenceSource::debug_mcp("physical-control");
+        }
+        let diagnostics = slipway_runtime::backend_input_trace_equivalence_diagnostics(&[
+            &mcp_side,
+            &native_trace,
+        ]);
         assert_eq!(
-            payload.matches(r#""selected_region":"text-focus""#).count(),
-            4
+            diagnostics.len(),
+            1,
+            "comparator must pair the seam and real wheel traces: {diagnostics:?}"
         );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend command input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control must not synthesize backend-presented input inside runtime"]
-    fn runtime_app_mcp_physical_and_backend_input_share_event_probe_surface() {
-        let applied = Rc::new(Cell::new(0usize));
-        let applied_for_reducer = Rc::clone(&applied);
-        let mut app = SlipwayEguiRuntimeApp::new(
-            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
-            TwoCommandBridge::default(),
-            move |_, messages: Vec<ProbeMessage>| {
-                applied_for_reducer.set(applied_for_reducer.get() + messages.len());
-            },
-        );
-
-        egui::__run_test_ui(|ui| {
-            app.render_ui(ui);
-        });
-
-        let backend_frame = app
-            .runtime()
-            .last_backend_input_trace()
-            .and_then(|trace| trace.input.dispatch_evidence.as_ref())
-            .map(|evidence| evidence.frame.clone())
-            .expect("backend render pass records a declared frame");
-        let client = app.runtime().runtime_mcp_client_clone();
-        let physical_handle = client
-            .submit(physical_pointer_message(
-                "egui-shell-physical",
-                &backend_frame,
-                1.0,
-                1.0,
-            ))
-            .expect("runtime MCP physical request queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical control response sent");
-
-        assert_eq!(*app.runtime().local_state(), 10);
-        assert_eq!(applied.get(), 3);
-
-        let probe_handle = client
-            .submit(probe_event_message("egui-shell-events", &backend_frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = app.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 3);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(payload.matches(r#""dispatch_identity""#).count(), 3);
-        assert_eq!(payload.matches(r#""result_identity""#).count(), 3);
         assert_eq!(
-            payload.matches(r#""selected_region":"probe-hit""#).count(),
-            6
-        );
-        assert_eq!(payload.matches(r#""handled":true"#).count(), 6);
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend physical input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
+            diagnostics[0].code, "event_equivalence.identity_match",
+            "seam and real wheel must share dispatch AND result identity: {diagnostics:?}"
         );
     }
 

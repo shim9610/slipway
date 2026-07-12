@@ -71,6 +71,14 @@ Important public concepts:
 
 egui native wrapper code is not portable to iced. That is intentional.
 
+The egui root gate additionally requires font-resolution evidence from the
+root widget. For a plain facade app this is already satisfied:
+`SlipwayAppWidget` delegates to `SlipwayApp::resolve_app_font`, whose
+default refuses honestly (`app-font-resolution-refused`) so the backend
+falls back to its own fonts. Override that hook only to declare a real
+font source (see [IME and Korean text input](ime.md)). Do not write a root
+wrapper just to satisfy the font bound.
+
 ## Visible Backend Rules
 
 Visible backends must:

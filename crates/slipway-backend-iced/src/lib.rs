@@ -19,7 +19,8 @@ use slipway_core::{
     TextMeasurementEvidence, TextStyle, TopologyNode, UnsupportedCapabilityEvidence,
     ViewDefinition, ViewDefinitionInput, WidgetId, WidgetSlot, WidgetSlotAddress,
     expand_paint_unit_layers, paint_unit_sort_key, scroll_region_from_scrollable_capability,
-    text_edit_focus_region_from_capability, view_definition_contract_diagnostics_for_capabilities,
+    scroll_region_from_scrollable_capability_with_order, text_edit_focus_region_from_capability,
+    view_definition_contract_diagnostics_for_capabilities,
     view_definition_has_blocking_contract_diagnostic,
 };
 use slipway_debug_bridge::{
@@ -125,6 +126,58 @@ pub struct IcedBackendAdmission;
 
 pub fn iced_backend_admission() -> IcedBackendAdmission {
     IcedBackendAdmission
+}
+
+/// Derives the ADR-0002 B1 dispatch graph through iced's presentation
+/// pipeline: the same `IcedPresentationState` constructor the visible widget
+/// path uses assembles the view (iced scroll-region normalization,
+/// paint-unit expansion, root paint occlusion collection), child occluders
+/// are composed through the shared core collector (the declared analogue of
+/// iced's child explicit-layer occlusion merge), and the shared core builder
+/// (`slipway_core::derive_dispatch_graph_with_geometry_index`) derives nodes
+/// and edges from the presentation's dispatch inputs. Read-only: nothing
+/// consumes the returned graph for dispatch.
+pub fn iced_dispatch_graph_for_widget<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    layout_input: LayoutInput,
+    frame_seed: Option<&FrameIdentity>,
+) -> slipway_core::DispatchGraph
+where
+    W: SlipwayIcedBackendChildWidget,
+{
+    let target = widget.id();
+    let frame = iced_frame_identity(&target, frame_seed, layout_input.viewport.into_rect(), 0);
+    let view = widget.visible_backend_view_definition(
+        external,
+        local,
+        ViewDefinitionInput {
+            frame,
+            layout_input: layout_input.clone(),
+        },
+    );
+    let occlusions = slipway_core::dispatch_graph_occlusion_regions_for_composed_view(
+        widget, external, local, &view,
+    );
+    let capabilities = widget.capabilities();
+    let presentation = IcedPresentationState::from_view_definition_with_capabilities_and_address(
+        view,
+        &capabilities,
+        layout_input,
+        target.clone(),
+        None,
+        0,
+        Point { x: 0.0, y: 0.0 },
+    );
+    slipway_core::derive_dispatch_graph_with_geometry_index(
+        &target,
+        &presentation.geometry_index,
+        &presentation.hit_regions,
+        &presentation.focus_regions,
+        &presentation.scroll_regions,
+        &occlusions,
+    )
 }
 
 impl IcedBackendAdmission {
@@ -359,6 +412,17 @@ impl SlipwayBackendParityAdmission for IcedBackendAdmission {
 
 pub trait SlipwayIcedWidgetListVisitor<ExternalState, AppMessage> {
     fn set_iced_child_order_index(&mut self, _index: usize) {}
+
+    /// Paint sort key for the child mounted at `slot`, sourced from a cached
+    /// child presentation when the visitor carries one that is still valid
+    /// for the current frame. `None` makes the paint-order traversal fall
+    /// back to building the child view to compute the key.
+    fn iced_child_cached_paint_sort_key(
+        &self,
+        _slot: &WidgetSlotAddress,
+    ) -> Option<(i32, usize, usize)> {
+        None
+    }
 
     fn visit_iced_child<W>(
         &mut self,
@@ -1003,28 +1067,40 @@ macro_rules! impl_iced_widget_list_tuple {
                 V: SlipwayIcedWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
             {
                 let mut order = vec![(
-                    iced_child_paint_sort_key(
-                        &self.$first_index,
-                        external,
-                        &local.$first_index,
-                        parent_slot,
-                        $first_index,
-                        frame,
-                        placements,
-                    ),
+                    visitor
+                        .iced_child_cached_paint_sort_key(
+                            &parent_slot.child(self.$first_index.id(), $first_index),
+                        )
+                        .unwrap_or_else(|| {
+                            iced_child_paint_sort_key(
+                                &self.$first_index,
+                                external,
+                                &local.$first_index,
+                                parent_slot,
+                                $first_index,
+                                frame,
+                                placements,
+                            )
+                        }),
                     $first_index,
                 )];
                 $(
                     order.push((
-                        iced_child_paint_sort_key(
-                            &self.$index,
-                            external,
-                            &local.$index,
-                            parent_slot,
-                            $index,
-                            frame,
-                            placements,
-                        ),
+                        visitor
+                            .iced_child_cached_paint_sort_key(
+                                &parent_slot.child(self.$index.id(), $index),
+                            )
+                            .unwrap_or_else(|| {
+                                iced_child_paint_sort_key(
+                                    &self.$index,
+                                    external,
+                                    &local.$index,
+                                    parent_slot,
+                                    $index,
+                                    frame,
+                                    placements,
+                                )
+                            }),
                         $index,
                     ));
                 )*
@@ -1255,6 +1331,25 @@ where
 {
     scroll_region_from_scrollable_capability(
         widget, external, local, layout, region_id, address, enabled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn iced_scroll_region_from_capability_with_order<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    layout: &LayoutOutput,
+    region_id: Option<PresentationRegionId>,
+    address: Option<WidgetSlotAddress>,
+    enabled: bool,
+    order: HitRegionOrder,
+) -> ScrollRegionDeclaration
+where
+    W: SlipwayIcedScrollableContainerBackendWidget,
+{
+    scroll_region_from_scrollable_capability_with_order(
+        widget, external, local, layout, region_id, address, enabled, order,
     )
 }
 
@@ -1586,6 +1681,20 @@ pub fn iced_point(point: Point) -> iced::Point {
     iced::Point::new(point.x, point.y)
 }
 
+fn point_add(lhs: Point, rhs: Point) -> Point {
+    Point {
+        x: lhs.x + rhs.x,
+        y: lhs.y + rhs.y,
+    }
+}
+
+fn rect_translate(rect: Rect, offset: Point) -> Rect {
+    Rect {
+        origin: point_add(rect.origin, offset),
+        size: rect.size,
+    }
+}
+
 pub struct SlipwayIcedWidget<'a, W: SlipwayIcedBackendWidget> {
     widget: &'a W,
     external: &'a W::ExternalState,
@@ -1609,6 +1718,8 @@ pub struct SlipwayIcedRuntimeWidget<'a, W: SlipwayIcedBackendChildWidget> {
     external: &'a W::ExternalState,
     local: &'a W::LocalState,
     runtime_slot: Option<WidgetSlotAddress>,
+    root_origin: Point,
+    dispatch_context: Option<Cow<'a, IcedDispatchContext>>,
     width: iced::Length,
     height: iced::Length,
     presented_viewport_sink: Option<&'a Cell<Rect>>,
@@ -1640,6 +1751,9 @@ pub struct IcedPreeditOverlayStyle {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SlipwayIcedRuntimeMessage {
     BackendInput(BackendInputEvent),
+    /// No-consumer dispatch refusal evidence (audit finding MF-H3), published
+    /// so the runtime retains it in its bounded refusal ring.
+    DispatchRefusal(slipway_core::DeclaredEventDispatchEvidence),
     PreeditStyle(IcedPreeditOverlayStyle),
     DrainDebug,
     Noop,
@@ -1785,6 +1899,9 @@ where
     }
 
     pub fn drain_debug_pending(&mut self) -> (usize, Option<String>) {
+        self.assembled
+            .runtime
+            .record_presenting_backend(ICED_BACKEND_ID);
         self.sync_presented_viewport();
         let mut intercept = iced_winit_physical_control_reply;
         match self
@@ -1913,6 +2030,7 @@ struct IcedTreeState<L> {
     presentation: Option<IcedPresentationState>,
     hovered_region: Option<slipway_core::PresentationRegionId>,
     pressed_region: Option<IcedPressedPointerCapture>,
+    indicator_drag: Option<IcedIndicatorDragState>,
     focused_region: Option<slipway_core::PresentationRegionId>,
     layout_pass: u64,
 }
@@ -1926,7 +2044,9 @@ struct IcedRuntimeTreeState {
     scroll_region_trees: Vec<iced::advanced::widget::Tree>,
     hovered_region: Option<slipway_core::PresentationRegionId>,
     pressed_region: Option<IcedPressedPointerCapture>,
+    indicator_drag: Option<IcedIndicatorDragState>,
     focused_region: Option<slipway_core::PresentationRegionId>,
+    published_preedit_style: Option<IcedPreeditOverlayStyle>,
     layout_pass: u64,
 }
 
@@ -1939,17 +2059,22 @@ struct IcedDirtyScope {
 #[derive(Clone, Debug, PartialEq)]
 struct IcedPresentationState {
     target: WidgetId,
+    runtime_slot: Option<WidgetSlotAddress>,
     frame: FrameIdentity,
+    root_origin: Point,
     layout_input: LayoutInput,
     layout: LayoutOutput,
     geometry_index: PresentationGeometryIndex,
+    dispatch_context: IcedDispatchContext,
     root_child_placements: Arc<[slipway_core::ChildPlacement]>,
     native_scroll_regions: Arc<[ScrollRegionDeclaration]>,
+    native_scroll_dispatch_index: IcedNativeScrollDispatchIndex,
     text_input_regions: Arc<[FocusRegionDeclaration]>,
     text_editor_regions: Arc<[FocusRegionDeclaration]>,
     paint: Vec<PaintOp>,
     local_paint: Vec<PaintOp>,
     explicit_layer_paint_units: Vec<PaintUnit>,
+    paint_sort_orders: Vec<IcedPaintSortOrder>,
     paint_occlusion_regions: Vec<IcedPaintOcclusionRegion>,
     hit_regions: Vec<HitRegionDeclaration>,
     focus_regions: Vec<FocusRegionDeclaration>,
@@ -1959,9 +2084,93 @@ struct IcedPresentationState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct IcedDispatchContext {
+    geometry_index: PresentationGeometryIndex,
+    hit_regions: Arc<[HitRegionDeclaration]>,
+    focus_regions: Arc<[FocusRegionDeclaration]>,
+    scroll_regions: Arc<[ScrollRegionDeclaration]>,
+    paint_occlusion_regions: Arc<[IcedPaintOcclusionRegion]>,
+    /// The context view's own native scroll regions and their scroll
+    /// transform. When this context is applied to a mounted child
+    /// (`MountedRootLocal`), these describe the ANCESTOR transform: the
+    /// child's window-space points must be translated through this index
+    /// before they can be compared against `scroll_regions`, whose rects
+    /// live in the context view's un-scrolled content space.
+    native_scroll_regions: Arc<[ScrollRegionDeclaration]>,
+    native_scroll_dispatch_index: IcedNativeScrollDispatchIndex,
+    position_space: IcedDispatchPositionSpace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IcedDispatchPositionSpace {
+    ViewRootLocal,
+    MountedRootLocal,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct IcedNativeScrollDispatchIndex {
+    regions: Vec<IcedNativeScrollDispatchRegion>,
+    depth_ranges: Vec<IcedNativeScrollDepthRange>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct IcedNativeScrollDispatchRegion {
+    viewport_root: Rect,
+    content_root: Rect,
+    offset: Point,
+    depth: usize,
+    order: HitRegionOrder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IcedNativeScrollDepthRange {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct IcedPaintOcclusionRegion {
+    target: WidgetId,
+    address: Option<WidgetSlotAddress>,
     order: (i32, usize, usize),
     bounds: Rect,
+    /// Resolved wheel-channel opacity for this occluder. `true` (default for an
+    /// opaque layer) means the occluder blocks wheel input just like pointer
+    /// input; `false` means the layer was authored wheel-pass-through, so it
+    /// still occludes the pointer but lets the wheel reach the scroll region
+    /// behind it. Derived via `slipway_core::paint_layer_blocks_wheel`.
+    blocks_wheel: bool,
+}
+
+/// Sort-key source data for one expanded paint unit of the raw authored view.
+///
+/// Captured before scroll normalization and synthetic scroll-indicator paint
+/// mutate the view, so `iced_paint_sort_key_for_source_order` reproduces the
+/// `iced_child_paint_sort_key` computation for any queried source order
+/// without rebuilding the child view.
+#[derive(Clone, Debug, PartialEq)]
+struct IcedPaintSortOrder {
+    mode: slipway_core::PaintOrderMode,
+    z_index: i32,
+    order: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IcedInputRootLocalPoints {
+    visual: Point,
+    dispatch: Point,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IcedResolvedHitRegion<'a> {
+    region: &'a HitRegionDeclaration,
+    root_local_position: Point,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IcedResolvedFocusRegion<'a> {
+    region: &'a FocusRegionDeclaration,
+    root_local_position: Point,
 }
 
 impl IcedPresentationState {
@@ -1978,6 +2187,7 @@ impl IcedPresentationState {
             target,
             None,
             0,
+            Point { x: 0.0, y: 0.0 },
         )
     }
 
@@ -1988,8 +2198,15 @@ impl IcedPresentationState {
         target: WidgetId,
         address: Option<WidgetSlotAddress>,
         traversal_order: usize,
+        root_origin: Point,
     ) -> Self {
+        let paint_sort_orders = iced_view_paint_sort_orders(&view);
         let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+        let dispatch_hit_regions: Arc<[HitRegionDeclaration]> = view.hit_regions.clone().into();
+        let dispatch_focus_regions: Arc<[FocusRegionDeclaration]> =
+            view.focus_regions.clone().into();
+        let dispatch_scroll_regions: Arc<[ScrollRegionDeclaration]> =
+            view.scroll_regions.clone().into();
         normalize_iced_visible_scroll_regions(&mut view, &geometry_index);
         let admission =
             iced_backend_admission().admit_view_definition_with_capabilities(capabilities, &view);
@@ -2006,50 +2223,110 @@ impl IcedPresentationState {
             diagnostics.extend(unsupported.diagnostics.clone());
         }
 
-        let scroll_indicator_paint = iced_scroll_indicator_paint(&view);
+        let native_scroll_regions: Arc<[ScrollRegionDeclaration]> =
+            native_iced_scroll_regions_for_layout_with_geometry_index(
+                &geometry_index,
+                &view.layout,
+                &view.scroll_regions,
+                &view.target,
+            )
+            .into();
+        let native_scroll_dispatch_index =
+            iced_native_scroll_dispatch_index(&geometry_index, native_scroll_regions.as_ref());
+        let scroll_indicator_paint =
+            iced_scroll_indicator_paint(&geometry_index, &view, native_scroll_regions.as_ref());
         if !scroll_indicator_paint.is_empty() {
-            view.paint.push(PaintOp::keyed_layer_pass_through(
-                PaintLayerKey::ordered(5, usize::MAX),
-                scroll_indicator_paint,
-            ));
+            // The layer clip is LOAD-BEARING for iced compositing (Step 211
+            // live-pixel finding): iced draws an UNCLIPPED layer's quads into
+            // the parent layer bucket, and every authored clipped Group
+            // composites as its own sub-layer ON TOP of that bucket — an
+            // unclipped indicator layer is silently covered by any clipped
+            // authored content it overlaps (the reference example's nested
+            // inner panels), while op-presence probes and paint lists still
+            // show the ops. Clipping to the view's layout bounds gives the
+            // indicators their own top sub-layer; synthesized tracks always
+            // lie inside the (normalized) viewport, which layout contains.
+            view.paint.push(
+                PaintOp::keyed_layer_pass_through(
+                    PaintLayerKey::ordered(SCROLL_INDICATOR_LAYER_Z, usize::MAX),
+                    scroll_indicator_paint,
+                )
+                .with_layer_clip(slipway_core::ClipDeclaration {
+                    id: Some(format!("{}:scroll-indicators:clip", view.target.as_str())),
+                    bounds: Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: view.layout.bounds.size,
+                    },
+                    path: None,
+                }),
+            );
         }
         let root_child_placements: Arc<[slipway_core::ChildPlacement]> =
             root_child_placements_excluding_native_scroll_for_layout(
                 &view.layout,
                 &geometry_index,
-                &view.scroll_regions,
+                native_scroll_regions.as_ref(),
             )
             .into();
-        let native_scroll_regions: Arc<[ScrollRegionDeclaration]> =
-            native_iced_scroll_regions_for_layout(&view.layout, &view.scroll_regions).into();
         let text_input_regions: Arc<[FocusRegionDeclaration]> =
             text_input_focus_regions_for_view(&target, &view.focus_regions).into();
         let text_editor_regions: Arc<[FocusRegionDeclaration]> =
             text_editor_focus_regions_for_view(&target, &view.focus_regions).into();
-        let paint = ordered_iced_presentation_paint(&view, traversal_order, address.as_ref());
-        let local_paint = local_iced_presentation_paint(&view, traversal_order, address.as_ref());
-        let explicit_layer_paint_units =
-            iced_explicit_layer_paint_units(&view, traversal_order, address.as_ref());
+        let (paint, local_paint, explicit_layer_paint_units) =
+            iced_presentation_paint_lists(&view, traversal_order, address.as_ref());
         let paint_occlusion_regions = iced_paint_occlusion_regions(&explicit_layer_paint_units);
+        let dispatch_context = IcedDispatchContext {
+            geometry_index: geometry_index.clone(),
+            hit_regions: Arc::clone(&dispatch_hit_regions),
+            focus_regions: Arc::clone(&dispatch_focus_regions),
+            scroll_regions: Arc::clone(&dispatch_scroll_regions),
+            paint_occlusion_regions: paint_occlusion_regions.clone().into(),
+            native_scroll_regions: Arc::clone(&native_scroll_regions),
+            native_scroll_dispatch_index: native_scroll_dispatch_index.clone(),
+            position_space: IcedDispatchPositionSpace::ViewRootLocal,
+        };
         Self {
             target,
+            runtime_slot: address,
             frame: view.frame,
+            root_origin,
             layout_input,
             layout: view.layout,
             geometry_index,
+            dispatch_context,
             root_child_placements,
             native_scroll_regions,
+            native_scroll_dispatch_index,
             text_input_regions,
             text_editor_regions,
             paint,
             local_paint,
             explicit_layer_paint_units,
+            paint_sort_orders,
             paint_occlusion_regions,
             hit_regions: view.hit_regions,
             focus_regions: view.focus_regions,
             scroll_regions: view.scroll_regions,
             diagnostics,
             admission,
+        }
+    }
+
+    fn apply_dispatch_context_override(&mut self, context: Option<&IcedDispatchContext>) {
+        if let Some(context) = context {
+            self.dispatch_context = context.clone();
+            self.dispatch_context.position_space = IcedDispatchPositionSpace::MountedRootLocal;
+        } else {
+            self.dispatch_context = IcedDispatchContext {
+                geometry_index: self.geometry_index.clone(),
+                hit_regions: self.hit_regions.clone().into(),
+                focus_regions: self.focus_regions.clone().into(),
+                scroll_regions: self.scroll_regions.clone().into(),
+                paint_occlusion_regions: self.paint_occlusion_regions.clone().into(),
+                native_scroll_regions: Arc::clone(&self.native_scroll_regions),
+                native_scroll_dispatch_index: self.native_scroll_dispatch_index.clone(),
+                position_space: IcedDispatchPositionSpace::ViewRootLocal,
+            };
         }
     }
 
@@ -2074,22 +2351,65 @@ struct IcedRoutedInput {
     input: Option<BackendInputEvent>,
     capture_event: bool,
     request_redraw: bool,
+    /// No-consumer dispatch refusal evidence (audit finding MF-H3): when the
+    /// core resolver constructed complete refusal evidence (position,
+    /// candidates, reason) and routing produced no backend input, the
+    /// evidence is carried here so the runtime can retain it in its bounded
+    /// refusal ring instead of dropping it.
+    refusal: Option<slipway_core::DeclaredEventDispatchEvidence>,
+}
+
+/// The z-index of the synthesized scroll-indicator layer. Explicit
+/// (authored) layers with a HIGHER z paint over the indicators, so the
+/// interactive-indicator press check refuses points covered by an opaque
+/// occluder above this z — pointer selection must agree with the visible
+/// stacking.
+const SCROLL_INDICATOR_LAYER_Z: i32 = 5;
+
+/// Backend-internal capture for a SYNTHETIC scroll-indicator thumb drag
+/// (Step 212). This is deliberately NOT a declared hit region injected
+/// into the author's view: the indicator is backend presentation (like
+/// the native `Scrollable` rail on native-backed regions), so its hit
+/// surface lives here, invisible to authored hit-region resolution and to
+/// admission. The drag maps track-space pointer travel back to a declared
+/// offset and synthesizes `InputEvent::Scroll` through the same declared
+/// scroll dispatch machinery the native `on_scroll` sync path uses.
+#[derive(Clone, Debug, PartialEq)]
+struct IcedIndicatorDragState {
+    region_id: PresentationRegionId,
+    /// Root-local (visual) y of the press that started the drag.
+    press_y: f32,
+    /// The region's declared offset at press time; the drag maps
+    /// cumulative pointer travel from this anchor so per-frame offset
+    /// quantization by the author's handler cannot feed back into the
+    /// mapping.
+    start_offset_y: f32,
+    /// Track travel (track height minus thumb height) captured at press.
+    track_travel: f32,
+    /// Declared travel (content minus viewport) captured at press.
+    max_offset: f32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct IcedPressedPointerCapture {
     region_id: PresentationRegionId,
     layout_origin: Point,
+    button: Option<iced::mouse::Button>,
 }
 
 impl IcedPressedPointerCapture {
-    fn new(region_id: PresentationRegionId, layout_bounds: iced::Rectangle) -> Self {
+    fn new(
+        region_id: PresentationRegionId,
+        layout_bounds: iced::Rectangle,
+        button: Option<iced::mouse::Button>,
+    ) -> Self {
         Self {
             region_id,
             layout_origin: Point {
                 x: layout_bounds.x,
                 y: layout_bounds.y,
             },
+            button,
         }
     }
 
@@ -2157,6 +2477,31 @@ fn iced_presentation_for_widget<W>(
 where
     W: SlipwayIcedBackendChildWidget,
 {
+    iced_presentation_for_widget_with_root_origin(
+        widget,
+        external,
+        local,
+        input,
+        frame_seed,
+        layout_pass,
+        runtime_slot,
+        Point { x: 0.0, y: 0.0 },
+    )
+}
+
+fn iced_presentation_for_widget_with_root_origin<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    input: LayoutInput,
+    frame_seed: Option<&FrameIdentity>,
+    layout_pass: u64,
+    runtime_slot: Option<&WidgetSlotAddress>,
+    root_origin: Point,
+) -> IcedPresentationState
+where
+    W: SlipwayIcedBackendChildWidget,
+{
     let target = widget.id();
     let frame = iced_frame_identity(&target, frame_seed, input.viewport.into_rect(), layout_pass);
     let mut view = widget.visible_backend_view_definition(
@@ -2179,6 +2524,7 @@ where
         target,
         runtime_slot.cloned(),
         runtime_slot.map(|slot| slot.ordinal).unwrap_or(0),
+        root_origin,
     )
 }
 
@@ -2189,7 +2535,11 @@ fn iced_presentation_cache_matches(
     dirty_scopes: Option<&[IcedDirtyScope]>,
     target: &WidgetId,
     runtime_slot: Option<&WidgetSlotAddress>,
+    root_origin: Point,
 ) -> bool {
+    if presentation.root_origin != root_origin {
+        return false;
+    }
     let expected_frame_viewport = frame_seed
         .map(|seed| seed.viewport)
         .unwrap_or_else(|| input.viewport.into_rect());
@@ -2203,7 +2553,12 @@ fn iced_presentation_cache_matches(
             presentation.frame.surface_id == seed.surface_id
                 && presentation.frame.surface_instance_id == seed.surface_instance_id
                 && (presentation.frame.revision == seed.revision
-                    || !iced_dirty_scopes_include_target(dirty_scopes, target, runtime_slot))
+                    || !iced_dirty_scopes_touch_presentation(
+                        presentation,
+                        dirty_scopes,
+                        target,
+                        runtime_slot,
+                    ))
         }
         None => {
             presentation.frame.surface_id == "iced-visible"
@@ -2211,6 +2566,66 @@ fn iced_presentation_cache_matches(
                 && presentation.frame.revision == 0
         }
     }
+}
+
+/// Decides whether the given dirty scopes invalidate a cached presentation.
+///
+/// A cached presentation embeds input declarations COMPOSED from child
+/// widgets (scroll offsets, hit/focus bounds, occlusion rects), not only the
+/// presenting widget's own state. A dirty scope naming a
+/// declaration-contributing child therefore changes the cached declarations
+/// even though the presentation's own target is clean: reusing the cache
+/// would let the wheel preflight (`iced_declared_wheel_region_id_for_event`)
+/// and the declared route evaluate `scroll_region_can_consume_wheel_delta`
+/// against STALE offsets, resolve no consumer, and hand the wheel to the
+/// native visible-viewport fallback — the native `Scrollable` then consumes a
+/// wheel the fresh declarations route elsewhere (the Step 195 native
+/// scroll-region wheel leak; the Step 194 open-issue record blamed the
+/// upstream 1500ms scroll transaction, but the instrumented trace refuted
+/// that attribution: the transaction never bypasses the gate, the stale
+/// preflight selection does).
+fn iced_dirty_scopes_touch_presentation(
+    presentation: &IcedPresentationState,
+    dirty_scopes: Option<&[IcedDirtyScope]>,
+    target: &WidgetId,
+    runtime_slot: Option<&WidgetSlotAddress>,
+) -> bool {
+    if iced_dirty_scopes_include_target(dirty_scopes, target, runtime_slot) {
+        return true;
+    }
+    let Some(dirty_scopes) = dirty_scopes else {
+        return true;
+    };
+    dirty_scopes.iter().any(|scope| {
+        scope.target != *target
+            && presentation_composes_declarations_for_target(presentation, &scope.target)
+    })
+}
+
+/// True when the presentation carries any input declaration whose owner is
+/// `target`: such declarations are snapshots of that widget's state (scroll
+/// offsets, hit/focus geometry, occlusion rects) and go stale when the widget
+/// changes.
+fn presentation_composes_declarations_for_target(
+    presentation: &IcedPresentationState,
+    target: &WidgetId,
+) -> bool {
+    presentation
+        .scroll_regions
+        .iter()
+        .any(|region| region.target == *target)
+        || presentation
+            .hit_regions
+            .iter()
+            .any(|region| region.target == *target)
+        || presentation
+            .focus_regions
+            .iter()
+            .any(|region| region.target == *target)
+        || presentation
+            .paint_occlusion_regions
+            .iter()
+            .any(|region| region.target == *target)
 }
 
 fn refresh_iced_presentation_frame(
@@ -2235,11 +2650,25 @@ fn iced_dirty_scopes_include_target(
     dirty_scopes.iter().any(|scope| {
         scope.target == *target
             && match (&scope.slot, runtime_slot) {
-                (Some(dirty_slot), Some(runtime_slot)) => dirty_slot == runtime_slot,
-                (Some(_), None) => false,
+                (Some(dirty_slot), Some(runtime_slot)) => {
+                    dirty_slot_matches_runtime_slot(dirty_slot, runtime_slot)
+                }
+                (Some(dirty_slot), None) => {
+                    dirty_slot.path.len() == 1 && dirty_slot.widget == *target
+                }
                 (None, _) => true,
             }
     })
+}
+
+fn dirty_slot_matches_runtime_slot(
+    dirty_slot: &WidgetSlotAddress,
+    runtime_slot: &WidgetSlotAddress,
+) -> bool {
+    dirty_slot == runtime_slot
+        || (dirty_slot.widget == runtime_slot.widget
+            && dirty_slot.ordinal == runtime_slot.ordinal
+            && runtime_slot.path.ends_with(&dirty_slot.path))
 }
 
 fn iced_dirty_scopes_from_runtime<W>(runtime: &SlipwayRuntime<W>) -> Option<Vec<IcedDirtyScope>>
@@ -2390,13 +2819,19 @@ fn iced_runtime_child_widget<'a, W>(
     slot: WidgetSlotAddress,
     frame_seed: Option<&FrameIdentity>,
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&'a IcedDispatchContext>,
 ) -> SlipwayIcedRuntimeWidget<'a, W>
 where
     W: SlipwayIcedBackendChildWidget,
 {
-    let child = SlipwayIcedRuntimeWidget::new(widget, external, local)
+    let mut child = SlipwayIcedRuntimeWidget::new(widget, external, local)
         .with_runtime_slot(slot)
+        .with_root_origin(root_origin)
         .with_dirty_scopes(dirty_scopes.map(Cow::Borrowed));
+    if let Some(dispatch_context) = dispatch_context {
+        child = child.with_dispatch_context(dispatch_context);
+    }
     if let Some(frame_seed) = frame_seed {
         child.with_frame_seed(frame_seed.clone())
     } else {
@@ -2474,6 +2909,82 @@ where
         .unwrap_or((0, source_order, source_order))
 }
 
+fn iced_view_paint_sort_orders(view: &ViewDefinition) -> Vec<IcedPaintSortOrder> {
+    expand_paint_unit_layers(PaintUnit::from_view_ref(view, 0))
+        .into_iter()
+        .map(|unit| IcedPaintSortOrder {
+            mode: unit.order.mode,
+            z_index: unit.order.z_index,
+            order: unit.order.order,
+        })
+        .collect()
+}
+
+fn iced_paint_sort_key_for_source_order(
+    paint_sort_orders: &[IcedPaintSortOrder],
+    source_order: usize,
+) -> (i32, usize, usize) {
+    paint_sort_orders
+        .iter()
+        .map(|order| match order.mode {
+            slipway_core::PaintOrderMode::SourceOrder => (0, source_order, source_order),
+            slipway_core::PaintOrderMode::ExplicitLayered => (
+                order.z_index,
+                order.order.unwrap_or(source_order),
+                source_order,
+            ),
+        })
+        .max()
+        .unwrap_or((0, source_order, source_order))
+}
+
+/// Paint sort key for the runtime child mounted at `slot`, sourced from the
+/// presentation already stored in the child tree state by the last layout
+/// pass, without re-running the child view pipeline.
+///
+/// Returns `None` unless the stored presentation would be reused by the
+/// child layout cache for the same frame seed, dirty scopes, placement, and
+/// root origin; callers fall back to `iced_child_paint_sort_key` in that
+/// case so a dirty child sorts by its fresh view.
+fn iced_cached_child_paint_sort_key(
+    tree_children: &[iced::advanced::widget::Tree],
+    placements: &[slipway_core::ChildPlacement],
+    frame_seed: Option<&FrameIdentity>,
+    dirty_scopes: Option<&[IcedDirtyScope]>,
+    root_origin: Point,
+    slot: &WidgetSlotAddress,
+) -> Option<(i32, usize, usize)> {
+    let placement = iced_child_placement_for_slot(placements, &slot.widget, slot)?;
+    let tree = tree_children.get(slot.ordinal)?;
+    if tree.tag != iced::advanced::widget::tree::Tag::of::<IcedRuntimeTreeState>() {
+        return None;
+    }
+    let presentation = tree
+        .state
+        .downcast_ref::<IcedRuntimeTreeState>()
+        .presentation
+        .as_ref()?;
+    if presentation.target != slot.widget || presentation.runtime_slot.as_ref() != Some(slot) {
+        return None;
+    }
+    let input = iced_layout_input_from_limits(&iced_child_layout_limits(placement));
+    if !iced_presentation_cache_matches(
+        presentation,
+        &input,
+        frame_seed,
+        dirty_scopes,
+        &slot.widget,
+        Some(slot),
+        point_add(root_origin, placement.bounds.origin),
+    ) {
+        return None;
+    }
+    Some(iced_paint_sort_key_for_source_order(
+        &presentation.paint_sort_orders,
+        slot.ordinal,
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct IcedPaintJob {
     unit: PaintUnit,
@@ -2517,43 +3028,28 @@ fn iced_presentation_paint_units(
     expand_paint_unit_layers(unit)
 }
 
-fn ordered_iced_presentation_paint(
+fn iced_presentation_paint_lists(
     view: &ViewDefinition,
     traversal_order: usize,
     address: Option<&WidgetSlotAddress>,
-) -> Vec<PaintOp> {
-    let mut units = iced_presentation_paint_units(view, traversal_order, address);
-    units.sort_by_key(paint_unit_sort_key);
-    units.into_iter().flat_map(|unit| unit.paint).collect()
-}
-
-fn local_iced_presentation_paint(
-    view: &ViewDefinition,
-    traversal_order: usize,
-    address: Option<&WidgetSlotAddress>,
-) -> Vec<PaintOp> {
+) -> (Vec<PaintOp>, Vec<PaintOp>, Vec<PaintUnit>) {
     let unit_contains_extracted_layers = paint_ops_contain_layer(&view.paint);
-    iced_presentation_paint_units(view, traversal_order, address)
+    let units = iced_presentation_paint_units(view, traversal_order, address);
+    let mut ordered_units = units.clone();
+    ordered_units.sort_by_key(paint_unit_sort_key);
+    let paint = ordered_units
         .into_iter()
-        .filter(|unit| {
-            !iced_paint_unit_requires_surface_global_flush(unit, unit_contains_extracted_layers)
-        })
         .flat_map(|unit| unit.paint)
-        .collect()
-}
-
-fn iced_explicit_layer_paint_units(
-    view: &ViewDefinition,
-    traversal_order: usize,
-    address: Option<&WidgetSlotAddress>,
-) -> Vec<PaintUnit> {
-    let unit_contains_extracted_layers = paint_ops_contain_layer(&view.paint);
-    iced_presentation_paint_units(view, traversal_order, address)
-        .into_iter()
-        .filter(|unit| {
+        .collect();
+    let (explicit_layer_paint_units, local_units): (Vec<PaintUnit>, Vec<PaintUnit>) =
+        units.into_iter().partition(|unit| {
             iced_paint_unit_requires_surface_global_flush(unit, unit_contains_extracted_layers)
-        })
-        .collect()
+        });
+    let local_paint = local_units
+        .into_iter()
+        .flat_map(|unit| unit.paint)
+        .collect();
+    (paint, local_paint, explicit_layer_paint_units)
 }
 
 fn iced_paint_unit_requires_surface_global_flush(
@@ -2578,6 +3074,8 @@ fn iced_paint_occlusion_regions(units: &[PaintUnit]) -> Vec<IcedPaintOcclusionRe
     for unit in units {
         collect_iced_paint_occlusion_regions(
             &unit.paint,
+            &unit.target,
+            unit.address.as_ref(),
             paint_unit_sort_key(unit),
             None,
             &mut regions,
@@ -2587,31 +3085,79 @@ fn iced_paint_occlusion_regions(units: &[PaintUnit]) -> Vec<IcedPaintOcclusionRe
     regions
 }
 
-fn iced_scroll_indicator_paint(view: &ViewDefinition) -> Vec<PaintOp> {
+/// Track and thumb of the SYNTHETIC indicator this backend would draw for
+/// `region`, in root-local coordinates — `None` when no indicator is
+/// synthesized. THE single geometry source for the indicator: both the
+/// paint synthesis (`iced_scroll_indicator_paint`) and the interactive
+/// thumb-drag/track-click routing (`route_iced_event`, Step 212) call it,
+/// so the pixels and the hit surface cannot diverge.
+///
+/// Declared-indicator honor (Step 210, `ScrollIndicatorMode`): `Hidden`
+/// never synthesizes, even when the `Auto` conditions hold; `Visible`
+/// synthesizes whenever geometrically sensible (vertical axis and content
+/// taller than viewport), overriding the `Auto`-only no-child-placement
+/// condition; `Auto` keeps the pre-control conditions byte-identical.
+/// Native-backed regions are never synthesized here in any mode — the
+/// native scrollable's own rail is the indicator (and it is natively
+/// interactive; `iced_scroll_direction` suppresses it for `Hidden`).
+fn iced_synthetic_indicator_geometry(
+    geometry_index: &PresentationGeometryIndex,
+    layout: &LayoutOutput,
+    owner: &WidgetId,
+    native_scroll_regions: &[ScrollRegionDeclaration],
+    region: &ScrollRegionDeclaration,
+) -> Option<(Rect, Rect)> {
+    if region.indicator == slipway_core::ScrollIndicatorMode::Hidden {
+        return None;
+    }
+    if !region.enabled
+        || region.target != *owner
+        || native_scroll_regions
+            .iter()
+            .any(|native| native.id == region.id)
+        || (region.indicator != slipway_core::ScrollIndicatorMode::Visible
+            && scroll_region_has_real_child_placements_with_geometry_index(
+                geometry_index,
+                layout,
+                region,
+            ))
+        || !region.axes.vertical
+        || region.content_bounds.size.height <= region.viewport.size.height + 0.5
+    {
+        return None;
+    }
+    let viewport = slipway_core::declared_region_root_local_rect_with_geometry_index(
+        geometry_index,
+        &region.target,
+        region.address.as_ref(),
+        region.viewport.into_rect(),
+    );
+    let track = vertical_scroll_indicator_track(viewport)?;
+    let thumb = vertical_scroll_indicator_thumb(
+        track,
+        region.viewport.size.height,
+        region.content_bounds.size.height,
+        region.offset.y,
+    );
+    Some((track, thumb))
+}
+
+fn iced_scroll_indicator_paint(
+    geometry_index: &PresentationGeometryIndex,
+    view: &ViewDefinition,
+    native_scroll_regions: &[ScrollRegionDeclaration],
+) -> Vec<PaintOp> {
     let mut ops = Vec::new();
     for region in &view.scroll_regions {
-        if !region.enabled
-            || scroll_region_has_real_child_placements(&view.layout, region)
-            || !region.axes.vertical
-            || region.content_bounds.size.height <= region.viewport.size.height + 0.5
-        {
-            continue;
-        }
-        let viewport = slipway_core::declared_region_root_local_rect(
+        let Some((track, thumb)) = iced_synthetic_indicator_geometry(
+            geometry_index,
             &view.layout,
-            &region.target,
-            region.address.as_ref(),
-            *region.viewport,
-        );
-        let Some(track) = vertical_scroll_indicator_track(viewport) else {
+            &view.target,
+            native_scroll_regions,
+            region,
+        ) else {
             continue;
         };
-        let thumb = vertical_scroll_indicator_thumb(
-            track,
-            region.viewport.size.height,
-            region.content_bounds.size.height,
-            region.offset.y,
-        );
         ops.push(PaintOp::Fill {
             shape: ShapeDeclaration {
                 id: Some(format!("{}:scroll-indicator-track", region.id.as_str())),
@@ -2697,6 +3243,8 @@ fn scroll_indicator_thumb_color() -> slipway_core::Color {
 
 fn collect_iced_paint_occlusion_regions(
     ops: &[PaintOp],
+    target: &WidgetId,
+    address: Option<&WidgetSlotAddress>,
     order: (i32, usize, usize),
     clip: Option<Rect>,
     out: &mut Vec<IcedPaintOcclusionRegion>,
@@ -2710,6 +3258,8 @@ fn collect_iced_paint_occlusion_regions(
             } => {
                 collect_iced_paint_occlusion_regions(
                     ops,
+                    target,
+                    address,
                     order,
                     combine_clip_rects(clip, group_clip.as_ref().map(|clip| clip.bounds)),
                     out,
@@ -2717,6 +3267,7 @@ fn collect_iced_paint_occlusion_regions(
             }
             PaintOp::Layer {
                 input_transparency,
+                wheel_transparency,
                 clip: layer_clip,
                 ops,
                 ..
@@ -2727,9 +3278,18 @@ fn collect_iced_paint_occlusion_regions(
                     && let Some(bounds) =
                         paint_ops_root_bounds(ops).and_then(|bounds| clip_rect(bounds, active_clip))
                 {
-                    out.push(IcedPaintOcclusionRegion { order, bounds });
+                    out.push(IcedPaintOcclusionRegion {
+                        target: target.clone(),
+                        address: address.cloned(),
+                        order,
+                        bounds,
+                        blocks_wheel: slipway_core::paint_layer_blocks_wheel(
+                            *input_transparency,
+                            *wheel_transparency,
+                        ),
+                    });
                 }
-                collect_iced_paint_occlusion_regions(ops, order, active_clip, out);
+                collect_iced_paint_occlusion_regions(ops, target, address, order, active_clip, out);
             }
             PaintOp::Fill { .. } | PaintOp::Stroke { .. } | PaintOp::Text { .. } => {}
         }
@@ -3105,10 +3665,97 @@ fn iced_child_source_tree_index(slot: &WidgetSlotAddress, next_tree_index: &mut 
     index
 }
 
+struct IcedChildExplicitLayerOcclusionVisitor<'a, AppMessage> {
+    parent_presentation: &'a IcedPresentationState,
+    placements: &'a [slipway_core::ChildPlacement],
+    tree_children: &'a [iced::advanced::widget::Tree],
+    next_tree_index: usize,
+    regions: Vec<IcedPaintOcclusionRegion>,
+    _phantom: std::marker::PhantomData<AppMessage>,
+}
+
+impl<'a, AppMessage> IcedChildExplicitLayerOcclusionVisitor<'a, AppMessage> {
+    fn new(
+        parent_presentation: &'a IcedPresentationState,
+        placements: &'a [slipway_core::ChildPlacement],
+        tree_children: &'a [iced::advanced::widget::Tree],
+    ) -> Self {
+        Self {
+            parent_presentation,
+            placements,
+            tree_children,
+            next_tree_index: 0,
+            regions: Vec::new(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<ExternalState, AppMessage> SlipwayIcedWidgetListVisitor<ExternalState, AppMessage>
+    for IcedChildExplicitLayerOcclusionVisitor<'_, AppMessage>
+where
+    AppMessage: Clone,
+{
+    fn visit_iced_child<W>(
+        &mut self,
+        widget: &W,
+        _external: &ExternalState,
+        _local: &W::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        W: SlipwayIcedBackendChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+        let tree_index = iced_child_source_tree_index(&slot, &mut self.next_tree_index);
+        let Some(placement) = iced_child_placement_for_slot(self.placements, &widget.id(), &slot)
+        else {
+            return;
+        };
+        // Child layout already ran the child view pipeline and stored the
+        // resulting presentation; reuse its explicit layer paint units instead
+        // of executing the child view a second time per layout pass.
+        let Some(tree) = self.tree_children.get(tree_index) else {
+            return;
+        };
+        let Some(child_presentation) = tree
+            .state
+            .downcast_ref::<IcedRuntimeTreeState>()
+            .presentation
+            .as_ref()
+        else {
+            return;
+        };
+        for mut region in
+            iced_paint_occlusion_regions(&child_presentation.explicit_layer_paint_units)
+        {
+            let root_bounds = rect_translate(region.bounds, placement.bounds.origin);
+            let Some(visible_bounds) = native_scrolled_visible_occlusion_bounds(
+                &self.parent_presentation.native_scroll_dispatch_index,
+                root_bounds,
+            ) else {
+                continue;
+            };
+            region.bounds = visible_bounds;
+            self.regions.push(region);
+        }
+    }
+
+    fn visit_iced_native_child<N>(
+        &mut self,
+        _widget: &N,
+        _external: &ExternalState,
+        _local: &N::LocalState,
+        _slot: WidgetSlotAddress,
+    ) where
+        N: SlipwayIcedNativeChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+    }
+}
+
 struct IcedRuntimeChildTreeVisitor<'a, Theme, Renderer, AppMessage> {
     trees: Vec<iced::advanced::widget::Tree>,
     frame_seed: Option<&'a FrameIdentity>,
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
+    root_origin: Point,
     _phantom: std::marker::PhantomData<(Theme, Renderer, AppMessage)>,
 }
 
@@ -3116,11 +3763,13 @@ impl<'a, Theme, Renderer, AppMessage> IcedRuntimeChildTreeVisitor<'a, Theme, Ren
     fn new(
         frame_seed: Option<&'a FrameIdentity>,
         dirty_scopes: Option<&'a [IcedDirtyScope]>,
+        root_origin: Point,
     ) -> Self {
         Self {
             trees: Vec::new(),
             frame_seed,
             dirty_scopes,
+            root_origin,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -3152,6 +3801,8 @@ where
             slot,
             self.frame_seed,
             self.dirty_scopes,
+            self.root_origin,
+            None,
         );
         self.trees.push(iced::advanced::widget::Tree::new(
             &child as &dyn iced::advanced::Widget<SlipwayIcedRuntimeMessage, Theme, Renderer>,
@@ -3200,6 +3851,7 @@ where
     let mut visitor = IcedRuntimeChildTreeVisitor::<Theme, Renderer, W::AppMessage>::new(
         frame_seed,
         dirty_scopes,
+        Point { x: 0.0, y: 0.0 },
     );
     let _ = order_context;
     widget.visit_iced_authored_children(external, local, &mut visitor);
@@ -3211,6 +3863,7 @@ struct IcedRuntimeChildDiffVisitor<'a, 'b, Theme, Renderer, AppMessage> {
     next_index: usize,
     frame_seed: Option<&'b FrameIdentity>,
     dirty_scopes: Option<&'b [IcedDirtyScope]>,
+    root_origin: Point,
     _phantom: std::marker::PhantomData<(Theme, Renderer, AppMessage)>,
 }
 
@@ -3221,12 +3874,14 @@ impl<'a, 'b, Theme, Renderer, AppMessage>
         trees: &'a mut Vec<iced::advanced::widget::Tree>,
         frame_seed: Option<&'b FrameIdentity>,
         dirty_scopes: Option<&'b [IcedDirtyScope]>,
+        root_origin: Point,
     ) -> Self {
         Self {
             trees,
             next_index: 0,
             frame_seed,
             dirty_scopes,
+            root_origin,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -3258,6 +3913,8 @@ where
             slot,
             self.frame_seed,
             self.dirty_scopes,
+            self.root_origin,
+            None,
         );
         if let Some(tree) = self.trees.get_mut(self.next_index) {
             tree.diff(
@@ -3319,6 +3976,7 @@ fn reconcile_iced_runtime_child_trees<W, Theme, Renderer>(
         trees,
         frame_seed,
         dirty_scopes,
+        Point { x: 0.0, y: 0.0 },
     );
     let _ = order_context;
     widget.visit_iced_authored_children(external, local, &mut visitor);
@@ -3559,6 +4217,8 @@ struct IcedRuntimeChildLayoutVisitor<'a, 'b, Theme, Renderer, AppMessage> {
     current_order_index: Option<usize>,
     frame_seed: Option<&'b FrameIdentity>,
     dirty_scopes: Option<&'b [IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&'b IcedDispatchContext>,
     _phantom: std::marker::PhantomData<(Theme, AppMessage)>,
 }
 
@@ -3571,6 +4231,8 @@ impl<'a, 'b, Theme, Renderer, AppMessage>
         placements: &'a [slipway_core::ChildPlacement],
         frame_seed: Option<&'b FrameIdentity>,
         dirty_scopes: Option<&'b [IcedDirtyScope]>,
+        root_origin: Point,
+        dispatch_context: Option<&'b IcedDispatchContext>,
     ) -> Self {
         Self {
             tree_children,
@@ -3581,6 +4243,8 @@ impl<'a, 'b, Theme, Renderer, AppMessage>
             current_order_index: None,
             frame_seed,
             dirty_scopes,
+            root_origin,
+            dispatch_context,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -3613,6 +4277,9 @@ where
         let tree_index = iced_child_source_tree_index(&slot, &mut self.next_tree_index);
 
         let placement = iced_child_placement_for_slot(self.placements, &widget.id(), &slot);
+        let child_root_origin = placement
+            .map(|placement| point_add(self.root_origin, placement.bounds.origin))
+            .unwrap_or(self.root_origin);
         let child = iced_runtime_child_widget(
             widget,
             external,
@@ -3620,6 +4287,8 @@ where
             slot,
             self.frame_seed,
             self.dirty_scopes,
+            child_root_origin,
+            self.dispatch_context,
         );
         if tree_index >= self.tree_children.len() {
             self.tree_children.push(iced::advanced::widget::Tree::new(
@@ -3628,6 +4297,33 @@ where
         }
 
         let Some(placement) = placement else {
+            // The child has NO placement at this level this pass — e.g. its
+            // placement moved INSIDE a native scroll region (the app-level
+            // page region appearing after a window shrink re-parents every
+            // card under the scrollable's content tree). The tree entry must
+            // stay (child tree indices are positional), but a presentation
+            // frozen at the last directly-placed frame is a lie: it keeps
+            // phantom dispatch geometry alive, and the composite hit-region
+            // refresh (`refresh_composite_child_hit_regions`) would harvest
+            // the frozen copies and overwrite the CURRENT regions collected
+            // from the native-scroll subtree — the Step 213 stale-overlay
+            // press bug (presses at the panel's real position were resolved
+            // by the mounted child but dropped by the stale composed dispatch
+            // context, with no refusal evidence). Drop the presentation and
+            // the capture bookkeeping so only mounted presentations
+            // contribute; the next directly-placed layout pass rebuilds them.
+            if let Some(tree) = self.tree_children.get_mut(tree_index)
+                && tree.tag == iced::advanced::widget::tree::Tag::of::<IcedRuntimeTreeState>()
+            {
+                let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
+                if state.presentation.is_some() {
+                    state.presentation = None;
+                    state.hovered_region = None;
+                    state.pressed_region = None;
+                    state.indicator_drag = None;
+                    state.focused_region = None;
+                }
+            }
             self.nodes.push(iced_unplaced_child_node());
             return;
         };
@@ -3701,6 +4397,8 @@ fn layout_iced_runtime_children<W, Theme, Renderer>(
     frame: &FrameIdentity,
     frame_seed: Option<&FrameIdentity>,
     dirty_scopes: Option<&[IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&IcedDispatchContext>,
 ) -> Vec<iced::advanced::layout::Node>
 where
     W: SlipwayIcedBackendChildWidget,
@@ -3725,10 +4423,130 @@ where
         placements,
         frame_seed,
         dirty_scopes,
+        root_origin,
+        dispatch_context,
     );
     let _ = frame;
     widget.visit_iced_authored_children(external, local, &mut visitor);
     visitor.nodes
+}
+
+fn merge_child_explicit_layer_occlusions_into_presentation<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    presentation: &mut IcedPresentationState,
+    placements: &[slipway_core::ChildPlacement],
+    tree_children: &[iced::advanced::widget::Tree],
+) where
+    W: SlipwayIcedBackendChildWidget,
+    W::AppMessage: Clone,
+{
+    let mut visitor = IcedChildExplicitLayerOcclusionVisitor::<W::AppMessage>::new(
+        presentation,
+        placements,
+        tree_children,
+    );
+    widget.visit_iced_authored_children(external, local, &mut visitor);
+
+    let mut merged = iced_paint_occlusion_regions(&presentation.explicit_layer_paint_units);
+    merged.extend(visitor.regions);
+    merged.sort_by_key(|region| region.order);
+
+    presentation.paint_occlusion_regions = merged.clone();
+    // Mounted dispatch contexts test occlusion at `root_origin + view_local`
+    // (see `iced_evidence_root_local_point`), so the self-merged view-local
+    // bounds must be translated into mounted coordinates before they replace
+    // the mounted occlusion regions; untranslated bounds would occlude the
+    // mounted tree at phantom window positions.
+    presentation.dispatch_context.paint_occlusion_regions =
+        if presentation.dispatch_context.position_space
+            == IcedDispatchPositionSpace::MountedRootLocal
+        {
+            merged
+                .into_iter()
+                .map(|mut region| {
+                    region.bounds = rect_translate(region.bounds, presentation.root_origin);
+                    region
+                })
+                .collect()
+        } else {
+            merged.into()
+        };
+}
+
+/// Recursively collects the current hit regions of every mounted runtime child
+/// presentation reachable from `tree` (including native-scroll subtrees stored
+/// outside the iced child list), keyed by region id. Deeper (leaf) presentations
+/// overwrite shallower ones so the freshest copy wins.
+fn collect_descendant_runtime_hit_regions(
+    tree: &iced::advanced::widget::Tree,
+    out: &mut std::collections::HashMap<PresentationRegionId, HitRegionDeclaration>,
+) {
+    if tree.tag == iced::advanced::widget::tree::Tag::of::<IcedRuntimeTreeState>() {
+        let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
+        // A runtime tree WITHOUT a presentation is not mounted this pass
+        // (its placement moved elsewhere — e.g. inside a native scroll
+        // region; the layout visitor clears the frozen presentation). Its
+        // whole subtree is equally unmounted, so nothing under it may
+        // contribute: frozen copies would overwrite the CURRENT regions
+        // collected from the live mounting path (the Step 213 stale-overlay
+        // press bug).
+        let Some(presentation) = state.presentation.as_ref() else {
+            return;
+        };
+        for region in &presentation.hit_regions {
+            out.insert(region.id.clone(), region.clone());
+        }
+        for scroll_tree in &state.scroll_region_trees {
+            collect_descendant_runtime_hit_regions(scroll_tree, out);
+        }
+    }
+    for child in &tree.children {
+        collect_descendant_runtime_hit_regions(child, out);
+    }
+}
+
+/// Overwrites a composite presentation's flattened child hit regions in place
+/// with the current copies collected from its descendant runtime child
+/// presentations.
+///
+/// A composite view (`SlipwayAppWidget::view_definition`) flattens its
+/// descendants' hit regions into its own presentation at build time. When that
+/// presentation is reused across a child-local state change (the dirty scope
+/// targets the child, not the composite; e.g. an overlay drag), the flattened
+/// copies keep stale geometry and the composite's `ViewRootLocal` dispatch
+/// hit-tests the pre-move rects — one rebuild behind the child. The mounted
+/// child regions are byte-identical to the flattened copies apart from
+/// `bounds`/`order`/`cursor`, and the composite geometry index keys off the
+/// (unchanged) child placement, so overwriting the regions in place restores
+/// current dispatch geometry without a full composite rebuild.
+fn refresh_composite_child_hit_regions(
+    presentation: &mut IcedPresentationState,
+    child_hit_regions_by_id: &std::collections::HashMap<PresentationRegionId, HitRegionDeclaration>,
+) {
+    if child_hit_regions_by_id.is_empty() {
+        return;
+    }
+    let mut refreshed_any = false;
+    for region in &mut presentation.hit_regions {
+        if let Some(current) = child_hit_regions_by_id.get(&region.id) {
+            if region != current {
+                *region = current.clone();
+                refreshed_any = true;
+            }
+        }
+    }
+    if refreshed_any
+        && presentation.dispatch_context.position_space == IcedDispatchPositionSpace::ViewRootLocal
+    {
+        // `ViewRootLocal` dispatch resolution reads `dispatch_context.hit_regions`
+        // (a clone of the view regions taken at build time), so it must be brought
+        // forward with the refreshed regions. This is a layout-time refresh, not
+        // the per-event routing hot path.
+        presentation.dispatch_context.hit_regions =
+            presentation.hit_regions.iter().cloned().collect();
+    }
 }
 
 struct IcedRuntimeChildDrawVisitor<'a, 'b, Theme, Renderer, AppMessage> {
@@ -3745,6 +4563,8 @@ struct IcedRuntimeChildDrawVisitor<'a, 'b, Theme, Renderer, AppMessage> {
     current_order_index: Option<usize>,
     frame_seed: Option<&'a FrameIdentity>,
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&'a IcedDispatchContext>,
     _phantom: std::marker::PhantomData<AppMessage>,
 }
 
@@ -3779,6 +4599,9 @@ where
         if iced_child_placement_for_slot(self.placements, &widget.id(), &slot).is_none() {
             return;
         }
+        let child_root_origin = iced_child_placement_for_slot(self.placements, &widget.id(), &slot)
+            .map(|placement| point_add(self.root_origin, placement.bounds.origin))
+            .unwrap_or(self.root_origin);
 
         let Some(tree) = self.tree_children.get(tree_index) else {
             return;
@@ -3795,6 +4618,8 @@ where
             slot,
             self.frame_seed,
             self.dirty_scopes,
+            child_root_origin,
+            self.dispatch_context,
         );
         draw_iced_runtime_widget_local::<W, Theme, Renderer>(
             &child,
@@ -3871,6 +4696,8 @@ fn draw_iced_runtime_children<W, Theme, Renderer>(
     frame: &FrameIdentity,
     frame_seed: Option<&FrameIdentity>,
     dirty_scopes: Option<&[IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&IcedDispatchContext>,
 ) where
     W: SlipwayIcedBackendChildWidget,
     W::AppMessage: Clone,
@@ -3893,6 +4720,8 @@ fn draw_iced_runtime_children<W, Theme, Renderer>(
         current_order_index: None,
         frame_seed,
         dirty_scopes,
+        root_origin,
+        dispatch_context,
         _phantom: std::marker::PhantomData,
     };
     let _ = frame;
@@ -3946,6 +4775,8 @@ fn draw_iced_runtime_widget_local<W, Theme, Renderer>(
         &presentation.frame,
         widget.frame_seed.as_ref(),
         widget.dirty_scopes.as_deref(),
+        presentation.root_origin,
+        Some(&presentation.dispatch_context),
     );
     let text_input_regions = text_input_focus_regions(presentation);
     let text_editor_regions = text_editor_focus_regions(presentation);
@@ -4023,6 +4854,8 @@ struct IcedRuntimeChildOperateVisitor<'a, 'b, Theme, Renderer, AppMessage> {
     current_order_index: Option<usize>,
     frame_seed: Option<&'a FrameIdentity>,
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&'a IcedDispatchContext>,
     _phantom: std::marker::PhantomData<(Theme, AppMessage)>,
 }
 
@@ -4040,6 +4873,20 @@ where
         self.current_order_index = Some(index);
     }
 
+    fn iced_child_cached_paint_sort_key(
+        &self,
+        slot: &WidgetSlotAddress,
+    ) -> Option<(i32, usize, usize)> {
+        iced_cached_child_paint_sort_key(
+            &*self.tree_children,
+            self.placements,
+            self.frame_seed,
+            self.dirty_scopes,
+            self.root_origin,
+            slot,
+        )
+    }
+
     fn visit_iced_child<W>(
         &mut self,
         widget: &W,
@@ -4054,9 +4901,11 @@ where
         let layout_index = tree_index;
         self.next_layout_index = self.next_layout_index.max(layout_index + 1);
 
-        if iced_child_placement_for_slot(self.placements, &widget.id(), &slot).is_none() {
+        let Some(placement) = iced_child_placement_for_slot(self.placements, &widget.id(), &slot)
+        else {
             return;
-        }
+        };
+        let child_root_origin = point_add(self.root_origin, placement.bounds.origin);
 
         let Some(tree) = self.tree_children.get_mut(tree_index) else {
             return;
@@ -4073,6 +4922,8 @@ where
             slot,
             self.frame_seed,
             self.dirty_scopes,
+            child_root_origin,
+            self.dispatch_context,
         );
         <SlipwayIcedRuntimeWidget<'_, W> as iced::advanced::Widget<
             SlipwayIcedRuntimeMessage,
@@ -4144,6 +4995,8 @@ fn operate_iced_runtime_children<W, Theme, Renderer>(
     frame: &FrameIdentity,
     frame_seed: Option<&FrameIdentity>,
     dirty_scopes: Option<&[IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&IcedDispatchContext>,
 ) where
     W: SlipwayIcedBackendChildWidget,
     W::AppMessage: Clone,
@@ -4163,6 +5016,8 @@ fn operate_iced_runtime_children<W, Theme, Renderer>(
         current_order_index: None,
         frame_seed,
         dirty_scopes,
+        root_origin,
+        dispatch_context,
         _phantom: std::marker::PhantomData,
     };
     widget.visit_iced_authored_children_in_paint_order(
@@ -4188,6 +5043,8 @@ struct IcedRuntimeChildMouseVisitor<'a, 'b, Theme, Renderer, AppMessage> {
     current_order_index: Option<usize>,
     frame_seed: Option<&'a FrameIdentity>,
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&'a IcedDispatchContext>,
     _phantom: std::marker::PhantomData<(Theme, AppMessage)>,
 }
 
@@ -4203,6 +5060,20 @@ where
 {
     fn set_iced_child_order_index(&mut self, index: usize) {
         self.current_order_index = Some(index);
+    }
+
+    fn iced_child_cached_paint_sort_key(
+        &self,
+        slot: &WidgetSlotAddress,
+    ) -> Option<(i32, usize, usize)> {
+        iced_cached_child_paint_sort_key(
+            self.tree_children,
+            self.placements,
+            self.frame_seed,
+            self.dirty_scopes,
+            self.root_origin,
+            slot,
+        )
     }
 
     fn visit_iced_child<W>(
@@ -4223,9 +5094,11 @@ where
             return;
         }
 
-        if iced_child_placement_for_slot(self.placements, &widget.id(), &slot).is_none() {
+        let Some(placement) = iced_child_placement_for_slot(self.placements, &widget.id(), &slot)
+        else {
             return;
-        }
+        };
+        let child_root_origin = point_add(self.root_origin, placement.bounds.origin);
 
         let Some(tree) = self.tree_children.get(tree_index) else {
             return;
@@ -4242,6 +5115,8 @@ where
             slot,
             self.frame_seed,
             self.dirty_scopes,
+            child_root_origin,
+            self.dispatch_context,
         );
         self.interaction = <SlipwayIcedRuntimeWidget<'_, W> as iced::advanced::Widget<
             SlipwayIcedRuntimeMessage,
@@ -4320,6 +5195,8 @@ fn iced_runtime_children_mouse_interaction<W, Theme, Renderer>(
     frame: &FrameIdentity,
     frame_seed: Option<&FrameIdentity>,
     dirty_scopes: Option<&[IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&IcedDispatchContext>,
 ) -> iced::advanced::mouse::Interaction
 where
     W: SlipwayIcedBackendChildWidget,
@@ -4342,6 +5219,8 @@ where
         current_order_index: None,
         frame_seed,
         dirty_scopes,
+        root_origin,
+        dispatch_context,
         _phantom: std::marker::PhantomData,
     };
     widget.visit_iced_authored_children_in_paint_order(
@@ -4370,6 +5249,8 @@ struct IcedRuntimeChildUpdateVisitor<'a, 'b, 'c, Theme, Renderer> {
     current_order_index: Option<usize>,
     frame_seed: Option<&'a FrameIdentity>,
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&'a IcedDispatchContext>,
     _phantom: std::marker::PhantomData<Theme>,
 }
 
@@ -4385,6 +5266,20 @@ where
 {
     fn set_iced_child_order_index(&mut self, index: usize) {
         self.current_order_index = Some(index);
+    }
+
+    fn iced_child_cached_paint_sort_key(
+        &self,
+        slot: &WidgetSlotAddress,
+    ) -> Option<(i32, usize, usize)> {
+        iced_cached_child_paint_sort_key(
+            &*self.tree_children,
+            self.placements,
+            self.frame_seed,
+            self.dirty_scopes,
+            self.root_origin,
+            slot,
+        )
     }
 
     fn visit_iced_child<W>(
@@ -4405,9 +5300,11 @@ where
         let layout_index = tree_index;
         self.next_layout_index = self.next_layout_index.max(layout_index + 1);
 
-        if iced_child_placement_for_slot(self.placements, &widget.id(), &slot).is_none() {
+        let Some(placement) = iced_child_placement_for_slot(self.placements, &widget.id(), &slot)
+        else {
             return;
-        }
+        };
+        let child_root_origin = point_add(self.root_origin, placement.bounds.origin);
 
         let Some(tree) = self.tree_children.get_mut(tree_index) else {
             return;
@@ -4424,6 +5321,8 @@ where
             slot,
             self.frame_seed,
             self.dirty_scopes,
+            child_root_origin,
+            self.dispatch_context,
         );
         <SlipwayIcedRuntimeWidget<'_, W> as iced::advanced::Widget<
             SlipwayIcedRuntimeMessage,
@@ -4512,6 +5411,8 @@ fn update_iced_runtime_children<W, Theme, Renderer>(
     frame: &FrameIdentity,
     frame_seed: Option<&FrameIdentity>,
     dirty_scopes: Option<&[IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&IcedDispatchContext>,
 ) where
     W: SlipwayIcedBackendChildWidget,
     W::AppMessage: Clone,
@@ -4535,6 +5436,8 @@ fn update_iced_runtime_children<W, Theme, Renderer>(
         current_order_index: None,
         frame_seed,
         dirty_scopes,
+        root_origin,
+        dispatch_context,
         _phantom: std::marker::PhantomData,
     };
     widget.visit_iced_authored_children_in_paint_order(
@@ -4603,6 +5506,7 @@ fn update_iced_text_input_regions<AppMessage, Theme, Renderer>(
     clipboard: &mut dyn iced::advanced::Clipboard,
     shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
     viewport: &iced::Rectangle,
+    published_preedit_style: &mut Option<IcedPreeditOverlayStyle>,
 ) where
     AppMessage: Clone,
     Theme: SlipwayIcedThemeContract,
@@ -4654,7 +5558,13 @@ fn update_iced_text_input_regions<AppMessage, Theme, Renderer>(
         if shell.input_method() != &input_method_before
             && matches!(shell.input_method(), iced_core::InputMethod::Enabled { .. })
             && let Some(style) = preedit_overlay_style_for_region(region)
+            && published_preedit_style.as_ref() != Some(&style)
         {
+            // Every redraw tick re-enables the input method on a fresh shell,
+            // so an unconditional publish here re-marks the runner dirty each
+            // tick and locks a focused text input into a repaint loop. Only
+            // republish when the preedit style value actually changed.
+            *published_preedit_style = Some(style.clone());
             shell.publish(SlipwayIcedRuntimeMessage::PreeditStyle(style));
         }
     }
@@ -5300,6 +6210,7 @@ fn operate_iced_text_editor_regions<AppMessage, Theme, Renderer>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_iced_text_editor_regions<AppMessage, Theme, Renderer>(
     trees: &mut [iced::advanced::widget::Tree],
     presentation: &IcedPresentationState,
@@ -5312,6 +6223,7 @@ fn update_iced_text_editor_regions<AppMessage, Theme, Renderer>(
     clipboard: &mut dyn iced::advanced::Clipboard,
     shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
     viewport: &iced::Rectangle,
+    published_preedit_style: &mut Option<IcedPreeditOverlayStyle>,
 ) where
     AppMessage: Clone,
     Theme: SlipwayIcedThemeContract,
@@ -5349,7 +6261,12 @@ fn update_iced_text_editor_regions<AppMessage, Theme, Renderer>(
         if shell.input_method() != &input_method_before
             && matches!(shell.input_method(), iced_core::InputMethod::Enabled { .. })
             && let Some(style) = preedit_overlay_style_for_region(region)
+            && published_preedit_style.as_ref() != Some(&style)
         {
+            // See update_iced_text_input_regions: republishing an unchanged
+            // preedit style every redraw tick locks the runner into a repaint
+            // loop while a text edit region stays focused.
+            *published_preedit_style = Some(style.clone());
             shell.publish(SlipwayIcedRuntimeMessage::PreeditStyle(style));
         }
     }
@@ -5458,6 +6375,8 @@ where
     scroll: &'a ScrollRegionDeclaration,
     frame_seed: Option<&'a FrameIdentity>,
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
+    suppress_descendant_wheel_update: bool,
+    active_wheel_region: Option<PresentationRegionId>,
 }
 
 impl<'a, W, Theme, Renderer> From<IcedScrollContentWidget<'a, W>>
@@ -5543,6 +6462,7 @@ where
         limits: &iced::advanced::layout::Limits,
     ) -> iced::advanced::layout::Node {
         let placements = adjusted_scroll_child_placements(self.presentation, self.scroll);
+        let root_origin = scroll_content_root_origin(self.presentation, self.scroll);
         let child_nodes = layout_iced_runtime_children::<W, Theme, Renderer>(
             self.widget,
             self.external,
@@ -5553,6 +6473,8 @@ where
             &self.presentation.frame,
             self.frame_seed,
             self.dirty_scopes,
+            root_origin,
+            Some(&self.presentation.dispatch_context),
         );
         let intrinsic = iced::Size::new(
             self.scroll.content_bounds.size.width.max(0.0),
@@ -5576,6 +6498,7 @@ where
         operation: &mut dyn iced::advanced::widget::Operation,
     ) {
         let placements = adjusted_scroll_child_placements(self.presentation, self.scroll);
+        let root_origin = scroll_content_root_origin(self.presentation, self.scroll);
         operate_iced_runtime_children::<W, Theme, Renderer>(
             self.widget,
             self.external,
@@ -5588,6 +6511,8 @@ where
             &self.presentation.frame,
             self.frame_seed,
             self.dirty_scopes,
+            root_origin,
+            Some(&self.presentation.dispatch_context),
         );
     }
 
@@ -5602,7 +6527,28 @@ where
         shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
         viewport: &iced::Rectangle,
     ) {
-        let placements = adjusted_scroll_child_placements(self.presentation, self.scroll);
+        if !should_update_scroll_content_children_for_event(
+            event,
+            self.suppress_descendant_wheel_update,
+        ) {
+            return;
+        }
+        let mut placements = adjusted_scroll_child_placements(self.presentation, self.scroll);
+        if is_iced_wheel_event(event) {
+            if let Some(active_wheel_region) = self.active_wheel_region.as_ref() {
+                placements.retain(|placement| {
+                    scroll_content_child_placement_can_receive_wheel_region(
+                        self.presentation,
+                        placement,
+                        active_wheel_region,
+                    )
+                });
+            }
+            if placements.is_empty() {
+                return;
+            }
+        }
+        let root_origin = scroll_content_root_origin(self.presentation, self.scroll);
         update_iced_runtime_children::<W, Theme, Renderer>(
             self.widget,
             self.external,
@@ -5619,6 +6565,8 @@ where
             &self.presentation.frame,
             self.frame_seed,
             self.dirty_scopes,
+            root_origin,
+            Some(&self.presentation.dispatch_context),
         );
     }
 
@@ -5633,6 +6581,7 @@ where
         viewport: &iced::Rectangle,
     ) {
         let placements = adjusted_scroll_child_placements(self.presentation, self.scroll);
+        let root_origin = scroll_content_root_origin(self.presentation, self.scroll);
         let context = scroll_content_paint_queue_context(layout, viewport);
         with_iced_global_paint_context(context, || {
             draw_iced_runtime_children::<W, Theme, Renderer>(
@@ -5650,6 +6599,8 @@ where
                 &self.presentation.frame,
                 self.frame_seed,
                 self.dirty_scopes,
+                root_origin,
+                Some(&self.presentation.dispatch_context),
             );
         });
     }
@@ -5663,6 +6614,7 @@ where
         renderer: &Renderer,
     ) -> iced::advanced::mouse::Interaction {
         let placements = adjusted_scroll_child_placements(self.presentation, self.scroll);
+        let root_origin = scroll_content_root_origin(self.presentation, self.scroll);
         iced_runtime_children_mouse_interaction::<W, Theme, Renderer>(
             self.widget,
             self.external,
@@ -5676,17 +6628,78 @@ where
             &self.presentation.frame,
             self.frame_seed,
             self.dirty_scopes,
+            root_origin,
+            Some(&self.presentation.dispatch_context),
         )
     }
 }
 
+fn should_update_scroll_content_children_for_event(
+    event: &iced::Event,
+    suppress_descendant_wheel_update: bool,
+) -> bool {
+    !(suppress_descendant_wheel_update && is_iced_wheel_event(event))
+}
+
+fn scroll_content_child_placement_can_receive_wheel_region(
+    presentation: &IcedPresentationState,
+    placement: &slipway_core::ChildPlacement,
+    active_wheel_region: &PresentationRegionId,
+) -> bool {
+    let Some(region) = presentation
+        .dispatch_context
+        .scroll_regions
+        .iter()
+        .find(|region| &region.id == active_wheel_region)
+    else {
+        return false;
+    };
+
+    if placement.child == region.target {
+        return true;
+    }
+
+    let Some(placement_slot) = placement.local_state_slot.as_ref() else {
+        return false;
+    };
+    region.address.as_ref().is_some_and(|region_slot| {
+        region_slot.path.starts_with(&placement_slot.path)
+            || placement_slot.path.starts_with(&region_slot.path)
+    })
+}
+
+#[cfg(test)]
 fn native_iced_scroll_regions_for_layout(
     layout: &LayoutOutput,
     scroll_regions: &[ScrollRegionDeclaration],
+    owner: &WidgetId,
+) -> Vec<ScrollRegionDeclaration> {
+    let geometry_index = PresentationGeometryIndex::from_layout(layout);
+    native_iced_scroll_regions_for_layout_with_geometry_index(
+        &geometry_index,
+        layout,
+        scroll_regions,
+        owner,
+    )
+}
+
+fn native_iced_scroll_regions_for_layout_with_geometry_index(
+    geometry_index: &PresentationGeometryIndex,
+    layout: &LayoutOutput,
+    scroll_regions: &[ScrollRegionDeclaration],
+    owner: &WidgetId,
 ) -> Vec<ScrollRegionDeclaration> {
     scroll_regions
         .iter()
-        .filter(|scroll| scroll.enabled && scroll_region_has_real_child_placements(layout, scroll))
+        .filter(|scroll| {
+            scroll.enabled
+                && scroll.target == *owner
+                && scroll_region_has_real_child_placements_with_geometry_index(
+                    geometry_index,
+                    layout,
+                    scroll,
+                )
+        })
         .cloned()
         .collect()
 }
@@ -5747,6 +6760,20 @@ fn adjusted_scroll_child_placements(
         .collect()
 }
 
+fn scroll_content_root_origin(
+    presentation: &IcedPresentationState,
+    scroll: &ScrollRegionDeclaration,
+) -> Point {
+    let origin = region_root_local_rect(
+        presentation,
+        &scroll.target,
+        scroll.address.as_ref(),
+        scroll.content_bounds.into_rect(),
+    )
+    .origin;
+    origin
+}
+
 fn iced_scrollable_id(region: &ScrollRegionDeclaration) -> iced::advanced::widget::Id {
     iced::advanced::widget::Id::from(format!(
         "slipway-scroll:{}:{}",
@@ -5755,18 +6782,24 @@ fn iced_scrollable_id(region: &ScrollRegionDeclaration) -> iced::advanced::widge
     ))
 }
 
+// Native-backed regions: the iced Scrollable draws its own scrollbar, so
+// the declared indicator maps onto ITS rail (Step 210) — `Hidden` uses the
+// zero-width `Scrollbar::hidden()` (scrolling and wheel routing are
+// unaffected; the rail just paints nothing), `Auto`/`Visible` keep the
+// byte-identical default rail.
 fn iced_scroll_direction(region: &ScrollRegionDeclaration) -> iced::widget::scrollable::Direction {
+    let scrollbar = if region.indicator == slipway_core::ScrollIndicatorMode::Hidden {
+        iced::widget::scrollable::Scrollbar::hidden()
+    } else {
+        iced::widget::scrollable::Scrollbar::default()
+    };
     match (region.axes.horizontal, region.axes.vertical) {
         (true, true) => iced::widget::scrollable::Direction::Both {
-            horizontal: iced::widget::scrollable::Scrollbar::default(),
-            vertical: iced::widget::scrollable::Scrollbar::default(),
+            horizontal: scrollbar,
+            vertical: scrollbar,
         },
-        (true, false) => iced::widget::scrollable::Direction::Horizontal(
-            iced::widget::scrollable::Scrollbar::default(),
-        ),
-        (false, true) | (false, false) => iced::widget::scrollable::Direction::Vertical(
-            iced::widget::scrollable::Scrollbar::default(),
-        ),
+        (true, false) => iced::widget::scrollable::Direction::Horizontal(scrollbar),
+        (false, true) | (false, false) => iced::widget::scrollable::Direction::Vertical(scrollbar),
     }
 }
 
@@ -5778,6 +6811,8 @@ fn iced_scrollable_widget_for_region<'a, W, Theme, Renderer>(
     region: &'a ScrollRegionDeclaration,
     frame_seed: Option<&'a FrameIdentity>,
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
+    suppress_descendant_wheel_update: bool,
+    active_wheel_region: Option<PresentationRegionId>,
 ) -> iced::widget::Scrollable<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
 where
     W: SlipwayIcedBackendChildWidget + 'a,
@@ -5792,11 +6827,22 @@ where
     let target = region.target.clone();
     let target_slot = region.address.clone();
     let region_id = region.id.clone();
-    let declared_viewport = region.viewport;
-    let declared_content = region.content_bounds;
+    let selected_region = iced_dispatch_scroll_region_for_event(presentation, region).clone();
+    let declared_viewport = selected_region.viewport;
+    let declared_content = selected_region.content_bounds;
     let frame = presentation.frame.clone();
-    let scroll_regions = presentation.scroll_regions.clone();
-    let selected_region = region.clone();
+    let scroll_regions = iced_scroll_dispatch_regions_for_event(presentation, region);
+    // Content-space anchor for the positionless scroll-sync evidence (audit
+    // finding MF-M19): the selected region's declared viewport origin in
+    // root-local content space, precomputed here so the per-event closure
+    // stays allocation-free.
+    let evidence_position = slipway_core::declared_region_root_local_rect_with_geometry_index(
+        &presentation.geometry_index,
+        &selected_region.target,
+        selected_region.address.as_ref(),
+        selected_region.viewport.into_rect(),
+    )
+    .origin;
     let content = IcedScrollContentWidget {
         widget,
         external,
@@ -5805,6 +6851,8 @@ where
         scroll: region,
         frame_seed,
         dirty_scopes,
+        suppress_descendant_wheel_update,
+        active_wheel_region,
     };
 
     iced::widget::scrollable::<SlipwayIcedRuntimeMessage, Theme, Renderer>(content)
@@ -5828,6 +6876,7 @@ where
                 &scroll_regions,
                 &selected_region,
                 event,
+                Some(evidence_position),
             ))
         })
 }
@@ -5858,6 +6907,8 @@ fn reconcile_iced_scroll_region_trees<W, Theme, Renderer>(
             region,
             frame_seed,
             dirty_scopes,
+            false,
+            None,
         );
         if let Some(tree) = trees.get_mut(index) {
             tree.diff(
@@ -5916,33 +6967,33 @@ where
                 region,
                 frame_seed,
                 dirty_scopes,
+                false,
+                None,
             );
             let size = iced::Size::new(
                 region.viewport.size.width.max(0.0),
                 region.viewport.size.height.max(0.0),
             );
             let limits = iced::advanced::layout::Limits::new(size, size);
-            Some(
-                <iced::widget::Scrollable<
-                    '_,
-                    SlipwayIcedRuntimeMessage,
-                    Theme,
-                    Renderer,
-                > as iced::advanced::Widget<
-                    SlipwayIcedRuntimeMessage,
-                    Theme,
-                    Renderer,
-                >>::layout(&mut scrollable, tree, renderer, &limits)
-                .move_to(iced_point(
-                    region_root_local_rect(
-                        presentation,
-                        &region.target,
-                        region.address.as_ref(),
-                        region.viewport.into_rect(),
-                    )
-                    .origin,
-                )),
-            )
+            Some(<iced::widget::Scrollable<
+                '_,
+                SlipwayIcedRuntimeMessage,
+                Theme,
+                Renderer,
+            > as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                Theme,
+                Renderer,
+            >>::layout(&mut scrollable, tree, renderer, &limits)
+            .move_to(iced_point(
+                region_root_local_rect(
+                    presentation,
+                    &region.target,
+                    region.address.as_ref(),
+                    region.viewport.into_rect(),
+                )
+                .origin,
+            )))
         })
         .collect()
 }
@@ -5994,6 +7045,8 @@ fn operate_iced_scroll_regions<W, Theme, Renderer>(
             region,
             frame_seed,
             dirty_scopes,
+            false,
+            None,
         );
         <iced::widget::Scrollable<
             '_,
@@ -6043,7 +7096,16 @@ fn update_iced_scroll_regions<W, Theme, Renderer>(
     let Some(start) = scroll_layout_start(layout, regions.len(), text_count) else {
         return;
     };
+    let selected_wheel_region =
+        iced_declared_wheel_region_id_for_event(presentation, event, layout.bounds(), cursor);
     for (index, region) in regions.iter().enumerate() {
+        if !should_update_native_scroll_region_for_event(
+            event,
+            selected_wheel_region.as_ref(),
+            region,
+        ) {
+            continue;
+        }
         if shell.is_event_captured() {
             return;
         }
@@ -6058,6 +7120,10 @@ fn update_iced_scroll_regions<W, Theme, Renderer>(
             region,
             frame_seed,
             dirty_scopes,
+            selected_wheel_region
+                .as_ref()
+                .is_some_and(|selected| selected == &region.id),
+            selected_wheel_region.clone(),
         );
         <iced::widget::Scrollable<
             '_,
@@ -6080,6 +7146,164 @@ fn update_iced_scroll_regions<W, Theme, Renderer>(
             viewport,
         );
     }
+}
+
+fn should_update_native_scroll_region_for_event(
+    event: &iced::Event,
+    selected_wheel_region: Option<&PresentationRegionId>,
+    region: &ScrollRegionDeclaration,
+) -> bool {
+    if !is_iced_wheel_event(event) {
+        return true;
+    }
+
+    selected_wheel_region.is_some_and(|selected| selected == &region.id)
+}
+
+fn iced_declared_wheel_region_id_for_event(
+    presentation: &IcedPresentationState,
+    event: &iced::Event,
+    layout_bounds: iced::Rectangle,
+    cursor: iced::advanced::mouse::Cursor,
+) -> Option<PresentationRegionId> {
+    let (delta_x, delta_y) = iced_wheel_delta(event)?;
+    let position = cursor.position()?;
+    let points = iced_input_root_local_points(presentation, layout_bounds, position);
+    select_declared_wheel_consumer_at_input_points(presentation, points, delta_x, delta_y)
+        .map(|region| region.id.clone())
+}
+
+fn select_declared_wheel_consumer_at_input_points<'a>(
+    presentation: &'a IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<&'a ScrollRegionDeclaration> {
+    let selected = if presentation.dispatch_context.position_space
+        == IcedDispatchPositionSpace::MountedRootLocal
+    {
+        let mounted_points = iced_mounted_wheel_input_points(presentation, points);
+        select_wheel_consumer_with_native_fallback_at_input_points(
+            &presentation.dispatch_context.geometry_index,
+            presentation.dispatch_context.scroll_regions.as_ref(),
+            presentation.dispatch_context.native_scroll_regions.as_ref(),
+            mounted_points,
+            delta_x,
+            delta_y,
+        )
+    } else {
+        select_native_wheel_consumer_at_input_points(
+            presentation,
+            presentation.scroll_regions.as_slice(),
+            points,
+            delta_x,
+            delta_y,
+        )
+    };
+
+    selected.filter(|scroll| !wheel_blocker_prevents_scroll_dispatch(presentation, points, scroll))
+}
+
+/// Maps this presentation's view-local wheel points into the mounted dispatch
+/// context's coordinate space. `visual` is the context-space VISIBLE point
+/// (`root_origin` + view-local); the ancestor's native scroll regions keep
+/// their declared viewport rects at visible positions, so `visual` is the
+/// point that hit-tests them. `dispatch` additionally applies both this
+/// presentation's own native scroll translation (already in `points.dispatch`)
+/// and the ancestor native scroll translation resolved at the visible point,
+/// producing the context CONTENT-space point that hit-tests region rects
+/// declared inside the ancestor's scrolled content.
+fn iced_mounted_wheel_input_points(
+    presentation: &IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+) -> IcedInputRootLocalPoints {
+    let visual = iced_evidence_root_local_point(presentation, points.visual);
+    let ancestor_scrolled = iced_native_scrolled_root_local_point(
+        &presentation.dispatch_context.native_scroll_dispatch_index,
+        visual,
+    );
+    let self_scrolled = iced_evidence_root_local_point(presentation, points.dispatch);
+    IcedInputRootLocalPoints {
+        visual,
+        dispatch: Point {
+            x: self_scrolled.x + (ancestor_scrolled.x - visual.x),
+            y: self_scrolled.y + (ancestor_scrolled.y - visual.y),
+        },
+    }
+}
+
+fn select_native_wheel_consumer_at_input_points<'a>(
+    presentation: &'a IcedPresentationState,
+    regions: &'a [ScrollRegionDeclaration],
+    points: IcedInputRootLocalPoints,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<&'a ScrollRegionDeclaration> {
+    select_wheel_consumer_with_native_fallback_at_input_points(
+        &presentation.geometry_index,
+        regions,
+        presentation.native_scroll_regions.as_ref(),
+        points,
+        delta_x,
+        delta_y,
+    )
+}
+
+fn select_wheel_consumer_with_native_fallback_at_input_points<'a>(
+    geometry_index: &PresentationGeometryIndex,
+    regions: &'a [ScrollRegionDeclaration],
+    native_scroll_regions: &'a [ScrollRegionDeclaration],
+    points: IcedInputRootLocalPoints,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<&'a ScrollRegionDeclaration> {
+    let dispatch =
+        slipway_core::select_declared_wheel_consumer_at_root_local_point_with_geometry_index(
+            geometry_index,
+            regions,
+            points.dispatch,
+            delta_x,
+            delta_y,
+        );
+    if dispatch.is_some() || !iced_input_points_are_native_scrolled(points) {
+        return dispatch;
+    }
+    // The scrolled dispatch point selected nothing, so the cursor sits in a
+    // natively-scrolled dead band. Only the resolving view's own native scroll
+    // regions keep their declared viewport rects at visible window positions,
+    // so resolve the fallback through the visible viewport point restricted to
+    // those regions; consulting the full declared list at the visible point
+    // would let content-space rects act as fixed window-band phantom owners.
+    slipway_core::select_declared_wheel_consumer_at_root_local_point_with_geometry_index(
+        geometry_index,
+        native_scroll_regions,
+        points.visual,
+        delta_x,
+        delta_y,
+    )
+}
+
+fn scroll_region_is_native_in(
+    native_scroll_regions: &[ScrollRegionDeclaration],
+    region: &ScrollRegionDeclaration,
+) -> bool {
+    native_scroll_regions
+        .iter()
+        .any(|native| native.id == region.id)
+}
+
+fn iced_wheel_delta(event: &iced::Event) -> Option<(f32, f32)> {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => match delta {
+            iced::mouse::ScrollDelta::Lines { x, y } => Some((*x, *y)),
+            iced::mouse::ScrollDelta::Pixels { x, y } => Some((*x, *y)),
+        },
+        _ => None,
+    }
+}
+
+fn is_iced_wheel_event(event: &iced::Event) -> bool {
+    iced_wheel_delta(event).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6122,6 +7346,8 @@ fn draw_iced_scroll_regions<W, Theme, Renderer>(
             region,
             frame_seed,
             dirty_scopes,
+            false,
+            None,
         );
         <iced::widget::Scrollable<
             '_,
@@ -6183,6 +7409,8 @@ where
             region,
             frame_seed,
             dirty_scopes,
+            false,
+            None,
         );
         let interaction = <iced::widget::Scrollable<
             '_,
@@ -6263,6 +7491,10 @@ where
                 diagnostics: report.diagnostics,
             }
         }
+        SlipwayIcedRuntimeMessage::DispatchRefusal(evidence) => {
+            runtime.record_dispatch_refusal_for_backend(evidence, ICED_BACKEND_ID);
+            SlipwayIcedRuntimeUpdate::Noop
+        }
         SlipwayIcedRuntimeMessage::PreeditStyle(_) => SlipwayIcedRuntimeUpdate::Noop,
         SlipwayIcedRuntimeMessage::DrainDebug => SlipwayIcedRuntimeUpdate::DrainDebug,
         SlipwayIcedRuntimeMessage::Noop => SlipwayIcedRuntimeUpdate::Noop,
@@ -6323,8 +7555,10 @@ impl<'a, W: SlipwayIcedBackendChildWidget> SlipwayIcedRuntimeWidget<'a, W> {
             external,
             local,
             runtime_slot: None,
+            root_origin: Point { x: 0.0, y: 0.0 },
+            dispatch_context: None,
             width: iced::Length::Fill,
-            height: iced::Length::Shrink,
+            height: iced::Length::Fill,
             presented_viewport_sink: None,
             frame_seed: None,
             dirty_scopes: None,
@@ -6365,6 +7599,16 @@ impl<'a, W: SlipwayIcedBackendChildWidget> SlipwayIcedRuntimeWidget<'a, W> {
 
     fn with_runtime_slot(mut self, slot: WidgetSlotAddress) -> Self {
         self.runtime_slot = Some(slot);
+        self
+    }
+
+    fn with_root_origin(mut self, root_origin: Point) -> Self {
+        self.root_origin = root_origin;
+        self
+    }
+
+    fn with_dispatch_context(mut self, dispatch_context: &'a IcedDispatchContext) -> Self {
+        self.dispatch_context = Some(Cow::Borrowed(dispatch_context));
         self
     }
 
@@ -6561,7 +7805,9 @@ where
             scroll_region_trees: Vec::new(),
             hovered_region: None,
             pressed_region: None,
+            indicator_drag: None,
             focused_region: None,
+            published_preedit_style: None,
             layout_pass: 0,
         })
     }
@@ -6638,6 +7884,7 @@ where
                     self.dirty_scopes.as_deref(),
                     &state.id,
                     self.runtime_slot.as_ref(),
+                    self.root_origin,
                 )
             }) {
                 if let Some(presentation) = state.presentation.as_mut() {
@@ -6651,7 +7898,7 @@ where
                 }
             } else {
                 state.layout_pass = state.layout_pass.saturating_add(1);
-                state.presentation = Some(iced_presentation_for_widget(
+                state.presentation = Some(iced_presentation_for_widget_with_root_origin(
                     self.widget,
                     self.external,
                     self.local,
@@ -6659,7 +7906,11 @@ where
                     self.frame_seed.as_ref(),
                     state.layout_pass,
                     self.runtime_slot.as_ref(),
+                    self.root_origin,
                 ));
+            }
+            if let Some(presentation) = state.presentation.as_mut() {
+                presentation.apply_dispatch_context_override(self.dispatch_context.as_deref());
             }
             state
                 .presentation
@@ -6667,14 +7918,19 @@ where
                 .map(root_child_placements_excluding_native_scroll)
                 .unwrap_or_default()
         };
-        let child_frame = tree
-            .state
-            .downcast_ref::<IcedRuntimeTreeState>()
-            .presentation
-            .as_ref()
-            .expect("runtime layout must create presentation before child layout")
-            .frame
-            .clone();
+        let (child_frame, root_origin, dispatch_context) = {
+            let presentation = tree
+                .state
+                .downcast_ref::<IcedRuntimeTreeState>()
+                .presentation
+                .as_ref()
+                .expect("runtime layout must create presentation before child layout");
+            (
+                presentation.frame.clone(),
+                presentation.root_origin,
+                presentation.dispatch_context.clone(),
+            )
+        };
         let mut child_nodes = layout_iced_runtime_children::<W, Theme, Renderer>(
             self.widget,
             self.external,
@@ -6685,7 +7941,24 @@ where
             &child_frame,
             self.frame_seed.as_ref(),
             self.dirty_scopes.as_deref(),
+            root_origin,
+            Some(&dispatch_context),
         );
+        {
+            let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
+            let presentation = state
+                .presentation
+                .as_mut()
+                .expect("runtime layout must create presentation before child occlusion merge");
+            merge_child_explicit_layer_occlusions_into_presentation(
+                self.widget,
+                self.external,
+                self.local,
+                presentation,
+                root_placements.as_ref(),
+                &tree.children,
+            );
+        }
         {
             let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
             let presentation = state
@@ -6740,6 +8013,27 @@ where
                 ));
             }
         }
+        {
+            // Refresh this presentation's flattened descendant hit regions from
+            // the current mounted child presentations (already laid out above,
+            // including native-scroll subtrees). This keeps a reused composite
+            // presentation's `ViewRootLocal` dispatch geometry current after an
+            // intra-child drag without a full composite rebuild.
+            let mut child_hit_regions = std::collections::HashMap::new();
+            {
+                let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
+                for scroll_tree in &state.scroll_region_trees {
+                    collect_descendant_runtime_hit_regions(scroll_tree, &mut child_hit_regions);
+                }
+            }
+            for child in &tree.children {
+                collect_descendant_runtime_hit_regions(child, &mut child_hit_regions);
+            }
+            let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
+            if let Some(presentation) = state.presentation.as_mut() {
+                refresh_composite_child_hit_regions(presentation, &child_hit_regions);
+            }
+        }
         let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
         let presentation = state
             .presentation
@@ -6762,7 +8056,14 @@ where
         renderer: &Renderer,
         operation: &mut dyn iced::advanced::widget::Operation,
     ) {
-        let (root_placements, text_input_regions, text_editor_regions, frame) = {
+        let (
+            root_placements,
+            text_input_regions,
+            text_editor_regions,
+            frame,
+            root_origin,
+            dispatch_context,
+        ) = {
             let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
             let presentation = state
                 .presentation
@@ -6773,6 +8074,8 @@ where
                 text_input_focus_regions(presentation),
                 text_editor_focus_regions(presentation),
                 presentation.frame.clone(),
+                presentation.root_origin,
+                presentation.dispatch_context.clone(),
             )
         };
         let text_region_count = text_input_regions.len() + text_editor_regions.len();
@@ -6790,6 +8093,8 @@ where
                 &frame,
                 self.frame_seed.as_ref(),
                 self.dirty_scopes.as_deref(),
+                root_origin,
+                Some(&dispatch_context),
             );
             let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
             if let Some(presentation) = state.presentation.as_ref() {
@@ -6846,7 +8151,14 @@ where
             return;
         }
 
-        let (root_placements, text_input_regions, text_editor_regions, frame) = {
+        let (
+            root_placements,
+            text_input_regions,
+            text_editor_regions,
+            frame,
+            root_origin,
+            dispatch_context,
+        ) = {
             let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
             let presentation = state
                 .presentation
@@ -6857,6 +8169,8 @@ where
                 text_input_focus_regions(presentation),
                 text_editor_focus_regions(presentation),
                 presentation.frame.clone(),
+                presentation.root_origin,
+                presentation.dispatch_context.clone(),
             )
         };
         let text_region_count = text_input_regions.len() + text_editor_regions.len();
@@ -6879,6 +8193,7 @@ where
                 clipboard,
                 shell,
                 viewport,
+                &mut state.published_preedit_style,
             );
         }
 
@@ -6903,6 +8218,7 @@ where
                 clipboard,
                 shell,
                 viewport,
+                &mut state.published_preedit_style,
             );
         }
 
@@ -6926,6 +8242,8 @@ where
             &frame,
             self.frame_seed.as_ref(),
             self.dirty_scopes.as_deref(),
+            root_origin,
+            Some(&dispatch_context),
         );
 
         if shell.is_event_captured() {
@@ -6963,37 +8281,13 @@ where
 
         let routed = {
             let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
-            let mut hovered = state.hovered_region.clone();
-            let mut pressed = state.pressed_region.clone();
-            let mut focused = state.focused_region.clone();
-            let routed = route_iced_event(
-                event,
-                layout.bounds(),
-                cursor,
-                state.presentation.as_ref(),
-                &mut hovered,
-                &mut pressed,
-                &mut focused,
-            );
-            state.hovered_region = hovered;
-            state.pressed_region = pressed;
-            state.focused_region = focused;
-            routed
+            route_iced_event_for_tree_state(event, layout.bounds(), cursor, state)
         };
         let Some(routed) = routed else {
             return;
         };
 
-        if let Some(input) = routed.input {
-            shell.publish(SlipwayIcedRuntimeMessage::BackendInput(input));
-        }
-
-        if routed.capture_event {
-            shell.capture_event();
-        }
-        if routed.request_redraw {
-            shell.request_redraw();
-        }
+        publish_iced_routed_input(shell, routed);
     }
 
     fn draw(
@@ -7041,6 +8335,8 @@ where
                 &presentation.frame,
                 self.frame_seed.as_ref(),
                 self.dirty_scopes.as_deref(),
+                presentation.root_origin,
+                Some(&presentation.dispatch_context),
             );
             if child_interaction != iced::advanced::mouse::Interaction::None {
                 return child_interaction;
@@ -7154,7 +8450,9 @@ where
             scroll_region_trees: Vec::new(),
             hovered_region: None,
             pressed_region: None,
+            indicator_drag: None,
             focused_region: None,
+            published_preedit_style: None,
             layout_pass: 0,
         })
     }
@@ -7230,11 +8528,12 @@ where
                     None,
                     &state.id,
                     self.runtime_slot.as_ref(),
+                    Point { x: 0.0, y: 0.0 },
                 )
             }) {
                 state.layout_pass = state.layout_pass.saturating_add(1);
                 self.push_layout_intent(&input);
-                state.presentation = Some(iced_presentation_for_widget(
+                state.presentation = Some(iced_presentation_for_widget_with_root_origin(
                     self.widget,
                     self.external,
                     self.local,
@@ -7242,6 +8541,7 @@ where
                     self.frame_seed.as_ref(),
                     state.layout_pass,
                     self.runtime_slot.as_ref(),
+                    Point { x: 0.0, y: 0.0 },
                 ));
             }
             state
@@ -7250,14 +8550,19 @@ where
                 .map(root_child_placements_excluding_native_scroll)
                 .unwrap_or_default()
         };
-        let child_frame = tree
-            .state
-            .downcast_ref::<IcedRuntimeTreeState>()
-            .presentation
-            .as_ref()
-            .expect("runtime layout must create presentation before child layout")
-            .frame
-            .clone();
+        let (child_frame, root_origin, dispatch_context) = {
+            let presentation = tree
+                .state
+                .downcast_ref::<IcedRuntimeTreeState>()
+                .presentation
+                .as_ref()
+                .expect("runtime layout must create presentation before child layout");
+            (
+                presentation.frame.clone(),
+                presentation.root_origin,
+                presentation.dispatch_context.clone(),
+            )
+        };
         let mut child_nodes = layout_iced_runtime_children::<W, Theme, Renderer>(
             self.widget,
             self.external,
@@ -7268,7 +8573,24 @@ where
             &child_frame,
             self.frame_seed.as_ref(),
             None,
+            root_origin,
+            Some(&dispatch_context),
         );
+        {
+            let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
+            let presentation = state
+                .presentation
+                .as_mut()
+                .expect("runtime layout must create presentation before child occlusion merge");
+            merge_child_explicit_layer_occlusions_into_presentation(
+                self.widget,
+                self.external,
+                self.local,
+                presentation,
+                root_placements.as_ref(),
+                &tree.children,
+            );
+        }
         {
             let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
             let presentation = state
@@ -7323,6 +8645,27 @@ where
                 ));
             }
         }
+        {
+            // Refresh this presentation's flattened descendant hit regions from
+            // the current mounted child presentations (already laid out above,
+            // including native-scroll subtrees). This keeps a reused composite
+            // presentation's `ViewRootLocal` dispatch geometry current after an
+            // intra-child drag without a full composite rebuild.
+            let mut child_hit_regions = std::collections::HashMap::new();
+            {
+                let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
+                for scroll_tree in &state.scroll_region_trees {
+                    collect_descendant_runtime_hit_regions(scroll_tree, &mut child_hit_regions);
+                }
+            }
+            for child in &tree.children {
+                collect_descendant_runtime_hit_regions(child, &mut child_hit_regions);
+            }
+            let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
+            if let Some(presentation) = state.presentation.as_mut() {
+                refresh_composite_child_hit_regions(presentation, &child_hit_regions);
+            }
+        }
         let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
         let presentation = state
             .presentation
@@ -7345,7 +8688,14 @@ where
         renderer: &Renderer,
         operation: &mut dyn iced::advanced::widget::Operation,
     ) {
-        let (root_placements, text_input_regions, text_editor_regions, frame) = {
+        let (
+            root_placements,
+            text_input_regions,
+            text_editor_regions,
+            frame,
+            root_origin,
+            dispatch_context,
+        ) = {
             let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
             let presentation = state
                 .presentation
@@ -7356,6 +8706,8 @@ where
                 text_input_focus_regions(presentation),
                 text_editor_focus_regions(presentation),
                 presentation.frame.clone(),
+                presentation.root_origin,
+                presentation.dispatch_context.clone(),
             )
         };
         let text_region_count = text_input_regions.len() + text_editor_regions.len();
@@ -7373,6 +8725,8 @@ where
                 &frame,
                 self.frame_seed.as_ref(),
                 None,
+                root_origin,
+                Some(&dispatch_context),
             );
             let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
             if let Some(presentation) = state.presentation.as_ref() {
@@ -7429,7 +8783,14 @@ where
             return;
         }
 
-        let (root_placements, text_input_regions, text_editor_regions, frame) = {
+        let (
+            root_placements,
+            text_input_regions,
+            text_editor_regions,
+            frame,
+            root_origin,
+            dispatch_context,
+        ) = {
             let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
             let presentation = state
                 .presentation
@@ -7440,6 +8801,8 @@ where
                 text_input_focus_regions(presentation),
                 text_editor_focus_regions(presentation),
                 presentation.frame.clone(),
+                presentation.root_origin,
+                presentation.dispatch_context.clone(),
             )
         };
         let text_region_count = text_input_regions.len() + text_editor_regions.len();
@@ -7462,6 +8825,7 @@ where
                 clipboard,
                 shell,
                 viewport,
+                &mut state.published_preedit_style,
             );
         }
 
@@ -7486,6 +8850,7 @@ where
                 clipboard,
                 shell,
                 viewport,
+                &mut state.published_preedit_style,
             );
         }
 
@@ -7509,6 +8874,8 @@ where
             &frame,
             self.frame_seed.as_ref(),
             None,
+            root_origin,
+            Some(&dispatch_context),
         );
 
         if shell.is_event_captured() {
@@ -7546,37 +8913,13 @@ where
 
         let routed = {
             let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
-            let mut hovered = state.hovered_region.clone();
-            let mut pressed = state.pressed_region.clone();
-            let mut focused = state.focused_region.clone();
-            let routed = route_iced_event(
-                event,
-                layout.bounds(),
-                cursor,
-                state.presentation.as_ref(),
-                &mut hovered,
-                &mut pressed,
-                &mut focused,
-            );
-            state.hovered_region = hovered;
-            state.pressed_region = pressed;
-            state.focused_region = focused;
-            routed
+            route_iced_event_for_tree_state(event, layout.bounds(), cursor, state)
         };
         let Some(routed) = routed else {
             return;
         };
 
-        if let Some(input) = routed.input {
-            shell.publish(SlipwayIcedRuntimeMessage::BackendInput(input));
-        }
-
-        if routed.capture_event {
-            shell.capture_event();
-        }
-        if routed.request_redraw {
-            shell.request_redraw();
-        }
+        publish_iced_routed_input(shell, routed);
     }
 
     fn draw(
@@ -7599,6 +8942,8 @@ where
             presented_viewport_sink: None,
             frame_seed: self.frame_seed.clone(),
             dirty_scopes: None,
+            root_origin: Point { x: 0.0, y: 0.0 },
+            dispatch_context: None,
         };
         with_iced_surface_global_paint_queue(renderer, |renderer| {
             draw_iced_runtime_widget_local::<W, Theme, Renderer>(
@@ -7642,6 +8987,8 @@ where
                 &presentation.frame,
                 self.frame_seed.as_ref(),
                 None,
+                presentation.root_origin,
+                Some(&presentation.dispatch_context),
             );
             if child_interaction != iced::advanced::mouse::Interaction::None {
                 return child_interaction;
@@ -7782,6 +9129,7 @@ where
             presentation: None,
             hovered_region: None,
             pressed_region: None,
+            indicator_drag: None,
             focused_region: None,
             layout_pass: 0,
         })
@@ -7876,6 +9224,7 @@ where
             state.presentation.as_ref(),
             &mut state.hovered_region,
             &mut state.pressed_region,
+            &mut state.indicator_drag,
             &mut state.focused_region,
         ) else {
             return;
@@ -7966,6 +9315,7 @@ where
             presentation: None,
             hovered_region: None,
             pressed_region: None,
+            indicator_drag: None,
             focused_region: None,
             layout_pass: 0,
         })
@@ -8061,6 +9411,7 @@ where
             state.presentation.as_ref(),
             &mut state.hovered_region,
             &mut state.pressed_region,
+            &mut state.indicator_drag,
             &mut state.focused_region,
         ) else {
             return;
@@ -8130,6 +9481,52 @@ where
     }
 }
 
+fn route_iced_event_for_tree_state(
+    event: &iced::Event,
+    layout_bounds: iced::Rectangle,
+    cursor: iced::advanced::mouse::Cursor,
+    state: &mut IcedRuntimeTreeState,
+) -> Option<IcedRoutedInput> {
+    let mut hovered = state.hovered_region.clone();
+    let mut pressed = state.pressed_region.clone();
+    let mut indicator_drag = state.indicator_drag.clone();
+    let mut focused = state.focused_region.clone();
+    let routed = route_iced_event(
+        event,
+        layout_bounds,
+        cursor,
+        state.presentation.as_ref(),
+        &mut hovered,
+        &mut pressed,
+        &mut indicator_drag,
+        &mut focused,
+    );
+    state.hovered_region = hovered;
+    state.pressed_region = pressed;
+    state.indicator_drag = indicator_drag;
+    state.focused_region = focused;
+    routed
+}
+
+fn publish_iced_routed_input(
+    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
+    routed: IcedRoutedInput,
+) {
+    if let Some(input) = routed.input {
+        shell.publish(SlipwayIcedRuntimeMessage::BackendInput(input));
+    }
+    if let Some(refusal) = routed.refusal {
+        shell.publish(SlipwayIcedRuntimeMessage::DispatchRefusal(refusal));
+    }
+
+    if routed.capture_event {
+        shell.capture_event();
+    }
+    if routed.request_redraw {
+        shell.request_redraw();
+    }
+}
+
 fn route_iced_event(
     event: &iced::Event,
     layout_bounds: iced::Rectangle,
@@ -8137,15 +9534,40 @@ fn route_iced_event(
     presentation: Option<&IcedPresentationState>,
     hovered_region: &mut Option<slipway_core::PresentationRegionId>,
     pressed_region: &mut Option<IcedPressedPointerCapture>,
+    indicator_drag: &mut Option<IcedIndicatorDragState>,
     focused_region: &mut Option<slipway_core::PresentationRegionId>,
 ) -> Option<IcedRoutedInput> {
     let presentation = presentation?;
     let previous_hovered_region = hovered_region.clone();
-    let hover_changed = sync_hover_region(presentation, layout_bounds, cursor, hovered_region);
+    let pointer_captured = pressed_region.is_some() || indicator_drag.is_some();
+    let hover_changed = if pointer_captured {
+        false
+    } else {
+        sync_hover_region(presentation, layout_bounds, cursor, hovered_region)
+    };
 
     match event {
         iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
             let position = cursor.position().unwrap_or(*position);
+            let input_points = iced_input_root_local_points(presentation, layout_bounds, position);
+            // Active synthetic-indicator drag: the captured thumb follows
+            // the pointer; every move synthesizes a declared Scroll event
+            // (the same machinery as the native on_scroll sync).
+            if indicator_drag.is_some() {
+                let routed = indicator_drag.as_ref().and_then(|drag| {
+                    iced_indicator_drag_scroll_input(presentation, drag, input_points.visual.y)
+                });
+                if routed.is_none() {
+                    // The region disappeared from the view: drop the drag.
+                    *indicator_drag = None;
+                }
+                return Some(routed.unwrap_or(IcedRoutedInput {
+                    input: None,
+                    capture_event: true,
+                    request_redraw: true,
+                    refusal: None,
+                }));
+            }
             if let Some(capture_state) = pressed_region.as_ref()
                 && let Some(region) = hit_region_by_id(presentation, &capture_state.region_id)
             {
@@ -8154,30 +9576,42 @@ fn route_iced_event(
                 if capture {
                     let capture_layout_bounds =
                         capture_state.layout_bounds_for_capture(layout_bounds);
-                    return Some(captured_pointer_event_for_hit_region(
+                    let capture_points =
+                        iced_input_root_local_points(presentation, capture_layout_bounds, position);
+                    let root_local_position = hit_region_root_local_position_for_input(
+                        presentation,
+                        region,
+                        capture_points,
+                    );
+                    return Some(captured_pointer_event_for_hit_region_with_details_at_root(
                         region,
                         presentation,
-                        capture_layout_bounds,
-                        position,
+                        root_local_position,
                         slipway_core::PointerEventKind::Move,
                         None,
+                        pointer_details(capture_state.button),
                         true,
                         true,
                     ));
                 }
             }
 
-            if paint_occlusion_at_root_local_point(
-                presentation,
-                iced_view_root_local_point(layout_bounds, position),
-            )
-            .is_some()
-                && hit_region_at_point(presentation, layout_bounds, position).is_none()
+            if paint_occlusion_at_input_points(presentation, input_points).is_some()
+                && hit_region_at_input_points(presentation, input_points).is_none()
             {
+                if foreign_dispatch_hit_blocks_local_input(presentation, input_points) {
+                    return Some(IcedRoutedInput {
+                        input: None,
+                        capture_event: false,
+                        request_redraw: hover_changed,
+                        refusal: None,
+                    });
+                }
                 return Some(IcedRoutedInput {
                     input: None,
                     capture_event: true,
                     request_redraw: hover_changed,
+                    refusal: None,
                 });
             }
 
@@ -8185,6 +9619,7 @@ fn route_iced_event(
                 input: None,
                 capture_event: false,
                 request_redraw: true,
+                refusal: None,
             })
         }
         iced::Event::Mouse(iced::mouse::Event::CursorEntered) => {
@@ -8193,23 +9628,26 @@ fn route_iced_event(
                     input: None,
                     capture_event: false,
                     request_redraw: true,
+                    refusal: None,
                 });
             };
-            let Some(region) = hit_region_at_point(presentation, layout_bounds, position) else {
+            let input_points = iced_input_root_local_points(presentation, layout_bounds, position);
+            let Some(resolved) = hit_region_at_input_points(presentation, input_points) else {
                 return hover_changed.then_some(IcedRoutedInput {
                     input: None,
                     capture_event: false,
                     request_redraw: true,
+                    refusal: None,
                 });
             };
 
-            Some(pointer_event_for_hit_region(
-                region,
+            Some(pointer_event_for_hit_region_with_details_at_root(
+                resolved.region,
                 presentation,
-                layout_bounds,
-                position,
+                resolved.root_local_position,
                 slipway_core::PointerEventKind::Enter,
                 None,
+                pointer_details(None),
                 false,
                 true,
             ))
@@ -8222,6 +9660,7 @@ fn route_iced_event(
                     input: None,
                     capture_event: false,
                     request_redraw: true,
+                    refusal: None,
                 });
             };
             let Some(region) = hit_region_by_id(presentation, &previous) else {
@@ -8229,6 +9668,7 @@ fn route_iced_event(
                     input: None,
                     capture_event: false,
                     request_redraw: true,
+                    refusal: None,
                 });
             };
             let region_rect = region_root_local_rect(
@@ -8255,56 +9695,99 @@ fn route_iced_event(
         }
         iced::Event::Mouse(iced::mouse::Event::ButtonPressed(button)) => {
             let position = cursor.position()?;
-            let focus_changed = focus_region_at_point(presentation, layout_bounds, position)
-                .map(|region| set_region_id(focused_region, Some(region.id.clone())))
+            let input_points = iced_input_root_local_points(presentation, layout_bounds, position);
+
+            // Synthetic-indicator interaction (Step 212): a press on a
+            // synthesized track/thumb is claimed by the backend BEFORE
+            // authored hit resolution — the indicator paints in front of
+            // the authored content it annotates, so its hit surface fronts
+            // it too, EXCEPT under an opaque authored layer above the
+            // indicator layer's z (the occlusion guard inside the helper:
+            // pointer selection agrees with visible stacking). Thumb press
+            // -> captured drag; track press -> JUMP-TO-POSITION (the thumb
+            // centers on the click and the press keeps dragging from
+            // there).
+            if *button == iced::mouse::Button::Left
+                && let Some((drag, jump)) =
+                    iced_indicator_press_interaction(presentation, input_points)
+            {
+                let routed = jump
+                    .and_then(|offset_y| {
+                        iced_indicator_scroll_input_for_offset(
+                            presentation,
+                            &drag.region_id,
+                            offset_y,
+                        )
+                    })
+                    .unwrap_or(IcedRoutedInput {
+                        input: None,
+                        capture_event: true,
+                        request_redraw: true,
+                        refusal: None,
+                    });
+                *indicator_drag = Some(drag);
+                return Some(routed);
+            }
+
+            let focus_changed = focus_region_at_input_points(presentation, input_points)
+                .map(|resolved| set_region_id(focused_region, Some(resolved.region.id.clone())))
                 .unwrap_or_else(|| set_region_id(focused_region, None));
 
-            if let Some(region) = hit_region_at_point(presentation, layout_bounds, position) {
+            if let Some(resolved) = hit_region_at_input_points(presentation, input_points) {
                 *pressed_region = Some(IcedPressedPointerCapture::new(
-                    region.id.clone(),
+                    resolved.region.id.clone(),
                     layout_bounds,
-                ));
-                let capture =
-                    pointer_capture_for_region(region, slipway_core::PointerEventKind::Press, true);
-
-                return Some(pointer_event_for_hit_region(
-                    region,
-                    presentation,
-                    layout_bounds,
-                    position,
-                    slipway_core::PointerEventKind::Press,
                     Some(*button),
+                ));
+                let capture = pointer_capture_for_region(
+                    resolved.region,
+                    slipway_core::PointerEventKind::Press,
+                    true,
+                );
+
+                return Some(pointer_event_for_hit_region_with_details_at_root(
+                    resolved.region,
+                    presentation,
+                    resolved.root_local_position,
+                    slipway_core::PointerEventKind::Press,
+                    Some(pointer_button(*button)),
+                    pointer_details(Some(*button)),
                     capture,
                     true,
                 ));
             }
 
-            if paint_occlusion_at_root_local_point(
-                presentation,
-                iced_view_root_local_point(layout_bounds, position),
-            )
-            .is_some()
-            {
+            if foreign_dispatch_hit_blocks_local_input(presentation, input_points) {
+                return Some(IcedRoutedInput {
+                    input: None,
+                    capture_event: false,
+                    request_redraw: focus_changed || hover_changed,
+                    refusal: None,
+                });
+            }
+
+            if paint_occlusion_at_input_points(presentation, input_points).is_some() {
                 return Some(IcedRoutedInput {
                     input: None,
                     capture_event: true,
                     request_redraw: focus_changed || hover_changed,
+                    refusal: None,
                 });
             }
 
-            let Some(region) = focus_region_at_point(presentation, layout_bounds, position) else {
+            let Some(resolved) = focus_region_at_input_points(presentation, input_points) else {
                 return (hover_changed || focus_changed).then_some(IcedRoutedInput {
                     input: None,
                     capture_event: false,
                     request_redraw: true,
+                    refusal: None,
                 });
             };
 
-            Some(pointer_event_for_focus_region(
-                region,
+            Some(pointer_event_for_focus_region_at_root(
+                resolved.region,
                 presentation,
-                layout_bounds,
-                position,
+                resolved.root_local_position,
                 slipway_core::PointerEventKind::Press,
                 Some(*button),
                 true,
@@ -8312,7 +9795,18 @@ fn route_iced_event(
             ))
         }
         iced::Event::Mouse(iced::mouse::Event::ButtonReleased(button)) => {
+            // End of a synthetic-indicator drag: consume the release; the
+            // declared offset already tracks the last drag move.
+            if indicator_drag.take().is_some() {
+                return Some(IcedRoutedInput {
+                    input: None,
+                    capture_event: true,
+                    request_redraw: true,
+                    refusal: None,
+                });
+            }
             let position = cursor.position()?;
+            let input_points = iced_input_root_local_points(presentation, layout_bounds, position);
             let released_pressed_region = pressed_region.take();
             if let Some(capture_state) = released_pressed_region.as_ref()
                 && let Some(region) = hit_region_by_id(presentation, &capture_state.region_id)
@@ -8323,112 +9817,192 @@ fn route_iced_event(
                 )
             {
                 let capture_layout_bounds = capture_state.layout_bounds_for_capture(layout_bounds);
-                return Some(captured_pointer_event_for_hit_region(
+                let capture_points =
+                    iced_input_root_local_points(presentation, capture_layout_bounds, position);
+                let root_local_position =
+                    hit_region_root_local_position_for_input(presentation, region, capture_points);
+                return Some(captured_pointer_event_for_hit_region_with_details_at_root(
                     region,
                     presentation,
-                    capture_layout_bounds,
-                    position,
+                    root_local_position,
                     slipway_core::PointerEventKind::Release,
-                    Some(*button),
+                    Some(pointer_button(*button)),
+                    pointer_details(Some(*button)),
                     true,
                     true,
                 ));
             }
-            let hit_region =
-                hit_region_at_point(presentation, layout_bounds, position).or_else(|| {
-                    released_pressed_region
-                        .as_ref()
-                        .and_then(|capture| hit_region_by_id(presentation, &capture.region_id))
-                });
+            let hit_region = hit_region_at_input_points(presentation, input_points).or_else(|| {
+                released_pressed_region
+                    .as_ref()
+                    .and_then(|capture| hit_region_by_id(presentation, &capture.region_id))
+                    .map(|region| IcedResolvedHitRegion {
+                        region,
+                        root_local_position: hit_region_root_local_position_for_input(
+                            presentation,
+                            region,
+                            input_points,
+                        ),
+                    })
+            });
 
-            let Some(region) = hit_region else {
-                if paint_occlusion_at_root_local_point(
-                    presentation,
-                    iced_view_root_local_point(layout_bounds, position),
-                )
-                .is_some()
-                {
+            let Some(resolved) = hit_region else {
+                if paint_occlusion_at_input_points(presentation, input_points).is_some() {
+                    if foreign_dispatch_hit_blocks_local_input(presentation, input_points) {
+                        return Some(IcedRoutedInput {
+                            input: None,
+                            capture_event: false,
+                            request_redraw: hover_changed,
+                            refusal: None,
+                        });
+                    }
                     return Some(IcedRoutedInput {
                         input: None,
                         capture_event: true,
                         request_redraw: hover_changed,
+                        refusal: None,
                     });
                 }
                 return hover_changed.then_some(IcedRoutedInput {
                     input: None,
                     capture_event: false,
                     request_redraw: true,
+                    refusal: None,
                 });
             };
             let capture = released_pressed_region.is_some()
                 || pointer_capture_for_region(
-                    region,
+                    resolved.region,
                     slipway_core::PointerEventKind::Release,
                     false,
                 );
 
-            Some(pointer_event_for_hit_region(
-                region,
+            Some(pointer_event_for_hit_region_with_details_at_root(
+                resolved.region,
                 presentation,
-                layout_bounds,
-                position,
+                resolved.root_local_position,
                 slipway_core::PointerEventKind::Release,
-                Some(*button),
+                Some(pointer_button(*button)),
+                pointer_details(Some(*button)),
                 capture,
                 released_pressed_region.is_some() || hover_changed,
             ))
         }
         iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => {
             let position = cursor.position()?;
+            let input_points = iced_input_root_local_points(presentation, layout_bounds, position);
             let (delta_x, delta_y) = match delta {
                 iced::mouse::ScrollDelta::Lines { x, y } => (*x, *y),
                 iced::mouse::ScrollDelta::Pixels { x, y } => (*x, *y),
+            };
+            let uses_mounted_context = presentation.dispatch_context.position_space
+                == IcedDispatchPositionSpace::MountedRootLocal;
+            let (dispatch_position, dispatch_position_space) =
+                iced_wheel_dispatch_root_local_position(
+                    presentation,
+                    uses_mounted_context,
+                    input_points,
+                    delta_x,
+                    delta_y,
+                );
+            // The runtime independently re-resolves wheel dispatch at
+            // `evidence.input_position` against the current view's declared
+            // scroll regions (`refresh_backend_presented_scroll_input_for_
+            // current_view` and `validate_wheel_dispatch_evidence`), whose
+            // viewport rects live in un-scrolled root content space. The
+            // recorded position must therefore be the resolved dispatch-space
+            // point — the point at which that naive re-resolution reproduces
+            // this route's consumer choice — never the raw visual window
+            // point: under a nonzero native scroll offset the raw point
+            // re-resolves to whatever region owns that fixed window band,
+            // which live turned a routed child wheel into a state-only root
+            // ghost (and the ghost-inflated declared offset then killed the
+            // native root scrollable entirely).
+            let evidence_position = if uses_mounted_context {
+                dispatch_position
+            } else {
+                iced_evidence_root_local_point(presentation, dispatch_position)
+            };
+            let dispatch_geometry_index = if uses_mounted_context {
+                &presentation.dispatch_context.geometry_index
+            } else {
+                &presentation.geometry_index
+            };
+            let dispatch_scroll_regions = if uses_mounted_context {
+                Cow::Borrowed(presentation.dispatch_context.scroll_regions.as_ref())
+            } else {
+                Cow::Borrowed(presentation.scroll_regions.as_slice())
             };
             let (dispatch, evidence) =
                 slipway_core::resolve_declared_wheel_dispatch_with_evidence_and_geometry_index(
                     EvidenceSource::backend_presented(ICED_BACKEND_ID, "physical-input"),
                     presentation.frame.clone(),
-                    &presentation.geometry_index,
-                    &presentation.scroll_regions,
-                    iced_view_root_local_point(layout_bounds, position),
+                    dispatch_geometry_index,
+                    dispatch_scroll_regions.as_ref(),
+                    dispatch_position,
                     delta_x,
                     delta_y,
                 );
-            let occlusion = paint_occlusion_at_root_local_point(
-                presentation,
-                iced_view_root_local_point(layout_bounds, position),
-            );
+            let mut evidence = evidence;
+            evidence.input_position = Some(evidence_position);
+            evidence.input_position_space = Some(dispatch_position_space);
             let Some(dispatch) = dispatch else {
-                if occlusion.is_some() {
+                // No consumer (dead point / at-limit): retain the
+                // already-constructed refusal evidence instead of dropping it
+                // (audit finding MF-H3).
+                let mut refusal = evidence;
+                if front_wheel_blocker_order_at_input_points(presentation, input_points, None)
+                    .is_some()
+                {
+                    refusal.refusal_reason = Some(format!(
+                        "{}; a front wheel-blocking paint layer captured the wheel",
+                        refusal.refusal_reason.as_deref().unwrap_or(
+                            "no enabled scroll region accepted the physical wheel position"
+                        )
+                    ));
                     return Some(IcedRoutedInput {
                         input: None,
                         capture_event: true,
                         request_redraw: false,
+                        refusal: Some(refusal),
                     });
                 }
                 return Some(IcedRoutedInput {
                     input: None,
                     capture_event: false,
                     request_redraw: false,
+                    refusal: Some(refusal),
                 });
             };
-            if let Some(occlusion) = occlusion
-                && let Some(region) = presentation
-                    .scroll_regions
-                    .iter()
-                    .find(|region| region.id == dispatch.selected_region)
-                && paint_occlusion_blocks_scroll_order(occlusion, region)
+            if let Some(selected_scroll) = dispatch_scroll_regions
+                .iter()
+                .find(|scroll| scroll.id == dispatch.selected_region)
+                && wheel_blocker_prevents_scroll_dispatch(
+                    presentation,
+                    input_points,
+                    selected_scroll,
+                )
             {
+                // Blocked wheel: the dispatch resolved but a front
+                // wheel-blocking paint layer swallowed it — retain that as a
+                // refusal too (MF-H3).
+                let mut refusal = evidence;
+                refusal.refusal_reason = Some(format!(
+                    "declared wheel consumer `{}` is blocked by a front wheel-blocking paint layer",
+                    dispatch.selected_region.as_str()
+                ));
                 return Some(IcedRoutedInput {
                     input: None,
                     capture_event: true,
                     request_redraw: false,
+                    refusal: Some(refusal),
                 });
             }
 
             Some(IcedRoutedInput {
                 capture_event: dispatch.capture_event,
                 request_redraw: dispatch.capture_event,
+                refusal: None,
                 input: Some(BackendInputEvent::declared(dispatch.input, evidence)),
             })
         }
@@ -8438,6 +10012,7 @@ fn route_iced_event(
                     input: None,
                     capture_event: false,
                     request_redraw: false,
+                    refusal: None,
                 });
             }
             if !presentation.can_route_text_edit() {
@@ -8466,6 +10041,7 @@ fn route_iced_event(
                 )),
                 capture_event: true,
                 request_redraw: true,
+                refusal: None,
             })
         }
         iced::Event::Touch(iced::touch::Event::FingerPressed { id, position }) => {
@@ -8474,11 +10050,13 @@ fn route_iced_event(
                     input: None,
                     capture_event: false,
                     request_redraw: true,
+                    refusal: None,
                 });
             };
             *pressed_region = Some(IcedPressedPointerCapture::new(
                 region.id.clone(),
                 layout_bounds,
+                None,
             ));
             let capture =
                 pointer_capture_for_region(region, slipway_core::PointerEventKind::Press, true);
@@ -8522,6 +10100,7 @@ fn route_iced_event(
                     input: None,
                     capture_event: false,
                     request_redraw: true,
+                    refusal: None,
                 });
             };
 
@@ -8628,6 +10207,7 @@ fn route_iced_event(
                     )),
                     capture_event: true,
                     request_redraw: true,
+                    refusal: None,
                 })
             } else {
                 let event = InputEvent::Keyboard(slipway_core::KeyboardEvent {
@@ -8654,6 +10234,7 @@ fn route_iced_event(
                     )),
                     capture_event: true,
                     request_redraw: false,
+                    refusal: None,
                 })
             }
         }
@@ -8686,12 +10267,14 @@ fn route_iced_event(
                 )),
                 capture_event: true,
                 request_redraw: false,
+                refusal: None,
             })
         }
         _ => hover_changed.then_some(IcedRoutedInput {
             input: None,
             capture_event: false,
             request_redraw: true,
+            refusal: None,
         }),
     }
 }
@@ -8757,29 +10340,6 @@ fn pointer_event_for_hit_region(
     )
 }
 
-fn captured_pointer_event_for_hit_region(
-    region: &HitRegionDeclaration,
-    presentation: &IcedPresentationState,
-    layout_bounds: iced::Rectangle,
-    position: iced::Point,
-    kind: slipway_core::PointerEventKind,
-    button: Option<iced::mouse::Button>,
-    capture_event: bool,
-    request_redraw: bool,
-) -> IcedRoutedInput {
-    captured_pointer_event_for_hit_region_with_details(
-        region,
-        presentation,
-        layout_bounds,
-        position,
-        kind,
-        button.map(pointer_button),
-        pointer_details(button),
-        capture_event,
-        request_redraw,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn captured_pointer_event_for_hit_region_with_details(
     region: &HitRegionDeclaration,
@@ -8792,26 +10352,73 @@ fn captured_pointer_event_for_hit_region_with_details(
     capture_event: bool,
     request_redraw: bool,
 ) -> IcedRoutedInput {
-    let view_root_local_position = iced_view_root_local_point(layout_bounds, position);
+    let points = iced_input_root_local_points(presentation, layout_bounds, position);
+    let root_local_position =
+        hit_region_root_local_position_for_input(presentation, region, points);
+    captured_pointer_event_for_hit_region_with_details_at_root(
+        region,
+        presentation,
+        root_local_position,
+        kind,
+        button,
+        details,
+        capture_event,
+        request_redraw,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn captured_pointer_event_for_hit_region_with_details_at_root(
+    region: &HitRegionDeclaration,
+    presentation: &IcedPresentationState,
+    root_local_position: Point,
+    kind: slipway_core::PointerEventKind,
+    button: Option<slipway_core::PointerButton>,
+    details: slipway_core::PointerDetails,
+    capture_event: bool,
+    request_redraw: bool,
+) -> IcedRoutedInput {
+    let evidence_position = iced_evidence_root_local_point(presentation, root_local_position);
+    let uses_mounted_context =
+        iced_dispatch_uses_mounted_context(&presentation.dispatch_context, region);
+    let dispatch_position = iced_dispatch_root_local_position(
+        uses_mounted_context,
+        root_local_position,
+        evidence_position,
+    );
+    let dispatch_geometry_index = if uses_mounted_context {
+        &presentation.dispatch_context.geometry_index
+    } else {
+        &presentation.geometry_index
+    };
+    let dispatch_hit_regions =
+        iced_dispatch_hit_regions(&presentation.dispatch_context, region, uses_mounted_context);
     let (dispatch, evidence) =
         slipway_core::resolve_declared_captured_pointer_dispatch_with_evidence_and_geometry_index(
             EvidenceSource::backend_presented(ICED_BACKEND_ID, "physical-input"),
             presentation.frame.clone(),
-            &presentation.geometry_index,
-            &presentation.hit_regions,
+            dispatch_geometry_index,
+            dispatch_hit_regions.as_ref(),
             &region.id,
-            view_root_local_position,
+            dispatch_position,
             kind,
             button,
             details,
             capture_event,
         );
-    let input = dispatch.map(|dispatch| BackendInputEvent::declared(dispatch.input, evidence));
+    let input = dispatch
+        .filter(|dispatch| dispatch.selected_region == region.id)
+        .map(|dispatch| {
+            let mut input = BackendInputEvent::declared(dispatch.input, evidence);
+            set_backend_input_evidence_position(&mut input, evidence_position);
+            input
+        });
     let resolved = input.is_some();
     IcedRoutedInput {
         input,
         capture_event: capture_event && resolved,
         request_redraw: request_redraw && resolved,
+        refusal: None,
     }
 }
 
@@ -8826,59 +10433,112 @@ fn pointer_event_for_hit_region_with_details(
     capture_event: bool,
     request_redraw: bool,
 ) -> IcedRoutedInput {
-    let view_root_local_position = iced_view_root_local_point(layout_bounds, position);
+    let points = iced_input_root_local_points(presentation, layout_bounds, position);
+    let root_local_position =
+        hit_region_root_local_position_for_input(presentation, region, points);
+    pointer_event_for_hit_region_with_details_at_root(
+        region,
+        presentation,
+        root_local_position,
+        kind,
+        button,
+        details,
+        capture_event,
+        request_redraw,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pointer_event_for_hit_region_with_details_at_root(
+    region: &HitRegionDeclaration,
+    presentation: &IcedPresentationState,
+    root_local_position: Point,
+    kind: slipway_core::PointerEventKind,
+    button: Option<slipway_core::PointerButton>,
+    details: slipway_core::PointerDetails,
+    capture_event: bool,
+    request_redraw: bool,
+) -> IcedRoutedInput {
+    let evidence_position = iced_evidence_root_local_point(presentation, root_local_position);
+    let uses_mounted_context =
+        iced_dispatch_uses_mounted_context(&presentation.dispatch_context, region);
+    let dispatch_position = iced_dispatch_root_local_position(
+        uses_mounted_context,
+        root_local_position,
+        evidence_position,
+    );
+    let dispatch_geometry_index = if uses_mounted_context {
+        &presentation.dispatch_context.geometry_index
+    } else {
+        &presentation.geometry_index
+    };
+    let dispatch_hit_regions =
+        iced_dispatch_hit_regions(&presentation.dispatch_context, region, uses_mounted_context);
     let (dispatch, evidence) =
         slipway_core::resolve_declared_pointer_dispatch_with_evidence_and_geometry_index(
             EvidenceSource::backend_presented(ICED_BACKEND_ID, "physical-input"),
             presentation.frame.clone(),
-            &presentation.geometry_index,
-            std::slice::from_ref(region),
-            view_root_local_position,
+            dispatch_geometry_index,
+            dispatch_hit_regions.as_ref(),
+            dispatch_position,
             kind,
             button,
             details.clone(),
             capture_event,
         );
-    let input = dispatch.map(|dispatch| BackendInputEvent::declared(dispatch.input, evidence));
+    let input = dispatch
+        .filter(|dispatch| dispatch.selected_region == region.id)
+        .map(|dispatch| {
+            let mut input = BackendInputEvent::declared(dispatch.input, evidence);
+            set_backend_input_evidence_position(&mut input, evidence_position);
+            input
+        });
     let resolved = input.is_some();
     IcedRoutedInput {
         input,
         capture_event: capture_event && resolved,
         request_redraw: request_redraw && resolved,
+        refusal: None,
     }
 }
 
-fn pointer_event_for_focus_region(
+fn pointer_event_for_focus_region_at_root(
     region: &FocusRegionDeclaration,
     presentation: &IcedPresentationState,
-    layout_bounds: iced::Rectangle,
-    position: iced::Point,
+    root_local_position: Point,
     kind: slipway_core::PointerEventKind,
     button: Option<iced::mouse::Button>,
     capture_event: bool,
     request_redraw: bool,
 ) -> IcedRoutedInput {
     let target_rect = target_rect_for_focus_region(presentation, region);
-    let view_root_local_position = iced_view_root_local_point(layout_bounds, position);
     let event = InputEvent::Pointer(slipway_core::PointerEvent {
         target: focus_target(region),
         target_slot: region.address.clone(),
-        position: target_local_point(layout_bounds, target_rect, position),
+        position: target_local_point_from_root(root_local_position, target_rect),
         target_bounds: Some(TargetLocalRect::new(target_local_bounds(target_rect))),
         kind,
         button: button.map(pointer_button),
         details: pointer_details(button),
     });
     IcedRoutedInput {
-        input: Some(backend_focus_input_event(
-            presentation,
-            region,
-            DeclaredEventDispatchKind::Pointer,
-            Some(view_root_local_position),
-            event,
-        )),
+        input: Some({
+            let mut input = backend_focus_input_event(
+                presentation,
+                region,
+                DeclaredEventDispatchKind::Pointer,
+                Some(root_local_position),
+                event,
+            );
+            set_backend_input_evidence_position(
+                &mut input,
+                iced_evidence_root_local_point(presentation, root_local_position),
+            );
+            input
+        }),
         capture_event,
         request_redraw,
+        refusal: None,
     }
 }
 
@@ -8893,10 +10553,19 @@ fn backend_focus_input_event(
     input_position: Option<Point>,
     event: InputEvent,
 ) -> BackendInputEvent {
+    let uses_mounted_context =
+        iced_dispatch_uses_mounted_focus_context(&presentation.dispatch_context, region);
+    let dispatch_geometry_index = if uses_mounted_context {
+        &presentation.dispatch_context.geometry_index
+    } else {
+        &presentation.geometry_index
+    };
+    let dispatch_focus_regions =
+        iced_dispatch_focus_regions(&presentation.dispatch_context, region, uses_mounted_context);
     backend_focus_input_event_from_parts(
         presentation.frame.clone(),
-        &presentation.geometry_index,
-        &presentation.focus_regions,
+        dispatch_geometry_index,
+        dispatch_focus_regions.as_ref(),
         region,
         kind,
         input_position,
@@ -8931,15 +10600,176 @@ fn backend_scroll_input_event_from_parts(
     scroll_regions: &[ScrollRegionDeclaration],
     region: &ScrollRegionDeclaration,
     event: InputEvent,
+    input_position: Option<Point>,
 ) -> BackendInputEvent {
-    let evidence = slipway_core::declared_scroll_dispatch_evidence(
-        EvidenceSource::backend_presented(ICED_BACKEND_ID, "native-scroll"),
+    backend_scroll_input_event_from_parts_with_pass(
+        frame,
+        scroll_regions,
+        region,
+        event,
+        input_position,
+        "native-scroll",
+    )
+}
+
+fn backend_scroll_input_event_from_parts_with_pass(
+    frame: FrameIdentity,
+    scroll_regions: &[ScrollRegionDeclaration],
+    region: &ScrollRegionDeclaration,
+    event: InputEvent,
+    input_position: Option<Point>,
+    pass: &str,
+) -> BackendInputEvent {
+    let evidence = slipway_core::declared_scroll_dispatch_evidence_at_position(
+        EvidenceSource::backend_presented(ICED_BACKEND_ID, pass),
         frame,
         scroll_regions,
         Some(region),
         event.clone(),
+        input_position,
     );
     BackendInputEvent::declared(event, evidence)
+}
+
+/// Press resolution for the SYNTHETIC scroll indicators (Step 212): when
+/// the root-local press point lands on a synthesized track, returns the
+/// backend-internal drag capture to start — anchored at the current
+/// declared offset for a THUMB press, or at the jumped offset (with
+/// `Some(jumped)` to emit) for a TRACK press (jump-to-position: the thumb
+/// centers on the click and the press keeps dragging from there).
+/// Geometry comes from `iced_synthetic_indicator_geometry`, the same
+/// source the paint synthesis uses. Points covered by an opaque authored
+/// layer ABOVE the indicator layer's z (`SCROLL_INDICATOR_LAYER_Z`) are
+/// refused, so pointer selection agrees with the visible stacking (the
+/// overlay panels paint over the indicators and win their pixels).
+fn iced_indicator_press_interaction(
+    presentation: &IcedPresentationState,
+    input_points: IcedInputRootLocalPoints,
+) -> Option<(IcedIndicatorDragState, Option<f32>)> {
+    if let Some(occlusion) = paint_occlusion_at_input_points(presentation, input_points)
+        && occlusion.order.0 > SCROLL_INDICATOR_LAYER_Z
+    {
+        return None;
+    }
+    let position = input_points.visual;
+    let (region, track, thumb) = presentation
+        .scroll_regions
+        .iter()
+        .filter_map(|region| {
+            let (track, thumb) = iced_synthetic_indicator_geometry(
+                &presentation.geometry_index,
+                &presentation.layout,
+                &presentation.target,
+                presentation.native_scroll_regions.as_ref(),
+                region,
+            )?;
+            rect_contains_root_local_point(track, position).then_some((region, track, thumb))
+        })
+        .max_by_key(|(region, _, _)| {
+            (
+                region.order.z_index,
+                region.order.paint_order,
+                region.order.traversal_order,
+            )
+        })?;
+    let track_travel = (track.size.height - thumb.size.height).max(0.0);
+    let max_offset = (region.content_bounds.size.height - region.viewport.size.height).max(0.0);
+    if track_travel <= 0.0 || max_offset <= 0.0 {
+        return None;
+    }
+    if rect_contains_root_local_point(thumb, position) {
+        return Some((
+            IcedIndicatorDragState {
+                region_id: region.id.clone(),
+                press_y: position.y,
+                start_offset_y: region.offset.y.clamp(0.0, max_offset),
+                track_travel,
+                max_offset,
+            },
+            None,
+        ));
+    }
+    let jumped = ((position.y - track.origin.y - thumb.size.height / 2.0) / track_travel
+        * max_offset)
+        .clamp(0.0, max_offset);
+    Some((
+        IcedIndicatorDragState {
+            region_id: region.id.clone(),
+            press_y: position.y,
+            start_offset_y: jumped,
+            track_travel,
+            max_offset,
+        },
+        Some(jumped),
+    ))
+}
+
+/// One drag step of an active synthetic-indicator capture: cumulative
+/// pointer travel from the press anchor maps through the track-to-content
+/// ratio captured at press time, clamped to the declared travel, and goes
+/// out as a declared Scroll event. `None` when the dragged region left
+/// the view.
+fn iced_indicator_drag_scroll_input(
+    presentation: &IcedPresentationState,
+    drag: &IcedIndicatorDragState,
+    current_y: f32,
+) -> Option<IcedRoutedInput> {
+    if drag.track_travel <= 0.0 || drag.max_offset <= 0.0 {
+        return None;
+    }
+    let offset_y = (drag.start_offset_y
+        + (current_y - drag.press_y) * drag.max_offset / drag.track_travel)
+        .clamp(0.0, drag.max_offset);
+    iced_indicator_scroll_input_for_offset(presentation, &drag.region_id, offset_y)
+}
+
+/// Synthesizes the declared Scroll input the indicator interaction emits:
+/// the same event shape and evidence path as the native `on_scroll` sync
+/// (`backend_scroll_input_event_from_parts`), with the
+/// `synthetic-indicator` pass label — runtime validation treats it like
+/// any declared scroll dispatch.
+fn iced_indicator_scroll_input_for_offset(
+    presentation: &IcedPresentationState,
+    region_id: &PresentationRegionId,
+    offset_y: f32,
+) -> Option<IcedRoutedInput> {
+    let region = presentation
+        .scroll_regions
+        .iter()
+        .find(|region| region.enabled && &region.id == region_id)?;
+    let selected_region = iced_dispatch_scroll_region_for_event(presentation, region);
+    let event = InputEvent::Scroll(ScrollEvent {
+        target: selected_region.target.clone(),
+        target_slot: selected_region.address.clone(),
+        region_id: selected_region.id.clone(),
+        offset_x: selected_region.offset.x,
+        offset_y,
+        viewport: selected_region.viewport,
+        content_bounds: selected_region.content_bounds,
+    });
+    let scroll_regions = iced_scroll_dispatch_regions_for_event(presentation, region);
+    let input = backend_scroll_input_event_from_parts_with_pass(
+        presentation.frame.clone(),
+        scroll_regions.as_ref(),
+        selected_region,
+        event,
+        Some(
+            slipway_core::declared_region_root_local_rect_with_geometry_index(
+                &presentation.geometry_index,
+                &selected_region.target,
+                selected_region.address.as_ref(),
+                selected_region.viewport.into_rect(),
+            )
+            .origin,
+        ),
+        "synthetic-indicator",
+    );
+    Some(IcedRoutedInput {
+        input: Some(input),
+        capture_event: true,
+        request_redraw: true,
+        refusal: None,
+    })
 }
 
 fn focus_region_for_native_physical_selector<'a>(
@@ -8959,29 +10789,6 @@ fn focus_region_for_native_physical_selector<'a>(
             slipway_core::select_declared_focus_region_at_root_local_point_with_geometry_index(
                 &presentation.geometry_index,
                 &presentation.focus_regions,
-                *position,
-            )
-        }
-    }
-}
-
-fn scroll_region_for_native_physical_selector<'a>(
-    presentation: &'a IcedPresentationState,
-    selector: &DebugPhysicalControlDeclarationSelector,
-) -> Option<&'a ScrollRegionDeclaration> {
-    match selector {
-        DebugPhysicalControlDeclarationSelector::Target { target } => presentation
-            .scroll_regions
-            .iter()
-            .find(|region| region.enabled && &region.target == target),
-        DebugPhysicalControlDeclarationSelector::Region { region } => presentation
-            .scroll_regions
-            .iter()
-            .find(|candidate| candidate.enabled && &candidate.id == region),
-        DebugPhysicalControlDeclarationSelector::Position { position } => {
-            slipway_core::select_declared_scroll_region_at_root_local_point_with_geometry_index(
-                &presentation.geometry_index,
-                &presentation.scroll_regions,
                 *position,
             )
         }
@@ -9044,26 +10851,38 @@ fn backend_native_text_caret_input_event(
     )
 }
 
+#[cfg(test)]
 fn backend_native_scroll_input_event(
     presentation: &IcedPresentationState,
     region: &ScrollRegionDeclaration,
     offset_x: f32,
     offset_y: f32,
 ) -> BackendInputEvent {
+    let selected_region = iced_dispatch_scroll_region_for_event(presentation, region);
     let event = InputEvent::Scroll(ScrollEvent {
-        target: region.target.clone(),
-        target_slot: region.address.clone(),
-        region_id: region.id.clone(),
+        target: selected_region.target.clone(),
+        target_slot: selected_region.address.clone(),
+        region_id: selected_region.id.clone(),
         offset_x,
         offset_y,
-        viewport: region.viewport,
-        content_bounds: region.content_bounds,
+        viewport: selected_region.viewport,
+        content_bounds: selected_region.content_bounds,
     });
+    let scroll_regions = iced_scroll_dispatch_regions_for_event(presentation, region);
     backend_scroll_input_event_from_parts(
         presentation.frame.clone(),
-        &presentation.scroll_regions,
-        region,
+        scroll_regions.as_ref(),
+        selected_region,
         event,
+        Some(
+            slipway_core::declared_region_root_local_rect_with_geometry_index(
+                &presentation.geometry_index,
+                &selected_region.target,
+                selected_region.address.as_ref(),
+                selected_region.viewport.into_rect(),
+            )
+            .origin,
+        ),
     )
 }
 
@@ -9080,17 +10899,157 @@ fn hit_region_at_point<'a>(
     layout_bounds: iced::Rectangle,
     position: iced::Point,
 ) -> Option<&'a HitRegionDeclaration> {
-    let root_local_position = iced_view_root_local_point(layout_bounds, position);
-    let selected = slipway_core::select_declared_hit_region_at_root_local_point_with_geometry_index(
+    hit_region_at_input_points(
+        presentation,
+        iced_input_root_local_points(presentation, layout_bounds, position),
+    )
+    .map(|resolved| resolved.region)
+}
+
+fn hit_region_at_input_points<'a>(
+    presentation: &'a IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+) -> Option<IcedResolvedHitRegion<'a>> {
+    let selected = select_hit_region_at_input_points(presentation, points);
+    let Some(occlusion) = paint_occlusion_at_input_points(presentation, points) else {
+        return selected;
+    };
+    selected.filter(|resolved| !paint_occlusion_blocks_hit_order(occlusion, &resolved.region.order))
+}
+
+fn select_hit_region_at_input_points<'a>(
+    presentation: &'a IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+) -> Option<IcedResolvedHitRegion<'a>> {
+    let visual = if iced_input_points_are_native_scrolled(points) {
+        None
+    } else {
+        select_local_hit_region_at_root_local_point(presentation, points.visual).map(|region| {
+            IcedResolvedHitRegion {
+                region,
+                root_local_position: points.visual,
+            }
+        })
+    };
+    let dispatch_raw =
+        select_dispatch_hit_region_at_root_local_point(presentation, points.dispatch);
+    let dispatch = dispatch_raw
+        .filter(|region| hit_region_belongs_to_presentation(presentation, region))
+        .map(|region| IcedResolvedHitRegion {
+            region,
+            root_local_position: points.dispatch,
+        });
+    if let Some(foreign_dispatch) =
+        dispatch_raw.filter(|region| !hit_region_belongs_to_presentation(presentation, region))
+    {
+        return match visual {
+            Some(visual)
+                if hit_order_key(&visual.region.order)
+                    >= hit_order_key(&foreign_dispatch.order) =>
+            {
+                Some(visual)
+            }
+            _ => None,
+        };
+    }
+    front_hit_region(visual, dispatch)
+}
+
+fn select_local_hit_region_at_root_local_point<'a>(
+    presentation: &'a IcedPresentationState,
+    root_local_position: Point,
+) -> Option<&'a HitRegionDeclaration> {
+    slipway_core::select_declared_hit_region_at_root_local_point_with_geometry_index(
         &presentation.geometry_index,
         &presentation.hit_regions,
         root_local_position,
-    );
-    let Some(occlusion) = paint_occlusion_at_root_local_point(presentation, root_local_position)
+    )
+}
+
+fn select_dispatch_hit_region_at_root_local_point<'a>(
+    presentation: &'a IcedPresentationState,
+    root_local_position: Point,
+) -> Option<&'a HitRegionDeclaration> {
+    if presentation.dispatch_context.position_space == IcedDispatchPositionSpace::MountedRootLocal {
+        return slipway_core::select_declared_hit_region_at_root_local_point_with_geometry_index(
+            &presentation.dispatch_context.geometry_index,
+            &presentation.dispatch_context.hit_regions,
+            iced_evidence_root_local_point(presentation, root_local_position),
+        );
+    }
+
+    select_local_hit_region_at_root_local_point(presentation, root_local_position)
+}
+
+fn foreign_dispatch_hit_blocks_local_input(
+    presentation: &IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+) -> bool {
+    if presentation.dispatch_context.position_space != IcedDispatchPositionSpace::MountedRootLocal {
+        return false;
+    }
+    let Some(foreign) =
+        select_dispatch_hit_region_at_root_local_point(presentation, points.dispatch)
+            .filter(|region| !hit_region_belongs_to_presentation(presentation, region))
     else {
-        return selected;
+        return false;
     };
-    selected.filter(|region| !paint_occlusion_blocks_hit_order(occlusion, &region.order))
+    select_local_hit_region_at_root_local_point(presentation, points.visual)
+        .is_none_or(|local| hit_order_key(&foreign.order) > hit_order_key(&local.order))
+}
+
+fn hit_region_belongs_to_presentation(
+    presentation: &IcedPresentationState,
+    region: &HitRegionDeclaration,
+) -> bool {
+    region_belongs_to_presentation(presentation, &region.target, region.address.as_ref())
+}
+
+fn hit_region_root_local_position_for_input(
+    presentation: &IcedPresentationState,
+    region: &HitRegionDeclaration,
+    points: IcedInputRootLocalPoints,
+) -> Point {
+    if iced_input_points_are_native_scrolled(points) {
+        return points.dispatch;
+    }
+
+    if region_contains_root_local_point(presentation, region, points.visual) {
+        points.visual
+    } else {
+        points.dispatch
+    }
+}
+
+fn region_contains_root_local_point(
+    presentation: &IcedPresentationState,
+    region: &HitRegionDeclaration,
+    root_local_position: Point,
+) -> bool {
+    slipway_core::declared_region_contains_root_local_point_with_geometry_index(
+        &presentation.geometry_index,
+        &region.target,
+        region.address.as_ref(),
+        region.bounds.into_rect(),
+        root_local_position,
+    )
+}
+
+fn front_hit_region<'a>(
+    left: Option<IcedResolvedHitRegion<'a>>,
+    right: Option<IcedResolvedHitRegion<'a>>,
+) -> Option<IcedResolvedHitRegion<'a>> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if hit_order_key(&right.region.order) > hit_order_key(&left.region.order) {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(region), None) | (None, Some(region)) => Some(region),
+        (None, None) => None,
+    }
 }
 
 fn hit_region_by_id<'a>(
@@ -9101,6 +11060,17 @@ fn hit_region_by_id<'a>(
         .hit_regions
         .iter()
         .find(|region| region.enabled && &region.id == id)
+        .or_else(|| {
+            presentation
+                .dispatch_context
+                .hit_regions
+                .iter()
+                .find(|region| {
+                    region.enabled
+                        && &region.id == id
+                        && hit_region_belongs_to_presentation(presentation, region)
+                })
+        })
 }
 
 fn focus_region_at_point<'a>(
@@ -9108,17 +11078,94 @@ fn focus_region_at_point<'a>(
     layout_bounds: iced::Rectangle,
     position: iced::Point,
 ) -> Option<&'a FocusRegionDeclaration> {
-    let root_local_position = iced_view_root_local_point(layout_bounds, position);
-    if paint_occlusion_at_root_local_point(presentation, root_local_position).is_some()
-        && hit_region_at_point(presentation, layout_bounds, position).is_none()
+    focus_region_at_input_points(
+        presentation,
+        iced_input_root_local_points(presentation, layout_bounds, position),
+    )
+    .map(|resolved| resolved.region)
+}
+
+fn focus_region_at_input_points<'a>(
+    presentation: &'a IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+) -> Option<IcedResolvedFocusRegion<'a>> {
+    if paint_occlusion_at_input_points(presentation, points).is_some()
+        && hit_region_at_input_points(presentation, points).is_none()
     {
         return None;
     }
+    let visual = if iced_input_points_are_native_scrolled(points) {
+        None
+    } else {
+        select_local_focus_region_at_root_local_point(presentation, points.visual).map(|region| {
+            IcedResolvedFocusRegion {
+                region,
+                root_local_position: points.visual,
+            }
+        })
+    };
+    let dispatch_raw =
+        select_dispatch_focus_region_at_root_local_point(presentation, points.dispatch);
+    let dispatch = dispatch_raw
+        .filter(|region| focus_region_belongs_to_presentation(presentation, region))
+        .map(|region| IcedResolvedFocusRegion {
+            region,
+            root_local_position: points.dispatch,
+        });
+    if dispatch_raw
+        .is_some_and(|region| !focus_region_belongs_to_presentation(presentation, region))
+    {
+        return visual;
+    }
+    visual.or(dispatch)
+}
+
+fn select_dispatch_focus_region_at_root_local_point<'a>(
+    presentation: &'a IcedPresentationState,
+    root_local_position: Point,
+) -> Option<&'a FocusRegionDeclaration> {
+    if presentation.dispatch_context.position_space == IcedDispatchPositionSpace::MountedRootLocal {
+        return slipway_core::select_declared_focus_region_at_root_local_point_with_geometry_index(
+            &presentation.dispatch_context.geometry_index,
+            &presentation.dispatch_context.focus_regions,
+            iced_evidence_root_local_point(presentation, root_local_position),
+        );
+    }
+
+    select_local_focus_region_at_root_local_point(presentation, root_local_position)
+}
+
+fn select_local_focus_region_at_root_local_point<'a>(
+    presentation: &'a IcedPresentationState,
+    root_local_position: Point,
+) -> Option<&'a FocusRegionDeclaration> {
     slipway_core::select_declared_focus_region_at_root_local_point_with_geometry_index(
         &presentation.geometry_index,
         &presentation.focus_regions,
         root_local_position,
     )
+}
+
+fn focus_region_belongs_to_presentation(
+    presentation: &IcedPresentationState,
+    region: &FocusRegionDeclaration,
+) -> bool {
+    region_belongs_to_presentation(presentation, &region.target, region.address.as_ref())
+}
+
+fn region_belongs_to_presentation(
+    presentation: &IcedPresentationState,
+    target: &WidgetId,
+    address: Option<&WidgetSlotAddress>,
+) -> bool {
+    if let Some(runtime_slot) = presentation.runtime_slot.as_ref() {
+        return address
+            .map(|address| address.path.starts_with(&runtime_slot.path))
+            .unwrap_or(target == &presentation.target);
+    }
+
+    target == &presentation.target
+        || address.is_some_and(|address| address.path.first() == Some(&presentation.target))
 }
 
 fn focused_focus_region<'a>(
@@ -9139,31 +11186,485 @@ fn iced_view_root_local_point(layout_bounds: iced::Rectangle, position: iced::Po
     }
 }
 
+fn iced_input_root_local_points(
+    presentation: &IcedPresentationState,
+    layout_bounds: iced::Rectangle,
+    position: iced::Point,
+) -> IcedInputRootLocalPoints {
+    let visual = iced_view_root_local_point(layout_bounds, position);
+    IcedInputRootLocalPoints {
+        visual,
+        dispatch: iced_native_scrolled_root_local_point(
+            &presentation.native_scroll_dispatch_index,
+            visual,
+        ),
+    }
+}
+
+fn iced_input_points_are_native_scrolled(points: IcedInputRootLocalPoints) -> bool {
+    (points.visual.x - points.dispatch.x).abs() > f32::EPSILON
+        || (points.visual.y - points.dispatch.y).abs() > f32::EPSILON
+}
+
+fn iced_native_scrolled_root_local_point(
+    scroll_index: &IcedNativeScrollDispatchIndex,
+    root_local_position: Point,
+) -> Point {
+    let mut point = root_local_position;
+
+    for depth_range in &scroll_index.depth_ranges {
+        if let Some(scroll) = scroll_index.regions[depth_range.start..depth_range.end]
+            .iter()
+            .find(|scroll| rect_contains_root_local_point(scroll.viewport_root, point))
+        {
+            point = Point {
+                x: scroll.content_root.origin.x
+                    + (point.x - scroll.viewport_root.origin.x)
+                    + scroll.offset.x,
+                y: scroll.content_root.origin.y
+                    + (point.y - scroll.viewport_root.origin.y)
+                    + scroll.offset.y,
+            };
+        }
+    }
+
+    point
+}
+
+fn native_scrolled_visible_occlusion_bounds(
+    scroll_index: &IcedNativeScrollDispatchIndex,
+    root_content_bounds: Rect,
+) -> Option<Rect> {
+    let mut bounds = root_content_bounds;
+    for depth_range in scroll_index.depth_ranges.iter().rev() {
+        if let Some(visible) = scroll_index.regions[depth_range.start..depth_range.end]
+            .iter()
+            .filter_map(|scroll| {
+                let candidate = Rect {
+                    origin: Point {
+                        x: scroll.viewport_root.origin.x
+                            + (bounds.origin.x - scroll.content_root.origin.x)
+                            - scroll.offset.x,
+                        y: scroll.viewport_root.origin.y
+                            + (bounds.origin.y - scroll.content_root.origin.y)
+                            - scroll.offset.y,
+                    },
+                    size: bounds.size,
+                };
+                rect_intersection(candidate, scroll.viewport_root)
+            })
+            .next()
+        {
+            bounds = visible;
+        }
+    }
+    iced_declared_rect_is_valid(bounds).then_some(bounds)
+}
+
+fn iced_native_scroll_dispatch_index(
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &[ScrollRegionDeclaration],
+) -> IcedNativeScrollDispatchIndex {
+    let mut regions: Vec<IcedNativeScrollDispatchRegion> = scroll_regions
+        .iter()
+        .filter(|scroll| scroll.enabled)
+        .map(|scroll| IcedNativeScrollDispatchRegion {
+            viewport_root: slipway_core::declared_region_root_local_rect_with_geometry_index(
+                geometry_index,
+                &scroll.target,
+                scroll.address.as_ref(),
+                scroll.viewport.into_rect(),
+            ),
+            content_root: slipway_core::declared_region_root_local_rect_with_geometry_index(
+                geometry_index,
+                &scroll.target,
+                scroll.address.as_ref(),
+                scroll.content_bounds.into_rect(),
+            ),
+            offset: scroll.offset,
+            depth: scroll
+                .address
+                .as_ref()
+                .map_or(0, |address| address.path.len()),
+            order: scroll.order.clone(),
+        })
+        .collect();
+
+    regions.sort_by(|a, b| {
+        a.depth
+            .cmp(&b.depth)
+            .then_with(|| b.order.z_index.cmp(&a.order.z_index))
+            .then_with(|| b.order.paint_order.cmp(&a.order.paint_order))
+            .then_with(|| b.order.traversal_order.cmp(&a.order.traversal_order))
+    });
+
+    let mut depth_ranges = Vec::new();
+    let mut start = 0;
+    while start < regions.len() {
+        let depth = regions[start].depth;
+        let mut end = start + 1;
+        while end < regions.len() && regions[end].depth == depth {
+            end += 1;
+        }
+        depth_ranges.push(IcedNativeScrollDepthRange { start, end });
+        start = end;
+    }
+
+    IcedNativeScrollDispatchIndex {
+        regions,
+        depth_ranges,
+    }
+}
+
+fn iced_evidence_root_local_point(
+    presentation: &IcedPresentationState,
+    view_root_local_position: Point,
+) -> Point {
+    point_add(presentation.root_origin, view_root_local_position)
+}
+
+fn iced_dispatch_root_local_position(
+    uses_mounted_context: bool,
+    view_root_local_position: Point,
+    mounted_root_local_position: Point,
+) -> Point {
+    if uses_mounted_context {
+        mounted_root_local_position
+    } else {
+        view_root_local_position
+    }
+}
+
+fn iced_wheel_dispatch_root_local_position(
+    presentation: &IcedPresentationState,
+    uses_mounted_context: bool,
+    points: IcedInputRootLocalPoints,
+    delta_x: f32,
+    delta_y: f32,
+) -> (Point, slipway_core::DispatchPositionSpace) {
+    let (geometry_index, scroll_regions, native_scroll_regions, visual, dispatch) =
+        if uses_mounted_context {
+            // Both points are mapped into the mounted context's space: the
+            // visual point stays at the context-space VISIBLE position while
+            // the dispatch point also carries the ancestor native scroll
+            // translation into the context's content space.
+            let mounted_points = iced_mounted_wheel_input_points(presentation, points);
+            (
+                &presentation.dispatch_context.geometry_index,
+                presentation.dispatch_context.scroll_regions.as_ref(),
+                presentation.dispatch_context.native_scroll_regions.as_ref(),
+                mounted_points.visual,
+                mounted_points.dispatch,
+            )
+        } else {
+            (
+                &presentation.geometry_index,
+                presentation.scroll_regions.as_slice(),
+                presentation.native_scroll_regions.as_ref(),
+                points.visual,
+                points.dispatch,
+            )
+        };
+    let visual_selected =
+        slipway_core::select_declared_wheel_consumer_at_root_local_point_with_geometry_index(
+            geometry_index,
+            scroll_regions,
+            visual,
+            delta_x,
+            delta_y,
+        );
+    let dispatch_selected =
+        slipway_core::select_declared_wheel_consumer_at_root_local_point_with_geometry_index(
+            geometry_index,
+            scroll_regions,
+            dispatch,
+            delta_x,
+            delta_y,
+        );
+    // Core owner selection tests declared viewport rects at their un-scrolled
+    // geometry positions, so a native-scrolled root owner is only reachable
+    // through the visible viewport point while nested content owners are only
+    // reachable through the scrolled dispatch point. Fall back to the visible
+    // viewport point only when the scrolled dispatch point selects nothing and
+    // the visible point selects one of the resolving view's own native scroll
+    // regions (the regions whose offsets produced the visual/dispatch
+    // divergence; for a mounted context these are the ANCESTOR's native
+    // regions); every other divergence keeps the dispatch point so
+    // content-space rects cannot act as fixed window-band phantom owners.
+    match (visual_selected, dispatch_selected) {
+        (Some(visual_region), None)
+            if scroll_region_is_native_in(native_scroll_regions, visual_region) =>
+        {
+            (visual, slipway_core::DispatchPositionSpace::Viewport)
+        }
+        _ => (dispatch, slipway_core::DispatchPositionSpace::Content),
+    }
+}
+
+fn iced_dispatch_uses_mounted_context(
+    dispatch_context: &IcedDispatchContext,
+    region: &HitRegionDeclaration,
+) -> bool {
+    dispatch_context.position_space == IcedDispatchPositionSpace::MountedRootLocal
+        && dispatch_context
+            .hit_regions
+            .iter()
+            .any(|candidate| candidate.id == region.id)
+}
+
+fn iced_dispatch_hit_regions<'a>(
+    dispatch_context: &'a IcedDispatchContext,
+    region: &'a HitRegionDeclaration,
+    uses_mounted_context: bool,
+) -> Cow<'a, [HitRegionDeclaration]> {
+    if uses_mounted_context {
+        return Cow::Borrowed(&dispatch_context.hit_regions);
+    }
+
+    let Some(index) = dispatch_context
+        .hit_regions
+        .iter()
+        .position(|candidate| candidate.id == region.id)
+    else {
+        return Cow::Owned(vec![region.clone()]);
+    };
+
+    if dispatch_context.hit_regions[index] == *region {
+        Cow::Borrowed(&dispatch_context.hit_regions)
+    } else {
+        let mut hit_regions = dispatch_context.hit_regions.to_vec();
+        hit_regions[index] = region.clone();
+        Cow::Owned(hit_regions)
+    }
+}
+
+fn iced_dispatch_scroll_region_for_event<'a>(
+    presentation: &'a IcedPresentationState,
+    region: &'a ScrollRegionDeclaration,
+) -> &'a ScrollRegionDeclaration {
+    presentation
+        .dispatch_context
+        .scroll_regions
+        .iter()
+        .find(|candidate| candidate.id == region.id)
+        .unwrap_or(region)
+}
+
+fn iced_dispatch_uses_mounted_focus_context(
+    dispatch_context: &IcedDispatchContext,
+    region: &FocusRegionDeclaration,
+) -> bool {
+    dispatch_context.position_space == IcedDispatchPositionSpace::MountedRootLocal
+        && dispatch_context
+            .focus_regions
+            .iter()
+            .any(|candidate| candidate.id == region.id)
+}
+
+fn iced_dispatch_focus_regions<'a>(
+    dispatch_context: &'a IcedDispatchContext,
+    region: &'a FocusRegionDeclaration,
+    uses_mounted_context: bool,
+) -> Cow<'a, [FocusRegionDeclaration]> {
+    if uses_mounted_context {
+        return Cow::Borrowed(&dispatch_context.focus_regions);
+    }
+
+    let Some(index) = dispatch_context
+        .focus_regions
+        .iter()
+        .position(|candidate| candidate.id == region.id)
+    else {
+        return Cow::Owned(vec![region.clone()]);
+    };
+
+    if dispatch_context.focus_regions[index] == *region {
+        Cow::Borrowed(&dispatch_context.focus_regions)
+    } else {
+        let mut focus_regions = dispatch_context.focus_regions.to_vec();
+        focus_regions[index] = region.clone();
+        Cow::Owned(focus_regions)
+    }
+}
+
+fn iced_scroll_dispatch_regions_for_event<'a>(
+    presentation: &'a IcedPresentationState,
+    region: &'a ScrollRegionDeclaration,
+) -> Cow<'a, [ScrollRegionDeclaration]> {
+    if presentation
+        .dispatch_context
+        .scroll_regions
+        .iter()
+        .any(|candidate| candidate.id == region.id)
+    {
+        Cow::Borrowed(&presentation.dispatch_context.scroll_regions)
+    } else {
+        Cow::Borrowed(presentation.scroll_regions.as_slice())
+    }
+}
+
+fn set_backend_input_evidence_position(input: &mut BackendInputEvent, input_position: Point) {
+    if let Some(evidence) = input.dispatch_evidence.as_mut() {
+        evidence.input_position = Some(input_position);
+    }
+}
+
 fn paint_occlusion_at_root_local_point(
     presentation: &IcedPresentationState,
     position: Point,
 ) -> Option<&IcedPaintOcclusionRegion> {
-    presentation
+    paint_occlusion_at_root_local_point_filtered(presentation, position, false)
+}
+
+/// Topmost occlusion covering `position`. With `wheel_blocking_only`, occluders
+/// authored wheel-pass-through (`blocks_wheel == false`) are skipped BEFORE the
+/// top-most selection, so a wheel-transparent occluder never hides a
+/// wheel-blocking one beneath it. The pointer path passes `false` and sees
+/// every occluder exactly as before.
+fn paint_occlusion_at_root_local_point_filtered(
+    presentation: &IcedPresentationState,
+    position: Point,
+    wheel_blocking_only: bool,
+) -> Option<&IcedPaintOcclusionRegion> {
+    let local = presentation
         .paint_occlusion_regions
         .iter()
-        .filter(|region| rect_contains_root_local_point(region.bounds, position))
-        .max_by_key(|region| region.order)
+        .filter(|region| {
+            rect_contains_root_local_point(region.bounds, position)
+                && (!wheel_blocking_only || region.blocks_wheel)
+        })
+        .max_by_key(|region| region.order);
+    let dispatch = if presentation.dispatch_context.position_space
+        == IcedDispatchPositionSpace::MountedRootLocal
+    {
+        let mounted_position = iced_evidence_root_local_point(presentation, position);
+        presentation
+            .dispatch_context
+            .paint_occlusion_regions
+            .iter()
+            .filter(|region| {
+                rect_contains_root_local_point(region.bounds, mounted_position)
+                    && (!wheel_blocking_only || region.blocks_wheel)
+            })
+            .max_by_key(|region| region.order)
+    } else {
+        None
+    };
+    front_paint_occlusion(local, dispatch)
+}
+
+fn paint_occlusion_at_input_points(
+    presentation: &IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+) -> Option<&IcedPaintOcclusionRegion> {
+    let visual = paint_occlusion_at_root_local_point(presentation, points.visual);
+    let dispatch = if points.visual == points.dispatch {
+        None
+    } else {
+        paint_occlusion_at_root_local_point(presentation, points.dispatch)
+    };
+    front_paint_occlusion(visual, dispatch)
+}
+
+fn front_paint_occlusion<'a>(
+    left: Option<&'a IcedPaintOcclusionRegion>,
+    right: Option<&'a IcedPaintOcclusionRegion>,
+) -> Option<&'a IcedPaintOcclusionRegion> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if right.order > left.order {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(region), None) | (None, Some(region)) => Some(region),
+        (None, None) => None,
+    }
+}
+
+fn hit_order_key(order: &HitRegionOrder) -> (i32, usize, usize) {
+    (order.z_index, order.paint_order, order.traversal_order)
+}
+
+fn front_wheel_blocker_order_at_input_points(
+    presentation: &IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+    selected_scroll: Option<&ScrollRegionDeclaration>,
+) -> Option<(i32, usize, usize)> {
+    // Wheel channel: consider only occluders authored to block the wheel. An
+    // occluder authored pointer-opaque but wheel-pass-through is skipped here so
+    // the wheel reaches the scroll region behind it, while pointer occlusion
+    // (paint_occlusion_at_input_points) still sees it.
+    paint_occlusion_at_root_local_point_filtered(presentation, points.visual, true)
+        .filter(|occlusion| {
+            selected_scroll.is_none_or(|scroll| {
+                !paint_occlusion_belongs_to_scroll_region(presentation, occlusion, scroll)
+            })
+        })
+        .map(|occlusion| occlusion.order)
+}
+
+fn paint_occlusion_belongs_to_scroll_region(
+    presentation: &IcedPresentationState,
+    occlusion: &IcedPaintOcclusionRegion,
+    scroll: &ScrollRegionDeclaration,
+) -> bool {
+    if occlusion.target == scroll.target && occlusion.address.as_ref() == scroll.address.as_ref() {
+        return true;
+    }
+
+    let Some(scroll_address) = scroll.address.as_ref() else {
+        return false;
+    };
+
+    let is_scroll_descendant = presentation
+        .layout
+        .child_placements
+        .iter()
+        .any(|placement| {
+            placement.child == occlusion.target
+                && placement.local_state_slot.as_ref().is_some_and(|slot| {
+                    slot == scroll_address || slot_is_descendant(scroll_address, slot)
+                })
+        });
+
+    // Same/default-layer descendant content must not prevent its scroll owner
+    // from receiving wheel input. Explicit front layers are global input
+    // occluders unless authored as pass-through, so descendant overlays still
+    // absorb wheel before root/native scroll.
+    is_scroll_descendant && !paint_occlusion_is_global_front_layer(occlusion)
+}
+
+fn paint_occlusion_is_global_front_layer(occlusion: &IcedPaintOcclusionRegion) -> bool {
+    occlusion.order.0 > 0
+}
+
+fn wheel_blocker_prevents_scroll_dispatch(
+    presentation: &IcedPresentationState,
+    points: IcedInputRootLocalPoints,
+    selected_scroll: &ScrollRegionDeclaration,
+) -> bool {
+    front_wheel_blocker_order_at_input_points(presentation, points, Some(selected_scroll))
+        .is_some_and(|blocker| blocker > hit_order_key(&selected_scroll.order))
 }
 
 fn paint_occlusion_blocks_hit_order(
     occlusion: &IcedPaintOcclusionRegion,
     hit_order: &HitRegionOrder,
 ) -> bool {
-    let (occlusion_z, occlusion_paint, _) = occlusion.order;
-    occlusion_z > hit_order.z_index
-        || (occlusion_z == hit_order.z_index && occlusion_paint > hit_order.paint_order)
+    slipway_core::hit_region_order_is_front_of(
+        &hit_region_order_from_key(occlusion.order),
+        hit_order,
+    )
 }
 
-fn paint_occlusion_blocks_scroll_order(
-    occlusion: &IcedPaintOcclusionRegion,
-    scroll: &ScrollRegionDeclaration,
-) -> bool {
-    paint_occlusion_blocks_hit_order(occlusion, &scroll.order)
+fn hit_region_order_from_key(key: (i32, usize, usize)) -> HitRegionOrder {
+    HitRegionOrder {
+        z_index: key.0,
+        paint_order: key.1,
+        traversal_order: key.2,
+    }
 }
 
 fn rect_contains_root_local_point(rect: Rect, point: Point) -> bool {
@@ -9213,14 +11714,10 @@ fn target_local_bounds(target_rect: Rect) -> Rect {
     }
 }
 
-fn target_local_point(
-    layout_bounds: iced::Rectangle,
-    target_rect: Rect,
-    position: iced::Point,
-) -> Point {
+fn target_local_point_from_root(root_local_position: Point, target_rect: Rect) -> Point {
     Point {
-        x: position.x - layout_bounds.x - target_rect.origin.x,
-        y: position.y - layout_bounds.y - target_rect.origin.y,
+        x: root_local_position.x - target_rect.origin.x,
+        y: root_local_position.y - target_rect.origin.y,
     }
 }
 
@@ -9696,10 +12193,18 @@ fn scroll_region_has_real_child_placements(
     scroll: &ScrollRegionDeclaration,
 ) -> bool {
     let geometry_index = PresentationGeometryIndex::from_layout(layout);
+    scroll_region_has_real_child_placements_with_geometry_index(&geometry_index, layout, scroll)
+}
+
+fn scroll_region_has_real_child_placements_with_geometry_index(
+    geometry_index: &PresentationGeometryIndex,
+    layout: &LayoutOutput,
+    scroll: &ScrollRegionDeclaration,
+) -> bool {
     layout
         .child_placements
         .iter()
-        .any(|placement| scroll_contains_placement_for_layout(&geometry_index, scroll, placement))
+        .any(|placement| scroll_contains_placement_for_layout(geometry_index, scroll, placement))
 }
 
 fn scroll_contains_placement(
@@ -10260,10 +12765,10 @@ mod tests {
     use slipway_core::{
         BaselineShift, CaretGeometryEvidence, CaretSet, Color, CommandEvent, EmittedMessage,
         FontStyle, FontWeight, FrameIdentity, ImeCompositionPolicyDeclaration, PaintOp,
-        PointerEvent, PointerEventKind, ScrollEvent, ShapeDeclaration, ShapeKind, Size,
-        SlipwayLogic, SlipwaySsot, SlipwayView, SlipwayWidgetListVisitor, SlipwayWidgetTypes,
-        TextBufferSnapshot, TextDecoration, TextEditCommandDeclaration, TextEditKind,
-        TextSelectionPolicyDeclaration, TextStyle,
+        PointerEvent, PointerEventKind, ShapeDeclaration, ShapeKind, Size, SlipwayLogic,
+        SlipwaySsot, SlipwayView, SlipwayWidgetListVisitor, SlipwayWidgetTypes, TextBufferSnapshot,
+        TextDecoration, TextEditCommandDeclaration, TextEditKind, TextSelectionPolicyDeclaration,
+        TextStyle,
     };
     use slipway_debug_bridge::{
         DebugCommand, DebugPhysicalControl, DebugReplyProduct, MessageDisposition,
@@ -10290,6 +12795,32 @@ mod tests {
             !source.contains(concat!("presentation.hit_regions", ".clone()")),
             "visible pointer routing must not clone the full hit-region list on the hot path"
         );
+    }
+
+    #[test]
+    fn iced_native_scroll_point_transform_hot_path_uses_frame_index() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("fn iced_native_scrolled_root_local_point(")
+            .expect("scroll point transform exists");
+        let end = source[start..]
+            .find("fn iced_native_scroll_dispatch_index(")
+            .map(|offset| start + offset)
+            .expect("scroll point transform remains bounded");
+        let body = &source[start..end];
+
+        for forbidden in [
+            ".collect",
+            "region_root_local_rect(",
+            "declared_region_root_local_rect",
+            "PresentationGeometryIndex::from_layout",
+            "native_scroll_regions",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "visible event coordinate transform must use the frame-owned scroll dispatch index without hot-path {forbidden}"
+            );
+        }
     }
 
     fn collect_paint_text_labels<'a>(ops: &'a [PaintOp], labels: &mut Vec<&'a str>) {
@@ -10335,14 +12866,16 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     struct TestWidget;
 
-    struct DragTestWidget;
-
-    struct HoverTestWidget;
-
-    struct CancelTestWidget;
-
     #[derive(Clone, Debug, PartialEq)]
     struct FocusedInputWidget;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct ScrollRegionParentWidget;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct OffsetChildApp {
+        widgets: (TestWidget,),
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ScrollProbeWidget;
@@ -10649,9 +13182,6 @@ mod tests {
 
     impl_iced_test_leaf_children!(
         TestWidget,
-        DragTestWidget,
-        HoverTestWidget,
-        CancelTestWidget,
         FocusedInputWidget,
         ScrollProbeWidget,
         TextEditUnsupportedWidget,
@@ -10660,11 +13190,14 @@ mod tests {
         LifecycleProbeChild,
         UnsupportedPaintWidget,
         LayeredChild,
+        CountingLayeredChild,
+        LayeredHitChild,
     );
 
     impl_iced_test_event_policy!(
         TestWidget,
         FocusedInputWidget,
+        ScrollRegionParentWidget,
         ScrollProbeWidget,
         TextEditUnsupportedWidget,
         ChildPaintWidget,
@@ -10677,6 +13210,8 @@ mod tests {
         UnsupportedPaintWidget,
         UnsupportedPaintParentWithChildWidget,
         LayeredChild,
+        CountingLayeredChild,
+        LayeredHitChild,
         ScrollLayerParent,
     );
 
@@ -11196,7 +13731,7 @@ mod tests {
             &self,
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
-            _wheel: &slipway_core::WheelEvent,
+            _region: &slipway_core::PresentationRegionId,
         ) -> slipway_core::WheelRoutingPolicyDeclaration {
             slipway_core::WheelRoutingPolicyDeclaration {
                 target: self.id.clone(),
@@ -11590,453 +14125,6 @@ mod tests {
         }
     }
 
-    impl SlipwayWidgetTypes for DragTestWidget {
-        type ExternalState = ();
-        type LocalState = Local;
-        type AppMessage = Message;
-    }
-
-    impl SlipwaySsot for DragTestWidget {
-        fn id(&self) -> WidgetId {
-            TestWidget.id()
-        }
-
-        fn capabilities(&self) -> Vec<Capability> {
-            TestWidget.capabilities()
-        }
-
-        fn topology(&self, external: &Self::ExternalState) -> TopologyNode {
-            TestWidget.topology(external)
-        }
-
-        fn unsupported(&self) -> Vec<Diagnostic> {
-            TestWidget.unsupported()
-        }
-    }
-
-    impl SlipwayLogic for DragTestWidget {
-        fn handle_event(
-            &self,
-            external: &Self::ExternalState,
-            local: &mut Self::LocalState,
-            event: InputEvent,
-        ) -> EventOutcome<Self::AppMessage> {
-            match &event {
-                InputEvent::Pointer(pointer)
-                    if pointer.target == self.id()
-                        && pointer.kind == slipway_core::PointerEventKind::Move =>
-                {
-                    TestWidget.handle_event(external, local, event)
-                }
-                _ => EventOutcome::ignored(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventRoutingPolicy for DragTestWidget {
-        fn event_routing_policy(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-        ) -> slipway_core::EventRoutingPolicyDeclaration {
-            let id = self.id();
-            slipway_core::EventRoutingPolicyDeclaration {
-                target: id.clone(),
-                event_target: event.target().clone(),
-                route: slipway_core::EventRoute {
-                    route_id: Some("iced.test.move.route".to_string()),
-                    address: event.target_slot().cloned(),
-                    path: vec![id],
-                    phase: slipway_core::EventRoutePhase::Target,
-                },
-                capture: Vec::new(),
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventDispositionPolicy for DragTestWidget {
-        fn event_disposition(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-            _route: &slipway_core::EventRoute,
-        ) -> slipway_core::EventPropagationEvidence {
-            let id = self.id();
-            let handled = matches!(
-                event,
-                slipway_core::InputEvent::Pointer(pointer)
-                    if pointer.target == id
-                        && pointer.kind == slipway_core::PointerEventKind::Move
-            );
-            let disposition = slipway_core::EventDisposition {
-                handled,
-                propagate: !handled,
-                default_action_allowed: true,
-            };
-            slipway_core::EventPropagationEvidence {
-                target: id.clone(),
-                event: event.clone(),
-                steps: vec![slipway_core::EventPropagationStep {
-                    stage: slipway_core::EventPropagationStage::Target,
-                    node: Some(id),
-                    disposition,
-                    emitted_messages: Vec::new(),
-                    changes: Vec::new(),
-                }],
-                final_disposition: disposition,
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl SlipwayView for DragTestWidget {
-        fn initial_local_state(&self) -> Self::LocalState {
-            TestWidget.initial_local_state()
-        }
-
-        fn layout(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: LayoutInput,
-        ) -> LayoutOutput {
-            TestWidget.layout(external, local, input)
-        }
-
-        fn paint(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            layout: &LayoutOutput,
-        ) -> Vec<PaintOp> {
-            TestWidget.paint(external, local, layout)
-        }
-
-        fn observe_state(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-        ) -> Vec<StateObservation> {
-            TestWidget.observe_state(external, local)
-        }
-    }
-
-    impl SlipwayViewDefinition for DragTestWidget {
-        fn view_definition(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: ViewDefinitionInput,
-        ) -> ViewDefinition {
-            let mut view = TestWidget.view_definition(external, local, input);
-            if let Some(region) = view.hit_regions.first_mut() {
-                region.capture = slipway_core::PointerCaptureIntent::DuringDrag;
-            }
-            view
-        }
-    }
-
-    impl SlipwayWidgetTypes for HoverTestWidget {
-        type ExternalState = ();
-        type LocalState = Local;
-        type AppMessage = Message;
-    }
-
-    impl SlipwaySsot for HoverTestWidget {
-        fn id(&self) -> WidgetId {
-            TestWidget.id()
-        }
-
-        fn capabilities(&self) -> Vec<Capability> {
-            TestWidget.capabilities()
-        }
-
-        fn topology(&self, external: &Self::ExternalState) -> TopologyNode {
-            TestWidget.topology(external)
-        }
-
-        fn unsupported(&self) -> Vec<Diagnostic> {
-            TestWidget.unsupported()
-        }
-    }
-
-    impl SlipwayLogic for HoverTestWidget {
-        fn handle_event(
-            &self,
-            external: &Self::ExternalState,
-            local: &mut Self::LocalState,
-            event: InputEvent,
-        ) -> EventOutcome<Self::AppMessage> {
-            match &event {
-                InputEvent::Pointer(pointer)
-                    if pointer.target == self.id()
-                        && matches!(
-                            pointer.kind,
-                            slipway_core::PointerEventKind::Enter
-                                | slipway_core::PointerEventKind::Leave
-                        ) =>
-                {
-                    TestWidget.handle_event(external, local, event)
-                }
-                _ => EventOutcome::ignored(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventRoutingPolicy for HoverTestWidget {
-        fn event_routing_policy(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-        ) -> slipway_core::EventRoutingPolicyDeclaration {
-            let id = self.id();
-            slipway_core::EventRoutingPolicyDeclaration {
-                target: id.clone(),
-                event_target: event.target().clone(),
-                route: slipway_core::EventRoute {
-                    route_id: Some("iced.test.hover.route".to_string()),
-                    address: event.target_slot().cloned(),
-                    path: vec![id],
-                    phase: slipway_core::EventRoutePhase::Target,
-                },
-                capture: Vec::new(),
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventDispositionPolicy for HoverTestWidget {
-        fn event_disposition(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-            _route: &slipway_core::EventRoute,
-        ) -> slipway_core::EventPropagationEvidence {
-            let id = self.id();
-            let handled = matches!(
-                event,
-                slipway_core::InputEvent::Pointer(pointer)
-                    if pointer.target == id
-                        && matches!(
-                            pointer.kind,
-                            slipway_core::PointerEventKind::Enter
-                                | slipway_core::PointerEventKind::Leave
-                        )
-            );
-            let disposition = slipway_core::EventDisposition {
-                handled,
-                propagate: !handled,
-                default_action_allowed: true,
-            };
-            slipway_core::EventPropagationEvidence {
-                target: id.clone(),
-                event: event.clone(),
-                steps: vec![slipway_core::EventPropagationStep {
-                    stage: slipway_core::EventPropagationStage::Target,
-                    node: Some(id),
-                    disposition,
-                    emitted_messages: Vec::new(),
-                    changes: Vec::new(),
-                }],
-                final_disposition: disposition,
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl SlipwayView for HoverTestWidget {
-        fn initial_local_state(&self) -> Self::LocalState {
-            TestWidget.initial_local_state()
-        }
-
-        fn layout(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: LayoutInput,
-        ) -> LayoutOutput {
-            TestWidget.layout(external, local, input)
-        }
-
-        fn paint(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            layout: &LayoutOutput,
-        ) -> Vec<PaintOp> {
-            TestWidget.paint(external, local, layout)
-        }
-
-        fn observe_state(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-        ) -> Vec<StateObservation> {
-            TestWidget.observe_state(external, local)
-        }
-    }
-
-    impl SlipwayViewDefinition for HoverTestWidget {
-        fn view_definition(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: ViewDefinitionInput,
-        ) -> ViewDefinition {
-            TestWidget.view_definition(external, local, input)
-        }
-    }
-
-    impl SlipwayWidgetTypes for CancelTestWidget {
-        type ExternalState = ();
-        type LocalState = Local;
-        type AppMessage = Message;
-    }
-
-    impl SlipwaySsot for CancelTestWidget {
-        fn id(&self) -> WidgetId {
-            TestWidget.id()
-        }
-
-        fn capabilities(&self) -> Vec<Capability> {
-            TestWidget.capabilities()
-        }
-
-        fn topology(&self, external: &Self::ExternalState) -> TopologyNode {
-            TestWidget.topology(external)
-        }
-
-        fn unsupported(&self) -> Vec<Diagnostic> {
-            TestWidget.unsupported()
-        }
-    }
-
-    impl SlipwayLogic for CancelTestWidget {
-        fn handle_event(
-            &self,
-            external: &Self::ExternalState,
-            local: &mut Self::LocalState,
-            event: InputEvent,
-        ) -> EventOutcome<Self::AppMessage> {
-            match &event {
-                InputEvent::Pointer(pointer)
-                    if pointer.target == self.id()
-                        && pointer.kind == slipway_core::PointerEventKind::Cancel =>
-                {
-                    TestWidget.handle_event(external, local, event)
-                }
-                _ => EventOutcome::ignored(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventRoutingPolicy for CancelTestWidget {
-        fn event_routing_policy(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-        ) -> slipway_core::EventRoutingPolicyDeclaration {
-            let id = self.id();
-            slipway_core::EventRoutingPolicyDeclaration {
-                target: id.clone(),
-                event_target: event.target().clone(),
-                route: slipway_core::EventRoute {
-                    route_id: Some("iced.test.cancel.route".to_string()),
-                    address: event.target_slot().cloned(),
-                    path: vec![id],
-                    phase: slipway_core::EventRoutePhase::Target,
-                },
-                capture: Vec::new(),
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl slipway_core::SlipwayEventDispositionPolicy for CancelTestWidget {
-        fn event_disposition(
-            &self,
-            _external: &Self::ExternalState,
-            _local: &Self::LocalState,
-            event: &slipway_core::InputEvent,
-            _route: &slipway_core::EventRoute,
-        ) -> slipway_core::EventPropagationEvidence {
-            let id = self.id();
-            let handled = matches!(
-                event,
-                slipway_core::InputEvent::Pointer(pointer)
-                    if pointer.target == id
-                        && pointer.kind == slipway_core::PointerEventKind::Cancel
-            );
-            let disposition = slipway_core::EventDisposition {
-                handled,
-                propagate: !handled,
-                default_action_allowed: true,
-            };
-            slipway_core::EventPropagationEvidence {
-                target: id.clone(),
-                event: event.clone(),
-                steps: vec![slipway_core::EventPropagationStep {
-                    stage: slipway_core::EventPropagationStage::Target,
-                    node: Some(id),
-                    disposition,
-                    emitted_messages: Vec::new(),
-                    changes: Vec::new(),
-                }],
-                final_disposition: disposition,
-                diagnostics: Vec::new(),
-            }
-        }
-    }
-
-    impl SlipwayView for CancelTestWidget {
-        fn initial_local_state(&self) -> Self::LocalState {
-            TestWidget.initial_local_state()
-        }
-
-        fn layout(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: LayoutInput,
-        ) -> LayoutOutput {
-            TestWidget.layout(external, local, input)
-        }
-
-        fn paint(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            layout: &LayoutOutput,
-        ) -> Vec<PaintOp> {
-            TestWidget.paint(external, local, layout)
-        }
-
-        fn observe_state(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-        ) -> Vec<StateObservation> {
-            TestWidget.observe_state(external, local)
-        }
-    }
-
-    impl SlipwayViewDefinition for CancelTestWidget {
-        fn view_definition(
-            &self,
-            external: &Self::ExternalState,
-            local: &Self::LocalState,
-            input: ViewDefinitionInput,
-        ) -> ViewDefinition {
-            TestWidget.view_definition(external, local, input)
-        }
-    }
-
     impl SlipwayLayoutIntent for TestWidget {
         fn layout_intent(
             &self,
@@ -12265,7 +14353,7 @@ mod tests {
                     if wheel.target == self.id()
                         && wheel.target_slot == Some(WidgetSlotAddress::new(self.id(), 0))
                         && wheel.delta_x == 0.0
-                        && wheel.delta_y == 7.0 =>
+                        && wheel.delta_y == -7.0 =>
                 {
                     local.clicks += 1;
                     EventOutcome::message(self.id(), "wheeled", Message::Clicked)
@@ -12495,6 +14583,233 @@ mod tests {
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
             }
+        }
+    }
+
+    impl SlipwayWidgetTypes for ScrollRegionParentWidget {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = Message;
+    }
+
+    impl SlipwaySsot for ScrollRegionParentWidget {
+        fn id(&self) -> WidgetId {
+            WidgetId::from("iced.scroll-parent")
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![
+                Capability::ChildTraversal,
+                Capability::Layout,
+                Capability::ScrollRegionPresentation,
+            ]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            let child = TestWidget.id();
+            TopologyNode {
+                id: self.id(),
+                local_state_slot: Some(WidgetSlotAddress::new(self.id(), 0)),
+                children: vec![TopologyNode {
+                    id: child.clone(),
+                    local_state_slot: Some(WidgetSlotAddress::new(self.id(), 0).child(child, 0)),
+                    children: Vec::new(),
+                }],
+            }
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+
+        fn visit_authored_children<V>(
+            &self,
+            external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            visitor: &mut V,
+        ) where
+            V: SlipwayWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+            let child = TestWidget;
+            visitor.visit_child(
+                &child,
+                external,
+                &child.initial_local_state(),
+                WidgetSlotAddress::new(self.id(), 0).child(child.id(), 0),
+            );
+        }
+    }
+
+    impl SlipwayLogic for ScrollRegionParentWidget {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            EventOutcome::ignored()
+        }
+    }
+
+    impl SlipwayView for ScrollRegionParentWidget {
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: TestWidget.id(),
+                    local_state_slot: Some(
+                        WidgetSlotAddress::new(self.id(), 0).child(TestWidget.id(), 0),
+                    ),
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 24.0, y: 18.0 },
+                        size: Size {
+                            width: 30.0,
+                            height: 14.0,
+                        },
+                    }),
+                }],
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayViewDefinition for ScrollRegionParentWidget {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            let mut view = ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                layout,
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: Vec::new(),
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+            view.scroll_regions.push(test_scroll_region_from_capability(
+                self.id(),
+                "test-native-scroll-click",
+                Rect {
+                    origin: Point { x: 10.0, y: 12.0 },
+                    size: Size {
+                        width: 70.0,
+                        height: 34.0,
+                    },
+                },
+                Rect {
+                    origin: Point { x: 10.0, y: 12.0 },
+                    size: Size {
+                        width: 70.0,
+                        height: 120.0,
+                    },
+                },
+                slipway_core::ScrollConsumptionPolicy {
+                    wheel: true,
+                    drag: false,
+                    keyboard: false,
+                    programmatic: false,
+                },
+            ));
+            view.scroll_regions[0].address = Some(WidgetSlotAddress::new(self.id(), 0));
+            view
+        }
+    }
+
+    impl slipway_core::SlipwayApp for OffsetChildApp {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = Message;
+        type Widgets = (TestWidget,);
+
+        fn id(&self) -> WidgetId {
+            WidgetId::from("iced.offset-app")
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout_plan(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+            children: Vec<slipway_core::ChildLayoutSeed>,
+        ) -> slipway_core::AppLayoutPlan {
+            slipway_core::AppLayoutPlan {
+                bounds: input.viewport,
+                children: children
+                    .into_iter()
+                    .map(|seed| {
+                        let bounds = Rect {
+                            origin: Point { x: 24.0, y: 18.0 },
+                            size: Size {
+                                width: 30.0,
+                                height: 14.0,
+                            },
+                        };
+                        slipway_core::ChildLayoutPlan::placed_for_seed(
+                            seed,
+                            iced_child_layout_input(bounds),
+                            slipway_core::ParentLocalRect::new(bounds),
+                        )
+                    })
+                    .collect(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayIcedAuthoredChildren for ScrollRegionParentWidget {
+        fn visit_iced_authored_children<V>(
+            &self,
+            external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            visitor: &mut V,
+        ) where
+            V: SlipwayIcedWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+            let child = TestWidget;
+            visitor.visit_iced_child(
+                &child,
+                external,
+                &child.initial_local_state(),
+                WidgetSlotAddress::new(self.id(), 0).child(child.id(), 0),
+            );
         }
     }
 
@@ -12794,6 +15109,164 @@ mod tests {
     }
 
     #[derive(Clone, Debug, PartialEq)]
+    struct LayeredHitChild {
+        id: &'static str,
+        traversal_order: usize,
+    }
+
+    impl LayeredHitChild {
+        fn new(id: &'static str, traversal_order: usize) -> Self {
+            Self {
+                id,
+                traversal_order,
+            }
+        }
+
+        fn hit_id(&self) -> PresentationRegionId {
+            PresentationRegionId::from(format!("{}.hit", self.id))
+        }
+    }
+
+    impl SlipwayWidgetTypes for LayeredHitChild {
+        type ExternalState = ();
+        type LocalState = bool;
+        type AppMessage = Message;
+    }
+
+    impl SlipwaySsot for LayeredHitChild {
+        fn id(&self) -> WidgetId {
+            WidgetId::from(self.id)
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for LayeredHitChild {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            if matches!(event, InputEvent::Pointer(pointer) if pointer.kind == PointerEventKind::Press)
+            {
+                *local = true;
+                EventOutcome::handled()
+            } else {
+                EventOutcome::ignored()
+            }
+        }
+    }
+
+    impl SlipwayView for LayeredHitChild {
+        fn initial_local_state(&self) -> Self::LocalState {
+            false
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            vec![PaintOp::keyed_layer(
+                slipway_core::PaintLayerKey::ordered(10, 0),
+                vec![PaintOp::Fill {
+                    shape: ShapeDeclaration {
+                        id: Some(format!("{}.layer", self.id)),
+                        kind: ShapeKind::Rectangle,
+                        bounds: layout.bounds.into_rect(),
+                        path: None,
+                        clip: None,
+                    },
+                    color: Color {
+                        red: 1.0,
+                        green: 1.0,
+                        blue: 1.0,
+                        alpha: 1.0,
+                    },
+                }],
+            )]
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayViewDefinition for LayeredHitChild {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            let bounds = layout.bounds;
+            let paint = self.paint(external, local, &layout);
+            let target = self.id();
+
+            ViewDefinition {
+                target: target.clone(),
+                frame: input.frame,
+                layout,
+                paint,
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(target.clone()),
+                hit_regions: vec![slipway_core::hit_region_from_pointer_capability(
+                    self,
+                    external,
+                    local,
+                    self.hit_id(),
+                    None,
+                    bounds,
+                    slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                    slipway_core::HitRegionOrder {
+                        z_index: 10,
+                        paint_order: 0,
+                        traversal_order: self.traversal_order,
+                    },
+                    Some(format!("{}.route", self.id)),
+                    CursorCapability::Pointer,
+                    true,
+                    slipway_core::PointerCaptureIntent::OnPress,
+                )],
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
     struct LayeredApp {
         widgets: (LayeredChild, LayeredChild),
     }
@@ -12850,8 +15323,224 @@ mod tests {
     }
 
     #[derive(Clone, Debug, PartialEq)]
+    struct CountingLayeredChild {
+        id: &'static str,
+        z_index: i32,
+    }
+
+    impl SlipwayWidgetTypes for CountingLayeredChild {
+        type ExternalState = LifecycleCounterState;
+        type LocalState = ();
+        type AppMessage = Message;
+    }
+
+    impl SlipwaySsot for CountingLayeredChild {
+        fn id(&self) -> WidgetId {
+            WidgetId::from(self.id)
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for CountingLayeredChild {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            EventOutcome::ignored()
+        }
+    }
+
+    impl SlipwayView for CountingLayeredChild {
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayViewDefinition for CountingLayeredChild {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            increment(&external.child_views);
+            let layout = self.layout(external, local, input.layout_input);
+
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                layout,
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::layered_order(
+                    self.id(),
+                    self.z_index,
+                    0,
+                ),
+                hit_regions: Vec::new(),
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct CountingLayeredApp {
+        widgets: (CountingLayeredChild, CountingLayeredChild),
+    }
+
+    impl slipway_core::SlipwayApp for CountingLayeredApp {
+        type ExternalState = LifecycleCounterState;
+        type LocalState = ();
+        type AppMessage = Message;
+        type Widgets = (CountingLayeredChild, CountingLayeredChild);
+
+        fn id(&self) -> WidgetId {
+            WidgetId::from("iced.counting-layered-app")
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout_plan(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+            children: Vec<slipway_core::ChildLayoutSeed>,
+        ) -> slipway_core::AppLayoutPlan {
+            slipway_core::AppLayoutPlan {
+                bounds: input.viewport,
+                children: children
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, seed)| {
+                        let bounds = Rect {
+                            origin: Point {
+                                x: index as f32 * 10.0,
+                                y: 0.0,
+                            },
+                            size: Size {
+                                width: 10.0,
+                                height: 10.0,
+                            },
+                        };
+                        slipway_core::ChildLayoutPlan::placed_for_seed(
+                            seed,
+                            iced_child_layout_input(bounds),
+                            slipway_core::ParentLocalRect::new(bounds),
+                        )
+                    })
+                    .collect(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct LayeredHitApp {
+        widgets: (LayeredHitChild, LayeredHitChild),
+    }
+
+    impl slipway_core::SlipwayApp for LayeredHitApp {
+        type ExternalState = ();
+        type LocalState = bool;
+        type AppMessage = Message;
+        type Widgets = (LayeredHitChild, LayeredHitChild);
+
+        fn id(&self) -> WidgetId {
+            WidgetId::from("iced.layer-hit-app")
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {
+            false
+        }
+
+        fn layout_plan(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+            children: Vec<slipway_core::ChildLayoutSeed>,
+        ) -> slipway_core::AppLayoutPlan {
+            let bounds = Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 80.0,
+                    height: 60.0,
+                },
+            };
+            slipway_core::AppLayoutPlan {
+                bounds: input.viewport,
+                children: children
+                    .into_iter()
+                    .map(|seed| {
+                        slipway_core::ChildLayoutPlan::placed_for_seed(
+                            seed,
+                            iced_child_layout_input(bounds),
+                            slipway_core::ParentLocalRect::new(bounds),
+                        )
+                    })
+                    .collect(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
     struct ScrollLayerParent {
         child: LayeredChild,
+        scroll_offset_y: f32,
     }
 
     impl ScrollLayerParent {
@@ -12995,6 +15684,23 @@ mod tests {
                 },
             };
 
+            let mut scroll_region = test_scroll_region_from_capability(
+                self.id(),
+                "iced.scroll-layer.region",
+                viewport,
+                content,
+                slipway_core::ScrollConsumptionPolicy {
+                    wheel: true,
+                    drag: true,
+                    keyboard: true,
+                    programmatic: true,
+                },
+            );
+            scroll_region.offset = Point {
+                x: 0.0,
+                y: self.scroll_offset_y,
+            };
+
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -13003,18 +15709,7 @@ mod tests {
                 paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
-                scroll_regions: vec![test_scroll_region_from_capability(
-                    self.id(),
-                    "iced.scroll-layer.region",
-                    viewport,
-                    content,
-                    slipway_core::ScrollConsumptionPolicy {
-                        wheel: true,
-                        drag: true,
-                        keyboard: true,
-                        programmatic: true,
-                    },
-                )],
+                scroll_regions: vec![scroll_region],
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -13128,13 +15823,14 @@ mod tests {
             .collect()
     }
 
-    fn draw_scroll_layer_parent_after_wheel(wheel_y: f32) -> RecordingRenderer {
+    fn draw_scroll_layer_parent_with_scroll_offset(scroll_offset_y: f32) -> RecordingRenderer {
         type ScrollLayerRuntimeWidget<'a> = SlipwayIcedRuntimeWidget<'a, ScrollLayerParent>;
 
         let runtime = SlipwayRuntime::new(
             ScrollLayerParent {
                 child: LayeredChild::new("iced.scroll-layer.child", 0, Some(20))
                     .with_default_paint(),
+                scroll_offset_y,
             },
             (),
         );
@@ -13173,27 +15869,6 @@ mod tests {
             width: 100.0,
             height: 100.0,
         };
-        let mut clipboard = iced::advanced::clipboard::Null;
-        let mut messages = Vec::new();
-        let mut shell = iced::advanced::Shell::new(&mut messages);
-        <ScrollLayerRuntimeWidget<'_> as Widget<
-            SlipwayIcedRuntimeMessage,
-            iced::Theme,
-            RecordingRenderer,
-        >>::update(
-            &mut widget,
-            &mut tree,
-            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
-                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: wheel_y },
-            }),
-            layout,
-            iced::advanced::mouse::Cursor::Available(iced::Point::new(5.0, 5.0)),
-            &renderer,
-            &mut clipboard,
-            &mut shell,
-            &viewport,
-        );
-
         let style = iced::advanced::renderer::Style {
             text_color: iced::Color::BLACK,
         };
@@ -13371,6 +16046,284 @@ mod tests {
     }
 
     #[test]
+    fn iced_presentation_paint_sort_orders_reproduce_fresh_child_paint_sort_keys() {
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 60.0,
+                height: 20.0,
+            },
+        };
+        let children = vec![
+            LayeredChild::new("iced.sort-orders.keyed", 3, Some(40)).with_keyed_layer_order(7),
+            LayeredChild {
+                id: "iced.sort-orders.keyed-unordered",
+                z_index: 2,
+                keyed_layer_z_index: Some(20),
+                keyed_layer_order: None,
+                source_order: false,
+                include_default_paint: true,
+            },
+            LayeredChild::new("iced.sort-orders.layered", 6, None),
+            LayeredChild::new("iced.sort-orders.source", 0, None).with_source_order(),
+            LayeredChild {
+                id: "iced.sort-orders.empty",
+                z_index: 0,
+                keyed_layer_z_index: None,
+                keyed_layer_order: None,
+                source_order: true,
+                include_default_paint: false,
+            },
+        ];
+        let mut views: Vec<ViewDefinition> = children
+            .iter()
+            .map(|child| {
+                child.visible_backend_view_definition(
+                    &(),
+                    &(),
+                    ViewDefinitionInput {
+                        frame: frame(211),
+                        layout_input: iced_child_layout_input(bounds),
+                    },
+                )
+            })
+            .collect();
+
+        // A vertically overflowing scroll region with no real child placements
+        // gains synthetic indicator paint during presentation construction.
+        // The stored sort orders must still reproduce the raw pre-indicator
+        // view's sort key.
+        let indicator_target = WidgetId::from("iced.sort-orders.indicator");
+        let indicator_viewport = bounds;
+        let indicator_content = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 60.0,
+                height: 80.0,
+            },
+        };
+        let mut indicator_region = test_scroll_region_from_capability(
+            indicator_target.clone(),
+            "iced.sort-orders.indicator.region",
+            indicator_viewport,
+            indicator_content,
+            slipway_core::ScrollConsumptionPolicy {
+                wheel: true,
+                drag: true,
+                keyboard: true,
+                programmatic: true,
+            },
+        );
+        indicator_region.offset = Point { x: 0.0, y: 10.0 };
+        views.push(ViewDefinition {
+            target: indicator_target.clone(),
+            frame: frame(212),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(indicator_viewport),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(
+                indicator_target.clone(),
+            ),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![indicator_region],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        });
+
+        for view in views {
+            let presentation = IcedPresentationState::from_view_definition(
+                view.clone(),
+                iced_child_layout_input(bounds),
+                view.target.clone(),
+            );
+            if view.target == indicator_target {
+                assert!(
+                    presentation
+                        .explicit_layer_paint_units
+                        .iter()
+                        .any(|unit| unit.order.z_index == 5
+                            && unit.order.order == Some(usize::MAX)),
+                    "indicator fixture must actually receive synthetic scroll indicator paint"
+                );
+            }
+            for source_order in [0usize, 1, 7] {
+                let fresh =
+                    expand_paint_unit_layers(PaintUnit::from_view(view.clone(), source_order))
+                        .iter()
+                        .map(paint_unit_sort_key)
+                        .max()
+                        .unwrap_or((0, source_order, source_order));
+                assert_eq!(
+                    iced_paint_sort_key_for_source_order(
+                        &presentation.paint_sort_orders,
+                        source_order
+                    ),
+                    fresh,
+                    "cached paint sort key must reproduce the fresh child sort key for `{}` at source order {source_order}",
+                    view.target.as_str(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iced_paint_order_traversal_reuses_cached_child_sort_keys_without_view_rebuild() {
+        type CountingRuntimeWidget<'a> =
+            SlipwayIcedRuntimeWidget<'a, slipway_core::SlipwayAppWidget<CountingLayeredApp>>;
+
+        let runtime = SlipwayRuntime::new(
+            slipway_core::SlipwayAppWidget::new(CountingLayeredApp {
+                widgets: (
+                    CountingLayeredChild {
+                        id: "iced.counting-layer.top",
+                        z_index: 20,
+                    },
+                    CountingLayeredChild {
+                        id: "iced.counting-layer.bottom",
+                        z_index: 10,
+                    },
+                ),
+            }),
+            LifecycleCounterState::default(),
+        );
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let mut tree = iced::advanced::widget::Tree {
+            tag: <CountingRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::tag(&widget),
+            state: <CountingRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::state(&widget),
+            children: <CountingRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::children(&widget),
+        };
+        let renderer = RecordingRenderer::default();
+        let limits = iced::advanced::layout::Limits::new(
+            iced::Size::new(0.0, 0.0),
+            iced::Size::new(100.0, 40.0),
+        );
+        let node = <CountingRuntimeWidget<'_> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >>::layout(&mut widget, &mut tree, &renderer, &limits);
+
+        let frame_seed = runtime.last_frame_identity();
+        let (placements, root_origin, root_frame) = {
+            let presentation = tree
+                .state
+                .downcast_ref::<IcedRuntimeTreeState>()
+                .presentation
+                .as_ref()
+                .expect("root layout stores the app presentation");
+            (
+                root_child_placements_excluding_native_scroll(presentation),
+                presentation.root_origin,
+                presentation.frame.clone(),
+            )
+        };
+        let root_slot = WidgetSlotAddress::new(WidgetId::from("iced.counting-layered-app"), 0);
+        for (index, (id, z_index)) in [
+            ("iced.counting-layer.top", 20),
+            ("iced.counting-layer.bottom", 10),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let slot = root_slot.child(WidgetId::from(id), index);
+            let cached = iced_cached_child_paint_sort_key(
+                &tree.children,
+                placements.as_ref(),
+                Some(&frame_seed),
+                None,
+                root_origin,
+                &slot,
+            )
+            .expect("laid-out child presentations provide cached paint sort keys");
+            let fresh = iced_child_paint_sort_key(
+                &CountingLayeredChild { id, z_index },
+                runtime.external(),
+                &(),
+                &root_slot,
+                index,
+                &root_frame,
+                placements.as_ref(),
+            );
+            assert_eq!(
+                cached, fresh,
+                "cached paint sort key must equal the freshly computed key for `{id}`"
+            );
+        }
+
+        let views_before_traversals = runtime.external().child_views.get();
+        let viewport = iced::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 40.0,
+        };
+
+        let event = iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: iced::Point::new(5.0, 5.0),
+        });
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        {
+            let mut shell = iced::advanced::Shell::new(&mut messages);
+            <CountingRuntimeWidget<'_> as Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::update(
+                &mut widget,
+                &mut tree,
+                &event,
+                iced::advanced::Layout::new(&node),
+                iced::advanced::mouse::Cursor::Available(iced::Point::new(5.0, 5.0)),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+        }
+        assert_eq!(
+            runtime.external().child_views.get(),
+            views_before_traversals,
+            "update paint-order traversal must not rebuild child views for cached presentations"
+        );
+
+        let _ = <CountingRuntimeWidget<'_> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >>::mouse_interaction(
+            &widget,
+            &tree,
+            iced::advanced::Layout::new(&node),
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(5.0, 5.0)),
+            &viewport,
+            &renderer,
+        );
+        assert_eq!(
+            runtime.external().child_views.get(),
+            views_before_traversals,
+            "mouse-interaction paint-order traversal must not rebuild child views for cached presentations"
+        );
+    }
+
+    #[test]
     fn iced_child_default_paint_is_not_raised_with_extracted_keyed_layer() {
         let app = slipway_core::SlipwayAppWidget::new(LayeredApp {
             widgets: (
@@ -13433,7 +16386,7 @@ mod tests {
 
     #[test]
     fn iced_scroll_child_keyed_layer_uses_root_queue_with_clip_and_offset() {
-        let renderer = draw_scroll_layer_parent_after_wheel(-12.0);
+        let renderer = draw_scroll_layer_parent_with_scroll_offset(12.0);
         let draw = renderer
             .text_calls
             .iter()
@@ -13454,15 +16407,15 @@ mod tests {
             draw.active_layers
         );
         assert!(
-            (draw.position.y - 18.0).abs() < 0.01,
-            "the queued scroll child layer must preserve the scroll offset; got y={}",
+            (draw.position.y - 30.0).abs() < 0.01,
+            "the queued scroll child layer must stay content-local; iced native Scrollable applies the scroll offset, got y={}",
             draw.position.y
         );
     }
 
     #[test]
     fn iced_scroll_child_default_paint_draws_under_native_scroll_layer() {
-        let renderer = draw_scroll_layer_parent_after_wheel(-12.0);
+        let renderer = draw_scroll_layer_parent_with_scroll_offset(12.0);
         let draw = renderer
             .text_calls
             .iter()
@@ -14699,7 +17652,112 @@ mod tests {
         IcedPressedPointerCapture {
             region_id: PresentationRegionId::from(id),
             layout_origin: Point { x, y },
+            button: Some(iced::mouse::Button::Left),
         }
+    }
+
+    fn mounted_child_validation_view(
+        frame: FrameIdentity,
+        root: WidgetId,
+        child: WidgetId,
+        child_slot: WidgetSlotAddress,
+        root_bounds: Rect,
+        child_bounds: Rect,
+        hit_regions: Vec<HitRegionDeclaration>,
+        focus_regions: Vec<FocusRegionDeclaration>,
+        scroll_regions: Vec<ScrollRegionDeclaration>,
+    ) -> ViewDefinition {
+        ViewDefinition {
+            target: root.clone(),
+            frame,
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(root_bounds),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child,
+                    bounds: slipway_core::ParentLocalRect::new(child_bounds),
+                    local_state_slot: Some(child_slot),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root),
+            hit_regions,
+            focus_regions,
+            scroll_regions,
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn mounted_root_dispatch_context(
+        validation_view: &ViewDefinition,
+        paint_occlusion_regions: Vec<IcedPaintOcclusionRegion>,
+    ) -> IcedDispatchContext {
+        let geometry_index = PresentationGeometryIndex::from_layout(&validation_view.layout);
+        let native_scroll_regions: Arc<[ScrollRegionDeclaration]> =
+            native_iced_scroll_regions_for_layout_with_geometry_index(
+                &geometry_index,
+                &validation_view.layout,
+                &validation_view.scroll_regions,
+                &validation_view.target,
+            )
+            .into();
+        let native_scroll_dispatch_index =
+            iced_native_scroll_dispatch_index(&geometry_index, native_scroll_regions.as_ref());
+        IcedDispatchContext {
+            geometry_index,
+            hit_regions: validation_view.hit_regions.clone().into(),
+            focus_regions: validation_view.focus_regions.clone().into(),
+            scroll_regions: validation_view.scroll_regions.clone().into(),
+            paint_occlusion_regions: paint_occlusion_regions.into(),
+            native_scroll_regions,
+            native_scroll_dispatch_index,
+            position_space: IcedDispatchPositionSpace::ViewRootLocal,
+        }
+    }
+
+    fn assert_mounted_dispatch_evidence(
+        validation_view: &ViewDefinition,
+        input: &BackendInputEvent,
+        expected_source_detail: &str,
+        expected_kind: slipway_core::DeclaredEventDispatchKind,
+        expected_region: &str,
+        expected_route_id: &str,
+        expected_slot: &WidgetSlotAddress,
+        expected_input_position: Point,
+    ) {
+        assert_eq!(input.event.target_slot(), Some(expected_slot));
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("backend-presented input carries dispatch evidence");
+        assert_eq!(
+            &evidence.source,
+            &EvidenceSource::backend_presented(ICED_BACKEND_ID, expected_source_detail)
+        );
+        assert_eq!(evidence.kind, expected_kind);
+        assert_eq!(evidence.input_position, Some(expected_input_position));
+        let expected_region = PresentationRegionId::from(expected_region);
+        assert_eq!(evidence.selected_region.as_ref(), Some(&expected_region));
+        assert_eq!(
+            evidence.candidate_regions.as_slice(),
+            std::slice::from_ref(&expected_region)
+        );
+        assert_eq!(evidence.generated_event.as_ref(), Some(&input.event));
+        let route = evidence.route.as_ref().expect("evidence records route");
+        assert_eq!(route.route_id.as_deref(), Some(expected_route_id));
+        assert_eq!(route.address.as_ref(), Some(expected_slot));
+        assert_eq!(route.path.as_slice(), expected_slot.path.as_slice());
+        assert_eq!(route.phase, slipway_core::EventRoutePhase::Target);
+
+        let diagnostics = slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+            validation_view,
+            input,
+            Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+            Some(ICED_BACKEND_ID),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     fn frame_json(frame: &FrameIdentity) -> String {
@@ -14731,133 +17789,6 @@ mod tests {
             frame_json(frame),
             x,
             y,
-        )
-    }
-
-    fn physical_pointer_phase_message(
-        id: &str,
-        frame: &FrameIdentity,
-        x: f32,
-        y: f32,
-        phase: &str,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"pointer","phase":"{}","position":{{"x":{},"y":{}}},"device":"mouse"}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            phase,
-            x,
-            y,
-        )
-    }
-
-    fn physical_touch_phase_message(
-        id: &str,
-        frame: &FrameIdentity,
-        x: f32,
-        y: f32,
-        phase: &str,
-        pointer_id: u64,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"pointer","phase":"{}","position":{{"x":{},"y":{}}},"device":"touch","pointer_id":{},"pointer_is_pressed":false}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            phase,
-            x,
-            y,
-            pointer_id,
-        )
-    }
-
-    fn physical_keyboard_message(
-        id: &str,
-        frame: &FrameIdentity,
-        target: &str,
-        key: &str,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"keyboard","target":"{}","key":"{}","phase":"press"}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            target,
-            key,
-        )
-    }
-
-    fn physical_text_edit_message(
-        id: &str,
-        frame: &FrameIdentity,
-        target: &str,
-        text: &str,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"text_edit","target":"{}","edit_kind":"replace_selection","text":"{}"}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            target,
-            text,
-        )
-    }
-
-    fn physical_command_message(
-        id: &str,
-        frame: &FrameIdentity,
-        target: &str,
-        command: &str,
-        payload_ref: &str,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"command","target":"{}","command":"{}","payload_ref":"{}"}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            target,
-            command,
-            payload_ref,
-        )
-    }
-
-    fn physical_scroll_message(
-        id: &str,
-        frame: &FrameIdentity,
-        target: &str,
-        offset_x: f32,
-        offset_y: f32,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"scroll","target":"{}","offset_x":{},"offset_y":{}}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            target,
-            offset_x,
-            offset_y,
-        )
-    }
-
-    fn physical_wheel_message(
-        id: &str,
-        frame: &FrameIdentity,
-        x: f32,
-        y: f32,
-        delta_x: f32,
-        delta_y: f32,
-    ) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"wheel","position":{{"x":{},"y":{}}},"delta_x":{},"delta_y":{}}}}}}}}}"#,
-            id,
-            frame_json(frame),
-            x,
-            y,
-            delta_x,
-            delta_y,
-        )
-    }
-
-    fn probe_event_message(id: &str, frame: &FrameIdentity) -> String {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.probe","arguments":{{"frame":{},"kinds":["event"]}}}}}}"#,
-            id,
-            frame_json(frame),
         )
     }
 
@@ -16001,6 +18932,17 @@ mod tests {
 
         let native_scroll = native_iced_scroll_regions(&presentation);
         assert_eq!(native_scroll.len(), 1);
+        let indicator_shapes = presentation
+            .explicit_layer_paint_units
+            .iter()
+            .flat_map(|unit| paint_shape_ids(&unit.paint))
+            .into_iter()
+            .filter(|id| id.contains("scroll-indicator"))
+            .collect::<Vec<_>>();
+        assert!(
+            indicator_shapes.is_empty(),
+            "native iced scrollable regions must not also get custom scroll indicators"
+        );
         assert!(root_child_placements_excluding_native_scroll(&presentation).is_empty());
         let adjusted = adjusted_scroll_child_placements(&presentation, &native_scroll[0]);
         assert_eq!(adjusted.len(), 1);
@@ -16020,6 +18962,149 @@ mod tests {
             &native_scroll[0],
             None,
             None,
+            false,
+            None,
+        );
+    }
+
+    #[test]
+    fn native_iced_scroll_regions_are_owned_by_presented_target_only() {
+        let root = WidgetId::from("native-scroll-root-owner");
+        let child = WidgetId::from("native-scroll-child-owner");
+        let grandchild = WidgetId::from("native-scroll-grandchild-owner");
+        let child_slot = WidgetSlotAddress::new(root.clone(), 0).child(child.clone(), 0);
+        let grandchild_slot = child_slot.child(grandchild.clone(), 0);
+        let layout = LayoutOutput {
+            bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 240.0,
+                    height: 180.0,
+                },
+            }),
+            child_placements: vec![
+                slipway_core::ChildPlacement {
+                    child: child.clone(),
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 12.0, y: 20.0 },
+                        size: Size {
+                            width: 180.0,
+                            height: 120.0,
+                        },
+                    }),
+                    local_state_slot: Some(child_slot.clone()),
+                },
+                slipway_core::ChildPlacement {
+                    child: grandchild,
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 24.0, y: 44.0 },
+                        size: Size {
+                            width: 120.0,
+                            height: 40.0,
+                        },
+                    }),
+                    local_state_slot: Some(grandchild_slot),
+                },
+            ],
+            diagnostics: Vec::new(),
+        };
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-owned-scroll"),
+            root.clone(),
+            None,
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 240.0,
+                    height: 90.0,
+                },
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 240.0,
+                    height: 180.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let child_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("child-owned-scroll"),
+            child.clone(),
+            Some(child_slot),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 160.0,
+                    height: 60.0,
+                },
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 160.0,
+                    height: 140.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 2,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+
+        assert!(scroll_region_has_real_child_placements(
+            &layout,
+            &root_scroll
+        ));
+        assert!(scroll_region_has_real_child_placements(
+            &layout,
+            &child_scroll
+        ));
+
+        let root_owned = native_iced_scroll_regions_for_layout(
+            &layout,
+            &[root_scroll.clone(), child_scroll.clone()],
+            &root,
+        );
+        assert_eq!(
+            root_owned
+                .iter()
+                .map(|region| region.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root-owned-scroll"],
+            "parent presentation must not instantiate child-owned native scrollables"
+        );
+
+        let child_owned =
+            native_iced_scroll_regions_for_layout(&layout, &[root_scroll, child_scroll], &child);
+        assert_eq!(
+            child_owned
+                .iter()
+                .map(|region| region.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-owned-scroll"],
+            "child presentation remains responsible for child-owned native scrollables"
         );
     }
 
@@ -16179,7 +19264,7 @@ mod tests {
     }
 
     #[test]
-    fn native_iced_scroll_region_still_owns_descendant_child_placement() {
+    fn root_presentation_does_not_instantiate_descendant_owned_native_scroll_region() {
         let (scroll_target, scroll_slot, overlay, overlay_slot, owned_child, owned_slot) =
             scroll_ownership_slots();
         let sibling = slipway_core::ChildPlacement {
@@ -16207,17 +19292,18 @@ mod tests {
         let scroll = scroll_ownership_test_region(scroll_target, scroll_slot);
         let presentation = scroll_ownership_test_presentation(27, vec![sibling, owned], scroll);
 
-        let native_scroll = native_iced_scroll_regions(&presentation);
-        assert_eq!(native_scroll.len(), 1);
-        let adjusted = adjusted_scroll_child_placements(&presentation, &native_scroll[0]);
-        assert_eq!(adjusted.len(), 1);
-        assert_eq!(adjusted[0].child, owned_child);
-        assert_eq!(adjusted[0].bounds.origin.x, 8.0);
-        assert_eq!(adjusted[0].bounds.origin.y, 16.0);
+        assert!(
+            native_iced_scroll_regions(&presentation).is_empty(),
+            "root presentation must not instantiate native scroll widgets for descendant-owned scroll regions"
+        );
 
         let root_placements = root_child_placements_excluding_native_scroll(&presentation);
-        assert_eq!(root_placements.len(), 1);
+        assert_eq!(root_placements.len(), 2);
         assert_eq!(root_placements[0].child, overlay);
+        assert_eq!(
+            root_placements[1].child, owned_child,
+            "descendant-owned scroll regions must not make the parent hide placement records"
+        );
     }
 
     #[test]
@@ -16613,6 +19699,126 @@ mod tests {
     }
 
     #[test]
+    fn focused_text_input_publishes_preedit_style_once_while_unchanged() {
+        let runtime = SlipwayRuntime::new(TextEditUnsupportedWidget, ());
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let mut tree = iced::advanced::widget::Tree {
+            tag: <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::tag(&widget),
+            state: <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::state(&widget),
+            children: Vec::new(),
+        };
+        let renderer = RecordingRenderer::default();
+        let limits = iced::advanced::layout::Limits::new(
+            iced::Size::new(0.0, 0.0),
+            iced::Size::new(100.0, 40.0),
+        );
+        let node = <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >>::layout(&mut widget, &mut tree, &renderer, &limits);
+        let layout = iced::advanced::Layout::new(&node);
+        let viewport = iced::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 40.0,
+        };
+        let mut clipboard = iced::advanced::clipboard::Null;
+        fn preedit_style_count(messages: &[SlipwayIcedRuntimeMessage]) -> usize {
+            messages
+                .iter()
+                .filter(|message| matches!(message, SlipwayIcedRuntimeMessage::PreeditStyle(_)))
+                .count()
+        }
+
+        let mut press_messages = Vec::new();
+        {
+            let event =
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left));
+            let mut shell = iced::advanced::Shell::new(&mut press_messages);
+            <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::update(
+                &mut widget,
+                &mut tree,
+                &event,
+                layout,
+                iced::advanced::mouse::Cursor::Available(iced::Point::new(10.0, 10.0)),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+        }
+
+        let mut first_redraw_messages = Vec::new();
+        {
+            let mut shell = iced::advanced::Shell::new(&mut first_redraw_messages);
+            <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::update(
+                &mut widget,
+                &mut tree,
+                &iced::Event::Window(iced::window::Event::RedrawRequested(
+                    std::time::Instant::now(),
+                )),
+                layout,
+                iced::advanced::mouse::Cursor::Available(iced::Point::new(10.0, 10.0)),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+        }
+
+        let mut second_redraw_messages = Vec::new();
+        {
+            let mut shell = iced::advanced::Shell::new(&mut second_redraw_messages);
+            <SlipwayIcedRuntimeWidget<'_, TextEditUnsupportedWidget> as Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::update(
+                &mut widget,
+                &mut tree,
+                &iced::Event::Window(iced::window::Event::RedrawRequested(
+                    std::time::Instant::now(),
+                )),
+                layout,
+                iced::advanced::mouse::Cursor::Available(iced::Point::new(10.0, 10.0)),
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+        }
+
+        assert_eq!(
+            preedit_style_count(&press_messages) + preedit_style_count(&first_redraw_messages),
+            1,
+            "focusing a text input publishes the preedit style exactly once"
+        );
+        assert_eq!(
+            preedit_style_count(&second_redraw_messages),
+            0,
+            "an unchanged preedit style must not republish on the next redraw tick"
+        );
+    }
+
+    #[test]
     fn iced_runtime_child_native_text_input_focus_requests_input_method_on_redraw() {
         let runtime = SlipwayRuntime::new(ParentWithTextChildWidget, ());
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
@@ -16771,6 +19977,54 @@ mod tests {
             "runner-style UserInterface cache rebuild must preserve child native text input focus"
         );
         let _ = viewport;
+    }
+
+    #[test]
+    fn iced_runtime_user_interface_publishes_input_for_child_inside_native_scroll_region() {
+        let runtime = SlipwayRuntime::new(ScrollRegionParentWidget, ());
+        let mut renderer = RecordingRenderer::default();
+        let cache = iced_winit::runtime::user_interface::Cache::new();
+        let bounds = iced::Size::new(100.0, 60.0);
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(29.0, 23.0));
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+
+        let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >::build(
+            SlipwayIcedRuntimeWidget::from_runtime(&runtime),
+            bounds,
+            cache,
+            &mut renderer,
+        );
+        let _ = ui.update(
+            &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Left,
+            ))],
+            cursor,
+            &mut renderer,
+            &mut clipboard,
+            &mut messages,
+        );
+
+        assert_eq!(messages.len(), 1);
+        let SlipwayIcedRuntimeMessage::BackendInput(input) = messages.remove(0) else {
+            panic!("expected scroll child pointer input message");
+        };
+        let InputEvent::Pointer(pointer) = input.event else {
+            panic!("expected pointer input for scroll child");
+        };
+        assert_eq!(pointer.target, WidgetId::from("iced.test"));
+        assert_eq!(
+            pointer.target_slot,
+            Some(
+                WidgetSlotAddress::new(WidgetId::from("iced.scroll-parent"), 0)
+                    .child(WidgetId::from("iced.test"), 0)
+            )
+        );
+        assert_eq!(pointer.position, Point { x: 5.0, y: 5.0 });
     }
 
     #[test]
@@ -17493,6 +20747,2104 @@ mod tests {
     }
 
     #[test]
+    fn runtime_widget_update_publishes_input_for_child_inside_native_scroll_region() {
+        let runtime = SlipwayRuntime::new(ScrollRegionParentWidget, ());
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let mut tree = iced::advanced::widget::Tree {
+            tag:
+                <SlipwayIcedRuntimeWidget<'_, ScrollRegionParentWidget> as iced::advanced::Widget<
+                    SlipwayIcedRuntimeMessage,
+                    iced::Theme,
+                    (),
+                >>::tag(&widget),
+            state:
+                <SlipwayIcedRuntimeWidget<'_, ScrollRegionParentWidget> as iced::advanced::Widget<
+                    SlipwayIcedRuntimeMessage,
+                    iced::Theme,
+                    (),
+                >>::state(&widget),
+            children:
+                <SlipwayIcedRuntimeWidget<'_, ScrollRegionParentWidget> as iced::advanced::Widget<
+                    SlipwayIcedRuntimeMessage,
+                    iced::Theme,
+                    (),
+                >>::children(&widget),
+        };
+        let renderer = ();
+        let limits = iced::advanced::layout::Limits::new(
+            iced::Size::new(0.0, 0.0),
+            iced::Size::new(100.0, 60.0),
+        );
+        let node = <SlipwayIcedRuntimeWidget<'_, ScrollRegionParentWidget> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            (),
+        >>::layout(&mut widget, &mut tree, &renderer, &limits);
+
+        let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
+        let presentation = state
+            .presentation
+            .as_ref()
+            .expect("layout builds a presentation");
+        assert!(
+            root_child_placements_excluding_native_scroll(presentation).is_empty(),
+            "fixture must use the native scroll-owned child route"
+        );
+        assert_eq!(native_iced_scroll_regions(presentation).len(), 1);
+
+        let event =
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left));
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(29.0, 23.0));
+        let viewport = iced::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 60.0,
+        };
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+
+        {
+            let mut shell = iced::advanced::Shell::new(&mut messages);
+            <SlipwayIcedRuntimeWidget<'_, ScrollRegionParentWidget> as Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                (),
+            >>::update(
+                &mut widget,
+                &mut tree,
+                &event,
+                iced::advanced::Layout::new(&node),
+                cursor,
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            assert!(shell.is_event_captured());
+        }
+
+        assert_eq!(messages.len(), 1);
+        let SlipwayIcedRuntimeMessage::BackendInput(input) = messages.remove(0) else {
+            panic!("expected scroll child pointer input message");
+        };
+        assert_eq!(
+            input
+                .dispatch_evidence
+                .as_ref()
+                .map(|evidence| evidence.source.clone()),
+            Some(EvidenceSource::backend_presented(
+                ICED_BACKEND_ID,
+                "physical-input"
+            ))
+        );
+        let InputEvent::Pointer(pointer) = input.event else {
+            panic!("expected pointer input for scroll child");
+        };
+        assert_eq!(pointer.target, WidgetId::from("iced.test"));
+        assert_eq!(
+            pointer.target_slot,
+            Some(
+                WidgetSlotAddress::new(WidgetId::from("iced.scroll-parent"), 0)
+                    .child(WidgetId::from("iced.test"), 0)
+            )
+        );
+        assert_eq!(pointer.position, Point { x: 5.0, y: 5.0 });
+        assert_eq!(
+            pointer.target_bounds,
+            Some(TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 30.0,
+                    height: 14.0,
+                },
+            }))
+        );
+    }
+
+    #[test]
+    fn iced_native_scroll_offset_dispatches_visible_press_to_scrolled_child() {
+        let root = WidgetId::from("iced.scrolled-dispatch.root");
+        let child = WidgetId::from("iced.scrolled-dispatch.child");
+        let root_widget = InteractionCapabilityWidget { id: root.clone() };
+        let child_widget = InteractionCapabilityWidget { id: child.clone() };
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 160.0,
+            },
+        };
+        let lower_visible_hit = slipway_core::hit_region_from_pointer_capability(
+            &root_widget,
+            &(),
+            &(),
+            PresentationRegionId::from("unscrolled-visible-hit"),
+            None,
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 10.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 30.0,
+                },
+            }),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            Some("unscrolled-route".to_string()),
+            CursorCapability::Pointer,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let scrolled_child_hit = slipway_core::hit_region_from_pointer_capability(
+            &child_widget,
+            &(),
+            &(),
+            PresentationRegionId::from("scrolled-child-hit"),
+            Some(child_slot.clone()),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 80.0,
+                    height: 30.0,
+                },
+            }),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 1,
+                traversal_order: 1,
+            },
+            Some("scrolled-child-route".to_string()),
+            CursorCapability::Pointer,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(920),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: child.clone(),
+                    local_state_slot: Some(child_slot.clone()),
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 100.0 },
+                        size: Size {
+                            width: 80.0,
+                            height: 30.0,
+                        },
+                    }),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: vec![lower_visible_hit, scrolled_child_hit],
+            focus_regions: Vec::new(),
+            scroll_regions: vec![ScrollRegionDeclaration::explicit(
+                PresentationRegionId::from("root-native-scroll"),
+                root.clone(),
+                None,
+                TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 50.0,
+                    },
+                }),
+                TargetLocalRect::new(bounds),
+                Point { x: 0.0, y: 100.0 },
+                slipway_core::ScrollAxes {
+                    horizontal: false,
+                    vertical: true,
+                },
+                slipway_core::WheelRouting::NearestScrollable,
+                HitRegionOrder {
+                    z_index: 0,
+                    paint_order: 0,
+                    traversal_order: 0,
+                },
+                slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+                true,
+            )],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let validation_view = view.clone();
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 50.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 100.0,
+                        height: 50.0,
+                    },
+                },
+            },
+            root.clone(),
+        );
+        assert_eq!(native_iced_scroll_regions(&presentation).len(), 1);
+        assert_eq!(presentation.native_scroll_dispatch_index.regions.len(), 1);
+
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 50.0,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(10.0, 20.0)),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("visible press inside native scroll must route");
+        let input = routed
+            .input
+            .expect("visible press inside native scroll produces backend input");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("dispatch evidence is required");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("scrolled-child-hit")),
+            "visible y=20 must be translated to scrolled content y=120 before hit dispatch"
+        );
+        let diagnostics = slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+            &validation_view,
+            &input,
+            Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+            Some(ICED_BACKEND_ID),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let InputEvent::Pointer(pointer) = input.event else {
+            panic!("expected pointer event");
+        };
+        assert_eq!(pointer.target, child);
+        assert_eq!(pointer.target_slot, Some(child_slot));
+        assert_eq!(pointer.position, Point { x: 10.0, y: 20.0 });
+    }
+
+    #[test]
+    fn mounted_dispatch_hit_selection_prefers_global_front_region() {
+        let root = WidgetId::from("iced.mounted-hit.root");
+        let child = WidgetId::from("iced.mounted-hit.child");
+        let child_widget = InteractionCapabilityWidget { id: child.clone() };
+        let child_slot = WidgetSlotAddress::new(root.clone(), 0).child(child.clone(), 0);
+        let child_origin = Point { x: 200.0, y: 400.0 };
+        let child_bounds = Rect {
+            origin: child_origin,
+            size: Size {
+                width: 100.0,
+                height: 80.0,
+            },
+        };
+        let local_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: child_bounds.size,
+        };
+        let lower_local_hit = slipway_core::hit_region_from_pointer_capability(
+            &child_widget,
+            &(),
+            &(),
+            PresentationRegionId::from("local-lower-hit"),
+            None,
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 8.0, y: 8.0 },
+                size: Size {
+                    width: 50.0,
+                    height: 24.0,
+                },
+            }),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            Some("local-lower-route".to_string()),
+            CursorCapability::Pointer,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let mut front_mounted_hit = slipway_core::hit_region_from_pointer_capability(
+            &child_widget,
+            &(),
+            &(),
+            PresentationRegionId::from("mounted-front-hit"),
+            Some(child_slot.clone()),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 8.0, y: 8.0 },
+                size: Size {
+                    width: 50.0,
+                    height: 24.0,
+                },
+            }),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            HitRegionOrder {
+                z_index: 20,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            Some("mounted-front-route".to_string()),
+            CursorCapability::Grab,
+            true,
+            slipway_core::PointerCaptureIntent::DuringDrag,
+        );
+        front_mounted_hit.route.path = child_slot.path.clone();
+        let local_view = ViewDefinition {
+            target: child.clone(),
+            frame: frame(923),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(local_bounds),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(child.clone()),
+            hit_regions: vec![lower_local_hit],
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let validation_view = mounted_child_validation_view(
+            frame(923),
+            root.clone(),
+            child.clone(),
+            child_slot.clone(),
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 800.0,
+                    height: 800.0,
+                },
+            },
+            child_bounds,
+            vec![front_mounted_hit],
+            Vec::new(),
+            Vec::new(),
+        );
+        let root_context = mounted_root_dispatch_context(&validation_view, Vec::new());
+        let mut presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                local_view,
+                &[],
+                LayoutInput {
+                    viewport: TargetLocalRect::new(local_bounds),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: local_bounds.size,
+                    },
+                },
+                child,
+                Some(child_slot),
+                0,
+                child_origin,
+            );
+        presentation.apply_dispatch_context_override(Some(&root_context));
+
+        let selected = select_hit_region_at_input_points(
+            &presentation,
+            IcedInputRootLocalPoints {
+                visual: Point { x: 12.0, y: 12.0 },
+                dispatch: Point { x: 12.0, y: 12.0 },
+            },
+        )
+        .expect("mounted dispatch hit must be selectable");
+
+        assert_eq!(
+            selected.region.id,
+            PresentationRegionId::from("mounted-front-hit")
+        );
+        assert_eq!(selected.root_local_position, Point { x: 12.0, y: 12.0 });
+
+        let layout_bounds = iced::Rectangle {
+            x: child_origin.x,
+            y: child_origin.y,
+            width: child_bounds.size.width,
+            height: child_bounds.size.height,
+        };
+        let press_position = iced::Point::new(child_origin.x + 12.0, child_origin.y + 12.0);
+        let move_position = iced::Point::new(child_origin.x + 28.0, child_origin.y + 18.0);
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+
+        let press = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(press_position),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("mounted front hit press routes")
+        .input
+        .expect("mounted front hit press publishes backend input");
+        assert_mounted_dispatch_evidence(
+            &validation_view,
+            &press,
+            "physical-input",
+            slipway_core::DeclaredEventDispatchKind::Pointer,
+            "mounted-front-hit",
+            "mounted-front-route",
+            press.event.target_slot().as_ref().expect("mounted slot"),
+            Point {
+                x: child_origin.x + 12.0,
+                y: child_origin.y + 12.0,
+            },
+        );
+        assert_eq!(
+            pressed_region
+                .as_ref()
+                .map(|capture| capture.region_id.clone()),
+            Some(PresentationRegionId::from("mounted-front-hit"))
+        );
+
+        let moved = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                position: move_position,
+            }),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(move_position),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("mounted front hit captured move routes")
+        .input
+        .expect("mounted front hit captured move publishes backend input");
+        assert_mounted_dispatch_evidence(
+            &validation_view,
+            &moved,
+            "physical-input",
+            slipway_core::DeclaredEventDispatchKind::Pointer,
+            "mounted-front-hit",
+            "mounted-front-route",
+            moved.event.target_slot().as_ref().expect("mounted slot"),
+            Point {
+                x: child_origin.x + 28.0,
+                y: child_origin.y + 18.0,
+            },
+        );
+
+        let released = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(move_position),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("mounted front hit captured release routes")
+        .input
+        .expect("mounted front hit captured release publishes backend input");
+        assert_mounted_dispatch_evidence(
+            &validation_view,
+            &released,
+            "physical-input",
+            slipway_core::DeclaredEventDispatchKind::Pointer,
+            "mounted-front-hit",
+            "mounted-front-route",
+            released.event.target_slot().as_ref().expect("mounted slot"),
+            Point {
+                x: child_origin.x + 28.0,
+                y: child_origin.y + 18.0,
+            },
+        );
+        assert!(
+            pressed_region.is_none(),
+            "release must clear mounted capture state"
+        );
+    }
+
+    #[test]
+    fn native_scroll_input_evidence_uses_authored_scroll_declaration_after_visible_normalization() {
+        let root = WidgetId::from("iced.normalized-scroll.root");
+        let child = WidgetId::from("iced.normalized-scroll.child");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 160.0,
+            },
+        };
+        let authored_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-native-scroll"),
+            root.clone(),
+            None,
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 50.0,
+                },
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 80.0,
+                    height: 160.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(970),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child,
+                    local_state_slot: Some(child_slot),
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 70.0 },
+                        size: Size {
+                            width: 80.0,
+                            height: 30.0,
+                        },
+                    }),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![authored_scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let validation_view = view.clone();
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 50.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 100.0,
+                        height: 50.0,
+                    },
+                },
+            },
+            root,
+        );
+
+        assert_eq!(
+            presentation.scroll_regions[0].content_bounds.size.width, 100.0,
+            "visible scrollable may normalize undersized content to stay presentable"
+        );
+        assert_eq!(
+            presentation.dispatch_context.scroll_regions[0]
+                .content_bounds
+                .size
+                .width,
+            80.0,
+            "dispatch evidence must retain the authored declaration validated by runtime"
+        );
+
+        let native_regions = native_iced_scroll_regions(&presentation);
+        let input = backend_native_scroll_input_event(&presentation, &native_regions[0], 0.0, 24.0);
+        let InputEvent::Scroll(scroll) = &input.event else {
+            panic!("expected scroll event");
+        };
+        assert_eq!(
+            scroll.content_bounds,
+            validation_view.scroll_regions[0].content_bounds
+        );
+        let scroll_evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("native scroll carries dispatch evidence");
+        assert!(
+            scroll_evidence.input_position.is_some(),
+            "native-scroll evidence must record the content-space viewport anchor (MF-M19)"
+        );
+        assert_eq!(
+            scroll_evidence.input_position_space,
+            Some(slipway_core::DispatchPositionSpace::Content)
+        );
+
+        let diagnostics = slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+            &validation_view,
+            &input,
+            Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+            Some(ICED_BACKEND_ID),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn visual_front_layer_absorbs_press_before_scrolled_content_hit() {
+        let root = WidgetId::from("iced.scrolled-occlusion.root");
+        let child = WidgetId::from("iced.scrolled-occlusion.child");
+        let child_widget = InteractionCapabilityWidget { id: child.clone() };
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 160.0,
+            },
+        };
+        let visual_layer_bounds = Rect {
+            origin: Point { x: 0.0, y: 10.0 },
+            size: Size {
+                width: 100.0,
+                height: 30.0,
+            },
+        };
+        let scrolled_child_hit = slipway_core::hit_region_from_pointer_capability(
+            &child_widget,
+            &(),
+            &(),
+            PresentationRegionId::from("scrolled-child-hit"),
+            Some(child_slot.clone()),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 80.0,
+                    height: 30.0,
+                },
+            }),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            Some("scrolled-child-route".to_string()),
+            CursorCapability::Pointer,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(921),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(root_bounds),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: child.clone(),
+                    local_state_slot: Some(child_slot),
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 100.0 },
+                        size: Size {
+                            width: 80.0,
+                            height: 30.0,
+                        },
+                    }),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: vec![PaintOp::keyed_layer(
+                slipway_core::PaintLayerKey::ordered(10, 0),
+                vec![PaintOp::Fill {
+                    shape: ShapeDeclaration {
+                        id: Some("front-visual-layer".to_string()),
+                        kind: ShapeKind::Rectangle,
+                        bounds: visual_layer_bounds,
+                        path: None,
+                        clip: None,
+                    },
+                    color: test_rgb(255, 255, 255),
+                }],
+            )],
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: vec![scrolled_child_hit],
+            focus_regions: Vec::new(),
+            scroll_regions: vec![ScrollRegionDeclaration::explicit(
+                PresentationRegionId::from("root-native-scroll"),
+                root.clone(),
+                None,
+                TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 50.0,
+                    },
+                }),
+                TargetLocalRect::new(root_bounds),
+                Point { x: 0.0, y: 100.0 },
+                slipway_core::ScrollAxes {
+                    horizontal: false,
+                    vertical: true,
+                },
+                slipway_core::WheelRouting::NearestScrollable,
+                HitRegionOrder::default(),
+                slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+                true,
+            )],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 50.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 100.0,
+                        height: 50.0,
+                    },
+                },
+            },
+            root,
+        );
+
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 50.0,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(10.0, 20.0)),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("front visual layer absorbs the press");
+
+        assert!(routed.capture_event);
+        assert!(
+            routed.input.is_none(),
+            "visible front layer must absorb before a scrolled content hit can receive the press"
+        );
+    }
+
+    #[test]
+    fn iced_child_press_at_nonzero_placement_passes_runtime_contract_and_reaches_app() {
+        let mut runtime = SlipwayRuntime::from_app(
+            OffsetChildApp {
+                widgets: (TestWidget,),
+            },
+            (),
+        );
+        let mut renderer = RecordingRenderer::default();
+        let cache = iced_winit::runtime::user_interface::Cache::new();
+        let bounds = iced::Size::new(100.0, 60.0);
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(29.0, 23.0));
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+
+        {
+            let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >::build(
+                SlipwayIcedRuntimeWidget::from_runtime(&runtime),
+                bounds,
+                cache,
+                &mut renderer,
+            );
+            let _ = ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                    iced::mouse::Button::Left,
+                ))],
+                cursor,
+                &mut renderer,
+                &mut clipboard,
+                &mut messages,
+            );
+        }
+
+        assert_eq!(messages.len(), 1);
+        let SlipwayIcedRuntimeMessage::BackendInput(input) = messages.remove(0) else {
+            panic!("expected child backend input message");
+        };
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("child input carries dispatch evidence");
+        assert_eq!(evidence.input_position, Some(Point { x: 29.0, y: 23.0 }));
+        let InputEvent::Pointer(pointer) = &input.event else {
+            panic!("expected child pointer input");
+        };
+        let expected_slot = WidgetSlotAddress::new(WidgetId::from("iced.offset-app"), 0)
+            .child(WidgetId::from("iced.test"), 0);
+        assert_eq!(pointer.target, WidgetId::from("iced.test"));
+        assert_eq!(pointer.target_slot, Some(expected_slot.clone()));
+        assert_eq!(pointer.position, Point { x: 5.0, y: 5.0 });
+        assert_eq!(
+            pointer.target_bounds,
+            Some(TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 30.0,
+                    height: 14.0,
+                },
+            }))
+        );
+        assert_eq!(
+            evidence.selected_region.as_ref(),
+            Some(&PresentationRegionId::from("iced.test.hit"))
+        );
+        assert_eq!(
+            evidence.candidate_regions.as_slice(),
+            std::slice::from_ref(&PresentationRegionId::from("iced.test.hit"))
+        );
+        assert_eq!(evidence.generated_event.as_ref(), Some(&input.event));
+        let route = evidence.route.as_ref().expect("child input records route");
+        assert_eq!(route.route_id.as_deref(), Some("iced.test.route"));
+        assert_eq!(route.address.as_ref(), Some(&expected_slot));
+        assert_eq!(route.path.as_slice(), expected_slot.path.as_slice());
+        assert_eq!(route.phase, slipway_core::EventRoutePhase::Target);
+
+        let mut applied_batches = Vec::new();
+        let report = runtime.apply_backend_input_event_for_backend_with_app_reducer(
+            input,
+            ICED_BACKEND_ID,
+            &mut |_external, messages: Vec<Message>| applied_batches.push(messages),
+        );
+
+        assert!(
+            report.handled,
+            "child press must pass runtime gate: {report:?}"
+        );
+        assert_eq!(report.emitted_messages, 1);
+        assert_eq!(report.applied_messages, 1);
+        assert!(
+            !report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_EVENT_MISMATCH
+            }),
+            "mounted child evidence must not be rejected: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(runtime.local_state().widgets.0.clicks, 1);
+        assert_eq!(applied_batches, vec![vec![Message::Clicked]]);
+    }
+
+    #[test]
+    fn mounted_child_non_press_dispatch_evidence_uses_root_input_position() {
+        let root = WidgetId::from("mounted-child-root");
+        let child = TestWidget.id();
+        let child_slot = WidgetSlotAddress::new(root.clone(), 0).child(child.clone(), 0);
+        let root_origin = Point { x: 24.0, y: 18.0 };
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 40.0,
+            },
+        };
+        let child_bounds = Rect {
+            origin: root_origin,
+            size: Size {
+                width: 30.0,
+                height: 14.0,
+            },
+        };
+        let layout_bounds = iced::Rectangle {
+            x: root_origin.x,
+            y: root_origin.y,
+            width: child_bounds.size.width,
+            height: child_bounds.size.height,
+        };
+        let cursor = iced::Point::new(29.0, 23.0);
+        let expected_input_position = Point {
+            x: cursor.x,
+            y: cursor.y,
+        };
+        let expected_target_position = Point { x: 5.0, y: 5.0 };
+        let expected_target_bounds = Some(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: child_bounds.size,
+        }));
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: child_bounds.size,
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: child_bounds.size,
+            },
+        };
+
+        let mut pointer_view = TestWidget.view_definition(
+            &(),
+            &Local { clicks: 0 },
+            ViewDefinitionInput {
+                frame: frame(701),
+                layout_input: layout_input.clone(),
+            },
+        );
+        pointer_view.hit_regions[0].capture = slipway_core::PointerCaptureIntent::DuringDrag;
+        apply_runtime_slot_to_view_definition(&mut pointer_view, &child_slot);
+        let pointer_validation_view = mounted_child_validation_view(
+            frame(701),
+            root.clone(),
+            child.clone(),
+            child_slot.clone(),
+            root_bounds,
+            child_bounds,
+            pointer_view.hit_regions.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let pointer_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                pointer_view,
+                &TestWidget.capabilities(),
+                layout_input.clone(),
+                child.clone(),
+                Some(child_slot.clone()),
+                0,
+                root_origin,
+            );
+        let mut hovered_region = None;
+        let mut pressed_region = Some(pressed_capture_with_origin(
+            "iced.test.hit",
+            root_origin.x,
+            root_origin.y,
+        ));
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let captured = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: cursor }),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(cursor),
+            Some(&pointer_presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("captured mounted child move routes")
+        .input
+        .expect("captured mounted child move publishes input");
+        assert_mounted_dispatch_evidence(
+            &pointer_validation_view,
+            &captured,
+            "physical-input",
+            slipway_core::DeclaredEventDispatchKind::Pointer,
+            "iced.test.hit",
+            "iced.test.route",
+            &child_slot,
+            expected_input_position,
+        );
+        assert!(
+            captured
+                .dispatch_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.capture_event)
+        );
+        let InputEvent::Pointer(pointer) = &captured.event else {
+            panic!("expected captured move pointer input");
+        };
+        assert_eq!(pointer.kind, slipway_core::PointerEventKind::Move);
+        assert_eq!(pointer.position, expected_target_position);
+        assert_eq!(pointer.target_bounds, expected_target_bounds);
+
+        let mut release_pressed_region = Some(pressed_capture_with_origin(
+            "iced.test.hit",
+            root_origin.x,
+            root_origin.y,
+        ));
+        let released = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(cursor),
+            Some(&pointer_presentation),
+            &mut None,
+            &mut release_pressed_region,
+            &mut None,
+            &mut None,
+        )
+        .expect("captured mounted child release routes")
+        .input
+        .expect("captured mounted child release publishes input");
+        assert_mounted_dispatch_evidence(
+            &pointer_validation_view,
+            &released,
+            "physical-input",
+            slipway_core::DeclaredEventDispatchKind::Pointer,
+            "iced.test.hit",
+            "iced.test.route",
+            &child_slot,
+            expected_input_position,
+        );
+        assert!(
+            released
+                .dispatch_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.capture_event)
+        );
+        let InputEvent::Pointer(pointer) = &released.event else {
+            panic!("expected captured release pointer input");
+        };
+        assert_eq!(pointer.kind, slipway_core::PointerEventKind::Release);
+        assert_eq!(pointer.button, Some(slipway_core::PointerButton::Primary));
+        assert_eq!(pointer.position, expected_target_position);
+        assert_eq!(pointer.target_bounds, expected_target_bounds);
+
+        let mut wheel_view = TestWidget.view_definition(
+            &(),
+            &Local { clicks: 0 },
+            ViewDefinitionInput {
+                frame: frame(702),
+                layout_input: layout_input.clone(),
+            },
+        );
+        wheel_view
+            .scroll_regions
+            .push(test_scroll_region_from_capability(
+                WidgetId::from("iced.test"),
+                "mounted-wheel",
+                layout_input.viewport.into_rect(),
+                Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 30.0,
+                        height: 80.0,
+                    },
+                },
+                slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            ));
+        apply_runtime_slot_to_view_definition(&mut wheel_view, &child_slot);
+        let wheel_validation_view = mounted_child_validation_view(
+            frame(702),
+            root.clone(),
+            child.clone(),
+            child_slot.clone(),
+            root_bounds,
+            child_bounds,
+            Vec::new(),
+            Vec::new(),
+            wheel_view.scroll_regions.clone(),
+        );
+        let wheel_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                wheel_view,
+                &TestWidget.capabilities(),
+                layout_input.clone(),
+                child.clone(),
+                Some(child_slot.clone()),
+                0,
+                root_origin,
+            );
+        let wheel_slot = wheel_presentation.scroll_regions[0]
+            .address
+            .clone()
+            .expect("mounted wheel region has an address");
+        let wheel = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -8.0 },
+            }),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(cursor),
+            Some(&wheel_presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("mounted child wheel routes")
+        .input
+        .expect("mounted child wheel publishes input");
+        assert_mounted_dispatch_evidence(
+            &wheel_validation_view,
+            &wheel,
+            "physical-input",
+            slipway_core::DeclaredEventDispatchKind::Wheel,
+            "mounted-wheel",
+            "mounted-wheel",
+            &wheel_slot,
+            expected_input_position,
+        );
+        let InputEvent::Wheel(wheel_event) = &wheel.event else {
+            panic!("expected mounted wheel input");
+        };
+        assert_eq!(wheel_event.delta_y, -8.0);
+
+        let focus_widget = TextEditUnsupportedWidget;
+        let mut focus_view = focus_widget.view_definition(
+            &(),
+            &(),
+            ViewDefinitionInput {
+                frame: frame(703),
+                layout_input: layout_input.clone(),
+            },
+        );
+        focus_view.hit_regions.clear();
+        let focus_child = focus_widget.id();
+        let focus_slot = WidgetSlotAddress::new(root.clone(), 0).child(focus_child.clone(), 0);
+        apply_runtime_slot_to_view_definition(&mut focus_view, &focus_slot);
+        let focus_validation_view = mounted_child_validation_view(
+            frame(703),
+            root,
+            focus_child.clone(),
+            focus_slot.clone(),
+            root_bounds,
+            child_bounds,
+            Vec::new(),
+            focus_view.focus_regions.clone(),
+            Vec::new(),
+        );
+        let focus_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                focus_view,
+                &focus_widget.capabilities(),
+                layout_input,
+                focus_widget.id(),
+                Some(focus_slot.clone()),
+                0,
+                root_origin,
+            );
+        let focus = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(cursor),
+            Some(&focus_presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("mounted child focus press routes")
+        .input
+        .expect("mounted child focus press publishes input");
+        assert_mounted_dispatch_evidence(
+            &focus_validation_view,
+            &focus,
+            "focused-input",
+            slipway_core::DeclaredEventDispatchKind::Pointer,
+            "text-edit-focus",
+            "text-edit-focus",
+            &focus_slot,
+            expected_input_position,
+        );
+        let InputEvent::Pointer(pointer) = &focus.event else {
+            panic!("expected focus press pointer input");
+        };
+        assert_eq!(pointer.kind, slipway_core::PointerEventKind::Press);
+        assert_eq!(pointer.position, expected_target_position);
+        assert_eq!(pointer.target_bounds, expected_target_bounds);
+    }
+
+    #[test]
+    fn mounted_child_wheel_evidence_uses_root_scroll_dispatch_context_candidates() {
+        let root = WidgetId::from("mounted-scroll-root");
+        let child = TestWidget.id();
+        let child_slot = WidgetSlotAddress::new(root.clone(), 0).child(child.clone(), 0);
+        let root_origin = Point { x: 24.0, y: 18.0 };
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 60.0,
+            },
+        };
+        let child_bounds = Rect {
+            origin: root_origin,
+            size: Size {
+                width: 30.0,
+                height: 30.0,
+            },
+        };
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: child_bounds.size,
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: child_bounds.size,
+            },
+        };
+        let layout_bounds = iced::Rectangle {
+            x: root_origin.x,
+            y: root_origin.y,
+            width: child_bounds.size.width,
+            height: child_bounds.size.height,
+        };
+        let cursor = iced::Point::new(29.0, 23.0);
+        let input_position = Point {
+            x: cursor.x,
+            y: cursor.y,
+        };
+
+        let mut wheel_view = TestWidget.view_definition(
+            &(),
+            &Local { clicks: 0 },
+            ViewDefinitionInput {
+                frame: frame(705),
+                layout_input: layout_input.clone(),
+            },
+        );
+        wheel_view
+            .scroll_regions
+            .push(test_scroll_region_from_capability(
+                child.clone(),
+                "mounted-wheel",
+                layout_input.viewport.into_rect(),
+                Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 30.0,
+                        height: 120.0,
+                    },
+                },
+                slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            ));
+        wheel_view.scroll_regions[0].order = HitRegionOrder {
+            z_index: 1,
+            paint_order: 0,
+            traversal_order: 0,
+        };
+        apply_runtime_slot_to_view_definition(&mut wheel_view, &child_slot);
+
+        let child_scroll = wheel_view.scroll_regions[0].clone();
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            root.clone(),
+            None,
+            TargetLocalRect::new(root_bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: root_bounds.size.width,
+                    height: 180.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let validation_view = mounted_child_validation_view(
+            frame(705),
+            root.clone(),
+            child.clone(),
+            child_slot.clone(),
+            root_bounds,
+            child_bounds,
+            Vec::new(),
+            Vec::new(),
+            vec![root_scroll.clone(), child_scroll],
+        );
+        let root_context = mounted_root_dispatch_context(&validation_view, Vec::new());
+        let mut wheel_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                wheel_view,
+                &TestWidget.capabilities(),
+                layout_input,
+                child.clone(),
+                Some(child_slot.clone()),
+                0,
+                root_origin,
+            );
+        wheel_presentation.apply_dispatch_context_override(Some(&root_context));
+
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let wheel = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -8.0 },
+            }),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(cursor),
+            Some(&wheel_presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("mounted child wheel routes")
+        .input
+        .expect("mounted child wheel publishes input");
+        let evidence = wheel
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(evidence.input_position, Some(input_position));
+        assert_eq!(
+            evidence.candidate_regions,
+            vec![
+                PresentationRegionId::from("root-scroll"),
+                PresentationRegionId::from("mounted-wheel"),
+            ]
+        );
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("mounted-wheel"))
+        );
+        let diagnostics = slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+            &validation_view,
+            &wheel,
+            Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+            Some(ICED_BACKEND_ID),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn mounted_front_opaque_paint_blocks_child_scroll_wheel_dispatch() {
+        let root = WidgetId::from("mounted-front-opaque-wheel-root");
+        let child = TestWidget.id();
+        let overlay = WidgetId::from("mounted-front-opaque-overlay");
+        let child_slot = WidgetSlotAddress::new(root.clone(), 0).child(child.clone(), 0);
+        let overlay_slot = WidgetSlotAddress::new(root.clone(), 1).child(overlay.clone(), 0);
+        let root_origin = Point { x: 24.0, y: 18.0 };
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 60.0,
+            },
+        };
+        let child_bounds = Rect {
+            origin: root_origin,
+            size: Size {
+                width: 30.0,
+                height: 30.0,
+            },
+        };
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: child_bounds.size,
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: child_bounds.size,
+            },
+        };
+        let layout_bounds = iced::Rectangle {
+            x: root_origin.x,
+            y: root_origin.y,
+            width: child_bounds.size.width,
+            height: child_bounds.size.height,
+        };
+        let cursor = iced::Point::new(29.0, 23.0);
+
+        let mut child_view = TestWidget.view_definition(
+            &(),
+            &Local { clicks: 0 },
+            ViewDefinitionInput {
+                frame: frame(708),
+                layout_input: layout_input.clone(),
+            },
+        );
+        child_view
+            .scroll_regions
+            .push(test_scroll_region_from_capability(
+                child.clone(),
+                "mounted-wheel-under-overlay",
+                layout_input.viewport.into_rect(),
+                Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 30.0,
+                        height: 120.0,
+                    },
+                },
+                slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            ));
+        child_view.scroll_regions[0].order = HitRegionOrder {
+            z_index: 1,
+            paint_order: 0,
+            traversal_order: 0,
+        };
+        apply_runtime_slot_to_view_definition(&mut child_view, &child_slot);
+
+        let validation_view = mounted_child_validation_view(
+            frame(708),
+            root.clone(),
+            child.clone(),
+            child_slot.clone(),
+            root_bounds,
+            child_bounds,
+            child_view.hit_regions.clone(),
+            Vec::new(),
+            child_view.scroll_regions.clone(),
+        );
+        let root_context = mounted_root_dispatch_context(
+            &validation_view,
+            vec![IcedPaintOcclusionRegion {
+                target: overlay,
+                address: Some(overlay_slot),
+                order: (10, 0, 10_000),
+                bounds: Rect {
+                    origin: root_origin,
+                    size: child_bounds.size,
+                },
+                blocks_wheel: true,
+            }],
+        );
+        let mut child_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                child_view,
+                &TestWidget.capabilities(),
+                layout_input,
+                child,
+                Some(child_slot),
+                0,
+                root_origin,
+            );
+        child_presentation.apply_dispatch_context_override(Some(&root_context));
+
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -8.0 },
+            }),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(cursor),
+            Some(&child_presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("front opaque paint absorbs wheel over child scroll");
+
+        assert!(routed.capture_event);
+        assert!(
+            routed.input.is_none(),
+            "child scroll must not receive wheel through a different-owner front overlay"
+        );
+    }
+
+    #[test]
+    fn mounted_child_occlusion_merge_translates_self_units_into_mounted_dispatch_context() {
+        let root = WidgetId::from("mounted-occlusion-merge-root");
+        let child = TestWidget.id();
+        let child_slot = WidgetSlotAddress::new(root.clone(), 0).child(child.clone(), 0);
+        let root_origin = Point { x: 24.0, y: 18.0 };
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 60.0,
+            },
+        };
+        let child_bounds = Rect {
+            origin: root_origin,
+            size: Size {
+                width: 30.0,
+                height: 30.0,
+            },
+        };
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: child_bounds.size,
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: child_bounds.size,
+            },
+        };
+        let mut child_view = TestWidget.view_definition(
+            &(),
+            &Local { clicks: 0 },
+            ViewDefinitionInput {
+                frame: frame(6301),
+                layout_input: layout_input.clone(),
+            },
+        );
+        apply_runtime_slot_to_view_definition(&mut child_view, &child_slot);
+        let validation_view = mounted_child_validation_view(
+            frame(6301),
+            root.clone(),
+            child.clone(),
+            child_slot.clone(),
+            root_bounds,
+            child_bounds,
+            child_view.hit_regions.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let root_context = mounted_root_dispatch_context(&validation_view, Vec::new());
+        let mut child_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                child_view,
+                &TestWidget.capabilities(),
+                layout_input,
+                child.clone(),
+                Some(child_slot.clone()),
+                0,
+                root_origin,
+            );
+        child_presentation.apply_dispatch_context_override(Some(&root_context));
+
+        let occluder_local = Rect {
+            origin: Point { x: 4.0, y: 6.0 },
+            size: Size {
+                width: 20.0,
+                height: 10.0,
+            },
+        };
+        child_presentation.explicit_layer_paint_units = vec![PaintUnit {
+            target: child.clone(),
+            address: Some(child_slot),
+            order: slipway_core::PaintOrderDeclaration::layer(child, 10),
+            traversal_order: 0,
+            paint: vec![PaintOp::keyed_layer(
+                PaintLayerKey::ordered(10, 0),
+                vec![PaintOp::Fill {
+                    shape: ShapeDeclaration {
+                        id: Some("mounted-occluder".to_string()),
+                        kind: ShapeKind::Rectangle,
+                        bounds: occluder_local,
+                        path: None,
+                        clip: None,
+                    },
+                    color: Color {
+                        red: 0.1,
+                        green: 0.1,
+                        blue: 0.1,
+                        alpha: 1.0,
+                    },
+                }],
+            )],
+        }];
+
+        merge_child_explicit_layer_occlusions_into_presentation(
+            &TestWidget,
+            &(),
+            &Local { clicks: 0 },
+            &mut child_presentation,
+            &[],
+            &[],
+        );
+
+        assert_eq!(child_presentation.paint_occlusion_regions.len(), 1);
+        assert_eq!(
+            child_presentation.paint_occlusion_regions[0].bounds, occluder_local,
+            "self occlusion regions stay in view-local space"
+        );
+        assert_eq!(
+            child_presentation
+                .dispatch_context
+                .paint_occlusion_regions
+                .len(),
+            1
+        );
+        assert_eq!(
+            child_presentation.dispatch_context.paint_occlusion_regions[0].bounds,
+            rect_translate(occluder_local, root_origin),
+            "mounted dispatch occlusion bounds must be translated by root_origin"
+        );
+
+        // A window point over the untranslated child-local rect position lies
+        // outside the mounted child, so it must not report occlusion there.
+        let phantom_view_local = Point {
+            x: occluder_local.origin.x - root_origin.x,
+            y: occluder_local.origin.y - root_origin.y,
+        };
+        assert!(
+            paint_occlusion_at_root_local_point(&child_presentation, phantom_view_local).is_none(),
+            "untranslated occlusion bounds must not act as window-space phantom occluders"
+        );
+        // The translated window position sits over the real occluder.
+        let occluded_view_local = Point {
+            x: occluder_local.origin.x + 1.0,
+            y: occluder_local.origin.y + 1.0,
+        };
+        assert!(
+            paint_occlusion_at_root_local_point(&child_presentation, occluded_view_local).is_some(),
+            "translated window position over the occluder must occlude"
+        );
+    }
+
+    #[test]
+    fn mounted_child_without_local_scroll_routes_wheel_to_root_scroll_context() {
+        let root = WidgetId::from("mounted-root-wheel-fallback-root");
+        let child = TestWidget.id();
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let root_origin = Point { x: 24.0, y: 18.0 };
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 60.0,
+            },
+        };
+        let child_bounds = Rect {
+            origin: root_origin,
+            size: Size {
+                width: 30.0,
+                height: 30.0,
+            },
+        };
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: child_bounds.size,
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: child_bounds.size,
+            },
+        };
+        let layout_bounds = iced::Rectangle {
+            x: root_origin.x,
+            y: root_origin.y,
+            width: child_bounds.size.width,
+            height: child_bounds.size.height,
+        };
+        let cursor = iced::Point::new(29.0, 23.0);
+        let input_position = Point {
+            x: cursor.x,
+            y: cursor.y,
+        };
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(root_bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: root_bounds.size.width,
+                    height: 180.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let mut child_view = TestWidget.view_definition(
+            &(),
+            &Local { clicks: 0 },
+            ViewDefinitionInput {
+                frame: frame(706),
+                layout_input: layout_input.clone(),
+            },
+        );
+        child_view.scroll_regions.clear();
+        apply_runtime_slot_to_view_definition(&mut child_view, &child_slot);
+        let validation_view = mounted_child_validation_view(
+            frame(706),
+            root.clone(),
+            child.clone(),
+            child_slot.clone(),
+            root_bounds,
+            child_bounds,
+            child_view.hit_regions.clone(),
+            Vec::new(),
+            vec![root_scroll.clone()],
+        );
+        let root_context = mounted_root_dispatch_context(&validation_view, Vec::new());
+        let mut child_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                child_view,
+                &TestWidget.capabilities(),
+                layout_input,
+                child,
+                Some(child_slot),
+                0,
+                root_origin,
+            );
+        child_presentation.apply_dispatch_context_override(Some(&root_context));
+
+        let wheel = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -8.0 },
+            }),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(cursor),
+            Some(&child_presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("mounted child wheel falls back to mounted root context")
+        .input
+        .expect("root scroll wheel event is published");
+        let InputEvent::Wheel(wheel_event) = &wheel.event else {
+            panic!("expected root wheel input");
+        };
+        assert_eq!(wheel_event.target, root);
+        assert_eq!(wheel_event.target_slot.as_ref(), Some(&root_slot));
+        assert_eq!(
+            wheel_event.region_id.as_ref(),
+            Some(&PresentationRegionId::from("root-scroll"))
+        );
+        let evidence = wheel
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(evidence.input_position, Some(input_position));
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("root-scroll"))
+        );
+        let diagnostics = slipway_core::backend_input_dispatch_evidence_contract_diagnostics(
+            &validation_view,
+            &wheel,
+            Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
+            Some(ICED_BACKEND_ID),
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn mounted_child_touch_dispatch_evidence_uses_root_input_position() {
+        let root = WidgetId::from("mounted-touch-root");
+        let child = TestWidget.id();
+        let child_slot = WidgetSlotAddress::new(root.clone(), 0).child(child.clone(), 0);
+        let root_origin = Point { x: 24.0, y: 18.0 };
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 40.0,
+            },
+        };
+        let child_bounds = Rect {
+            origin: root_origin,
+            size: Size {
+                width: 30.0,
+                height: 14.0,
+            },
+        };
+        let layout_bounds = iced::Rectangle {
+            x: root_origin.x,
+            y: root_origin.y,
+            width: child_bounds.size.width,
+            height: child_bounds.size.height,
+        };
+        let touch_position = iced::Point::new(29.0, 23.0);
+        let expected_input_position = Point {
+            x: touch_position.x,
+            y: touch_position.y,
+        };
+        let expected_target_position = Point { x: 5.0, y: 5.0 };
+        let expected_target_bounds = Some(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: child_bounds.size,
+        }));
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: child_bounds.size,
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: child_bounds.size,
+            },
+        };
+
+        let mut touch_view = TestWidget.view_definition(
+            &(),
+            &Local { clicks: 0 },
+            ViewDefinitionInput {
+                frame: frame(704),
+                layout_input: layout_input.clone(),
+            },
+        );
+        touch_view.hit_regions[0].capture = slipway_core::PointerCaptureIntent::DuringDrag;
+        apply_runtime_slot_to_view_definition(&mut touch_view, &child_slot);
+        let touch_validation_view = mounted_child_validation_view(
+            frame(704),
+            root,
+            child.clone(),
+            child_slot.clone(),
+            root_bounds,
+            child_bounds,
+            touch_view.hit_regions.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let touch_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                touch_view,
+                &TestWidget.capabilities(),
+                layout_input,
+                child.clone(),
+                Some(child_slot.clone()),
+                0,
+                root_origin,
+            );
+        let finger = iced::touch::Finger(11);
+
+        let mut moved_pressed_region = Some(pressed_capture_with_origin(
+            "iced.test.hit",
+            root_origin.x,
+            root_origin.y,
+        ));
+        let moved = route_iced_event(
+            &iced::Event::Touch(iced::touch::Event::FingerMoved {
+                id: finger,
+                position: touch_position,
+            }),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(touch_position),
+            Some(&touch_presentation),
+            &mut None,
+            &mut moved_pressed_region,
+            &mut None,
+            &mut None,
+        )
+        .expect("mounted child touch move routes")
+        .input
+        .expect("mounted child touch move publishes input");
+        assert_mounted_dispatch_evidence(
+            &touch_validation_view,
+            &moved,
+            "physical-input",
+            slipway_core::DeclaredEventDispatchKind::Pointer,
+            "iced.test.hit",
+            "iced.test.route",
+            &child_slot,
+            expected_input_position,
+        );
+        assert!(
+            moved
+                .dispatch_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.capture_event)
+        );
+        let InputEvent::Pointer(pointer) = &moved.event else {
+            panic!("expected mounted touch move pointer input");
+        };
+        assert_eq!(pointer.target, child);
+        assert_eq!(pointer.kind, slipway_core::PointerEventKind::Move);
+        assert_eq!(pointer.button, None);
+        assert_eq!(pointer.position, expected_target_position);
+        assert_eq!(pointer.target_bounds, expected_target_bounds);
+        assert_eq!(pointer.details.pointer_id, Some(finger.0));
+        assert_eq!(
+            pointer.details.device,
+            slipway_core::PointerDeviceKind::Touch
+        );
+        assert!(pointer.details.buttons.primary);
+
+        let mut lifted_pressed_region = Some(pressed_capture_with_origin(
+            "iced.test.hit",
+            root_origin.x,
+            root_origin.y,
+        ));
+        let lifted = route_iced_event(
+            &iced::Event::Touch(iced::touch::Event::FingerLifted {
+                id: finger,
+                position: touch_position,
+            }),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(touch_position),
+            Some(&touch_presentation),
+            &mut None,
+            &mut lifted_pressed_region,
+            &mut None,
+            &mut None,
+        )
+        .expect("mounted child touch lift routes")
+        .input
+        .expect("mounted child touch lift publishes input");
+        assert_mounted_dispatch_evidence(
+            &touch_validation_view,
+            &lifted,
+            "physical-input",
+            slipway_core::DeclaredEventDispatchKind::Pointer,
+            "iced.test.hit",
+            "iced.test.route",
+            &child_slot,
+            expected_input_position,
+        );
+        assert!(
+            lifted
+                .dispatch_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.capture_event)
+        );
+        let InputEvent::Pointer(pointer) = &lifted.event else {
+            panic!("expected mounted touch lift pointer input");
+        };
+        assert_eq!(pointer.target, child);
+        assert_eq!(pointer.kind, slipway_core::PointerEventKind::Release);
+        assert_eq!(pointer.button, None);
+        assert_eq!(pointer.position, expected_target_position);
+        assert_eq!(pointer.target_bounds, expected_target_bounds);
+        assert_eq!(pointer.details.pointer_id, Some(finger.0));
+        assert_eq!(
+            pointer.details.device,
+            slipway_core::PointerDeviceKind::Touch
+        );
+        assert!(!pointer.details.buttons.primary);
+
+        let mut lost_pressed_region = Some(pressed_capture_with_origin(
+            "iced.test.hit",
+            root_origin.x,
+            root_origin.y,
+        ));
+        let lost = route_iced_event(
+            &iced::Event::Touch(iced::touch::Event::FingerLost {
+                id: finger,
+                position: touch_position,
+            }),
+            layout_bounds,
+            iced::advanced::mouse::Cursor::Available(touch_position),
+            Some(&touch_presentation),
+            &mut None,
+            &mut lost_pressed_region,
+            &mut None,
+            &mut None,
+        )
+        .expect("mounted child touch lost routes")
+        .input
+        .expect("mounted child touch lost publishes input");
+        assert_mounted_dispatch_evidence(
+            &touch_validation_view,
+            &lost,
+            "physical-input",
+            slipway_core::DeclaredEventDispatchKind::Pointer,
+            "iced.test.hit",
+            "iced.test.route",
+            &child_slot,
+            expected_input_position,
+        );
+        assert!(
+            lost.dispatch_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.capture_event)
+        );
+        let InputEvent::Pointer(pointer) = &lost.event else {
+            panic!("expected mounted touch lost pointer input");
+        };
+        assert_eq!(pointer.target, child);
+        assert_eq!(pointer.kind, slipway_core::PointerEventKind::Cancel);
+        assert_eq!(pointer.button, None);
+        assert_eq!(pointer.position, expected_target_position);
+        assert_eq!(pointer.target_bounds, expected_target_bounds);
+        assert_eq!(pointer.details.pointer_id, Some(finger.0));
+        assert_eq!(
+            pointer.details.device,
+            slipway_core::PointerDeviceKind::Touch
+        );
+        assert!(!pointer.details.buttons.primary);
+    }
+
+    #[test]
     fn runtime_widget_cursor_move_without_capture_does_not_publish_input() {
         let runtime = SlipwayRuntime::new(ChildTreeWidget, ());
         let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
@@ -17964,6 +23316,7 @@ mod tests {
         assert_eq!(presentation.paint_occlusion_regions.len(), 1);
         let mut hovered_region = None;
         let mut pressed_region = None;
+        let mut indicator_drag = None;
         let mut focused_region = None;
         let routed = route_iced_event(
             &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
@@ -17977,6 +23330,7 @@ mod tests {
             Some(&presentation),
             &mut hovered_region,
             &mut pressed_region,
+            &mut indicator_drag,
             &mut focused_region,
         )
         .expect("opaque paint layer returns a routed absorption result");
@@ -18062,6 +23416,7 @@ mod tests {
 
         let mut hovered_region = None;
         let mut pressed_region = None;
+        let mut indicator_drag = None;
         let mut focused_region = None;
         let routed = route_iced_event(
             &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
@@ -18075,6 +23430,7 @@ mod tests {
             Some(&presentation),
             &mut hovered_region,
             &mut pressed_region,
+            &mut indicator_drag,
             &mut focused_region,
         )
         .expect("same-layer hit routes through opaque paint");
@@ -18092,6 +23448,2705 @@ mod tests {
                 .as_ref()
                 .and_then(|evidence| evidence.selected_region.as_ref()),
             Some(&PresentationRegionId::from("own-hit"))
+        );
+    }
+
+    #[test]
+    fn overlapping_explicit_layers_route_press_to_visually_front_matching_hit_region() {
+        let target = WidgetId::from("overlap-layer-front-input-test");
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let lower_hit = slipway_core::hit_region_from_pointer_capability(
+            &InteractionCapabilityWidget { id: target.clone() },
+            &(),
+            &(),
+            PresentationRegionId::from("lower-hit"),
+            None,
+            TargetLocalRect::new(bounds),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            slipway_core::HitRegionOrder {
+                z_index: 10,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            Some("lower-hit-route".to_string()),
+            CursorCapability::Pointer,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let front_hit = slipway_core::hit_region_from_pointer_capability(
+            &InteractionCapabilityWidget { id: target.clone() },
+            &(),
+            &(),
+            PresentationRegionId::from("front-hit"),
+            None,
+            TargetLocalRect::new(bounds),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            slipway_core::HitRegionOrder {
+                z_index: 10,
+                paint_order: 0,
+                traversal_order: 1,
+            },
+            Some("front-hit-route".to_string()),
+            CursorCapability::Grab,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let view = ViewDefinition {
+            target: target.clone(),
+            frame: frame(619),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(target.clone()),
+            hit_regions: vec![lower_hit, front_hit],
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: bounds.size,
+                },
+            },
+            target.clone(),
+        );
+        presentation.paint_occlusion_regions = vec![IcedPaintOcclusionRegion {
+            target: target.clone(),
+            address: None,
+            order: (10, 0, 1),
+            bounds,
+            blocks_wheel: true,
+        }];
+
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("front matching hit routes through overlapping explicit layers");
+
+        assert!(routed.capture_event);
+        let input = routed
+            .input
+            .expect("front hit region must receive the press");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("front hit dispatch carries evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("front-hit"))
+        );
+    }
+
+    #[test]
+    fn front_opaque_explicit_layer_with_higher_traversal_absorbs_lower_hit_region() {
+        let target = WidgetId::from("overlap-layer-traversal-occlusion-test");
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let lower_hit = slipway_core::hit_region_from_pointer_capability(
+            &InteractionCapabilityWidget { id: target.clone() },
+            &(),
+            &(),
+            PresentationRegionId::from("lower-hit"),
+            None,
+            TargetLocalRect::new(bounds),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            slipway_core::HitRegionOrder {
+                z_index: 10,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            Some("lower-hit-route".to_string()),
+            CursorCapability::Pointer,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let view = ViewDefinition {
+            target: target.clone(),
+            frame: frame(620),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(target.clone()),
+            hit_regions: vec![lower_hit],
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: bounds.size,
+                },
+            },
+            target.clone(),
+        );
+        presentation.paint_occlusion_regions = vec![IcedPaintOcclusionRegion {
+            target: target.clone(),
+            address: None,
+            order: (10, 0, 1),
+            bounds,
+            blocks_wheel: true,
+        }];
+
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("front opaque layer absorbs the press");
+
+        assert!(routed.capture_event);
+        assert!(
+            routed.input.is_none(),
+            "a lower hit region must not receive input through a front opaque layer"
+        );
+    }
+
+    #[test]
+    fn front_opaque_layer_blocks_wheel_dispatch_to_lower_scroll_owner() {
+        let root = WidgetId::from("iced.wheel-block.root");
+        let overlay = WidgetId::from("iced.wheel-block.overlay");
+        let overlay_slot = WidgetSlotAddress::new(root.clone(), 0).child(overlay.clone(), 0);
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let mut scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            root.clone(),
+            None,
+            TargetLocalRect::new(bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 16.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder::default(),
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        scroll.order = HitRegionOrder {
+            z_index: 0,
+            paint_order: 0,
+            traversal_order: 0,
+        };
+        let front_hit = slipway_core::hit_region_from_pointer_capability(
+            &InteractionCapabilityWidget {
+                id: overlay.clone(),
+            },
+            &(),
+            &(),
+            PresentationRegionId::from("front-overlay-hit"),
+            Some(overlay_slot.clone()),
+            TargetLocalRect::new(bounds),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            HitRegionOrder {
+                z_index: 10,
+                paint_order: 0,
+                traversal_order: 10_000,
+            },
+            Some("front-overlay-route".to_string()),
+            CursorCapability::Pointer,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(621),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: overlay.clone(),
+                    bounds: slipway_core::ParentLocalRect::new(bounds),
+                    local_state_slot: Some(overlay_slot.clone()),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: vec![front_hit],
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: bounds.size,
+                },
+            },
+            root,
+        );
+        presentation.paint_occlusion_regions = vec![IcedPaintOcclusionRegion {
+            target: overlay.clone(),
+            address: Some(overlay_slot),
+            order: (10, 0, 10_000),
+            bounds,
+            blocks_wheel: true,
+        }];
+
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("front overlay absorbs wheel over lower scroll owner");
+
+        assert!(routed.capture_event);
+        assert!(
+            routed.input.is_none(),
+            "front overlay must not allow lower scroll owner to receive wheel"
+        );
+        let refusal = routed
+            .refusal
+            .expect("blocked wheel retains its refusal evidence (MF-H3)");
+        assert_eq!(
+            refusal.selected_region,
+            Some(PresentationRegionId::from("root-scroll")),
+            "the refusal names the would-be consumer"
+        );
+        assert!(
+            refusal.refusal_reason.as_deref().is_some_and(
+                |reason| reason.contains("blocked by a front wheel-blocking paint layer")
+            ),
+            "the refusal reason names the blocker: {:?}",
+            refusal.refusal_reason
+        );
+        assert!(refusal.input_position.is_some());
+        assert_eq!(
+            refusal.input_position_space,
+            Some(slipway_core::DispatchPositionSpace::Content)
+        );
+    }
+
+    #[test]
+    fn dead_point_wheel_retains_refusal_evidence_and_apply_records_it() {
+        // MF-H3: a wheel whose delta no containing region can consume (wheel
+        // UP at offset 0) used to vanish without a trace. The route must now
+        // carry the core resolver's refusal evidence, and applying the
+        // published DispatchRefusal message must retain it in the runtime's
+        // bounded refusal ring.
+        let root = WidgetId::from("iced.dead-wheel.root");
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            root.clone(),
+            None,
+            TargetLocalRect::new(bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder::default(),
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(622),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: bounds.size,
+                },
+            },
+            root,
+        );
+
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            }),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("dead-point wheel still yields a routed result carrying the refusal");
+
+        assert!(
+            routed.input.is_none(),
+            "no consumer for wheel up at offset 0"
+        );
+        let refusal = routed
+            .refusal
+            .expect("dead-point wheel retains its refusal evidence (MF-H3)");
+        assert_eq!(refusal.selected_region, None);
+        assert_eq!(
+            refusal.candidate_regions,
+            vec![PresentationRegionId::from("root-scroll")],
+            "the containing-but-at-limit region stays listed as a candidate"
+        );
+        assert_eq!(
+            refusal.refusal_reason.as_deref(),
+            Some("no enabled scroll region accepted the physical wheel position")
+        );
+        assert_eq!(refusal.input_position, Some(Point { x: 12.0, y: 12.0 }));
+        assert_eq!(
+            refusal.input_position_space,
+            Some(slipway_core::DispatchPositionSpace::Content)
+        );
+
+        let mut runtime = SlipwayRuntime::new(TestWidget, ());
+        assert!(runtime.last_dispatch_refusal().is_none());
+        let update = apply_iced_runtime_message(
+            &mut runtime,
+            SlipwayIcedRuntimeMessage::DispatchRefusal(refusal.clone()),
+            &mut |_, _| {},
+        );
+        assert_eq!(update, SlipwayIcedRuntimeUpdate::Noop);
+        assert_eq!(runtime.last_dispatch_refusal(), Some(&refusal));
+    }
+
+    #[test]
+    fn descendant_content_does_not_block_addressed_root_scroll_wheel_dispatch() {
+        let root = WidgetId::from("iced.wheel-descendant.root");
+        let panel = WidgetId::from("iced.wheel-descendant.panel");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let panel_slot = root_slot.child(panel.clone(), 0);
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("addressed-root-scroll"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 16.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(6211),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: panel.clone(),
+                    bounds: slipway_core::ParentLocalRect::new(bounds),
+                    local_state_slot: Some(panel_slot.clone()),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: bounds.size,
+                },
+            },
+            root,
+        );
+        presentation.paint_occlusion_regions = vec![IcedPaintOcclusionRegion {
+            target: panel,
+            address: None,
+            order: (0, 0, 0),
+            bounds,
+            blocks_wheel: true,
+        }];
+
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("descendant content must not block its addressed root scroll owner");
+
+        assert!(routed.capture_event);
+        let input = routed
+            .input
+            .expect("addressed root scroll receives wheel through descendant content");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("addressed-root-scroll"))
+        );
+    }
+
+    #[test]
+    fn addressed_root_scroll_is_blocked_by_front_opaque_overlay_descendant() {
+        let root = WidgetId::from("iced.wheel-root-overlay.root");
+        let overlay = WidgetId::from("iced.wheel-root-overlay.overlay");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let overlay_slot = root_slot.child(overlay.clone(), 0);
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("addressed-root-scroll-under-overlay"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 16.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(6212),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: overlay.clone(),
+                    bounds: slipway_core::ParentLocalRect::new(bounds),
+                    local_state_slot: Some(overlay_slot.clone()),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: bounds.size,
+                },
+            },
+            root,
+        );
+        presentation.paint_occlusion_regions = vec![IcedPaintOcclusionRegion {
+            target: overlay,
+            address: Some(overlay_slot),
+            order: (10, 0, 10_000),
+            bounds,
+            blocks_wheel: true,
+        }];
+
+        let preflight = iced_declared_wheel_region_id_for_event(
+            &presentation,
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+        );
+        assert!(
+            preflight.is_none(),
+            "native scroll preflight must not select root scroll through a front overlay"
+        );
+
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("front descendant overlay absorbs wheel over addressed root scroll");
+
+        assert!(routed.capture_event);
+        assert!(
+            routed.input.is_none(),
+            "front descendant overlay must not let addressed root scroll consume wheel"
+        );
+
+        // Step 195 (M2 shape): the declared block above must ALSO deny the
+        // native widget path. The native Scrollable's offset can only advance
+        // inside its `update`, which `update_iced_scroll_regions` invokes for
+        // a wheel ONLY when the preflight selected that region. With the
+        // preflight blocked (None), every native scroll region must be
+        // refused, so the wheel produces NO routed dispatch AND no native
+        // root scroll offset change.
+        assert!(
+            !presentation.native_scroll_regions.is_empty(),
+            "fixture presents the addressed root scroll as a native scrollable"
+        );
+        for region in presentation.native_scroll_regions.iter() {
+            assert!(
+                !should_update_native_scroll_region_for_event(
+                    &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                        delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+                    }),
+                    preflight.as_ref(),
+                    region,
+                ),
+                "a wheel blocked by a front opaque overlay must never reach native Scrollable {}",
+                region.id.as_str(),
+            );
+        }
+    }
+
+    #[test]
+    fn addressed_root_scroll_receives_wheel_through_wheel_transparent_front_overlay() {
+        // Mirror `addressed_root_scroll_is_blocked_by_front_opaque_overlay_descendant`
+        // exactly, except the front opaque overlay occlusion is authored
+        // wheel-pass-through (`blocks_wheel: false`). The overlay still occludes
+        // the pointer, but the wheel must now reach the addressed root scroll
+        // behind it in BOTH the preflight and the declared route.
+        let root = WidgetId::from("iced.wheel-root-overlay.root");
+        let overlay = WidgetId::from("iced.wheel-root-overlay.overlay");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let overlay_slot = root_slot.child(overlay.clone(), 0);
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("addressed-root-scroll-under-overlay"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 16.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(6213),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: overlay.clone(),
+                    bounds: slipway_core::ParentLocalRect::new(bounds),
+                    local_state_slot: Some(overlay_slot.clone()),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let mut presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: bounds.size,
+                },
+            },
+            root,
+        );
+        presentation.paint_occlusion_regions = vec![IcedPaintOcclusionRegion {
+            target: overlay,
+            address: Some(overlay_slot),
+            order: (10, 0, 10_000),
+            bounds,
+            blocks_wheel: false,
+        }];
+
+        let preflight = iced_declared_wheel_region_id_for_event(
+            &presentation,
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+        );
+        assert_eq!(
+            preflight,
+            Some(PresentationRegionId::from(
+                "addressed-root-scroll-under-overlay"
+            )),
+            "wheel-transparent overlay must let the native scroll preflight select the root scroll"
+        );
+
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("wheel-transparent overlay routes the wheel to the addressed root scroll");
+
+        assert!(routed.capture_event);
+        let input = routed
+            .input
+            .expect("addressed root scroll receives wheel through the wheel-transparent overlay");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from(
+                "addressed-root-scroll-under-overlay"
+            ))
+        );
+    }
+
+    #[test]
+    fn native_scrolled_root_wheel_owner_uses_visible_viewport_point() {
+        let root = WidgetId::from("iced.native-root-scroll.root");
+        let panel = WidgetId::from("iced.native-root-scroll.panel");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let panel_slot = root_slot.child(panel.clone(), 0);
+        let viewport = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 768.0,
+            },
+        };
+        let content = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 1484.0,
+            },
+        };
+        let scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(viewport),
+            TargetLocalRect::new(content),
+            Point { x: 0.0, y: 240.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::SelfFirst,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(6212),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(content),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: panel,
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 16.0, y: 636.0 },
+                        size: Size {
+                            width: 608.0,
+                            height: 228.0,
+                        },
+                    }),
+                    local_state_slot: Some(panel_slot),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            root,
+        );
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        });
+        let layout_bounds = iced::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: viewport.size.width,
+            height: viewport.size.height,
+        };
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(500.0, 700.0));
+
+        let selected =
+            iced_declared_wheel_region_id_for_event(&presentation, &wheel, layout_bounds, cursor)
+                .expect("lower visible viewport point must still select root scroll owner");
+        assert_eq!(selected, PresentationRegionId::from("root-scroll"));
+
+        let routed = route_iced_event(
+            &wheel,
+            layout_bounds,
+            cursor,
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("lower visible viewport wheel routes to root scroll owner");
+        let input = routed
+            .input
+            .expect("root scroll owner receives lower viewport wheel");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("root-scroll"))
+        );
+        assert_eq!(
+            evidence.input_position_space,
+            Some(slipway_core::DispatchPositionSpace::Viewport),
+            "the visible-viewport fallback branch must annotate its space"
+        );
+    }
+
+    #[test]
+    fn same_owner_hit_region_does_not_block_its_scroll_wheel_dispatch() {
+        let target = WidgetId::from("iced.wheel-same-owner.root");
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("same-owner-scroll"),
+            target.clone(),
+            None,
+            TargetLocalRect::new(bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 16.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder::default(),
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let row_hit = slipway_core::hit_region_from_pointer_capability(
+            &InteractionCapabilityWidget { id: target.clone() },
+            &(),
+            &(),
+            PresentationRegionId::from("same-owner-row-hit"),
+            None,
+            TargetLocalRect::new(bounds),
+            slipway_core::PointerEventCoordinateSpace::TargetLocal,
+            HitRegionOrder {
+                z_index: 10,
+                paint_order: 0,
+                traversal_order: 10_000,
+            },
+            Some("same-owner-row-route".to_string()),
+            CursorCapability::Pointer,
+            true,
+            slipway_core::PointerCaptureIntent::OnPress,
+        );
+        let view = ViewDefinition {
+            target: target.clone(),
+            frame: frame(622),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(bounds),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(target.clone()),
+            hit_regions: vec![row_hit],
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: bounds.size,
+                },
+            },
+            target,
+        );
+
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+            }),
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("same owner hit must still allow wheel dispatch");
+
+        assert!(routed.capture_event);
+        let input = routed
+            .input
+            .expect("same owner scroll receives wheel behind row hit");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("same-owner-scroll"))
+        );
+    }
+
+    #[test]
+    fn native_scrolled_child_wheel_owner_uses_content_dispatch_point() {
+        let root = WidgetId::from("iced.native-child-scroll.root");
+        let child = WidgetId::from("iced.native-child-scroll.child");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let viewport = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 768.0,
+            },
+        };
+        let content = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 1484.0,
+            },
+        };
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(viewport),
+            TargetLocalRect::new(content),
+            Point { x: 0.0, y: 240.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::SelfFirst,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let child_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("child-scroll"),
+            child.clone(),
+            Some(child_slot.clone()),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 16.0, y: 16.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 80.0,
+                },
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 16.0, y: 16.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::SelfFirst,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(6213),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(content),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child,
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 636.0 },
+                        size: Size {
+                            width: 240.0,
+                            height: 140.0,
+                        },
+                    }),
+                    local_state_slot: Some(child_slot),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![root_scroll, child_scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            root,
+        );
+
+        let selected = select_native_wheel_consumer_at_input_points(
+            &presentation,
+            presentation.scroll_regions.as_slice(),
+            IcedInputRootLocalPoints {
+                visual: Point { x: 40.0, y: 420.0 },
+                dispatch: Point { x: 40.0, y: 660.0 },
+            },
+            0.0,
+            -1.0,
+        )
+        .expect("visible child under native root scroll must use scrolled content dispatch point");
+        assert_eq!(selected.id, PresentationRegionId::from("child-scroll"));
+
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        });
+        let routed = route_iced_event(
+            &wheel,
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: viewport.size.width,
+                height: viewport.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(40.0, 420.0)),
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("wheel route must also use the scrolled dispatch point");
+        let input = routed
+            .input
+            .expect("child scroll receives routed wheel input");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("child-scroll"))
+        );
+
+        // Live regression (Step 188, root offset 120 ghost): the runtime
+        // independently re-resolves the wheel consumer at
+        // `evidence.input_position` against the declared regions in
+        // un-scrolled content space and REPLACES this dispatch with whatever
+        // it finds there. The evidence must therefore record the scrolled
+        // content-space dispatch point; recording the raw window point makes
+        // the runtime re-derive the natively-scrolled root band owner and
+        // turn the routed child wheel into a state-only root ghost.
+        let evidence_position = evidence
+            .input_position
+            .expect("wheel evidence records an input position");
+        assert_eq!(evidence_position, Point { x: 40.0, y: 660.0 });
+        assert_eq!(
+            evidence.input_position_space,
+            Some(slipway_core::DispatchPositionSpace::Content),
+            "the scrolled content dispatch branch must annotate its space"
+        );
+        let re_resolved = slipway_core::resolve_declared_wheel_dispatch_with_geometry_index(
+            &presentation.geometry_index,
+            presentation.scroll_regions.as_slice(),
+            evidence_position,
+            0.0,
+            -1.0,
+        )
+        .expect("runtime re-resolution at the evidence position finds a consumer");
+        assert_eq!(
+            Some(&re_resolved.selected_region),
+            evidence.selected_region.as_ref(),
+            "runtime re-resolution at evidence.input_position must reproduce the routed consumer"
+        );
+    }
+
+    #[test]
+    fn declared_parent_first_child_scroll_defers_wheel_to_root_owner() {
+        // Mirror of `native_scrolled_child_wheel_owner_uses_content_dispatch_
+        // point`, but the fronter child region declares ParentFirst while the
+        // root stays on the default: the backend wheel path must select the
+        // strictly-containing root ancestor instead of the child that wins by
+        // order (ADR-0002 B2 routed through the shared core selector).
+        let root = WidgetId::from("iced.parent-first-scroll.root");
+        let child = WidgetId::from("iced.parent-first-scroll.child");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let viewport = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 768.0,
+            },
+        };
+        let content = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 1484.0,
+            },
+        };
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(viewport),
+            TargetLocalRect::new(content),
+            Point { x: 0.0, y: 240.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let child_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("child-scroll"),
+            child.clone(),
+            Some(child_slot.clone()),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 16.0, y: 16.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 80.0,
+                },
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 16.0, y: 16.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::ParentFirst,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(6215),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(content),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child,
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 636.0 },
+                        size: Size {
+                            width: 240.0,
+                            height: 140.0,
+                        },
+                    }),
+                    local_state_slot: Some(child_slot),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![root_scroll, child_scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            root,
+        );
+
+        // The scrolled content dispatch point (40, 660) sits inside BOTH the
+        // child viewport (root-local 16..216 x 652..732) and the root
+        // viewport; both can consume delta_y = -1. Without ParentFirst the
+        // fronter child wins (the sibling test above asserts exactly that);
+        // with ParentFirst the child defers to the root ancestor.
+        let selected = select_native_wheel_consumer_at_input_points(
+            &presentation,
+            presentation.scroll_regions.as_slice(),
+            IcedInputRootLocalPoints {
+                visual: Point { x: 40.0, y: 420.0 },
+                dispatch: Point { x: 40.0, y: 660.0 },
+            },
+            0.0,
+            -1.0,
+        )
+        .expect("ParentFirst deference still selects a consumer");
+        assert_eq!(selected.id, PresentationRegionId::from("root-scroll"));
+
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        });
+        let routed = route_iced_event(
+            &wheel,
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: viewport.size.width,
+                height: viewport.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(40.0, 420.0)),
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("ParentFirst wheel routes to the root scroll owner");
+        let input = routed
+            .input
+            .expect("root scroll receives the deferred wheel input");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("root-scroll"))
+        );
+
+        // The runtime re-resolution at the evidence position runs the same
+        // routing-aware selector, so it reproduces the deferred owner.
+        let evidence_position = evidence
+            .input_position
+            .expect("wheel evidence records an input position");
+        let re_resolved = slipway_core::resolve_declared_wheel_dispatch_with_geometry_index(
+            &presentation.geometry_index,
+            presentation.scroll_regions.as_slice(),
+            evidence_position,
+            0.0,
+            -1.0,
+        )
+        .expect("runtime re-resolution at the evidence position finds a consumer");
+        assert_eq!(
+            Some(&re_resolved.selected_region),
+            evidence.selected_region.as_ref(),
+            "runtime re-resolution must reproduce the ParentFirst deferred owner"
+        );
+    }
+
+    #[test]
+    fn native_scrolled_root_wheel_ignores_phantom_content_band_consumer() {
+        let root = WidgetId::from("iced.native-phantom-band.root");
+        let child = WidgetId::from("iced.native-phantom-band.child");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let viewport = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 768.0,
+            },
+        };
+        let content = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 1484.0,
+            },
+        };
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(viewport),
+            TargetLocalRect::new(content),
+            Point { x: 0.0, y: 240.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::SelfFirst,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        // Declared consumable child region whose content-space rect stays at
+        // the fixed window band y 540..620 even though the visible child moved
+        // up with the scrolled content.
+        let child_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("child-scroll"),
+            child.clone(),
+            Some(child_slot.clone()),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 16.0, y: 16.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 80.0,
+                },
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 16.0, y: 16.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::SelfFirst,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(6214),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(content),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child,
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 524.0 },
+                        size: Size {
+                            width: 240.0,
+                            height: 140.0,
+                        },
+                    }),
+                    local_state_slot: Some(child_slot),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![root_scroll, child_scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            root,
+        );
+
+        // Cursor over plain scrolled content at (40, 560): the visible point
+        // falls inside the child's content-space band while the scrolled
+        // dispatch point (40, 800) selects nothing.
+        let selected = select_native_wheel_consumer_at_input_points(
+            &presentation,
+            presentation.scroll_regions.as_slice(),
+            IcedInputRootLocalPoints {
+                visual: Point { x: 40.0, y: 560.0 },
+                dispatch: Point { x: 40.0, y: 800.0 },
+            },
+            0.0,
+            -1.0,
+        )
+        .expect("dead-band wheel over plain content must keep a native owner");
+        assert_eq!(selected.id, PresentationRegionId::from("root-scroll"));
+
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+        });
+        let layout_bounds = iced::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: viewport.size.width,
+            height: viewport.size.height,
+        };
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(40.0, 560.0));
+        let preflight =
+            iced_declared_wheel_region_id_for_event(&presentation, &wheel, layout_bounds, cursor)
+                .expect("native scroll preflight keeps the root owner in the dead band");
+        assert_eq!(preflight, PresentationRegionId::from("root-scroll"));
+
+        let routed = route_iced_event(
+            &wheel,
+            layout_bounds,
+            cursor,
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("wheel over the phantom band still routes");
+        assert!(
+            routed.input.is_none(),
+            "phantom content-band consumer must not receive the wheel"
+        );
+        assert!(
+            !routed.capture_event,
+            "phantom content-band consumer must not capture the wheel"
+        );
+    }
+
+    #[test]
+    fn native_wheel_selection_skips_child_scroll_at_directional_boundary() {
+        let target = WidgetId::from("iced.native-wheel-boundary.root");
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 220.0,
+                height: 180.0,
+            },
+        };
+        let child_viewport = Rect {
+            origin: Point { x: 20.0, y: 20.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let mut root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            target.clone(),
+            None,
+            TargetLocalRect::new(root_bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 220.0,
+                    height: 540.0,
+                },
+            }),
+            Point { x: 0.0, y: 80.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        root_scroll.order = HitRegionOrder {
+            z_index: 0,
+            paint_order: 0,
+            traversal_order: 0,
+        };
+        let child_max_offset = 160.0;
+        let mut child_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("child-scroll"),
+            target.clone(),
+            None,
+            TargetLocalRect::new(child_viewport),
+            TargetLocalRect::new(Rect {
+                origin: child_viewport.origin,
+                size: Size {
+                    width: child_viewport.size.width,
+                    height: child_viewport.size.height + child_max_offset,
+                },
+            }),
+            Point {
+                x: 0.0,
+                y: child_max_offset,
+            },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 10,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        child_scroll.order = HitRegionOrder {
+            z_index: 10,
+            paint_order: 0,
+            traversal_order: 0,
+        };
+        let view = ViewDefinition {
+            target: target.clone(),
+            frame: frame(623),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(root_bounds),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(target.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![root_scroll.clone(), child_scroll.clone()],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(root_bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: root_bounds.size,
+                },
+            },
+            target,
+        );
+        let selected = select_native_wheel_consumer_at_input_points(
+            &presentation,
+            presentation.scroll_regions.as_slice(),
+            IcedInputRootLocalPoints {
+                visual: Point { x: 40.0, y: 40.0 },
+                dispatch: Point { x: 40.0, y: 40.0 },
+            },
+            0.0,
+            -1.0,
+        )
+        .expect("parent should receive down-wheel once child is already at bottom");
+
+        assert_eq!(selected.id, PresentationRegionId::from("root-scroll"));
+    }
+
+    #[test]
+    fn native_wheel_selection_prefers_child_scroll_when_child_can_consume() {
+        let target = WidgetId::from("iced.native-wheel-child.root");
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 220.0,
+                height: 180.0,
+            },
+        };
+        let child_viewport = Rect {
+            origin: Point { x: 20.0, y: 20.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        };
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            target.clone(),
+            None,
+            TargetLocalRect::new(root_bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 220.0,
+                    height: 540.0,
+                },
+            }),
+            Point { x: 0.0, y: 80.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let child_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("child-scroll"),
+            target.clone(),
+            None,
+            TargetLocalRect::new(child_viewport),
+            TargetLocalRect::new(Rect {
+                origin: child_viewport.origin,
+                size: Size {
+                    width: child_viewport.size.width,
+                    height: 240.0,
+                },
+            }),
+            Point { x: 0.0, y: 24.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 10,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: target.clone(),
+            frame: frame(624),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(root_bounds),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(target.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![root_scroll, child_scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(root_bounds),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: root_bounds.size,
+                },
+            },
+            target,
+        );
+        let selected = select_native_wheel_consumer_at_input_points(
+            &presentation,
+            presentation.scroll_regions.as_slice(),
+            IcedInputRootLocalPoints {
+                visual: Point { x: 40.0, y: 40.0 },
+                dispatch: Point { x: 40.0, y: 40.0 },
+            },
+            0.0,
+            -1.0,
+        )
+        .expect("child should receive down-wheel while it can still scroll");
+
+        assert_eq!(selected.id, PresentationRegionId::from("child-scroll"));
+    }
+
+    #[test]
+    fn mounted_native_wheel_preflight_uses_root_dispatch_context_at_child_boundary() {
+        let root = WidgetId::from("iced.mounted-native-wheel.root");
+        let child = WidgetId::from("iced.mounted-native-wheel.child");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 80.0,
+            },
+        };
+        let child_bounds = Rect {
+            origin: Point { x: 24.0, y: 18.0 },
+            size: Size {
+                width: 30.0,
+                height: 30.0,
+            },
+        };
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("root-scroll"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(root_bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: root_bounds.size.width,
+                    height: 200.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let child_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("child-scroll"),
+            child.clone(),
+            Some(child_slot.clone()),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: child_bounds.size,
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: child_bounds.size.width,
+                    height: 120.0,
+                },
+            }),
+            Point { x: 0.0, y: 90.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 10,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let child_view = ViewDefinition {
+            target: child.clone(),
+            frame: frame(625),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: child_bounds.size,
+                }),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(child.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![child_scroll.clone()],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let validation_view = mounted_child_validation_view(
+            frame(625),
+            root.clone(),
+            child.clone(),
+            child_slot.clone(),
+            root_bounds,
+            child_bounds,
+            Vec::new(),
+            Vec::new(),
+            vec![root_scroll, child_scroll],
+        );
+        let root_context = mounted_root_dispatch_context(&validation_view, Vec::new());
+        let mut child_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                child_view,
+                &TestWidget.capabilities(),
+                LayoutInput {
+                    viewport: TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: child_bounds.size,
+                    }),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: child_bounds.size,
+                    },
+                },
+                child,
+                Some(child_slot),
+                0,
+                child_bounds.origin,
+            );
+        child_presentation.apply_dispatch_context_override(Some(&root_context));
+
+        let selected = iced_declared_wheel_region_id_for_event(
+            &child_presentation,
+            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -8.0 },
+            }),
+            iced::Rectangle {
+                x: child_bounds.origin.x,
+                y: child_bounds.origin.y,
+                width: child_bounds.size.width,
+                height: child_bounds.size.height,
+            },
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(
+                child_bounds.origin.x + 5.0,
+                child_bounds.origin.y + 5.0,
+            )),
+        )
+        .expect("mounted native wheel preflight should find the root fallback owner");
+
+        assert_eq!(selected, PresentationRegionId::from("root-scroll"));
+    }
+
+    /// Builds a mounted child presentation whose dispatch context comes from
+    /// an ancestor with a NATIVE scroll region at `root_offset_y`. The child
+    /// placement in the ancestor layout is authored in the ancestor's CONTENT
+    /// space (`child_content_origin_y`), while the child's `root_origin` and
+    /// iced layout bounds sit at its VISIBLE window position
+    /// (`child_content_origin_y - root_offset_y`), matching the live mounted
+    /// update path where the raw window cursor reaches the child's route.
+    fn ancestor_scrolled_mounted_child_presentation(
+        frame_number: u64,
+        root_offset_y: f32,
+        child_content_origin_y: f32,
+    ) -> (IcedPresentationState, iced::Rectangle) {
+        let root = WidgetId::from("mounted-ancestor-scroll-root");
+        let child = TestWidget.id();
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let root_bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 100.0,
+            },
+        };
+        let child_size = Size {
+            width: 30.0,
+            height: 30.0,
+        };
+        let child_content_bounds = Rect {
+            origin: Point {
+                x: 24.0,
+                y: child_content_origin_y,
+            },
+            size: child_size,
+        };
+        let child_visible_origin = Point {
+            x: 24.0,
+            y: child_content_origin_y - root_offset_y,
+        };
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: child_size,
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: child_size,
+            },
+        };
+        let mut child_view = TestWidget.view_definition(
+            &(),
+            &Local { clicks: 0 },
+            ViewDefinitionInput {
+                frame: frame(frame_number),
+                layout_input: layout_input.clone(),
+            },
+        );
+        child_view
+            .scroll_regions
+            .push(test_scroll_region_from_capability(
+                child.clone(),
+                "ancestor-scrolled-child-scroll",
+                layout_input.viewport.into_rect(),
+                Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: child_size.width,
+                        height: 120.0,
+                    },
+                },
+                slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            ));
+        child_view.scroll_regions[0].order = HitRegionOrder {
+            z_index: 1,
+            paint_order: 0,
+            traversal_order: 0,
+        };
+        apply_runtime_slot_to_view_definition(&mut child_view, &child_slot);
+        let child_scroll = child_view.scroll_regions[0].clone();
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("ancestor-root-scroll"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(root_bounds),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: root_bounds.size.width,
+                    height: 300.0,
+                },
+            }),
+            Point {
+                x: 0.0,
+                y: root_offset_y,
+            },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let validation_view = mounted_child_validation_view(
+            frame(frame_number),
+            root,
+            child.clone(),
+            child_slot.clone(),
+            root_bounds,
+            child_content_bounds,
+            Vec::new(),
+            Vec::new(),
+            vec![root_scroll, child_scroll],
+        );
+        let root_context = mounted_root_dispatch_context(&validation_view, Vec::new());
+        let mut child_presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                child_view,
+                &TestWidget.capabilities(),
+                layout_input,
+                child,
+                Some(child_slot),
+                0,
+                child_visible_origin,
+            );
+        child_presentation.apply_dispatch_context_override(Some(&root_context));
+        let layout_bounds = iced::Rectangle {
+            x: child_visible_origin.x,
+            y: child_visible_origin.y,
+            width: child_size.width,
+            height: child_size.height,
+        };
+        (child_presentation, layout_bounds)
+    }
+
+    #[test]
+    fn native_scrolled_ancestor_mounted_child_wheel_selects_child_region_at_visible_cursor() {
+        // Ancestor scrolled by 40: the child's content rect (y 58..88 in the
+        // ancestor's content space) is VISIBLE at window y 18..48. The raw
+        // window cursor (29, 23) is outside the content rect; the
+        // ancestor-translated point (29, 63) is inside it.
+        let (presentation, layout_bounds) =
+            ancestor_scrolled_mounted_child_presentation(6401, 40.0, 58.0);
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -8.0 },
+        });
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(29.0, 23.0));
+
+        let selected =
+            iced_declared_wheel_region_id_for_event(&presentation, &wheel, layout_bounds, cursor)
+                .expect("visible cursor over ancestor-scrolled child must select a consumer");
+        assert_eq!(
+            selected,
+            PresentationRegionId::from("ancestor-scrolled-child-scroll"),
+            "mounted preflight must translate the raw point through the ancestor scroll"
+        );
+
+        let routed = route_iced_event(
+            &wheel,
+            layout_bounds,
+            cursor,
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("visible cursor over ancestor-scrolled child routes the wheel");
+        assert!(routed.capture_event);
+        let input = routed
+            .input
+            .expect("ancestor-scrolled child scroll receives the wheel");
+        let InputEvent::Wheel(wheel_event) = &input.event else {
+            panic!("expected wheel input");
+        };
+        assert_eq!(wheel_event.target, TestWidget.id());
+        assert_eq!(
+            wheel_event.region_id.as_ref(),
+            Some(&PresentationRegionId::from(
+                "ancestor-scrolled-child-scroll"
+            ))
+        );
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("ancestor-scrolled-child-scroll"))
+        );
+        assert_eq!(
+            evidence.candidate_regions,
+            vec![
+                PresentationRegionId::from("ancestor-root-scroll"),
+                PresentationRegionId::from("ancestor-scrolled-child-scroll"),
+            ]
+        );
+        // The evidence position is the resolved dispatch-space point (the raw
+        // cursor translated through the ancestor scroll), because the runtime
+        // independently re-resolves the consumer at this position against the
+        // un-scrolled declared rects and must reproduce the same selection.
+        assert_eq!(evidence.input_position, Some(Point { x: 29.0, y: 63.0 }));
+        let re_resolved = slipway_core::resolve_declared_wheel_dispatch_with_geometry_index(
+            &presentation.dispatch_context.geometry_index,
+            presentation.dispatch_context.scroll_regions.as_ref(),
+            Point { x: 29.0, y: 63.0 },
+            0.0,
+            -8.0,
+        )
+        .expect("runtime re-resolution at the evidence position finds a consumer");
+        assert_eq!(
+            Some(&re_resolved.selected_region),
+            evidence.selected_region.as_ref(),
+            "runtime re-resolution at evidence.input_position must reproduce the routed consumer"
+        );
+    }
+
+    #[test]
+    fn native_scrolled_ancestor_mounted_child_wheel_ignores_raw_point_ghost_region() {
+        // Same geometry as the visible-cursor test, but the raw window cursor
+        // (29, 63) sits INSIDE the child's content-space rect (y 58..88) while
+        // the cursor is VISUALLY below the child (visible band y 18..48). The
+        // ancestor-translated point (29, 103) leaves both viewport rects, so
+        // the ghost child must not be selected; the ancestor's own native
+        // scroll region owns its visible band through the visual fallback.
+        let (presentation, layout_bounds) =
+            ancestor_scrolled_mounted_child_presentation(6402, 40.0, 58.0);
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -8.0 },
+        });
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(29.0, 63.0));
+
+        let selected =
+            iced_declared_wheel_region_id_for_event(&presentation, &wheel, layout_bounds, cursor)
+                .expect("ancestor native scroll owns the band below the visible child");
+        assert_eq!(
+            selected,
+            PresentationRegionId::from("ancestor-root-scroll"),
+            "raw content-space rect must not ghost-select the child"
+        );
+
+        let routed = route_iced_event(
+            &wheel,
+            layout_bounds,
+            cursor,
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("ghost band wheel still returns a routing decision");
+        // Declared route resolves no consumer at the translated point (the
+        // Step 186 preflight/route divergence in the native dead band is an
+        // intentional residual); it must not dispatch to the ghost child and
+        // must not capture, so the ancestor's native scrollable can consume.
+        assert!(routed.input.is_none());
+        assert!(!routed.capture_event);
+    }
+
+    #[test]
+    fn native_scrolled_ancestor_max_offset_wheel_still_selects_translated_child_consumer() {
+        // Ancestor at MAX offset 200 (content 300, viewport 100): the ancestor
+        // region can no longer consume a downward wheel, and the raw window
+        // point (29, 43) hits nothing in content space. The translated point
+        // (29, 243) sits inside the child's consumable region, so selection
+        // must not collapse to None (the live dead-wheel storm).
+        let (presentation, layout_bounds) =
+            ancestor_scrolled_mounted_child_presentation(6403, 200.0, 238.0);
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -8.0 },
+        });
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(29.0, 43.0));
+
+        let selected =
+            iced_declared_wheel_region_id_for_event(&presentation, &wheel, layout_bounds, cursor)
+                .expect("a translated consumable candidate must never resolve to None");
+        assert_eq!(
+            selected,
+            PresentationRegionId::from("ancestor-scrolled-child-scroll")
+        );
+
+        let routed = route_iced_event(
+            &wheel,
+            layout_bounds,
+            cursor,
+            Some(&presentation),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("max-offset wheel over the visible child routes the wheel");
+        assert!(routed.capture_event);
+        let input = routed
+            .input
+            .expect("child scroll receives the wheel at max ancestor offset");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("ancestor-scrolled-child-scroll"))
+        );
+    }
+
+    #[test]
+    fn selected_native_scroll_owner_suppresses_descendant_wheel_update_only() {
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -4.0 },
+        });
+        let press =
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left));
+
+        assert!(
+            !should_update_scroll_content_children_for_event(&wheel, true),
+            "selected native owner must not let descendants steal the same wheel"
+        );
+        assert!(should_update_scroll_content_children_for_event(
+            &wheel, false
+        ));
+        assert!(should_update_scroll_content_children_for_event(
+            &press, true
+        ));
+    }
+
+    #[test]
+    fn mounted_child_dirty_scope_accepts_local_child_slot_suffix() {
+        let target = WidgetId::from("iced.dirty.child");
+        let dirty_slot = WidgetSlotAddress::new(target.clone(), 0);
+        let runtime_slot =
+            WidgetSlotAddress::new(WidgetId::from("iced.dirty.app"), 0).child(target.clone(), 0);
+        let dirty = [IcedDirtyScope {
+            target: target.clone(),
+            slot: Some(dirty_slot),
+        }];
+
+        assert!(iced_dirty_scopes_include_target(
+            Some(&dirty),
+            &target,
+            Some(&runtime_slot),
+        ));
+    }
+
+    #[test]
+    fn native_scrolled_input_uses_dispatch_point_as_hit_candidate() {
+        let points = IcedInputRootLocalPoints {
+            visual: Point { x: 10.0, y: 10.0 },
+            dispatch: Point { x: 10.0, y: 90.0 },
+        };
+
+        assert!(iced_input_points_are_native_scrolled(points));
+    }
+
+    #[test]
+    fn native_wheel_update_reaches_only_selected_scroll_owner() {
+        fn region(id: &str) -> ScrollRegionDeclaration {
+            ScrollRegionDeclaration::explicit(
+                PresentationRegionId::from(id),
+                WidgetId::from("iced.native-wheel-update.target"),
+                None,
+                TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                }),
+                TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 180.0,
+                    },
+                }),
+                Point { x: 0.0, y: 0.0 },
+                slipway_core::ScrollAxes {
+                    horizontal: false,
+                    vertical: true,
+                },
+                slipway_core::WheelRouting::NearestScrollable,
+                HitRegionOrder::default(),
+                slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+                true,
+            )
+        }
+
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: -4.0 },
+        });
+        let selected = PresentationRegionId::from("selected-scroll");
+        let selected_region = region("selected-scroll");
+        let other_region = region("other-scroll");
+
+        assert!(should_update_native_scroll_region_for_event(
+            &wheel,
+            Some(&selected),
+            &selected_region,
+        ));
+        assert!(
+            !should_update_native_scroll_region_for_event(&wheel, Some(&selected), &other_region),
+            "a non-selected native Scrollable must not see the same wheel event"
+        );
+        assert!(
+            !should_update_native_scroll_region_for_event(&wheel, None, &selected_region),
+            "if declared dispatch has no wheel owner, native Scrollable must not invent one"
+        );
+        assert!(should_update_native_scroll_region_for_event(
+            &iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                position: iced::Point::new(1.0, 1.0),
+            }),
+            Some(&selected),
+            &other_region,
+        ));
+    }
+
+    #[test]
+    fn runtime_overlapped_keyed_sibling_press_routes_to_front_child_first() {
+        type LayeredHitRuntimeWidget<'a> =
+            SlipwayIcedRuntimeWidget<'a, slipway_core::SlipwayAppWidget<LayeredHitApp>>;
+
+        let app = slipway_core::SlipwayAppWidget::new(LayeredHitApp {
+            widgets: (
+                LayeredHitChild::new("iced.layer-hit.lower", 0),
+                LayeredHitChild::new("iced.layer-hit.front", 1),
+            ),
+        });
+        let mut runtime = SlipwayRuntime::new(app, ());
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let mut tree = iced::advanced::widget::Tree {
+            tag: <LayeredHitRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                (),
+            >>::tag(&widget),
+            state: <LayeredHitRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                (),
+            >>::state(&widget),
+            children: <LayeredHitRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                (),
+            >>::children(&widget),
+        };
+        let renderer = ();
+        let limits = iced::advanced::layout::Limits::new(
+            iced::Size::new(0.0, 0.0),
+            iced::Size::new(100.0, 80.0),
+        );
+        let node = <LayeredHitRuntimeWidget<'_> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            (),
+        >>::layout(&mut widget, &mut tree, &renderer, &limits);
+        let layout = iced::advanced::Layout::new(&node);
+        let event =
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left));
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0));
+        let viewport = iced::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 80.0,
+        };
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+
+        {
+            let mut shell = iced::advanced::Shell::new(&mut messages);
+            <LayeredHitRuntimeWidget<'_> as Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                (),
+            >>::update(
+                &mut widget,
+                &mut tree,
+                &event,
+                layout,
+                cursor,
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+            assert!(shell.is_event_captured());
+        }
+
+        assert_eq!(messages.len(), 1);
+        let SlipwayIcedRuntimeMessage::BackendInput(input) = messages.remove(0) else {
+            panic!("front child press must publish backend input");
+        };
+        assert_eq!(
+            input.event.target(),
+            &WidgetId::from("iced.layer-hit.front")
+        );
+        assert_eq!(
+            input
+                .dispatch_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.selected_region.as_ref()),
+            Some(&PresentationRegionId::from("iced.layer-hit.front.hit"))
+        );
+        assert_eq!(
+            input
+                .dispatch_evidence
+                .as_ref()
+                .map(|evidence| evidence.candidate_regions.as_slice()),
+            Some(
+                [
+                    PresentationRegionId::from("iced.layer-hit.lower.hit"),
+                    PresentationRegionId::from("iced.layer-hit.front.hit"),
+                ]
+                .as_slice()
+            )
+        );
+        let outcome = runtime.apply_backend_input_event_for_backend(input, ICED_BACKEND_ID);
+        assert!(outcome.handled, "{outcome:?}");
+        let local = runtime.local_state();
+        assert_eq!(
+            local.widgets,
+            (false, true),
+            "backend-presented front child press must mutate only the visually front child"
+        );
+    }
+
+    #[test]
+    fn child_local_back_hit_cannot_fabricate_front_dispatch() {
+        type LayeredHitRuntimeWidget<'a> =
+            SlipwayIcedRuntimeWidget<'a, slipway_core::SlipwayAppWidget<LayeredHitApp>>;
+
+        let app = slipway_core::SlipwayAppWidget::new(LayeredHitApp {
+            widgets: (
+                LayeredHitChild::new("iced.layer-hit.lower", 0),
+                LayeredHitChild::new("iced.layer-hit.front", 1),
+            ),
+        });
+        let runtime = SlipwayRuntime::new(app, ());
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let mut tree = iced::advanced::widget::Tree {
+            tag: <LayeredHitRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                (),
+            >>::tag(&widget),
+            state: <LayeredHitRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                (),
+            >>::state(&widget),
+            children: <LayeredHitRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                (),
+            >>::children(&widget),
+        };
+        let renderer = ();
+        let limits = iced::advanced::layout::Limits::new(
+            iced::Size::new(0.0, 0.0),
+            iced::Size::new(100.0, 80.0),
+        );
+        let node = <LayeredHitRuntimeWidget<'_> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            (),
+        >>::layout(&mut widget, &mut tree, &renderer, &limits);
+        let layout = iced::advanced::Layout::new(&node);
+        let lower_presentation = tree.children[0]
+            .state
+            .downcast_ref::<IcedRuntimeTreeState>()
+            .presentation
+            .as_ref()
+            .expect("lower child layout must have presentation")
+            .clone();
+        let mut hovered_region = None;
+        let mut pressed_region = None;
+        let mut indicator_drag = None;
+        let mut focused_region = None;
+        let routed = route_iced_event(
+            &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            layout.child(0).bounds(),
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(12.0, 12.0)),
+            Some(&lower_presentation),
+            &mut hovered_region,
+            &mut pressed_region,
+            &mut indicator_drag,
+            &mut focused_region,
+        )
+        .expect("local lower hit can be observed before root dispatch filtering");
+
+        assert!(
+            routed.input.is_none(),
+            "lower child must not publish an event when root dispatch selects the front sibling"
+        );
+        assert!(
+            !routed.capture_event,
+            "lower child must not capture a pointer owned by the front sibling"
         );
     }
 
@@ -18176,6 +26231,7 @@ mod tests {
 
         let mut hovered_region = None;
         let mut pressed_region = Some(pressed_capture("titlebar-hit"));
+        let mut indicator_drag = None;
         let mut focused_region = None;
         let routed = route_iced_event(
             &iced::Event::Mouse(iced::mouse::Event::CursorMoved {
@@ -18191,6 +26247,7 @@ mod tests {
             Some(&presentation),
             &mut hovered_region,
             &mut pressed_region,
+            &mut indicator_drag,
             &mut focused_region,
         )
         .expect("captured cursor move outside titlebar still routes");
@@ -18205,6 +26262,10 @@ mod tests {
         assert_eq!(pointer.kind, slipway_core::PointerEventKind::Move);
         assert_eq!(pointer.target, WidgetId::from("captured-drag-move-test"));
         assert_eq!(pointer.position, Point { x: 170.0, y: 96.0 });
+        assert!(
+            pointer.details.buttons.primary,
+            "captured mouse drag moves must preserve the pressed primary button state"
+        );
         let evidence = input
             .dispatch_evidence
             .as_ref()
@@ -18308,6 +26369,7 @@ mod tests {
 
         let mut hovered_region = None;
         let mut pressed_region = Some(pressed_capture("titlebar-hit"));
+        let mut indicator_drag = None;
         let mut focused_region = None;
         let routed = route_iced_event(
             &iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
@@ -18323,6 +26385,7 @@ mod tests {
             Some(&presentation),
             &mut hovered_region,
             &mut pressed_region,
+            &mut indicator_drag,
             &mut focused_region,
         )
         .expect("captured release outside titlebar still routes");
@@ -18428,6 +26491,7 @@ mod tests {
 
         let mut hovered_region = None;
         let mut pressed_region = Some(pressed_capture_with_origin("titlebar-hit", 0.0, 160.0));
+        let mut indicator_drag = None;
         let mut focused_region = None;
         let routed = route_iced_event(
             &iced::Event::Mouse(iced::mouse::Event::CursorMoved {
@@ -18443,6 +26507,7 @@ mod tests {
             Some(&presentation),
             &mut hovered_region,
             &mut pressed_region,
+            &mut indicator_drag,
             &mut focused_region,
         )
         .expect("captured move must route through the retained press frame");
@@ -18549,6 +26614,7 @@ mod tests {
             20.0,
             30.0,
         ));
+        let mut indicator_drag = None;
         let mut focused_region = None;
         let routed = route_iced_event(
             &iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: cursor }),
@@ -18557,6 +26623,7 @@ mod tests {
             Some(&presentation),
             &mut hovered_region,
             &mut pressed_region,
+            &mut indicator_drag,
             &mut focused_region,
         )
         .expect("captured child drag routes even when the window has a non-zero origin");
@@ -18681,6 +26748,919 @@ mod tests {
             indicator_shapes.len(),
             2,
             "custom/internal scroll regions still need visible scroll evidence in a pass-through paint layer"
+        );
+    }
+
+    #[test]
+    fn parent_presentation_does_not_paint_descendant_scroll_indicator() {
+        let root = WidgetId::from("parent-scroll-indicator-root");
+        let child = WidgetId::from("parent-scroll-indicator-child");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let child_bounds = Rect {
+            origin: Point { x: 20.0, y: 240.0 },
+            size: Size {
+                width: 160.0,
+                height: 90.0,
+            },
+        };
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(702),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 240.0,
+                        height: 380.0,
+                    },
+                }),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: child.clone(),
+                    bounds: slipway_core::ParentLocalRect::new(child_bounds),
+                    local_state_slot: Some(child_slot.clone()),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![
+                ScrollRegionDeclaration::explicit(
+                    PresentationRegionId::from("root-native-scroll"),
+                    root.clone(),
+                    Some(root_slot),
+                    TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 240.0,
+                            height: 120.0,
+                        },
+                    }),
+                    TargetLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 240.0,
+                            height: 380.0,
+                        },
+                    }),
+                    Point { x: 0.0, y: 160.0 },
+                    slipway_core::ScrollAxes {
+                        horizontal: false,
+                        vertical: true,
+                    },
+                    slipway_core::WheelRouting::SelfFirst,
+                    HitRegionOrder {
+                        z_index: 0,
+                        paint_order: 0,
+                        traversal_order: 0,
+                    },
+                    slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+                    true,
+                ),
+                ScrollRegionDeclaration::explicit(
+                    PresentationRegionId::from("child-internal-scroll"),
+                    child,
+                    Some(child_slot),
+                    TargetLocalRect::new(Rect {
+                        origin: Point { x: 4.0, y: 4.0 },
+                        size: Size {
+                            width: 120.0,
+                            height: 48.0,
+                        },
+                    }),
+                    TargetLocalRect::new(Rect {
+                        origin: Point { x: 4.0, y: 4.0 },
+                        size: Size {
+                            width: 120.0,
+                            height: 144.0,
+                        },
+                    }),
+                    Point { x: 0.0, y: 36.0 },
+                    slipway_core::ScrollAxes {
+                        horizontal: false,
+                        vertical: true,
+                    },
+                    slipway_core::WheelRouting::SelfFirst,
+                    HitRegionOrder {
+                        z_index: 0,
+                        paint_order: 0,
+                        traversal_order: 0,
+                    },
+                    slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+                    true,
+                ),
+            ],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 240.0,
+                        height: 120.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 240.0,
+                        height: 120.0,
+                    },
+                },
+            },
+            root,
+        );
+
+        let indicator_shapes = presentation
+            .explicit_layer_paint_units
+            .iter()
+            .flat_map(|unit| paint_shape_ids(&unit.paint))
+            .into_iter()
+            .filter(|id| id.contains("scroll-indicator"))
+            .collect::<Vec<_>>();
+        assert!(
+            indicator_shapes.is_empty(),
+            "a parent/root presentation must not paint descendant scroll indicators outside its native scroll clipping context"
+        );
+    }
+
+    // --- Step 210: declared scroll-indicator control (ScrollIndicatorMode) ---
+
+    fn declared_indicator_routed_view(
+        indicator: slipway_core::ScrollIndicatorMode,
+        frame_index: u64,
+    ) -> ViewDefinition {
+        // Routed (paint-only) region: self-targeted, no child placements,
+        // vertical, overflowing — exactly the shape iced's Auto conditions
+        // synthesize an indicator for.
+        let target = WidgetId::from("declared-indicator-target");
+        let viewport = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 200.0,
+                height: 100.0,
+            },
+        };
+        let content = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 200.0,
+                height: 300.0,
+            },
+        };
+        let region = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("declared-indicator-region"),
+            target.clone(),
+            None,
+            TargetLocalRect::new(viewport),
+            TargetLocalRect::new(content),
+            Point { x: 0.0, y: 40.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        )
+        .with_scroll_indicator(indicator);
+        ViewDefinition {
+            target: target.clone(),
+            frame: frame(frame_index),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(viewport),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(target),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![region],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn declared_indicator_shape_ids(view: ViewDefinition) -> Vec<String> {
+        let target = view.target.clone();
+        let viewport = view.layout.bounds.into_rect();
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            target,
+        );
+        presentation
+            .explicit_layer_paint_units
+            .iter()
+            .flat_map(|unit| paint_shape_ids(&unit.paint))
+            .filter(|id| id.contains("scroll-indicator"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    // Auto = byte-identical pre-control conditions: the routed overflowing
+    // region synthesizes track + thumb (the control case the Hidden test
+    // contrasts against).
+    #[test]
+    fn declared_indicator_auto_synthesizes_for_routed_overflowing_region() {
+        let ids = declared_indicator_shape_ids(declared_indicator_routed_view(
+            slipway_core::ScrollIndicatorMode::Auto,
+            720,
+        ));
+        assert!(
+            ids.iter().any(|id| id.contains("scroll-indicator-track"))
+                && ids.iter().any(|id| id.contains("scroll-indicator-thumb")),
+            "Auto must keep the pre-control synthesis: {ids:?}"
+        );
+    }
+
+    // Revert-and-fail guard: if the Hidden honor in
+    // `iced_scroll_indicator_paint` is reverted, the indicator reappears and
+    // this test fails.
+    #[test]
+    fn declared_indicator_hidden_suppresses_synthetic_indicator_even_when_auto_would_paint() {
+        let ids = declared_indicator_shape_ids(declared_indicator_routed_view(
+            slipway_core::ScrollIndicatorMode::Hidden,
+            721,
+        ));
+        assert!(
+            ids.is_empty(),
+            "Hidden must never synthesize an indicator: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn declared_indicator_visible_synthesizes_for_routed_overflowing_region() {
+        let ids = declared_indicator_shape_ids(declared_indicator_routed_view(
+            slipway_core::ScrollIndicatorMode::Visible,
+            722,
+        ));
+        assert!(
+            ids.iter().any(|id| id.contains("scroll-indicator-track"))
+                && ids.iter().any(|id| id.contains("scroll-indicator-thumb")),
+            "Visible must synthesize for a geometrically sensible region: {ids:?}"
+        );
+    }
+
+    // Native-backed regions: the declared mode maps onto the NATIVE
+    // scrollable's rail — Hidden uses the zero-width `Scrollbar::hidden()`,
+    // Auto/Visible keep the byte-identical default rail; no synthetic
+    // indicator is drawn over a native region in any mode.
+    #[test]
+    fn declared_indicator_maps_to_native_scrollbar_rail() {
+        let base = declared_indicator_routed_view(slipway_core::ScrollIndicatorMode::Auto, 723);
+        let auto_region = base.scroll_regions[0].clone();
+        let hidden_region = auto_region
+            .clone()
+            .with_scroll_indicator(slipway_core::ScrollIndicatorMode::Hidden);
+        let visible_region = auto_region
+            .clone()
+            .with_scroll_indicator(slipway_core::ScrollIndicatorMode::Visible);
+
+        assert_eq!(
+            iced_scroll_direction(&hidden_region),
+            iced::widget::scrollable::Direction::Vertical(
+                iced::widget::scrollable::Scrollbar::hidden()
+            )
+        );
+        assert_eq!(
+            iced_scroll_direction(&auto_region),
+            iced::widget::scrollable::Direction::Vertical(
+                iced::widget::scrollable::Scrollbar::default()
+            )
+        );
+        assert_eq!(
+            iced_scroll_direction(&visible_region),
+            iced::widget::scrollable::Direction::Vertical(
+                iced::widget::scrollable::Scrollbar::default()
+            )
+        );
+    }
+
+    #[test]
+    fn declared_indicator_visible_does_not_double_draw_over_native_region() {
+        // Rebuild the routed fixture as a NATIVE-backed region (real child
+        // placement inside the scroll content) declared Visible: no
+        // synthetic indicator may be drawn over the native scrollbar.
+        let mut view =
+            declared_indicator_routed_view(slipway_core::ScrollIndicatorMode::Visible, 724);
+        let root_slot = WidgetSlotAddress::new(view.target.clone(), 0);
+        let child = WidgetId::from("declared-indicator-native-child");
+        let child_slot = root_slot.child(child.clone(), 0);
+        view.scroll_regions[0].address = Some(root_slot);
+        view.layout
+            .child_placements
+            .push(slipway_core::ChildPlacement {
+                child,
+                bounds: slipway_core::ParentLocalRect::new(Rect {
+                    origin: Point { x: 10.0, y: 10.0 },
+                    size: Size {
+                        width: 60.0,
+                        height: 40.0,
+                    },
+                }),
+                local_state_slot: Some(child_slot),
+            });
+        let ids = declared_indicator_shape_ids(view);
+        assert!(
+            ids.is_empty(),
+            "Visible on a native-backed region must leave the indicator to the native scrollbar: {ids:?}"
+        );
+    }
+
+    // --- Step 212: interactive synthetic indicators (thumb drag + track jump) ---
+
+    fn declared_indicator_presentation(frame_index: u64) -> IcedPresentationState {
+        let view =
+            declared_indicator_routed_view(slipway_core::ScrollIndicatorMode::Auto, frame_index);
+        let viewport = view.layout.bounds.into_rect();
+        let target = view.target.clone();
+        IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            target,
+        )
+    }
+
+    fn route_indicator_event(
+        presentation: &IcedPresentationState,
+        event: iced::Event,
+        position: iced::Point,
+        indicator_drag: &mut Option<IcedIndicatorDragState>,
+    ) -> Option<IcedRoutedInput> {
+        let mut hovered = None;
+        let mut pressed = None;
+        let mut focused = None;
+        route_iced_event(
+            &event,
+            iced::Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+            },
+            iced::advanced::mouse::Cursor::Available(position),
+            Some(presentation),
+            &mut hovered,
+            &mut pressed,
+            indicator_drag,
+            &mut focused,
+        )
+    }
+
+    fn routed_scroll_offset_y(routed: &IcedRoutedInput) -> f32 {
+        let input = routed
+            .input
+            .as_ref()
+            .expect("indicator interaction must synthesize a scroll input");
+        let InputEvent::Scroll(scroll) = &input.event else {
+            panic!("indicator interaction must synthesize InputEvent::Scroll");
+        };
+        assert_eq!(
+            scroll.region_id,
+            PresentationRegionId::from("declared-indicator-region")
+        );
+        scroll.offset_y
+    }
+
+    // The fixture's synthetic indicator geometry (from
+    // `iced_synthetic_indicator_geometry`, the shared source): viewport
+    // (0,0,200,100), content 300, offset 40 -> track (191,4,5,92), thumb
+    // height 92/3 ≈ 30.67, thumb top 4 + 61.33*(40/200) ≈ 16.27.
+
+    // REVERT-AND-FAIL for the interactive-indicator seam: reverting the
+    // press/move handling in `route_iced_event` makes the press fall
+    // through to (empty) hit resolution and this test fails.
+    #[test]
+    fn synthetic_indicator_thumb_drag_synthesizes_scroll_input() {
+        let presentation = declared_indicator_presentation(730);
+        let mut drag = None;
+
+        // Press on the thumb: captured, no event yet.
+        let routed = route_indicator_event(
+            &presentation,
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Point::new(193.0, 20.0),
+            &mut drag,
+        )
+        .expect("thumb press must be claimed by the indicator");
+        assert!(routed.capture_event);
+        assert!(routed.input.is_none());
+        let state = drag.clone().expect("thumb press must start a drag capture");
+        assert_eq!(state.start_offset_y, 40.0);
+
+        // Drag down 30px: offset advances by 30 * max_offset / travel,
+        // through a synthesized declared Scroll event.
+        let routed = route_indicator_event(
+            &presentation,
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                position: iced::Point::new(193.0, 50.0),
+            }),
+            iced::Point::new(193.0, 50.0),
+            &mut drag,
+        )
+        .expect("captured drag move must route");
+        let expected = 40.0 + 30.0 * state.max_offset / state.track_travel;
+        let offset = routed_scroll_offset_y(&routed);
+        assert!(
+            (offset - expected).abs() < 0.5,
+            "drag must map track travel to the declared offset: got {offset}, expected {expected}"
+        );
+
+        // Release ends the capture and consumes.
+        let routed = route_indicator_event(
+            &presentation,
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
+            iced::Point::new(193.0, 50.0),
+            &mut drag,
+        )
+        .expect("release of an indicator drag must be consumed");
+        assert!(routed.capture_event);
+        assert!(routed.input.is_none());
+        assert!(drag.is_none(), "release must end the drag capture");
+    }
+
+    // Track click = JUMP-TO-POSITION (the documented semantics): the thumb
+    // centers on the click and the press keeps dragging from there.
+    #[test]
+    fn synthetic_indicator_track_click_jumps_to_position() {
+        let presentation = declared_indicator_presentation(731);
+        let mut drag = None;
+        let routed = route_indicator_event(
+            &presentation,
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Point::new(193.0, 92.0),
+            &mut drag,
+        )
+        .expect("track press must be claimed by the indicator");
+        let offset = routed_scroll_offset_y(&routed);
+        assert_eq!(
+            offset, 200.0,
+            "a click at the track bottom must jump to the max offset (clamped)"
+        );
+        let state = drag.expect("track click keeps dragging from the jumped position");
+        assert_eq!(state.start_offset_y, 200.0);
+    }
+
+    // The synthesized hit surface must not collide with authored content
+    // stacked ABOVE the indicator layer: an opaque authored layer at a
+    // higher z owns its pixels (the overlay-panel case).
+    #[test]
+    fn synthetic_indicator_press_defers_to_opaque_layer_above_it() {
+        let mut view = declared_indicator_routed_view(slipway_core::ScrollIndicatorMode::Auto, 732);
+        view.paint.push(
+            PaintOp::keyed_layer(
+                PaintLayerKey::ordered(SCROLL_INDICATOR_LAYER_Z + 1, 0),
+                vec![PaintOp::Fill {
+                    shape: ShapeDeclaration {
+                        id: Some("covering-panel".to_string()),
+                        kind: ShapeKind::Rectangle,
+                        bounds: Rect {
+                            origin: Point { x: 180.0, y: 0.0 },
+                            size: Size {
+                                width: 20.0,
+                                height: 100.0,
+                            },
+                        },
+                        path: None,
+                        clip: None,
+                    },
+                    color: slipway_core::Color {
+                        red: 1.0,
+                        green: 1.0,
+                        blue: 1.0,
+                        alpha: 1.0,
+                    },
+                }],
+            )
+            .with_layer_id("covering-panel-layer"),
+        );
+        let viewport = view.layout.bounds.into_rect();
+        let target = view.target.clone();
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            target,
+        );
+        let mut drag = None;
+        let routed = route_indicator_event(
+            &presentation,
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Point::new(193.0, 20.0),
+            &mut drag,
+        );
+        assert!(
+            drag.is_none(),
+            "a press under an opaque fronting layer must not start an indicator drag"
+        );
+        // The press is consumed by the occluding layer (paint occlusion),
+        // not by the indicator: no scroll input is synthesized.
+        if let Some(routed) = routed {
+            assert!(routed.input.is_none());
+        }
+    }
+
+    /// Rebuilds the reference example's nested card EXACTLY as the live
+    /// composed app mounts it (Step 211 repro): a leaf child widget view
+    /// with one Auto outer region and overlapping patched inner regions
+    /// (Visible / Hidden), runtime-slot-mounted the way
+    /// `iced_presentation_for_widget_with_root_origin` mounts children of a
+    /// `SlipwayAppWidget`, then presented with the child's declared
+    /// capabilities. Returns every scroll-indicator shape id in the
+    /// presentation's DRAWN paint lists (local + explicit-layer).
+    fn mounted_nested_card_indicator_shape_ids(frame_index: u64) -> Vec<String> {
+        let app = WidgetId::from("authored.app");
+        let target = WidgetId::from("authored.nested");
+        let card = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 560.0,
+                height: 176.0,
+            },
+        };
+        let outer_band = Rect {
+            origin: Point { x: 0.0, y: 28.0 },
+            size: Size {
+                width: 560.0,
+                height: 136.0,
+            },
+        };
+        let order = |index: usize| HitRegionOrder {
+            z_index: if index == 0 { 0 } else { 1 },
+            paint_order: index,
+            traversal_order: index,
+        };
+        let mut scroll_regions = vec![ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("authored.nested:outer"),
+            target.clone(),
+            Some(WidgetSlotAddress::new(target.clone(), 0)),
+            TargetLocalRect::new(outer_band),
+            TargetLocalRect::new(Rect {
+                origin: outer_band.origin,
+                size: Size {
+                    width: 560.0,
+                    height: 152.0,
+                },
+            }),
+            Point { x: 0.0, y: 0.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            order(0),
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        )];
+        for panel in 0..2usize {
+            let field = Rect {
+                origin: Point {
+                    x: 12.0,
+                    y: 46.0 + panel as f32 * 76.0,
+                },
+                size: Size {
+                    width: 536.0,
+                    height: 42.0,
+                },
+            };
+            scroll_regions.push(
+                ScrollRegionDeclaration::explicit(
+                    PresentationRegionId::from(format!("authored.nested:inner-{panel}")),
+                    target.clone(),
+                    Some(WidgetSlotAddress::new(target.clone(), 0)),
+                    TargetLocalRect::new(field),
+                    TargetLocalRect::new(Rect {
+                        origin: field.origin,
+                        size: Size {
+                            width: field.size.width,
+                            height: 112.0,
+                        },
+                    }),
+                    Point { x: 0.0, y: 0.0 },
+                    slipway_core::ScrollAxes {
+                        horizontal: false,
+                        vertical: true,
+                    },
+                    slipway_core::WheelRouting::NearestScrollable,
+                    order(panel + 1),
+                    slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+                    true,
+                )
+                .with_scroll_indicator(if panel == 0 {
+                    slipway_core::ScrollIndicatorMode::Visible
+                } else {
+                    slipway_core::ScrollIndicatorMode::Hidden
+                }),
+            );
+        }
+        let mut view = ViewDefinition {
+            target: target.clone(),
+            frame: frame(frame_index),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(card),
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+            paint: vec![PaintOp::Fill {
+                shape: ShapeDeclaration {
+                    id: Some("nested-panel".to_string()),
+                    kind: ShapeKind::RoundedRectangle,
+                    bounds: card,
+                    path: None,
+                    clip: None,
+                },
+                color: test_rgb(248, 250, 252),
+            }],
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(target.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions,
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        // The live child path (`iced_presentation_for_widget_with_root_origin`)
+        // mounts the runtime slot into the view before presenting.
+        let runtime_slot = WidgetSlotAddress::new(app, 0).child(target.clone(), 3);
+        apply_runtime_slot_to_view_definition(&mut view, &runtime_slot);
+        let presentation =
+            IcedPresentationState::from_view_definition_with_capabilities_and_address(
+                view,
+                &[
+                    Capability::WheelInput,
+                    Capability::ScrollRegionPresentation,
+                    Capability::Paint,
+                ],
+                LayoutInput {
+                    viewport: TargetLocalRect::new(card),
+                    constraints: LayoutConstraints {
+                        min: Size {
+                            width: 0.0,
+                            height: 0.0,
+                        },
+                        max: card.size,
+                    },
+                },
+                target,
+                Some(runtime_slot),
+                3,
+                Point { x: 16.0, y: 428.0 },
+            );
+        presentation
+            .local_paint
+            .iter()
+            .flat_map(|op| paint_shape_ids(std::slice::from_ref(op)))
+            .map(str::to_string)
+            .chain(
+                presentation
+                    .explicit_layer_paint_units
+                    .iter()
+                    .flat_map(|unit| paint_shape_ids(&unit.paint))
+                    .map(str::to_string),
+            )
+            .filter(|id| id.contains("scroll-indicator"))
+            .collect()
+    }
+
+    // Step 211 guard for the composed-app Visible bug: the Step 210 fixture
+    // tests only covered UNMOUNTED views (address = None) and only asserted
+    // op PRESENCE, so the live composed app shipped without a rendered
+    // Visible indicator. This test pins the MOUNTED child construction the
+    // live app actually runs.
+    #[test]
+    fn declared_indicator_visible_renders_in_mounted_composed_child_presentation() {
+        let ids = mounted_nested_card_indicator_shape_ids(725);
+        assert!(
+            ids.iter()
+                .any(|id| id == "authored.nested:inner-0:scroll-indicator-track")
+                && ids
+                    .iter()
+                    .any(|id| id == "authored.nested:inner-0:scroll-indicator-thumb"),
+            "the mounted Visible inner region must synthesize track+thumb: {ids:?}"
+        );
+        assert!(
+            ids.iter()
+                .any(|id| id == "authored.nested:outer:scroll-indicator-track"),
+            "the mounted Auto outer region must keep its indicator: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.contains("inner-1")),
+            "the mounted Hidden inner region must stay suppressed: {ids:?}"
+        );
+    }
+
+    /// Step 211 revert-and-fail guard for the COMPOSITING half of the live
+    /// Visible bug (the half op-presence assertions cannot see): iced draws
+    /// an UNCLIPPED layer's quads into the parent layer bucket, and every
+    /// authored clipped Group composites as its own sub-layer ON TOP of that
+    /// bucket — so an unclipped synthetic indicator layer is silently
+    /// covered by any clipped authored paint it overlaps (the reference
+    /// example's nested inner panels; live pixel evidence in the Step 211
+    /// packet). The synthesized indicator layer must therefore carry a layer
+    /// clip so `draw_group_ops` gives it its own composited sub-layer.
+    /// Reverting the `with_layer_clip` in
+    /// `from_view_definition_with_capabilities_and_address` fails this test.
+    #[test]
+    fn declared_indicator_layer_is_clip_composited_above_authored_clipped_groups() {
+        let view = declared_indicator_routed_view(slipway_core::ScrollIndicatorMode::Visible, 726);
+        let target = view.target.clone();
+        let viewport = view.layout.bounds.into_rect();
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            target,
+        );
+        let indicator_layers: Vec<&PaintOp> = presentation
+            .explicit_layer_paint_units
+            .iter()
+            .flat_map(|unit| unit.paint.iter())
+            .filter(|op| {
+                paint_shape_ids(std::slice::from_ref(*op))
+                    .iter()
+                    .any(|id| id.contains("scroll-indicator"))
+            })
+            .collect();
+        assert!(
+            !indicator_layers.is_empty(),
+            "expected a synthetic indicator layer in the explicit-layer paint units"
+        );
+        for op in indicator_layers {
+            let PaintOp::Layer { clip, .. } = op else {
+                panic!("the synthetic indicator ops must be wrapped in a Layer op: {op:?}");
+            };
+            let clip = clip
+                .as_ref()
+                .expect("the synthetic indicator layer must carry a layer clip so it composites as its own iced sub-layer above authored clipped groups");
+            assert_eq!(
+                clip.bounds, viewport,
+                "the indicator layer clip must cover the view layout bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn native_scroll_content_layout_does_not_pre_apply_scroll_offset() {
+        let root = WidgetId::from("native-scroll-content-root");
+        let child = WidgetId::from("native-scroll-content-child");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("native-scroll"),
+            root.clone(),
+            Some(root_slot),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 80.0,
+                },
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 120.0,
+                    height: 280.0,
+                },
+            }),
+            Point { x: 0.0, y: 96.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::SelfFirst,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(703),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 160.0,
+                        height: 340.0,
+                    },
+                }),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child,
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 18.0, y: 170.0 },
+                        size: Size {
+                            width: 80.0,
+                            height: 40.0,
+                        },
+                    }),
+                    local_state_slot: Some(child_slot),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                }),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: Size {
+                        width: 120.0,
+                        height: 80.0,
+                    },
+                },
+            },
+            root,
+        );
+        let native = native_iced_scroll_regions(&presentation);
+        assert_eq!(native.len(), 1);
+
+        let adjusted = adjusted_scroll_child_placements(&presentation, &native[0]);
+        assert_eq!(
+            adjusted[0].bounds.into_rect().origin,
+            Point { x: 18.0, y: 170.0 },
+            "native iced Scrollable applies the runtime offset; Slipway child layout must remain content-local"
+        );
+        assert_eq!(
+            scroll_content_root_origin(&presentation, &native[0]),
+            Point { x: 0.0, y: 0.0 },
+            "root origin for native scroll content is the declared content origin, not origin + offset"
         );
     }
 
@@ -18822,7 +27802,7 @@ mod tests {
     }
 
     #[test]
-    fn same_slot_internal_scroll_region_gets_indicator_not_native_scrollable() {
+    fn parent_presentation_does_not_paint_same_slot_child_scroll_indicator() {
         let root = WidgetId::from("same-slot-scroll-root");
         let child = WidgetId::from("same-slot-scroll-child");
         let child_slot = WidgetSlotAddress::new(root.clone(), 0).child(child.clone(), 0);
@@ -18920,7 +27900,10 @@ mod tests {
             .into_iter()
             .filter(|id| id.contains("scroll-indicator"))
             .collect::<Vec<_>>();
-        assert_eq!(indicator_shapes.len(), 2);
+        assert!(
+            indicator_shapes.is_empty(),
+            "a parent/root presentation must not paint a child-owned same-slot scroll indicator outside the child/root scroll clipping context"
+        );
     }
 
     #[test]
@@ -19091,6 +28074,606 @@ mod tests {
         );
     }
 
+    // Fixture for the composite-child hit-geometry staleness regression.
+    //
+    // A composite app (`SlipwayAppWidget`) flattens its children's hit regions
+    // into its own presentation. `MovableHitChild` moves its own hit region on a
+    // pointer event via a CHILD-LOCAL change (no emitted message), so the next
+    // frame's dirty scope targets the child and the composite presentation is
+    // reused rather than rebuilt. The composite's flattened copy of the child's
+    // hit region must still follow the child's fresh geometry, otherwise the
+    // composite `ViewRootLocal` dispatch hit-tests the pre-move rect one rebuild
+    // behind (the drag-release -> next-press defect).
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct MovableHitLocal {
+        moved: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct MovableHitChild;
+
+    impl MovableHitChild {
+        const REST_X: f32 = 0.0;
+        const MOVED_X: f32 = 40.0;
+
+        fn hit_bounds(local: &MovableHitLocal) -> TargetLocalRect {
+            let x = if local.moved {
+                Self::MOVED_X
+            } else {
+                Self::REST_X
+            };
+            TargetLocalRect::new(Rect {
+                origin: Point { x, y: 0.0 },
+                size: Size {
+                    width: 20.0,
+                    height: 40.0,
+                },
+            })
+        }
+    }
+
+    impl SlipwayWidgetTypes for MovableHitChild {
+        type ExternalState = ();
+        type LocalState = MovableHitLocal;
+        type AppMessage = Message;
+    }
+
+    impl SlipwaySsot for MovableHitChild {
+        fn id(&self) -> WidgetId {
+            WidgetId::from("iced.movable-hit")
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::PointerInput, Capability::Paint]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for MovableHitChild {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            local.moved = true;
+            let change = slipway_core::ChangeEvidence {
+                target: self.id(),
+                slot: Some(WidgetSlotAddress::new(self.id(), 0)),
+                field: "moved".to_string(),
+                before: Some("false".to_string()),
+                after: Some("true".to_string()),
+            };
+            EventOutcome {
+                handled: true,
+                propagate: false,
+                emitted_messages: Vec::new(),
+                changes: vec![change],
+                observations: Vec::new(),
+                probes: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayView for MovableHitChild {
+        fn initial_local_state(&self) -> Self::LocalState {
+            MovableHitLocal::default()
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            vec![StateObservation {
+                target: self.id(),
+                slot: None,
+                name: "moved".to_string(),
+                value: local.moved.to_string(),
+            }]
+        }
+    }
+
+    impl SlipwayViewDefinition for MovableHitChild {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            let region = slipway_core::hit_region_from_pointer_capability(
+                self,
+                external,
+                local,
+                PresentationRegionId::from("iced.movable-hit.hit"),
+                None,
+                Self::hit_bounds(local),
+                slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                slipway_core::HitRegionOrder {
+                    z_index: 0,
+                    paint_order: 0,
+                    traversal_order: 0,
+                },
+                Some("iced.movable-hit.route".to_string()),
+                CursorCapability::Pointer,
+                true,
+                slipway_core::PointerCaptureIntent::OnPress,
+            );
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                layout,
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: vec![region],
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl_iced_test_leaf_children!(MovableHitChild);
+    impl_iced_test_event_policy!(MovableHitChild);
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct MovableHitApp {
+        widgets: (MovableHitChild,),
+    }
+
+    impl slipway_core::SlipwayApp for MovableHitApp {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = Message;
+        type Widgets = (MovableHitChild,);
+
+        fn id(&self) -> WidgetId {
+            WidgetId::from("iced.movable-app")
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout_plan(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+            children: Vec<slipway_core::ChildLayoutSeed>,
+        ) -> slipway_core::AppLayoutPlan {
+            slipway_core::AppLayoutPlan {
+                bounds: input.viewport,
+                children: children
+                    .into_iter()
+                    .map(|seed| {
+                        let bounds = Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: Size {
+                                width: 100.0,
+                                height: 40.0,
+                            },
+                        };
+                        slipway_core::ChildLayoutPlan::placed_for_seed(
+                            seed,
+                            iced_child_layout_input(bounds),
+                            slipway_core::ParentLocalRect::new(bounds),
+                        )
+                    })
+                    .collect(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    fn composite_movable_hit_bounds_x(tree: &iced::advanced::widget::Tree) -> f32 {
+        let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
+        let presentation = state
+            .presentation
+            .as_ref()
+            .expect("composite presentation exists after layout");
+        presentation
+            .hit_regions
+            .iter()
+            .find(|region| region.id.as_str() == "iced.movable-hit.hit")
+            .expect("composite flattens the child hit region")
+            .bounds
+            .into_rect()
+            .origin
+            .x
+    }
+
+    #[test]
+    fn composite_dispatch_hit_geometry_follows_child_local_change_without_rebuild() {
+        type MovableRuntimeWidget<'a> =
+            SlipwayIcedRuntimeWidget<'a, slipway_core::SlipwayAppWidget<MovableHitApp>>;
+
+        let mut runtime = SlipwayRuntime::from_app(
+            MovableHitApp {
+                widgets: (MovableHitChild,),
+            },
+            (),
+        );
+        let renderer = RecordingRenderer::default();
+        let limits = iced::advanced::layout::Limits::new(
+            iced::Size::new(0.0, 0.0),
+            iced::Size::new(100.0, 40.0),
+        );
+
+        // Frame 1: build the composite tree with the child hit region at rest.
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let mut tree = iced::advanced::widget::Tree {
+            tag: <MovableRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::tag(&widget),
+            state: <MovableRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::state(&widget),
+            children: <MovableRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::children(&widget),
+        };
+        let _ = <MovableRuntimeWidget<'_> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >>::layout(&mut widget, &mut tree, &renderer, &limits);
+
+        assert_eq!(
+            composite_movable_hit_bounds_x(&tree),
+            MovableHitChild::REST_X,
+            "composite flattens the child hit region at its rest position"
+        );
+
+        // Route a press onto the child's rest hit region through the composite
+        // presentation and apply it. The child records a child-local change that
+        // moves its hit region; the next frame's dirty scope targets the child.
+        let press_input = {
+            let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
+            let presentation = state
+                .presentation
+                .as_ref()
+                .expect("composite presentation exists")
+                .clone();
+            let mut hovered = None;
+            let mut pressed = None;
+            let mut focused = None;
+            route_iced_event(
+                &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                iced::Rectangle {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                iced::advanced::mouse::Cursor::Available(iced::Point::new(5.0, 20.0)),
+                Some(&presentation),
+                &mut hovered,
+                &mut pressed,
+                &mut None,
+                &mut focused,
+            )
+            .expect("press over the rest hit region routes to the child")
+            .input
+            .expect("press yields a declared backend input")
+        };
+
+        let report = runtime.apply_backend_input_event_for_backend_with_app_reducer(
+            press_input,
+            ICED_BACKEND_ID,
+            &mut |_external, _messages: Vec<Message>| {},
+        );
+        assert!(report.handled, "child press must be handled: {report:?}");
+
+        // Frame 2: reuse the SAME tree. The composite presentation is REUSED
+        // (dirty scope targets the child, not the app), and the child rebuilds
+        // at its moved position. The composite's flattened dispatch hit geometry
+        // must follow the child without a full composite rebuild.
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let _ = <MovableRuntimeWidget<'_> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >>::layout(&mut widget, &mut tree, &renderer, &limits);
+
+        assert_eq!(
+            composite_movable_hit_bounds_x(&tree),
+            MovableHitChild::MOVED_X,
+            "reused composite dispatch hit geometry must follow the child-local move \
+             (regression: it lagged one rebuild behind, so the moved-to press missed)"
+        );
+    }
+
+    // Fixture for the Step 213 regression: the SAME composite-staleness class,
+    // with the app-level PAGE scroll region mounted (Step 212
+    // `SlipwayApp::app_scroll_regions`). When the page region appears, every
+    // child placement moves INSIDE the native scrollable's content tree and
+    // the root's direct child trees become UNPLACED. Their frozen
+    // presentations must stop contributing: if they keep hit-region copies,
+    // the composite refresh harvests the frozen rects and overwrites the
+    // CURRENT copies collected from the scrollable subtree, so the composed
+    // dispatch context stays permanently stale — a press at the panel's real
+    // position is then resolved by the mounted child but dropped against the
+    // stale context, with no refusal evidence (the live Step 213 symptom).
+    #[derive(Clone, Debug, PartialEq)]
+    struct MovablePageApp {
+        widgets: (MovableHitChild,),
+    }
+
+    impl MovablePageApp {
+        const COLUMN_HEIGHT: f32 = 80.0;
+    }
+
+    impl slipway_core::SlipwayApp for MovablePageApp {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = Message;
+        type Widgets = (MovableHitChild,);
+
+        fn id(&self) -> WidgetId {
+            WidgetId::from("iced.movable-page-app")
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout_plan(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+            children: Vec<slipway_core::ChildLayoutSeed>,
+        ) -> slipway_core::AppLayoutPlan {
+            slipway_core::AppLayoutPlan {
+                bounds: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: Self::COLUMN_HEIGHT.max(input.viewport.size.height),
+                    },
+                }),
+                children: children
+                    .into_iter()
+                    .map(|seed| {
+                        let bounds = Rect {
+                            origin: Point { x: 0.0, y: 0.0 },
+                            size: Size {
+                                width: 100.0,
+                                height: 40.0,
+                            },
+                        };
+                        slipway_core::ChildLayoutPlan::placed_for_seed(
+                            seed,
+                            iced_child_layout_input(bounds),
+                            slipway_core::ParentLocalRect::new(bounds),
+                        )
+                    })
+                    .collect(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn app_scroll_regions(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: &ViewDefinitionInput,
+            layout: &LayoutOutput,
+        ) -> Vec<ScrollRegionDeclaration> {
+            let viewport = input.layout_input.viewport.into_rect();
+            let content = layout.bounds.into_rect();
+            if content.size.height <= viewport.size.height + 0.5 {
+                return Vec::new();
+            }
+            vec![ScrollRegionDeclaration::explicit(
+                PresentationRegionId::from("iced.movable-page-app:page-scroll"),
+                self.id(),
+                Some(WidgetSlotAddress::new(self.id(), 0)),
+                TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: viewport.size,
+                }),
+                TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: content.size,
+                }),
+                Point { x: 0.0, y: 0.0 },
+                slipway_core::ScrollAxes {
+                    horizontal: false,
+                    vertical: true,
+                },
+                slipway_core::WheelRouting::NearestScrollable,
+                slipway_core::HitRegionOrder {
+                    z_index: -1,
+                    paint_order: 0,
+                    traversal_order: 0,
+                },
+                slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+                true,
+            )]
+        }
+    }
+
+    #[test]
+    fn composite_refresh_ignores_unplaced_direct_child_trees_after_page_region_mounts() {
+        type PageRuntimeWidget<'a> =
+            SlipwayIcedRuntimeWidget<'a, slipway_core::SlipwayAppWidget<MovablePageApp>>;
+
+        let mut runtime = SlipwayRuntime::from_app(
+            MovablePageApp {
+                widgets: (MovableHitChild,),
+            },
+            (),
+        );
+        let renderer = RecordingRenderer::default();
+        // Tall window: the column (80) fits, NO page region, the child is
+        // placed DIRECTLY under the composite root.
+        let tall_limits = iced::advanced::layout::Limits::new(
+            iced::Size::new(0.0, 0.0),
+            iced::Size::new(100.0, 80.0),
+        );
+        // Short window: the column exceeds the viewport, the page region is
+        // declared, and the child placement moves INSIDE the native
+        // scrollable's content tree — the direct child tree is now unplaced.
+        let short_limits = iced::advanced::layout::Limits::new(
+            iced::Size::new(0.0, 0.0),
+            iced::Size::new(100.0, 40.0),
+        );
+
+        // Frame 1 (tall): direct mounting; the direct child tree captures a
+        // presentation with the hit region at rest.
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let mut tree = iced::advanced::widget::Tree {
+            tag: <PageRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::tag(&widget),
+            state: <PageRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::state(&widget),
+            children: <PageRuntimeWidget<'_> as iced::advanced::Widget<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >>::children(&widget),
+        };
+        let _ = <PageRuntimeWidget<'_> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >>::layout(&mut widget, &mut tree, &renderer, &tall_limits);
+        assert_eq!(
+            composite_movable_hit_bounds_x(&tree),
+            MovableHitChild::REST_X,
+            "tall window: composite flattens the directly-placed child hit region at rest"
+        );
+
+        // Frame 2 (short): the page region mounts; the child is re-parented
+        // under the native scrollable. Route a press at the rest position
+        // through the composite and apply it — the child-local change moves
+        // the child's hit region.
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let _ = <PageRuntimeWidget<'_> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >>::layout(&mut widget, &mut tree, &renderer, &short_limits);
+        {
+            let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
+            let presentation = state
+                .presentation
+                .as_ref()
+                .expect("composite presentation exists");
+            assert!(
+                !presentation.native_scroll_regions.is_empty(),
+                "short window must mount the app page region natively"
+            );
+        }
+        let press_input = {
+            let state = tree.state.downcast_ref::<IcedRuntimeTreeState>();
+            let presentation = state
+                .presentation
+                .as_ref()
+                .expect("composite presentation exists")
+                .clone();
+            let mut hovered = None;
+            let mut pressed = None;
+            let mut focused = None;
+            route_iced_event(
+                &iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+                iced::Rectangle {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 40.0,
+                },
+                iced::advanced::mouse::Cursor::Available(iced::Point::new(5.0, 20.0)),
+                Some(&presentation),
+                &mut hovered,
+                &mut pressed,
+                &mut None,
+                &mut focused,
+            )
+            .expect("press over the rest hit region routes to the child")
+            .input
+            .expect("press yields a declared backend input")
+        };
+        let report = runtime.apply_backend_input_event_for_backend_with_app_reducer(
+            press_input,
+            ICED_BACKEND_ID,
+            &mut |_external, _messages: Vec<Message>| {},
+        );
+        assert!(report.handled, "child press must be handled: {report:?}");
+
+        // Frame 3 (short): the mounted child (inside the scrollable subtree)
+        // rebuilds at its moved position; the composite refresh must take THAT
+        // copy. REGRESSION (Step 213): the frozen frame-1 direct child tree —
+        // now unplaced — kept its rest-position presentation and overwrote the
+        // fresh scrollable-subtree copy, so the composed dispatch geometry
+        // stayed stale forever and presses at the moved-to position were
+        // silently dropped.
+        let mut widget = SlipwayIcedRuntimeWidget::from_runtime(&runtime);
+        let _ = <PageRuntimeWidget<'_> as Widget<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >>::layout(&mut widget, &mut tree, &renderer, &short_limits);
+        assert_eq!(
+            composite_movable_hit_bounds_x(&tree),
+            MovableHitChild::MOVED_X,
+            "composite dispatch hit geometry must follow the child mounted inside the \
+             native page scrollable; an unplaced direct child tree's frozen presentation \
+             must not overwrite it"
+        );
+    }
+
     #[test]
     fn runtime_widget_layout_reuses_presentation_for_same_revision_and_input() {
         let runtime = SlipwayRuntime::new(TestWidget, ());
@@ -19178,6 +28761,7 @@ mod tests {
             Some(&unrelated_dirty),
             &target,
             None,
+            Point { x: 0.0, y: 0.0 },
         ));
         refresh_iced_presentation_frame(
             &mut presentation,
@@ -19201,7 +28785,293 @@ mod tests {
             Some(&matching_dirty),
             &target,
             None,
+            Point { x: 0.0, y: 0.0 },
         ));
+
+        let root_slot_dirty = [IcedDirtyScope {
+            target: target.clone(),
+            slot: Some(WidgetSlotAddress::new(target.clone(), 0)),
+        }];
+        assert!(!iced_presentation_cache_matches(
+            &presentation,
+            &layout_input,
+            Some(&dirty_frame),
+            Some(&root_slot_dirty),
+            &target,
+            None,
+            Point { x: 0.0, y: 0.0 },
+        ));
+    }
+
+    /// Builds the native-root + declared-child scroll topology used by the
+    /// wheel-leak regression tests: a natively scrolled root region (offset
+    /// 716 of max 716) with one child placement carrying its own declared
+    /// scroll region whose CURRENT offset is `child_offset_y`.
+    fn wheel_leak_fixture(child_offset_y: f32) -> (IcedPresentationState, WidgetId, WidgetId) {
+        let root = WidgetId::from("iced.wheel-leak.root");
+        let child = WidgetId::from("iced.wheel-leak.child");
+        let root_slot = WidgetSlotAddress::new(root.clone(), 0);
+        let child_slot = root_slot.child(child.clone(), 0);
+        let viewport = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 768.0,
+            },
+        };
+        let content = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 640.0,
+                height: 1484.0,
+            },
+        };
+        let root_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("leak-root-scroll"),
+            root.clone(),
+            Some(root_slot.clone()),
+            TargetLocalRect::new(viewport),
+            TargetLocalRect::new(content),
+            Point { x: 0.0, y: 716.0 },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: -1,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let child_scroll = ScrollRegionDeclaration::explicit(
+            PresentationRegionId::from("leak-child-scroll"),
+            child.clone(),
+            Some(child_slot.clone()),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 16.0, y: 16.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 80.0,
+                },
+            }),
+            TargetLocalRect::new(Rect {
+                origin: Point { x: 16.0, y: 16.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 240.0,
+                },
+            }),
+            Point {
+                x: 0.0,
+                y: child_offset_y,
+            },
+            slipway_core::ScrollAxes {
+                horizontal: false,
+                vertical: true,
+            },
+            slipway_core::WheelRouting::NearestScrollable,
+            HitRegionOrder {
+                z_index: 0,
+                paint_order: 0,
+                traversal_order: 0,
+            },
+            slipway_core::ScrollConsumptionPolicy::exclusive_wheel(),
+            true,
+        );
+        let view = ViewDefinition {
+            target: root.clone(),
+            frame: frame(6214),
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(content),
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: child.clone(),
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 0.0, y: 1200.0 },
+                        size: Size {
+                            width: 240.0,
+                            height: 140.0,
+                        },
+                    }),
+                    local_state_slot: Some(child_slot),
+                }],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order: slipway_core::PaintOrderDeclaration::source_order(root.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![root_scroll, child_scroll],
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let presentation = IcedPresentationState::from_view_definition(
+            view,
+            LayoutInput {
+                viewport: TargetLocalRect::new(viewport),
+                constraints: LayoutConstraints {
+                    min: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                    max: viewport.size,
+                },
+            },
+            root.clone(),
+        );
+        (presentation, root, child)
+    }
+
+    #[test]
+    fn presentation_cache_rebuilds_when_dirty_scope_names_a_composed_child_declaration_target() {
+        // Step 195 wheel-leak regression: the cached root presentation embeds
+        // the CHILD's declared scroll region (offset snapshot). A dirty scope
+        // naming only the child previously left the root presentation cached,
+        // so the wheel preflight kept evaluating the child's STALE offset.
+        let (presentation, root, child) = wheel_leak_fixture(0.0);
+        let layout_input = presentation.layout_input.clone();
+        let mut dirty_frame = presentation.frame.clone();
+        dirty_frame.revision = dirty_frame.revision.saturating_add(1);
+
+        let child_dirty = [IcedDirtyScope {
+            target: child.clone(),
+            slot: Some(WidgetSlotAddress::new(root.clone(), 0).child(child, 0)),
+        }];
+        assert!(
+            !iced_presentation_cache_matches(
+                &presentation,
+                &layout_input,
+                Some(&dirty_frame),
+                Some(&child_dirty),
+                &root,
+                None,
+                Point { x: 0.0, y: 0.0 },
+            ),
+            "a dirty scope naming a composed declaration target must rebuild the presentation"
+        );
+
+        // Control: a dirty target contributing NO declarations to this
+        // presentation keeps the cache reuse (the Step 183-era win).
+        let uninvolved_dirty = [IcedDirtyScope {
+            target: WidgetId::from("iced.wheel-leak.uninvolved"),
+            slot: None,
+        }];
+        assert!(iced_presentation_cache_matches(
+            &presentation,
+            &layout_input,
+            Some(&dirty_frame),
+            Some(&uninvolved_dirty),
+            &root,
+            None,
+            Point { x: 0.0, y: 0.0 },
+        ));
+    }
+
+    #[test]
+    fn wheel_over_scrolled_child_routes_to_declared_owner_not_stale_native_fallback() {
+        // Step 195 wheel-leak regression, end-to-end shape (live trace in the
+        // step packet; Step 194 open-issue record): with the root natively
+        // scrolled to its max and the child scrolled (child offset 60), an UP
+        // wheel over the child must route to the CHILD. When the preflight
+        // instead evaluates a STALE snapshot (child offset still 0), the child
+        // cannot consume up, the dispatch point selects nothing, and the
+        // visible-viewport fallback hands the wheel to the native root
+        // Scrollable — which then consumes it natively (page scrolls, no
+        // routed dispatch), bypassing declared routing. The 1500ms upstream
+        // scroll transaction was REFUTED as the cause: the gate below never
+        // lets a non-selected native Scrollable see the wheel at all.
+        let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+            delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+        });
+        let layout_bounds = iced::Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 640.0,
+            height: 768.0,
+        };
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(40.0, 530.0));
+
+        // The stale snapshot reproduces the recorded leak selection: the
+        // native root wins through the visible-viewport fallback.
+        let (stale, root, child) = wheel_leak_fixture(0.0);
+        let stale_selected =
+            iced_declared_wheel_region_id_for_event(&stale, &wheel, layout_bounds, cursor)
+                .expect("stale snapshot falls back to the native root");
+        assert_eq!(
+            stale_selected,
+            PresentationRegionId::from("leak-root-scroll"),
+            "documented leak shape: stale child offset re-routes the wheel to the native root"
+        );
+
+        // The fix: a child-scoped dirty rebuild may not reuse the stale
+        // snapshot, so the gate always evaluates fresh declarations.
+        let mut dirty_frame = stale.frame.clone();
+        dirty_frame.revision = dirty_frame.revision.saturating_add(1);
+        let child_dirty = [IcedDirtyScope {
+            target: child.clone(),
+            slot: Some(WidgetSlotAddress::new(root.clone(), 0).child(child.clone(), 0)),
+        }];
+        assert!(
+            !iced_presentation_cache_matches(
+                &stale,
+                &stale.layout_input.clone(),
+                Some(&dirty_frame),
+                Some(&child_dirty),
+                &root,
+                None,
+                Point { x: 0.0, y: 0.0 },
+            ),
+            "the stale snapshot must be rebuilt before the next wheel is gated"
+        );
+
+        // Fresh declarations: the declared owner (child) wins the UP wheel,
+        // and the native root Scrollable is REFUSED the event — mid scroll
+        // transaction or not, it can never capture a wheel it never receives.
+        let (fresh, _, _) = wheel_leak_fixture(60.0);
+        let fresh_selected =
+            iced_declared_wheel_region_id_for_event(&fresh, &wheel, layout_bounds, cursor)
+                .expect("fresh snapshot selects the declared owner");
+        assert_eq!(
+            fresh_selected,
+            PresentationRegionId::from("leak-child-scroll")
+        );
+        let root_region = fresh
+            .native_scroll_regions
+            .iter()
+            .find(|region| region.id == PresentationRegionId::from("leak-root-scroll"))
+            .expect("the root region presents as a native scrollable");
+        assert!(
+            !should_update_native_scroll_region_for_event(
+                &wheel,
+                Some(&fresh_selected),
+                root_region,
+            ),
+            "the non-selected native root Scrollable must never see the wheel"
+        );
+
+        let routed = route_iced_event(
+            &wheel,
+            layout_bounds,
+            cursor,
+            Some(&fresh),
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .expect("fresh snapshot routes the wheel");
+        let input = routed.input.expect("declared owner receives routed wheel");
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("wheel carries dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(PresentationRegionId::from("leak-child-scroll"))
+        );
     }
 
     #[test]
@@ -19725,610 +29595,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_keyboard_input_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(FocusedInputWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
-            .runtime_mut()
-            .record_presented_viewport(frame.viewport);
-
-        let widget = FocusedInputWidget;
-        let view = widget.visible_backend_view_definition(
-            shell.runtime().external(),
-            shell.runtime().local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
-                    viewport: TargetLocalRect::new(frame.viewport),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: frame.viewport.size,
-                    },
-                },
-            },
-        );
-        let region = view
-            .focus_regions
-            .first()
-            .expect("focused widget declares focus region");
-        let event = InputEvent::Keyboard(slipway_core::KeyboardEvent {
-            target: region.target.clone(),
-            target_slot: region.address.clone(),
-            key: "Enter".to_string(),
-            kind: slipway_core::KeyEventKind::Press,
-            modifiers: slipway_core::Modifiers::default(),
-            details: slipway_core::KeyboardDetails::default(),
-        });
-        let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
-        let backend_input = backend_focus_input_event_from_parts(
-            frame.clone(),
-            &geometry_index,
-            &view.focus_regions,
-            region,
-            DeclaredEventDispatchKind::Keyboard,
-            None,
-            event,
-        );
-
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
-        assert_eq!(
-            update.runtime_update,
-            Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
-                diagnostics: Vec::new(),
-            })
-        );
-        assert_eq!(shell.runtime().local_state().clicks, 1);
-
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_keyboard_message(
-                "iced-shell-keyboard",
-                &frame,
-                "iced.focused",
-                "Enter",
-            ))
-            .expect("runtime MCP physical keyboard request queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical keyboard response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message("iced-shell-keyboard-events", &frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.focused.focus""#)
-                .count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend keyboard input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_text_edit_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(FocusedInputWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
-            .runtime_mut()
-            .record_presented_viewport(frame.viewport);
-
-        let widget = FocusedInputWidget;
-        let view = widget.visible_backend_view_definition(
-            shell.runtime().external(),
-            shell.runtime().local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
-                    viewport: TargetLocalRect::new(frame.viewport),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: frame.viewport.size,
-                    },
-                },
-            },
-        );
-        let region = view
-            .focus_regions
-            .first()
-            .expect("focused widget declares text-edit focus region");
-        let event = InputEvent::TextEdit(slipway_core::TextEditEvent {
-            target: region.target.clone(),
-            target_slot: region.address.clone(),
-            kind: TextEditKind::ReplaceSelection,
-            text: Some("abc".to_string()),
-            selection_before: None,
-            selection_after: None,
-        });
-        let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
-        let backend_input = backend_focus_input_event_from_parts(
-            frame.clone(),
-            &geometry_index,
-            &view.focus_regions,
-            region,
-            DeclaredEventDispatchKind::Text,
-            None,
-            event,
-        );
-
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
-        assert_eq!(
-            update.runtime_update,
-            Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
-                diagnostics: Vec::new(),
-            })
-        );
-        assert_eq!(shell.runtime().local_state().clicks, 1);
-
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_text_edit_message(
-                "iced-shell-text-edit",
-                &frame,
-                "iced.focused",
-                "abc",
-            ))
-            .expect("runtime MCP physical text-edit request queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical text-edit response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message("iced-shell-text-edit-events", &frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.focused.focus""#)
-                .count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""summary":"text_edit:ReplaceSelection""#),
-            "probe must preserve text-edit shape: {payload}"
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend text-edit input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_command_input_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(FocusedInputWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
-            .runtime_mut()
-            .record_presented_viewport(frame.viewport);
-
-        let widget = FocusedInputWidget;
-        let view = widget.visible_backend_view_definition(
-            shell.runtime().external(),
-            shell.runtime().local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
-                    viewport: TargetLocalRect::new(frame.viewport),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: frame.viewport.size,
-                    },
-                },
-            },
-        );
-        let region = view
-            .focus_regions
-            .first()
-            .expect("focused widget declares focus region");
-        let event = InputEvent::Command(CommandEvent {
-            target: region.target.clone(),
-            target_slot: region.address.clone(),
-            command: "submit".to_string(),
-            payload_ref: Some("payload-1".to_string()),
-            source: None,
-        });
-        let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
-        let backend_input = backend_focus_input_event_from_parts(
-            frame.clone(),
-            &geometry_index,
-            &view.focus_regions,
-            region,
-            DeclaredEventDispatchKind::Command,
-            None,
-            event,
-        );
-
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
-        assert_eq!(
-            update.runtime_update,
-            Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
-                diagnostics: Vec::new(),
-            })
-        );
-        assert_eq!(shell.runtime().local_state().clicks, 1);
-
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_command_message(
-                "iced-shell-command",
-                &frame,
-                "iced.focused",
-                "submit",
-                "payload-1",
-            ))
-            .expect("runtime MCP physical command request queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical command response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message("iced-shell-command-events", &frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.focused.focus""#)
-                .count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend command input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_wheel_input_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(ScrollProbeWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
-            .runtime_mut()
-            .record_presented_viewport(frame.viewport);
-
-        let widget = ScrollProbeWidget;
-        let view = widget.visible_backend_view_definition(
-            shell.runtime().external(),
-            shell.runtime().local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
-                    viewport: TargetLocalRect::new(frame.viewport),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: frame.viewport.size,
-                    },
-                },
-            },
-        );
-        let presentation = IcedPresentationState::from_view_definition(
-            view,
-            LayoutInput {
-                viewport: TargetLocalRect::new(frame.viewport),
-                constraints: LayoutConstraints {
-                    min: Size {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    max: frame.viewport.size,
-                },
-            },
-            widget.id(),
-        );
-        let mut hovered_region = None;
-        let mut pressed_region = None;
-        let mut focused_region = None;
-        let routed = route_iced_event(
-            &iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
-                delta: iced::mouse::ScrollDelta::Pixels { x: 0.0, y: 7.0 },
-            }),
-            iced::Rectangle {
-                x: 0.0,
-                y: 0.0,
-                width: frame.viewport.size.width,
-                height: frame.viewport.size.height,
-            },
-            iced::advanced::mouse::Cursor::Available(iced::Point::new(1.0, 1.0)),
-            Some(&presentation),
-            &mut hovered_region,
-            &mut pressed_region,
-            &mut focused_region,
-        )
-        .expect("iced wheel event routes through backend converter");
-        let backend_input = routed
-            .input
-            .expect("iced wheel event yields declared backend input");
-
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
-        assert_eq!(
-            update.runtime_update,
-            Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
-                diagnostics: Vec::new(),
-            })
-        );
-        assert_eq!(shell.runtime().local_state().clicks, 1);
-
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_wheel_message(
-                "iced-shell-wheel",
-                &frame,
-                1.0,
-                1.0,
-                0.0,
-                7.0,
-            ))
-            .expect("runtime MCP physical wheel request queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical wheel response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message("iced-shell-wheel-events", &frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.scroll.region""#)
-                .count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend wheel input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_scroll_input_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(ScrollProbeWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
-            .runtime_mut()
-            .record_presented_viewport(frame.viewport);
-
-        let widget = ScrollProbeWidget;
-        let view = widget.visible_backend_view_definition(
-            shell.runtime().external(),
-            shell.runtime().local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
-                    viewport: TargetLocalRect::new(frame.viewport),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: frame.viewport.size,
-                    },
-                },
-            },
-        );
-        let region = view
-            .scroll_regions
-            .first()
-            .expect("scroll widget declares scroll region");
-        let event = InputEvent::Scroll(ScrollEvent {
-            target: region.target.clone(),
-            target_slot: region.address.clone(),
-            region_id: region.id.clone(),
-            offset_x: 0.0,
-            offset_y: 24.0,
-            viewport: region.viewport,
-            content_bounds: region.content_bounds,
-        });
-        let backend_input = backend_scroll_input_event_from_parts(
-            frame.clone(),
-            &view.scroll_regions,
-            region,
-            event,
-        );
-
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
-        assert_eq!(
-            update.runtime_update,
-            Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
-                diagnostics: Vec::new(),
-            })
-        );
-        assert_eq!(shell.runtime().local_state().clicks, 1);
-
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_scroll_message(
-                "iced-shell-scroll",
-                &frame,
-                "iced.scroll",
-                0.0,
-                24.0,
-            ))
-            .expect("runtime MCP physical scroll request queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical scroll response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message("iced-shell-scroll-events", &frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.scroll.region""#)
-                .count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend scroll input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
     fn app_shell_refuses_forged_declared_backend_input_before_runtime_mutation() {
         let mut shell = SlipwayIcedRuntimeApp::from_parts(TestWidget, (), |_, _| {});
         let frame = shell.runtime().last_frame_identity();
@@ -20387,330 +29653,167 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_move_input_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(DragTestWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
-            .runtime_mut()
-            .record_presented_viewport(frame.viewport);
-
-        let widget = DragTestWidget;
-        let view = widget.visible_backend_view_definition(
-            shell.runtime().external(),
-            shell.runtime().local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
-                    viewport: TargetLocalRect::new(frame.viewport),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: frame.viewport.size,
-                    },
-                },
-            },
-        );
-        let presentation = IcedPresentationState::from_view_definition(
-            view,
-            LayoutInput {
-                viewport: TargetLocalRect::new(frame.viewport),
-                constraints: LayoutConstraints {
-                    min: Size {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    max: frame.viewport.size,
-                },
-            },
-            widget.id(),
-        );
-        let mut hovered_region = Some(PresentationRegionId::from("iced.test.hit"));
-        let mut pressed_region = Some(pressed_capture("iced.test.hit"));
-        let mut focused_region = None;
-        let routed = route_iced_event(
-            &iced::Event::Mouse(iced::mouse::Event::CursorMoved {
-                position: iced::Point::new(1.0, 1.0),
-            }),
-            iced::Rectangle {
-                x: 0.0,
-                y: 0.0,
-                width: frame.viewport.size.width,
-                height: frame.viewport.size.height,
-            },
-            iced::advanced::mouse::Cursor::Available(iced::Point::new(1.0, 1.0)),
-            Some(&presentation),
-            &mut hovered_region,
-            &mut pressed_region,
-            &mut focused_region,
-        )
-        .expect("iced captured cursor move routes through backend converter");
-        let backend_input = routed
-            .input
-            .expect("iced captured cursor move yields declared backend input");
-
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
-        assert_eq!(
-            update.runtime_update,
-            Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
-                diagnostics: Vec::new(),
-            })
-        );
-
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_pointer_phase_message(
-                "iced-shell-move",
-                &frame,
-                1.0,
-                1.0,
-                "move",
-            ))
-            .expect("runtime MCP physical pointer move request queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical pointer move response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message("iced-shell-move-events", &frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.test.hit""#)
-                .count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend pointer move share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_enter_input_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(HoverTestWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
-            .runtime_mut()
-            .record_presented_viewport(frame.viewport);
-
-        let widget = HoverTestWidget;
-        let view = widget.visible_backend_view_definition(
-            shell.runtime().external(),
-            shell.runtime().local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
-                    viewport: TargetLocalRect::new(frame.viewport),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: frame.viewport.size,
-                    },
-                },
-            },
-        );
-        let presentation = IcedPresentationState::from_view_definition(
-            view,
-            LayoutInput {
-                viewport: TargetLocalRect::new(frame.viewport),
-                constraints: LayoutConstraints {
-                    min: Size {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    max: frame.viewport.size,
-                },
-            },
-            widget.id(),
-        );
+    /// Routes an ingress event plan through the SAME widget dispatch path
+    /// both the real winit window-event path and the physical-control seam
+    /// use, returning the single backend input the plan produces.
+    fn dispatch_iced_ingress_events(
+        presentation: &IcedPresentationState,
+        viewport: Rect,
+        cursor: iced::Point,
+        focused: Option<PresentationRegionId>,
+        events: &[iced::Event],
+    ) -> BackendInputEvent {
         let mut hovered_region = None;
         let mut pressed_region = None;
-        let mut focused_region = None;
-        let routed = route_iced_event(
-            &iced::Event::Mouse(iced::mouse::Event::CursorEntered),
-            iced::Rectangle {
-                x: 0.0,
-                y: 0.0,
-                width: frame.viewport.size.width,
-                height: frame.viewport.size.height,
-            },
-            iced::advanced::mouse::Cursor::Available(iced::Point::new(1.0, 1.0)),
-            Some(&presentation),
-            &mut hovered_region,
-            &mut pressed_region,
-            &mut focused_region,
-        )
-        .expect("iced cursor enter routes through backend converter");
-        let backend_input = routed
-            .input
-            .expect("iced cursor enter yields declared backend input");
-
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
+        let mut indicator_drag = None;
+        let mut focused_region = focused;
+        let mut inputs = Vec::new();
+        for event in events {
+            if let Some(routed) = route_iced_event(
+                event,
+                iced::Rectangle {
+                    x: 0.0,
+                    y: 0.0,
+                    width: viewport.size.width,
+                    height: viewport.size.height,
+                },
+                iced::advanced::mouse::Cursor::Available(cursor),
+                Some(presentation),
+                &mut hovered_region,
+                &mut pressed_region,
+                &mut indicator_drag,
+                &mut focused_region,
+            ) {
+                if let Some(input) = routed.input {
+                    inputs.push(input);
+                }
+            }
+        }
         assert_eq!(
-            update.runtime_update,
-            Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
-                diagnostics: Vec::new(),
-            })
+            inputs.len(),
+            1,
+            "ingress event plan must produce exactly one backend input: {inputs:?}"
         );
+        inputs.remove(0)
+    }
 
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_pointer_phase_message(
-                "iced-shell-enter",
-                &frame,
-                1.0,
-                1.0,
-                "enter",
-            ))
-            .expect("runtime MCP physical pointer enter request queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical pointer enter response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message("iced-shell-enter-events", &frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.test.hit""#)
-                .count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend pointer enter share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
+    /// Marks a backend trace as the MCP-injected side of the runtime
+    /// `event_equivalence.*` comparator. The live seam labels its evidence
+    /// `backend_presented` because the current architecture injects through
+    /// the backend's own native path; the comparator's pair contract
+    /// (`debug_mcp` vs `backend_presented`) predates that unification, and
+    /// declared dispatch identity ignores the evidence source by contract
+    /// (pinned by `declared_dispatch_identity_ignores_evidence_source` in
+    /// slipway-core), so relabeling only selects the comparison role.
+    fn as_mcp_equivalence_side(
+        trace: &slipway_core::BackendInputTrace,
+    ) -> slipway_core::BackendInputTrace {
+        let mut mcp_side = trace.clone();
+        if let Some(evidence) = mcp_side.input.dispatch_evidence.as_mut() {
+            evidence.source = EvidenceSource::debug_mcp("physical-control");
+        }
+        mcp_side
     }
 
     #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_leave_input_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(HoverTestWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
+    fn seam_wheel_and_real_winit_wheel_share_dispatch_and_result_identity() {
+        // MF-M9 port to the current seam, headless: the seam side is the
+        // exact iced event plan the native runner injects for an MCP wheel
+        // (native_runner::iced_events_for_native_physical_operation); the
+        // real side is a synthetic winit CursorMoved + MouseWheel pushed
+        // through the same iced_winit conversion the real window-event path
+        // uses. Both plans must be event-identical, and after traveling the
+        // same dispatch path from identical fresh shells the runtime
+        // event_equivalence comparator must report an identity match.
+        use iced_winit::winit::dpi::PhysicalPosition;
+        use iced_winit::winit::event::{DeviceId, MouseScrollDelta, TouchPhase, WindowEvent};
+        use iced_winit::winit::keyboard::ModifiersState;
+
+        let operation = DebugPhysicalControl::Wheel {
+            position: Point { x: 1.0, y: 1.0 },
+            delta_x: 0.0,
+            delta_y: -7.0,
+        };
+        let seam_events = native_runner::iced_events_for_native_physical_operation(
+            &operation,
+            1.0,
+            ModifiersState::default(),
+        )
+        .expect("seam wheel operation maps to an iced event plan");
+        let real_events = vec![
+            iced_winit::conversion::window_event(
+                WindowEvent::CursorMoved {
+                    device_id: DeviceId::dummy(),
+                    position: PhysicalPosition::new(1.0, 1.0),
+                },
+                1.0,
+                ModifiersState::default(),
+            )
+            .expect("winit cursor move converts to an iced event"),
+            iced_winit::conversion::window_event(
+                WindowEvent::MouseWheel {
+                    device_id: DeviceId::dummy(),
+                    delta: MouseScrollDelta::LineDelta(0.0, -7.0),
+                    phase: TouchPhase::Moved,
+                },
+                1.0,
+                ModifiersState::default(),
+            )
+            .expect("winit mouse wheel converts to an iced event"),
+        ];
+        assert_eq!(
+            format!("{seam_events:?}"),
+            format!("{real_events:?}"),
+            "the seam must synthesize exactly the iced events real winit ingress delivers"
+        );
+
+        let mut native_shell = SlipwayIcedRuntimeApp::from_parts(ScrollProbeWidget, (), |_, _| {});
+        let frame = native_shell.runtime().last_frame_identity();
+        native_shell
             .runtime_mut()
             .record_presented_viewport(frame.viewport);
-
-        let widget = HoverTestWidget;
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(frame.viewport),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: frame.viewport.size,
+            },
+        };
+        let widget = ScrollProbeWidget;
         let view = widget.visible_backend_view_definition(
-            shell.runtime().external(),
-            shell.runtime().local_state(),
+            &(),
+            &Local { clicks: 0 },
             ViewDefinitionInput {
                 frame: frame.clone(),
-                layout_input: LayoutInput {
-                    viewport: TargetLocalRect::new(frame.viewport),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: frame.viewport.size,
-                    },
-                },
+                layout_input: layout_input.clone(),
             },
         );
-        let presentation = IcedPresentationState::from_view_definition(
-            view,
-            LayoutInput {
-                viewport: TargetLocalRect::new(frame.viewport),
-                constraints: LayoutConstraints {
-                    min: Size {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    max: frame.viewport.size,
-                },
-            },
-            widget.id(),
-        );
-        let mut hovered_region = Some(PresentationRegionId::from("iced.test.hit"));
-        let mut pressed_region = None;
-        let mut focused_region = None;
-        let routed = route_iced_event(
-            &iced::Event::Mouse(iced::mouse::Event::CursorLeft),
-            iced::Rectangle {
-                x: 0.0,
-                y: 0.0,
-                width: frame.viewport.size.width,
-                height: frame.viewport.size.height,
-            },
-            iced::advanced::mouse::Cursor::Unavailable,
-            Some(&presentation),
-            &mut hovered_region,
-            &mut pressed_region,
-            &mut focused_region,
-        )
-        .expect("iced cursor leave routes through backend converter");
-        let backend_input = routed
-            .input
-            .expect("iced cursor leave yields declared backend input");
+        let presentation =
+            IcedPresentationState::from_view_definition(view, layout_input, widget.id());
 
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
+        let native_input = dispatch_iced_ingress_events(
+            &presentation,
+            frame.viewport,
+            iced::Point::new(1.0, 1.0),
+            None,
+            &real_events,
+        );
+        let seam_input = dispatch_iced_ingress_events(
+            &presentation,
+            frame.viewport,
+            iced::Point::new(1.0, 1.0),
+            None,
+            &seam_events,
+        );
+        assert_eq!(
+            seam_input, native_input,
+            "same dispatch path must resolve the seam and real plans identically"
+        );
+
+        let update = native_shell.update(SlipwayIcedRuntimeMessage::BackendInput(native_input));
         assert_eq!(
             update.runtime_update,
             Some(SlipwayIcedRuntimeUpdate::Input {
@@ -20719,130 +29822,144 @@ mod tests {
                 diagnostics: Vec::new(),
             })
         );
+        let native_trace = native_shell
+            .runtime()
+            .last_backend_input_trace()
+            .cloned()
+            .expect("real ingress wheel records a backend input trace");
 
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_pointer_phase_message(
-                "iced-shell-leave",
-                &frame,
-                0.0,
-                0.0,
-                "leave",
-            ))
-            .expect("runtime MCP physical pointer leave request queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical pointer leave response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message("iced-shell-leave-events", &frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
+        let mut seam_shell = SlipwayIcedRuntimeApp::from_parts(ScrollProbeWidget, (), |_, _| {});
+        seam_shell
+            .runtime_mut()
+            .record_presented_viewport(frame.viewport);
+        let command = DebugCommand::physical_control_with_trace(
+            "iced-seam-wheel-equivalence",
+            frame.clone(),
+            operation,
+        );
+        assert!(
+            seam_shell
+                .runtime()
+                .backend_presented_physical_control_input_matches(&command, &seam_input),
+            "the native runner's backend-input matching must accept the seam wheel"
+        );
+        let product = seam_shell.handle_backend_presented_physical_control(command, seam_input);
+        let DebugReplyProduct::ControlTrace(control_trace) = product else {
+            panic!("seam ingress must return a physical control trace");
+        };
         assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.test.hit""#)
-                .count(),
-            4
+            control_trace.mode,
+            slipway_debug_bridge::DebugControlMode::PhysicalEquivalent
         );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend pointer leave share dispatch/result identity: {payload}"
+        assert!(control_trace.handled);
+        let seam_trace = seam_shell
+            .runtime()
+            .last_backend_input_trace()
+            .cloned()
+            .expect("seam ingress wheel records a backend input trace");
+
+        let mcp_side = as_mcp_equivalence_side(&seam_trace);
+        let diagnostics = slipway_runtime::backend_input_trace_equivalence_diagnostics(&[
+            &mcp_side,
+            &native_trace,
+        ]);
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "comparator must pair the seam and real wheel traces: {diagnostics:?}"
         );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
+        assert_eq!(
+            diagnostics[0].code, "event_equivalence.identity_match",
+            "seam and real wheel must share dispatch AND result identity: {diagnostics:?}"
         );
     }
 
     #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_touch_cancel_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(CancelTestWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
+    fn seam_keyboard_and_real_ingress_keyboard_share_dispatch_and_result_identity() {
+        // MF-M9 port to the current seam, headless: the seam side is the
+        // exact iced keyboard event the native runner injects for an MCP
+        // keyboard operation; the real side is the iced keyboard event
+        // shape iced_winit conversion produces for a hardware Enter press
+        // (winit's KeyEvent has a private platform-specific field and
+        // cannot be constructed in tests, so the converted shape is
+        // declared directly). Both travel the same dispatch path from
+        // identical fresh shells and must share dispatch/result identity
+        // under the runtime event_equivalence comparator.
+        use iced_winit::winit::keyboard::ModifiersState;
+
+        let operation = DebugPhysicalControl::Keyboard {
+            selector: DebugPhysicalControlDeclarationSelector::Target {
+                target: WidgetId::from("iced.focused"),
+            },
+            key: "Enter".to_string(),
+            kind: slipway_core::KeyEventKind::Press,
+            modifiers: slipway_core::Modifiers::default(),
+            details: slipway_core::KeyboardDetails::default(),
+        };
+        let seam_events = native_runner::iced_events_for_native_physical_operation(
+            &operation,
+            1.0,
+            ModifiersState::default(),
+        )
+        .expect("seam keyboard operation maps to an iced event plan");
+        let real_events = vec![iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+            modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            location: iced::keyboard::Location::Standard,
+            modifiers: iced::keyboard::Modifiers::default(),
+            text: None,
+            repeat: false,
+        })];
+
+        let mut native_shell = SlipwayIcedRuntimeApp::from_parts(FocusedInputWidget, (), |_, _| {});
+        let frame = native_shell.runtime().last_frame_identity();
+        native_shell
             .runtime_mut()
             .record_presented_viewport(frame.viewport);
-
-        let widget = CancelTestWidget;
+        let layout_input = LayoutInput {
+            viewport: TargetLocalRect::new(frame.viewport),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: frame.viewport.size,
+            },
+        };
+        let widget = FocusedInputWidget;
         let view = widget.visible_backend_view_definition(
-            shell.runtime().external(),
-            shell.runtime().local_state(),
+            &(),
+            &Local { clicks: 0 },
             ViewDefinitionInput {
                 frame: frame.clone(),
-                layout_input: LayoutInput {
-                    viewport: TargetLocalRect::new(frame.viewport),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: frame.viewport.size,
-                    },
-                },
+                layout_input: layout_input.clone(),
             },
         );
-        let presentation = IcedPresentationState::from_view_definition(
-            view,
-            LayoutInput {
-                viewport: TargetLocalRect::new(frame.viewport),
-                constraints: LayoutConstraints {
-                    min: Size {
-                        width: 0.0,
-                        height: 0.0,
-                    },
-                    max: frame.viewport.size,
-                },
-            },
-            widget.id(),
-        );
-        let mut hovered_region = Some(PresentationRegionId::from("iced.test.hit"));
-        let mut pressed_region = Some(pressed_capture("iced.test.hit"));
-        let mut focused_region = None;
-        let routed = route_iced_event(
-            &iced::Event::Touch(iced::touch::Event::FingerLost {
-                id: iced::touch::Finger(7),
-                position: iced::Point::new(1.0, 1.0),
-            }),
-            iced::Rectangle {
-                x: 0.0,
-                y: 0.0,
-                width: frame.viewport.size.width,
-                height: frame.viewport.size.height,
-            },
-            iced::advanced::mouse::Cursor::Available(iced::Point::new(1.0, 1.0)),
-            Some(&presentation),
-            &mut hovered_region,
-            &mut pressed_region,
-            &mut focused_region,
-        )
-        .expect("iced touch cancel routes through backend converter");
-        let backend_input = routed
-            .input
-            .expect("iced touch cancel yields declared backend input");
+        let presentation =
+            IcedPresentationState::from_view_definition(view, layout_input, widget.id());
+        let focus_region = PresentationRegionId::from("iced.focused.focus");
 
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
+        let native_input = dispatch_iced_ingress_events(
+            &presentation,
+            frame.viewport,
+            iced::Point::new(1.0, 1.0),
+            Some(focus_region.clone()),
+            &real_events,
+        );
+        let seam_input = dispatch_iced_ingress_events(
+            &presentation,
+            frame.viewport,
+            iced::Point::new(1.0, 1.0),
+            Some(focus_region),
+            &seam_events,
+        );
+        assert_eq!(
+            seam_input, native_input,
+            "same dispatch path must resolve the seam and real keyboard plans identically"
+        );
+
+        let update = native_shell.update(SlipwayIcedRuntimeMessage::BackendInput(native_input));
         assert_eq!(
             update.runtime_update,
             Some(SlipwayIcedRuntimeUpdate::Input {
@@ -20851,152 +29968,55 @@ mod tests {
                 diagnostics: Vec::new(),
             })
         );
+        let native_trace = native_shell
+            .runtime()
+            .last_backend_input_trace()
+            .cloned()
+            .expect("real ingress keyboard records a backend input trace");
 
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_touch_phase_message(
-                "iced-shell-touch-cancel",
-                &frame,
-                1.0,
-                1.0,
-                "cancel",
-                7,
-            ))
-            .expect("runtime MCP physical touch cancel request queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical touch cancel response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message(
-                "iced-shell-touch-cancel-events",
-                &frame,
-            ))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.test.hit""#)
-                .count(),
-            4
-        );
-        assert!(
-            payload.contains(r#""summary":"pointer:Cancel""#),
-            "event probe must expose pointer cancel generated events: {payload}"
-        );
-        assert!(
-            payload.contains(r#""kind":"Cancel""#),
-            "event probe must expose pointer cancel kind: {payload}"
-        );
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend touch cancel share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
-        );
-    }
-
-    #[test]
-    #[ignore = "obsolete: MCP physical_control no longer synthesizes a backend-presented event inside runtime"]
-    fn app_shell_mcp_physical_and_visible_backend_input_share_event_probe_surface() {
-        let mut shell = SlipwayIcedRuntimeApp::from_parts(TestWidget, (), |_, _| {});
-        let frame = shell.runtime().last_frame_identity();
-        shell
+        let mut seam_shell = SlipwayIcedRuntimeApp::from_parts(FocusedInputWidget, (), |_, _| {});
+        seam_shell
             .runtime_mut()
             .record_presented_viewport(frame.viewport);
-
-        let backend_input =
-            declared_iced_test_press(shell.runtime(), frame.clone(), Point { x: 1.0, y: 1.0 });
-        let update = shell.update(SlipwayIcedRuntimeMessage::BackendInput(backend_input));
+        let command = DebugCommand::physical_control_with_trace(
+            "iced-seam-keyboard-equivalence",
+            frame.clone(),
+            operation,
+        );
+        assert!(
+            seam_shell
+                .runtime()
+                .backend_presented_physical_control_input_matches(&command, &seam_input),
+            "the native runner's backend-input matching must accept the seam keyboard"
+        );
+        let product = seam_shell.handle_backend_presented_physical_control(command, seam_input);
+        let DebugReplyProduct::ControlTrace(control_trace) = product else {
+            panic!("seam ingress must return a physical control trace");
+        };
         assert_eq!(
-            update.runtime_update,
-            Some(SlipwayIcedRuntimeUpdate::Input {
-                handled: true,
-                applied_messages: 1,
-                diagnostics: Vec::new(),
-            })
+            control_trace.mode,
+            slipway_debug_bridge::DebugControlMode::PhysicalEquivalent
         );
+        assert!(control_trace.handled);
+        let seam_trace = seam_shell
+            .runtime()
+            .last_backend_input_trace()
+            .cloned()
+            .expect("seam ingress keyboard records a backend input trace");
 
-        let physical_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(physical_pointer_message(
-                "iced-shell-physical",
-                &frame,
-                1.0,
-                1.0,
-            ))
-            .expect("runtime MCP physical request queued");
-
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        physical_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("physical control response sent");
-        assert_eq!(shell.runtime().local_state().clicks, 2);
-
-        let probe_handle = shell
-            .debug_mcp()
-            .submit_runtime_request(probe_event_message("iced-shell-events", &frame))
-            .expect("runtime MCP event probe queued");
-        let (drained, error) = shell.drain_debug_pending();
-        assert_eq!(drained, 1);
-        assert_eq!(error, None);
-        let response = probe_handle
-            .recv()
-            .expect("transport response arrives")
-            .expect("event probe response sent");
-        let payload = response["result"]["content"][0]["text"]
-            .as_str()
-            .expect("tool result text");
-        assert_eq!(payload.matches(r#""kind":"event""#).count(), 2);
-        assert!(payload.contains(r#""label":"debug_mcp""#));
-        assert!(payload.contains(r#""label":"backend_presented""#));
-        assert_eq!(payload.matches(r#""dispatch_identity""#).count(), 2);
-        assert_eq!(payload.matches(r#""result_identity""#).count(), 2);
+        let mcp_side = as_mcp_equivalence_side(&seam_trace);
+        let diagnostics = slipway_runtime::backend_input_trace_equivalence_diagnostics(&[
+            &mcp_side,
+            &native_trace,
+        ]);
         assert_eq!(
-            payload
-                .matches(r#""selected_region":"iced.test.hit""#)
-                .count(),
-            4
+            diagnostics.len(),
+            1,
+            "comparator must pair the seam and real keyboard traces: {diagnostics:?}"
         );
-        assert_eq!(payload.matches(r#""handled":true"#).count(), 4);
-        assert!(
-            payload.contains(r#""code":"event_equivalence.identity_match""#),
-            "event probe must prove MCP and backend physical input share dispatch/result identity: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.dispatch_identity_mismatch""#),
-            "happy path must not report dispatch mismatch: {payload}"
-        );
-        assert!(
-            !payload.contains(r#""code":"event_equivalence.result_identity_mismatch""#),
-            "happy path must not report result mismatch: {payload}"
+        assert_eq!(
+            diagnostics[0].code, "event_equivalence.identity_match",
+            "seam and real keyboard must share dispatch AND result identity: {diagnostics:?}"
         );
     }
 }

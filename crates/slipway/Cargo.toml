@@ -20,3 +20,6 @@ iced = ["dep:slipway-backend-iced"]
 egui = ["dep:slipway-backend-egui"]
 all-backends = ["iced", "egui"]
 full = ["all-backends"]
+
+[lints]
+workspace = true

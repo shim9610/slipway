@@ -689,6 +689,22 @@ impl DebugControlTrace {
 pub struct DebugStatus {
     pub admitted: bool,
     pub detail: String,
+    /// Runtime state revision at the time the status reply was assembled.
+    pub revision: u64,
+    /// Visible backend that registered itself with the runtime, when one has.
+    /// `None` means no visible backend has identified itself (for example a
+    /// headless runtime).
+    pub backend_id: Option<String>,
+    /// Number of backend input traces currently retained in the bounded ring.
+    pub trace_buffer_depth: usize,
+    /// Capacity of the backend input trace ring.
+    pub trace_buffer_capacity: usize,
+    /// Debug replies the runtime handler refused (`DebugReplyProduct::Error`)
+    /// since the runtime started. Interceptor-produced backend refusals are
+    /// not counted here.
+    pub refused_debug_replies: u64,
+    /// Backend input traces recorded as unhandled since the runtime started.
+    pub unhandled_backend_input_traces: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -950,6 +966,7 @@ fn probe_frame_identity(product: &ProbeProduct) -> Option<&FrameIdentity> {
         ProbeProduct::ViewDefinition(view) => Some(&view.frame),
         ProbeProduct::RenderPacket(packet) => Some(&packet.frame),
         ProbeProduct::RenderEvidence(evidence) => Some(&evidence.frame),
+        ProbeProduct::DispatchGraph(probe) => Some(&probe.frame),
         _ => None,
     }
 }
@@ -1125,6 +1142,12 @@ mod tests {
                 DebugCommandKind::Status { .. } => DebugReplyProduct::Status(DebugStatus {
                     admitted: true,
                     detail: "ready".to_string(),
+                    revision: 0,
+                    backend_id: None,
+                    trace_buffer_depth: 0,
+                    trace_buffer_capacity: 0,
+                    refused_debug_replies: 0,
+                    unhandled_backend_input_traces: 0,
                 }),
                 DebugCommandKind::Probe { request, .. } => DebugReplyProduct::Probes(
                     request

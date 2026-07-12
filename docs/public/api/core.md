@@ -15,9 +15,10 @@ Do not use `use slipway::*` as the ordinary authoring surface. The facade root
 also re-exports low-level extension APIs for backend authors and provider
 wrappers. If app code needs a type that is not available from the prelude,
 confirm that the task is actually backend-extension work before importing it.
-If that decision is unclear, read
-[LLM contract checklist](../llm-contract-checklist.md) and report
-`PUBLIC_DOC_GAP` or `API_GAP` rather than importing internals.
+If that decision is unclear, read the
+[LLM contract checklist](../llm-contract-checklist.md) (the canonical
+statement of this rule) and report `PUBLIC_DOC_GAP` or `API_GAP` rather
+than importing internals.
 
 ## State And Identity
 
@@ -64,10 +65,11 @@ Important concepts:
 Authoring rule: child view/layout inputs are target-local. Parent placement is
 represented only by `ParentLocalRect`.
 
-Scroll declarations are created after layout. Use the scroll-region capability
-helper with the final `LayoutOutput`, not the incoming `LayoutInput`, so the
-scroll viewport is derived from the widget bounds that will actually be
-presented.
+Scroll declarations are created after layout: use
+`scroll_region_from_scrollable_capability` (or its `_with_order` variant when
+regions can overlap) with the final `LayoutOutput`, not the incoming
+`LayoutInput`, so the viewport derives from the presented bounds. Routing,
+ordering, and overlays: [Routing and scroll](routing-and-scroll.md).
 
 ## Interaction Declarations
 
@@ -111,12 +113,11 @@ LLM rule: when the source UI has meaningful components, preserve those
 boundaries as widgets or explicit container children. A single root surface is
 only acceptable for a genuinely single-widget UI.
 
-Tuple child lists are supported as a fixed-arity convenience for authored apps
-and containers. The public facade currently supports tuple child lists up to 16
-children across core, iced, and egui. This is not meant to be the only
-composition pattern: for larger or dynamic sets, use a dedicated container or
-collection widget that declares its own child/region contract instead of
-collapsing the whole UI into one painted surface.
+Tuple child lists are a fixed-arity convenience for authored apps and
+containers; the public facade supports them up to 16 children across core,
+iced, and egui. They are not the only composition pattern: for larger or
+dynamic sets, use a dedicated container or collection widget that declares
+its own child/region contract instead of one painted surface.
 
 Layering rule: overlays and popups need explicit `PaintOrderDeclaration`,
 declared overflow bounds, and matching hit regions. The backend preserves the
@@ -132,7 +133,8 @@ Visible backends may defensively crop or disable invalid scroll geometry to keep
 the window from presenting impossible rectangles. That repair is diagnostic
 evidence, not authoring authority. Treat a scroll-normalization diagnostic as a
 bug in the widget declaration unless the task explicitly accepts degraded
-scroll behavior.
+scroll behavior. Refusal codes are cataloged in
+[Diagnostics](diagnostics.md).
 
 ## Backend Input Evidence
 

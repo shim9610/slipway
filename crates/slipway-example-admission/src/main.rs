@@ -1,3 +1,50 @@
+//! # INTERNAL admission stress fixture — NOT the authoring template
+//!
+//! Do NOT copy this crate to author a Slipway app. The designated copy
+//! source is `crates/slipway-example-authored` (facade-only,
+//! `use slipway::prelude::*`, five-file split). This crate violates the
+//! documented authoring rules on purpose-preserving legacy grounds — one
+//! 7,000+-line `main.rs`, direct `slipway_core`/`slipway_runtime`/backend
+//! crate imports — and was formally demoted from example duty by the
+//! LLM-ergonomics audit (2026-07-11, findings LE-H2/LE-H6) and roadmap
+//! Phase 4.
+//!
+//! ## What this crate actually is (why it stays)
+//!
+//! * an admission/contract STRESS HARNESS: nine widget kinds exercising
+//!   action, segment, text-edit, toggle, slider, list-scroll, movable
+//!   overlay, overlay-stack z-order, and triple-nested-scroll admission;
+//! * a load-bearing REGRESSION FIXTURE: its 45 tests pin declaration and
+//!   dispatch behavior that step-packet procedures reference;
+//! * the debug-MCP LIVE-VERIFICATION target: drivers and step packets
+//!   launch `slipway-example-admission --iced|--egui` by name.
+//!
+//! Do not rename, move, or restructure it; keep tests and launch behavior
+//! stable. New authoring patterns belong in `slipway-example-authored`.
+//!
+//! ## Named-item section index
+//!
+//! * entry/launch: `main`, `run_egui`, `run_iced`, `print_probe`
+//! * app composition: `AdmissionApp`, `admission_widget_tuple`,
+//!   `AdmissionRuntimeAppWidget` (pre-Step-209 root-wrapper idiom),
+//!   `root_scroll_region_for_admission_app`
+//! * app state/messages: `AdmissionState`, `AdmissionMessage`,
+//!   `apply_messages`, `apply_text_edit_to_draft`
+//! * shared geometry constants: `LIST_ROW_*`, `CARD_*`, `NESTED_*`,
+//!   `ADMISSION_OVERLAY_*` (MUST agree with paint/hit/pointer math)
+//! * widget enum + locals: `AdmissionWidget`, `AdmissionLocal`
+//! * declarations: `AdmissionViewDeclarations`, the policy `impl` blocks
+//!   on `AdmissionWidget`, `unresolved_example_font_evidence`
+//! * outcome/style helpers: `message_outcome`, `local_change_outcome`,
+//!   `admission_text_input_style_token`, `admission_cjk_font_source`
+//! * regression tests: `mod tests` (45 tests, includes the pre-flight
+//!   admission suite)
+//!
+//! Authoring docs (read these, not this file):
+//! `docs/public/llm-entry.md`, `docs/public/quickstart-authoring.md`,
+//! `docs/public/llm-contract-checklist.md`,
+//! `docs/public/authoring-layout.md`.
+
 use slipway_backend_egui::{
     SlipwayEguiAuthoredChildren, SlipwayEguiWidgetListVisitor,
     run_slipway_egui_runtime_app_with_default_bridge,
@@ -12,17 +59,18 @@ use slipway_core::{
     EventRoutePhase, EvidenceSource, FocusRegionDeclaration, FocusTraversalMember,
     FontResolutionEvidence, FontResolutionRequest, HitRegionDeclaration, HitRegionOrder,
     ImeCompositionPolicyDeclaration, InputEvent, LayoutConstraints, LayoutInput, LayoutOutput,
-    PaintLayerKey, PaintOp, PaintOrderDeclaration, ParentLocalRect, PathCommand, PathDeclaration,
-    Point, PointerCaptureIntent, PresentationRegionId, ProbeCollector, ProbeMetadataDeclaration,
-    ProbeProduct, Rect, ResourceInstallationEvidence, ResourceInstallationStatus,
-    ResourceRefusalEvidence, ResourceSourceDeclaration, ResourceSourceKind,
-    ScrollRegionDeclaration, SemanticNode, SemanticSlotDeclaration, ShapeDeclaration, ShapeKind,
-    Size, SlipwayApp, SlipwayAppWidget, SlipwayFontResolutionPolicy, SlipwayLogic, SlipwaySsot,
-    SlipwayView, SlipwayViewDefinition, SlipwayWidgetListVisitor, SlipwayWidgetTypes,
-    SourceValidityEvidence, SourceValidityKind, StateObservation, TargetLocalRect,
-    TextBufferSnapshot, TextEditCommandDeclaration, TextEditKind, TextInputTypographyDeclaration,
-    TextLineMode, TextSelectionPolicyDeclaration, TextSelectionRange, TextStyle, TextViewport,
-    TopologyNode, ViewDefinition, ViewDefinitionInput, WheelRouting, WidgetId, WidgetSlotAddress,
+    PaintInputTransparency, PaintLayerKey, PaintOp, PaintOrderDeclaration, ParentLocalRect,
+    PathCommand, PathDeclaration, Point, PointerCaptureIntent, PresentationRegionId,
+    ProbeCollector, ProbeMetadataDeclaration, ProbeProduct, Rect, ResourceInstallationEvidence,
+    ResourceInstallationStatus, ResourceRefusalEvidence, ResourceSourceDeclaration,
+    ResourceSourceKind, ScrollRegionDeclaration, SemanticNode, SemanticSlotDeclaration,
+    ShapeDeclaration, ShapeKind, Size, SlipwayApp, SlipwayAppWidget, SlipwayFontResolutionPolicy,
+    SlipwayLogic, SlipwaySsot, SlipwayView, SlipwayViewDefinition, SlipwayWidgetListVisitor,
+    SlipwayWidgetTypes, SourceValidityEvidence, SourceValidityKind, StateObservation,
+    TargetLocalRect, TextBufferSnapshot, TextEditCommandDeclaration, TextEditKind,
+    TextInputTypographyDeclaration, TextLineMode, TextSelectionPolicyDeclaration,
+    TextSelectionRange, TextStyle, TextViewport, TopologyNode, ViewDefinition, ViewDefinitionInput,
+    WheelRouting, WidgetId, WidgetSlotAddress,
 };
 use slipway_runtime::{SlipwayRuntime, SlipwayRuntimeConfig};
 
@@ -225,7 +273,7 @@ impl SlipwayApp for AdmissionApp {
 
         for seed in children {
             let height = match seed.child.as_str() {
-                "admission.list" => 168.0,
+                "admission.list" => LIST_CARD_HEIGHT,
                 "admission.overlay" => 228.0,
                 "admission.overlay-stack" => 276.0,
                 "admission.nested-scroll" => 292.0,
@@ -486,7 +534,14 @@ fn root_scroll_region_for_admission_app(
             horizontal: false,
             vertical: true,
         },
-        WheelRouting::SelfFirst,
+        // The default routing mode: wheel selection stays the front-most
+        // containing consumable owner. Since the Step 200 revert
+        // (902f99eae) EVERY region in this example — this root page region,
+        // the List, the nested outer AND inners — authors the
+        // `NearestScrollable` default; no non-default declaration remains
+        // (see `AdmissionWidget::wheel_routing_policy` for the revert
+        // record and the authoring breadcrumb).
+        WheelRouting::NearestScrollable,
         HitRegionOrder {
             z_index: -1,
             paint_order: 0,
@@ -705,9 +760,30 @@ fn apply_text_edit_to_draft(current: &str, edit: &slipway_core::TextEditEvent) -
     }
 }
 
+// LIST card row geometry. The pointer-selection math
+// (`list_row_from_pointer_y`), the declared per-row hit regions
+// (`push_list_row_hit_regions`), the painted row labels (`paint`), and the
+// row-quantized scroll conversions MUST all derive from these same
+// constants: admission validates hit bounds against layout, but nothing
+// can validate them against paint, so a drift here silently routes clicks
+// to rows the user does not see.
+const LIST_ROW_TOP: f32 = 44.0;
+const LIST_ROW_STEP: f32 = 20.0;
+const LIST_ROW_COUNT: usize = 5;
+
+// Card geometry shared by `AdmissionWidget::layout`, the app's
+// `layout_plan`, and the (RESERVED, evidence-only) viewport-observation
+// declaration. The observation evidence MUST derive from the same
+// constants as the presented layout or the probe reports a viewport the
+// backend never presented.
+const CARD_MAX_WIDTH: f32 = 560.0;
+const LIST_CARD_HEIGHT: f32 = 168.0;
+
 fn list_row_from_pointer_y(y: f32) -> Option<usize> {
-    let row = ((y - 44.0) / 20.0).floor() as i32;
-    (0..5).contains(&row).then_some(row as usize)
+    let row = ((y - LIST_ROW_TOP) / LIST_ROW_STEP).floor() as i32;
+    (0..LIST_ROW_COUNT as i32)
+        .contains(&row)
+        .then_some(row as usize)
 }
 
 fn list_scroll_rows_after_wheel(current: i32, delta_y: f32) -> i32 {
@@ -718,7 +794,9 @@ fn list_scroll_rows_after_wheel(current: i32, delta_y: f32) -> i32 {
     } else {
         0
     };
-    (current + direction).clamp(0, 5)
+    // Wheel travel is quantized to one row per notch, capped at one full
+    // row-set of travel.
+    (current + direction).clamp(0, LIST_ROW_COUNT as i32)
 }
 
 fn list_scroll_content_height(viewport_height: f32) -> f32 {
@@ -728,8 +806,40 @@ fn list_scroll_content_height(viewport_height: f32) -> f32 {
 fn list_scroll_offset_y(scroll_rows: i32, viewport_height: f32) -> f32 {
     let content_height = list_scroll_content_height(viewport_height);
     let max_offset = (content_height - viewport_height).max(0.0);
-    (scroll_rows as f32 * 20.0).clamp(0.0, max_offset)
+    (scroll_rows as f32 * LIST_ROW_STEP).clamp(0.0, max_offset)
 }
+
+const NESTED_SCROLL_ROW_STEP: f32 = 18.0;
+const NESTED_SCROLL_MAX_ROWS: i32 = 7;
+const NESTED_INNER_VIEWPORT_HEIGHT: f32 = 62.0;
+// The OUTER region's travel is authored separately from the inner panels.
+// Its total travel (step * max rows = 24px) must stay strictly under half a
+// panel height (62 / 2 = 31px): whenever the outer consumes — a wheel over
+// the outer body, or default chaining once the inner under the cursor is at
+// its limit — it displaces the panels upward, and every later wheel resolves
+// the inner under the cursor at its DISPLACED position. With the old travel
+// (126px, two panel pitches) the anchored panel had scrolled out from under
+// the cursor by the time the outer saturated: the bottom panel's band became
+// bare outer body (a dead wheel), the top panel became unreachable, and a
+// cursor over the first panel landed on the THIRD — the live symptom "the
+// third nested panel never scrolls". Keeping the travel under half a panel
+// height guarantees every panel-center anchor still sits over its own panel
+// across the outer's whole travel.
+const NESTED_OUTER_ROW_STEP: f32 = 8.0;
+const NESTED_OUTER_MAX_ROWS: i32 = 3;
+// Nested-demo panel geometry. The declared inner viewports
+// (`nested_inner_content_viewport`), the region declarations built from
+// them (`push_nested_scroll_regions`), and the painted panel field +
+// outer-content tail markers (`push_nested_scroll_paint_ops`) MUST all
+// derive from these same constants: a pitch or top-offset drift makes the
+// wheel land on a panel the user is not pointing at, and admission cannot
+// catch it (it validates geometry against layout, not against paint).
+const NESTED_PANEL_COUNT: usize = 3;
+const NESTED_PANEL_PITCH: f32 = 70.0;
+// Content-local y of panel 0 inside the outer region; panels sit at
+// NESTED_OUTER_VIEWPORT_TOP + NESTED_PANEL_FIELD_TOP in card-local space.
+const NESTED_PANEL_FIELD_TOP: f32 = 14.0;
+const NESTED_OUTER_VIEWPORT_TOP: f32 = 44.0;
 
 fn nested_scroll_local(local: &AdmissionLocal) -> Option<(i32, [i32; 3])> {
     match local {
@@ -851,31 +961,63 @@ struct OverlayStackLayerSpec {
     key: PaintLayerKey,
 }
 
+const ADMISSION_OVERLAY_GLOBAL_Z: i32 = 10;
+const ADMISSION_MOVABLE_OVERLAY_ORDER: usize = 10;
+const ADMISSION_OVERLAY_STACK_ORDER_BASE: usize = 0;
+const ADMISSION_OVERLAY_HIT_TRAVERSAL_BASE: usize = 10_000;
+
 impl OverlayStackLayerSpec {
     fn new(overlay: usize, rank: usize) -> Self {
         Self {
             overlay,
-            key: PaintLayerKey::ordered(10, rank),
+            key: PaintLayerKey::ordered(
+                ADMISSION_OVERLAY_GLOBAL_Z,
+                ADMISSION_OVERLAY_STACK_ORDER_BASE + rank,
+            ),
         }
     }
 
     fn paint_layer(self, ops: Vec<PaintOp>) -> PaintOp {
+        // The overlay body stays pointer-opaque (clicks are occluded) but is
+        // authored wheel-pass-through, so wheeling over or while dragging the
+        // overlay scrolls the page behind it. See the explicit wheel-channel
+        // API `PaintOp::with_wheel_transparency`.
         PaintOp::keyed_layer(self.key, ops)
             .with_layer_id(format!("overlay-stack-window-{}", self.overlay))
+            .with_wheel_transparency(PaintInputTransparency::PassThrough)
     }
 
-    fn hit_order(self) -> HitRegionOrder {
+    fn absorb_hit_order(self) -> HitRegionOrder {
+        let paint_order = self.key.order.unwrap_or(self.overlay);
         HitRegionOrder {
             z_index: self.key.z_index,
-            paint_order: self.key.order.unwrap_or(self.overlay),
-            traversal_order: self.overlay,
+            paint_order,
+            traversal_order: ADMISSION_OVERLAY_HIT_TRAVERSAL_BASE + paint_order * 2,
+        }
+    }
+
+    fn drag_hit_order(self) -> HitRegionOrder {
+        let paint_order = self.key.order.unwrap_or(self.overlay);
+        HitRegionOrder {
+            z_index: self.key.z_index,
+            paint_order,
+            traversal_order: ADMISSION_OVERLAY_HIT_TRAVERSAL_BASE + paint_order * 2 + 1,
         }
     }
 }
 
 impl AdmissionWidget {
     fn overlay_layer_key() -> PaintLayerKey {
-        PaintLayerKey::ordered(12, 12)
+        PaintLayerKey::ordered(ADMISSION_OVERLAY_GLOBAL_Z, ADMISSION_MOVABLE_OVERLAY_ORDER)
+    }
+
+    fn overlay_hit_order_for_key(key: PaintLayerKey) -> HitRegionOrder {
+        let paint_order = key.order.unwrap_or(ADMISSION_MOVABLE_OVERLAY_ORDER);
+        HitRegionOrder {
+            z_index: key.z_index,
+            paint_order,
+            traversal_order: ADMISSION_OVERLAY_HIT_TRAVERSAL_BASE + paint_order * 2 + 1,
+        }
     }
 
     fn overlay_default_offset() -> Point {
@@ -992,6 +1134,10 @@ impl AdmissionWidget {
         }
     }
 
+    fn overlay_stack_drag_rect(bounds: Rect, offsets: [Point; 4], index: usize) -> Rect {
+        Self::overlay_stack_rect(bounds, offsets, index)
+    }
+
     fn overlay_stack_help_text_rect(bounds: Rect) -> Rect {
         Rect {
             origin: Point { x: 20.0, y: 44.0 },
@@ -1054,7 +1200,10 @@ impl AdmissionWidget {
 
     fn nested_outer_viewport(bounds: Rect) -> Rect {
         Rect {
-            origin: Point { x: 18.0, y: 44.0 },
+            origin: Point {
+                x: 18.0,
+                y: NESTED_OUTER_VIEWPORT_TOP,
+            },
             size: Size {
                 width: (bounds.size.width - 36.0).max(1.0),
                 height: (bounds.size.height - 68.0).max(1.0),
@@ -1066,11 +1215,14 @@ impl AdmissionWidget {
         Rect {
             origin: Point {
                 x: 32.0,
-                y: 58.0 + index as f32 * 70.0 - outer_offset_y,
+                y: NESTED_OUTER_VIEWPORT_TOP
+                    + NESTED_PANEL_FIELD_TOP
+                    + index as f32 * NESTED_PANEL_PITCH
+                    - outer_offset_y,
             },
             size: Size {
                 width: 156.0,
-                height: 62.0,
+                height: NESTED_INNER_VIEWPORT_HEIGHT,
             },
         }
     }
@@ -1087,16 +1239,31 @@ impl AdmissionWidget {
     }
 
     fn nested_outer_content_height() -> f32 {
-        360.0
+        // Aligned with the row-quantized wheel handler exactly like the inner
+        // panels (`nested_inner_content_height`): the demo card is 292 tall
+        // (`layout_plan`), so the outer viewport is 292 - 68 = 224, and the
+        // declared content extent puts the offset at `NESTED_OUTER_MAX_ROWS`
+        // rows exactly at the declared limit. Without this alignment the
+        // declaration keeps reporting consumable room after the handler
+        // saturates, so at-limit chaining to the page would never engage and
+        // wheels over a saturated outer would be silently dead. The travel
+        // itself is capped by the anchoring rule on
+        // `NESTED_OUTER_ROW_STEP`/`NESTED_OUTER_MAX_ROWS`.
+        224.0 + NESTED_OUTER_ROW_STEP * NESTED_OUTER_MAX_ROWS as f32
     }
 
-    fn nested_inner_content_height() -> f32 {
-        132.0
+    fn nested_inner_content_height(viewport_height: f32) -> f32 {
+        viewport_height + NESTED_SCROLL_ROW_STEP * NESTED_SCROLL_MAX_ROWS as f32
     }
 
-    fn nested_scroll_offset_y(rows: i32, viewport_height: f32, content_height: f32) -> f32 {
+    fn nested_scroll_offset_y(
+        rows: i32,
+        row_step: f32,
+        viewport_height: f32,
+        content_height: f32,
+    ) -> f32 {
         let max_offset = (content_height - viewport_height).max(0.0);
-        (rows as f32 * 18.0).clamp(0.0, max_offset)
+        (rows as f32 * row_step).clamp(0.0, max_offset)
     }
 
     fn text_input_focus_bounds(bounds: Rect) -> Rect {
@@ -1209,12 +1376,7 @@ impl AdmissionWidget {
                 bounds
             };
             let hit_order = if matches!(self, Self::Overlay(_)) {
-                let key = Self::overlay_layer_key();
-                HitRegionOrder {
-                    z_index: key.z_index,
-                    paint_order: key.order.unwrap_or(self.traversal_order()),
-                    traversal_order: self.traversal_order(),
-                }
+                Self::overlay_hit_order_for_key(Self::overlay_layer_key())
             } else {
                 HitRegionOrder {
                     z_index: 0,
@@ -1321,7 +1483,9 @@ impl AdmissionWidget {
         bounds: Rect,
     ) {
         let target = self.id();
-        for row in 0..5 {
+        // Hit bounds MUST derive from the same LIST_ROW_* constants as the
+        // painted rows and the pointer math (see the constants' comment).
+        for row in 0..LIST_ROW_COUNT {
             let id = PresentationRegionId::from(format!("{}:row-{row}", target.as_str()));
             declarations
                 .hit_regions
@@ -1334,7 +1498,7 @@ impl AdmissionWidget {
                     TargetLocalRect::new(Rect {
                         origin: Point {
                             x: 24.0,
-                            y: 44.0 + row as f32 * 20.0,
+                            y: LIST_ROW_TOP + row as f32 * LIST_ROW_STEP,
                         },
                         size: Size {
                             width: (bounds.size.width - 48.0).max(1.0),
@@ -1416,13 +1580,32 @@ impl AdmissionWidget {
                     external,
                     local,
                     PresentationRegionId::from(format!(
-                        "{}:overlay-{overlay}:drag",
+                        "{}:overlay-{overlay}:absorb",
                         target.as_str()
                     )),
                     address.clone(),
                     TargetLocalRect::new(Self::overlay_stack_rect(bounds, offsets, overlay)),
                     slipway_core::PointerEventCoordinateSpace::TargetLocal,
-                    layer_spec.hit_order(),
+                    layer_spec.absorb_hit_order(),
+                    Some(format!("{}:overlay-{overlay}:absorb", target.as_str())),
+                    CursorCapability::Pointer,
+                    true,
+                    PointerCaptureIntent::OnPress,
+                ));
+            declarations
+                .hit_regions
+                .push(slipway_core::hit_region_from_pointer_capability(
+                    self,
+                    external,
+                    local,
+                    PresentationRegionId::from(format!(
+                        "{}:overlay-{overlay}:drag",
+                        target.as_str()
+                    )),
+                    address.clone(),
+                    TargetLocalRect::new(Self::overlay_stack_drag_rect(bounds, offsets, overlay)),
+                    slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                    layer_spec.drag_hit_order(),
                     Some(format!("{}:overlay-{overlay}:drag", target.as_str())),
                     cursor,
                     true,
@@ -1445,6 +1628,7 @@ impl AdmissionWidget {
         let outer_viewport = Self::nested_outer_viewport(bounds);
         let outer_offset_y = Self::nested_scroll_offset_y(
             outer_scroll_rows,
+            NESTED_OUTER_ROW_STEP,
             outer_viewport.size.height,
             Self::nested_outer_content_height(),
         );
@@ -1457,7 +1641,7 @@ impl AdmissionWidget {
             Self::nested_outer_content_height(),
             outer_offset_y,
         ));
-        for index in 0..3 {
+        for index in 0..NESTED_PANEL_COUNT {
             let Some(viewport) =
                 Self::nested_inner_visible_viewport(index, outer_offset_y, outer_viewport)
             else {
@@ -1465,8 +1649,9 @@ impl AdmissionWidget {
             };
             let offset_y = Self::nested_scroll_offset_y(
                 inner_scroll_rows[index],
+                NESTED_SCROLL_ROW_STEP,
                 viewport.size.height,
-                Self::nested_inner_content_height(),
+                Self::nested_inner_content_height(viewport.size.height),
             );
             declarations.scroll_regions.push(self.nested_scroll_region(
                 external,
@@ -1474,12 +1659,23 @@ impl AdmissionWidget {
                 address.clone(),
                 &format!("inner-{index}"),
                 viewport,
-                Self::nested_inner_content_height(),
+                Self::nested_inner_content_height(viewport.size.height),
                 offset_y,
             ));
         }
     }
 
+    // Helper-then-patch idiom, and WHY the per-region override is
+    // legitimate: `SlipwayScrollBehaviorPolicy::scroll_behavior_policy` is
+    // a single-declaration surface (one geometry per widget), but this
+    // widget declares FOUR overlapping regions (outer + 3 inners) with
+    // distinct viewports, content heights, and offsets. The `_with_order`
+    // helper still does the contract wiring worth keeping — region-id
+    // resolution, the per-region wheel-routing snapshot (ADR-0002 B3), and
+    // the consumption policy — and the geometry fields are then overridden
+    // per region BEFORE the declaration is pushed, so admission validates
+    // exactly what is declared. Do not copy this shape for a single-region
+    // widget: there the policy itself should return the real geometry.
     fn nested_scroll_region(
         &self,
         external: &AdmissionState,
@@ -1495,31 +1691,11 @@ impl AdmissionWidget {
             child_placements: Vec::new(),
             diagnostics: Vec::new(),
         };
-        let mut declaration = slipway_core::scroll_region_from_scrollable_capability(
-            self,
-            external,
-            local,
-            &layout,
-            Some(PresentationRegionId::from(format!(
-                "{}:{region}",
-                self.id().as_str()
-            ))),
-            address,
-            true,
-        );
-        declaration.viewport = TargetLocalRect::new(viewport);
-        declaration.content_bounds = TargetLocalRect::new(Rect {
-            origin: viewport.origin,
-            size: Size {
-                width: viewport.size.width,
-                height: content_height.max(viewport.size.height),
-            },
-        });
-        declaration.offset = Point {
-            x: 0.0,
-            y: offset_y,
-        };
-        declaration.order = if let Some(index) = region
+        // Overlapping wheel-consuming regions need distinct orders (the
+        // `ambiguous_wheel_overlap` refusal): inners sit in front of the
+        // outer, so the pointed-at inner wins under the default
+        // `NearestScrollable` routing.
+        let order = if let Some(index) = region
             .strip_prefix("inner-")
             .and_then(|value| value.parse::<usize>().ok())
         {
@@ -1534,6 +1710,31 @@ impl AdmissionWidget {
                 paint_order: 0,
                 traversal_order: 0,
             }
+        };
+        let mut declaration = slipway_core::scroll_region_from_scrollable_capability_with_order(
+            self,
+            external,
+            local,
+            &layout,
+            Some(PresentationRegionId::from(format!(
+                "{}:{region}",
+                self.id().as_str()
+            ))),
+            address,
+            true,
+            order,
+        );
+        declaration.viewport = TargetLocalRect::new(viewport);
+        declaration.content_bounds = TargetLocalRect::new(Rect {
+            origin: viewport.origin,
+            size: Size {
+                width: viewport.size.width,
+                height: content_height.max(viewport.size.height),
+            },
+        });
+        declaration.offset = Point {
+            x: 0.0,
+            y: offset_y,
         };
         declaration
     }
@@ -1714,8 +1915,12 @@ impl AdmissionWidget {
                 .collect(),
         });
         out_ops.push(
+            // Pointer-opaque (still catches clicks / drag on the titlebar) but
+            // wheel-pass-through so wheeling over or while holding the movable
+            // overlay scrolls the page behind it.
             PaintOp::keyed_layer(Self::overlay_layer_key(), window_ops)
-                .with_layer_id("movable-overlay-window"),
+                .with_layer_id("movable-overlay-window")
+                .with_wheel_transparency(PaintInputTransparency::PassThrough),
         );
     }
 
@@ -1741,7 +1946,7 @@ impl AdmissionWidget {
 
         ops.push(PaintOp::Text {
             bounds: Self::overlay_stack_help_text_rect(bounds),
-            content: "front buttons; drag title bars".to_string(),
+            content: "front buttons; drag cards".to_string(),
             color: rgb(71, 85, 105),
             style: TextStyle::plain().with_font_size(12.0),
         });
@@ -1926,6 +2131,7 @@ impl AdmissionWidget {
         let outer = Self::nested_outer_viewport(bounds);
         let outer_offset = Self::nested_scroll_offset_y(
             outer_rows,
+            NESTED_OUTER_ROW_STEP,
             outer.size.height,
             Self::nested_outer_content_height(),
         );
@@ -1939,7 +2145,7 @@ impl AdmissionWidget {
             width: 1.0,
         });
         let mut content_ops = Vec::new();
-        for index in 0..3 {
+        for index in 0..NESTED_PANEL_COUNT {
             let viewport = Self::nested_inner_content_viewport(index, outer_offset);
             content_ops.push(PaintOp::Fill {
                 shape: rect_shape("nested-inner-bg", viewport, ShapeKind::RoundedRectangle),
@@ -1954,18 +2160,21 @@ impl AdmissionWidget {
                 color: rgb(203, 213, 225),
                 width: 1.0,
             });
-            let inner_offset = Self::nested_scroll_offset_y(
-                inner_rows[index],
-                viewport.size.height,
-                Self::nested_inner_content_height(),
-            );
+            // The panel is a routed (non-native) scroll region, so the author
+            // paints the VISIBLE window. The rows virtualize: the labels carry
+            // the scroll offset (`row + inner_rows`), so the row positions stay
+            // anchored to the panel. Subtracting the offset here as well would
+            // apply it twice — the painted window would slide out of the clip,
+            // showing labels that skip ahead two per notch and leaving the
+            // panel completely blank from offset 4 on while it still consumes
+            // wheels (the "collapsing" nested panel).
             let mut row_ops = Vec::new();
             for row in 0..4 {
                 row_ops.push(PaintOp::Text {
                     bounds: Rect {
                         origin: Point {
                             x: viewport.origin.x + 12.0,
-                            y: viewport.origin.y + 8.0 + row as f32 * 18.0 - inner_offset,
+                            y: viewport.origin.y + 8.0 + row as f32 * NESTED_SCROLL_ROW_STEP,
                         },
                         size: Size {
                             width: viewport.size.width - 24.0,
@@ -1986,6 +2195,42 @@ impl AdmissionWidget {
                 }),
                 ops: row_ops,
             });
+        }
+        // The outer declares `nested_outer_content_height()` of content so
+        // the outer's travel spans `NESTED_OUTER_MAX_ROWS` rows (the Step
+        // 194 extent/handler alignment), but the panels end above that
+        // extent. Paint tail markers through the declared remainder (below
+        // the panel field, up to the declared extent) so deep outer offsets
+        // show scrolling content instead of a blank band (the "collapsed"
+        // outer). Marker placement derives from the panel field bottom so it
+        // tracks the anchoring-capped travel.
+        let outer_content_height = Self::nested_outer_content_height();
+        // Derived from the same NESTED_PANEL_* constants as the declared
+        // inner viewports (see the constants' comment): content-local
+        // bottom edge of the last panel.
+        let panel_field_bottom = NESTED_PANEL_FIELD_TOP
+            + (NESTED_PANEL_COUNT - 1) as f32 * NESTED_PANEL_PITCH
+            + NESTED_INNER_VIEWPORT_HEIGHT;
+        let mut marker = 0;
+        let mut content_y = panel_field_bottom + 8.0;
+        while content_y + 16.0 <= outer_content_height {
+            content_ops.push(PaintOp::Text {
+                bounds: Rect {
+                    origin: Point {
+                        x: 32.0,
+                        y: outer.origin.y + content_y - outer_offset,
+                    },
+                    size: Size {
+                        width: 156.0,
+                        height: 16.0,
+                    },
+                },
+                content: format!("outer tail {}", marker + 1),
+                color: rgb(100, 116, 139),
+                style: TextStyle::plain().with_font_size(12.0),
+            });
+            marker += 1;
+            content_y += 30.0;
         }
         content_ops.push(PaintOp::Text {
             bounds: Rect {
@@ -2613,6 +2858,7 @@ impl slipway_core::SlipwayScrollBehaviorPolicy for AdmissionWidget {
                 outer_scroll_rows, ..
             } => Self::nested_scroll_offset_y(
                 *outer_scroll_rows,
+                NESTED_OUTER_ROW_STEP,
                 viewport.size.height,
                 content_height,
             ),
@@ -2661,11 +2907,32 @@ impl slipway_core::SlipwayWheelRoutingPolicy for AdmissionWidget {
         &self,
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
-        _wheel: &slipway_core::WheelEvent,
+        region: &slipway_core::PresentationRegionId,
     ) -> slipway_core::WheelRoutingPolicyDeclaration {
+        // The declaration-time call's `region` names the region being
+        // declared (ADR-0002 B3 / Step 197), so this single impl can author
+        // a different mode per region. A non-default route is authored by
+        // matching the widget + region id, e.g. the Step 194 declaration was
+        //
+        //     matches!(self, Self::NestedScroll(_))
+        //         && region.as_str().ends_with(":outer")
+        //         => WheelRouting::SelfFirst
+        //
+        // This example now deliberately authors NOTHING non-default: every
+        // region (the nested outer AND inners, the List, the root page
+        // region) stays on the `NearestScrollable` default, so the region
+        // under the cursor scrolls first — wheel over an inner panel scrolls
+        // THAT inner, chains to the outer at the inner's limit, and to the
+        // page at the outer's limit. The Step 194 `SelfFirst`-on-outer
+        // authoring was reverted by an architect live-UX decision
+        // (2026-07-11: pointing the wheel at an inner moved the outer). The
+        // authored-routing API itself stays proven by the synthetic-fixture
+        // suites (core `SelfFirst`/`ParentFirst` selection, iced/egui
+        // end-to-end routing, and the dispatch-graph flip tests).
+        let _ = region;
         slipway_core::WheelRoutingPolicyDeclaration {
             target: self.id(),
-            routing: WheelRouting::SelfFirst,
+            routing: WheelRouting::NearestScrollable,
             modifiers: None,
             diagnostics: Vec::new(),
         }
@@ -2678,11 +2945,13 @@ impl slipway_core::SlipwayViewportObservationPolicy for AdmissionWidget {
         _external: &Self::ExternalState,
         local: &Self::LocalState,
     ) -> slipway_core::ViewportObservationEvidence {
+        // Evidence viewport derives from the same card constants as
+        // `layout`/`layout_plan` (see CARD_MAX_WIDTH's comment).
         let viewport = Rect {
             origin: Point { x: 0.0, y: 0.0 },
             size: Size {
-                width: 560.0,
-                height: 168.0,
+                width: CARD_MAX_WIDTH,
+                height: LIST_CARD_HEIGHT,
             },
         };
         let offset_y = match local {
@@ -2693,6 +2962,7 @@ impl slipway_core::SlipwayViewportObservationPolicy for AdmissionWidget {
                 outer_scroll_rows, ..
             } => Self::nested_scroll_offset_y(
                 *outer_scroll_rows,
+                NESTED_OUTER_ROW_STEP,
                 viewport.size.height,
                 Self::nested_outer_content_height(),
             ),
@@ -2975,7 +3245,8 @@ impl SlipwayLogic for AdmissionWidget {
             (Self::Toggle(_), InputEvent::Pointer(pointer))
                 if pointer.kind == slipway_core::PointerEventKind::Release =>
             {
-                handled_no_change_outcome(self.id())
+                *local = AdmissionLocal::Toggle { armed: false };
+                local_change_outcome(self.id(), "toggle-release", "armed", "false")
             }
             (Self::Slider(_), InputEvent::Pointer(pointer))
                 if pointer.kind == slipway_core::PointerEventKind::Press =>
@@ -3030,7 +3301,11 @@ impl SlipwayLogic for AdmissionWidget {
                 )
             }
             (Self::List(_), InputEvent::Scroll(scroll)) => {
-                let next_rows = (scroll.offset_y / 20.0).round().clamp(0.0, 5.0) as i32;
+                // Inverse of `list_scroll_offset_y`: same LIST_ROW_*
+                // constants convert a declared offset back into rows.
+                let next_rows = (scroll.offset_y / LIST_ROW_STEP)
+                    .round()
+                    .clamp(0.0, LIST_ROW_COUNT as f32) as i32;
                 if let AdmissionLocal::List { scroll_rows } = local {
                     *scroll_rows = next_rows;
                 }
@@ -3109,18 +3384,32 @@ impl SlipwayLogic for AdmissionWidget {
                             height: 228.0,
                         },
                     });
-                let Some((drag_anchor, dragging)) = (match local {
+                let Some((current_offset, drag_anchor, dragging)) = (match local {
                     AdmissionLocal::Overlay {
+                        offset,
                         drag_anchor,
                         dragging,
                         ..
-                    } => Some((*drag_anchor, *dragging)),
+                    } => Some((*offset, *drag_anchor, *dragging)),
                     _ => None,
                 }) else {
                     return EventOutcome::ignored();
                 };
                 if !dragging {
                     return EventOutcome::ignored();
+                }
+                if !pointer.details.buttons.primary {
+                    *local = AdmissionLocal::Overlay {
+                        offset: current_offset,
+                        dragging: false,
+                        drag_anchor,
+                    };
+                    return local_change_outcome(
+                        self.id(),
+                        "overlay-drag-cancel-missing-button",
+                        "dragging",
+                        "false".to_string(),
+                    );
                 }
                 let next = Self::clamp_overlay_offset_to_allowed(
                     bounds,
@@ -3129,6 +3418,9 @@ impl SlipwayLogic for AdmissionWidget {
                         y: pointer.position.y - drag_anchor.y,
                     },
                 );
+                if current_offset == next {
+                    return handled_no_change_outcome(self.id());
+                }
                 *local = AdmissionLocal::Overlay {
                     offset: next,
                     dragging: true,
@@ -3221,7 +3513,6 @@ impl SlipwayLogic for AdmissionWidget {
                     *order,
                     pointer.position,
                 ) {
-                    Self::overlay_stack_bring_front(order, index);
                     *dragging = Some(index);
                     *drag_anchor = Point {
                         x: pointer.position.x - offsets[index].x,
@@ -3262,13 +3553,26 @@ impl SlipwayLogic for AdmissionWidget {
                 let Some(index) = *dragging else {
                     return EventOutcome::ignored();
                 };
-                offsets[index] = Self::clamp_overlay_stack_offset_to_allowed(
+                if !pointer.details.buttons.primary {
+                    *dragging = None;
+                    return local_change_outcome(
+                        self.id(),
+                        "overlay-stack-drag-cancel-missing-button",
+                        "dragging",
+                        "false".to_string(),
+                    );
+                }
+                let next_offset = Self::clamp_overlay_stack_offset_to_allowed(
                     bounds,
                     Point {
                         x: pointer.position.x - drag_anchor.x,
                         y: pointer.position.y - drag_anchor.y,
                     },
                 );
+                if offsets[index] == next_offset {
+                    return handled_no_change_outcome(self.id());
+                }
+                offsets[index] = next_offset;
                 local_change_outcome(
                     self.id(),
                     "overlay-stack-drag-move",
@@ -3303,6 +3607,13 @@ impl SlipwayLogic for AdmissionWidget {
                 )
             }
             (Self::NestedScroll(_), InputEvent::Wheel(wheel)) => {
+                // Which region id arrives here is decided entirely by the
+                // declared routing (ADR-0002 B2): every region declares the
+                // `NearestScrollable` default, so wheel over an inner panel
+                // delivers THAT inner's region id while it can consume, and
+                // the outer's id once that inner is at its limit (default
+                // at-limit chaining). The handler stays region-driven and
+                // encodes no selection-order assumptions of its own.
                 let selected_region = wheel
                     .region_id
                     .as_ref()
@@ -3318,7 +3629,7 @@ impl SlipwayLogic for AdmissionWidget {
                             inner_scroll_rows[index] = nested_scroll_rows_after_wheel(
                                 inner_scroll_rows[index],
                                 wheel.delta_y,
-                                4,
+                                NESTED_SCROLL_MAX_ROWS,
                             );
                             local_change_outcome(
                                 self.id(),
@@ -3331,7 +3642,7 @@ impl SlipwayLogic for AdmissionWidget {
                             *outer_scroll_rows = nested_scroll_rows_after_wheel(
                                 *outer_scroll_rows,
                                 wheel.delta_y,
-                                7,
+                                NESTED_OUTER_MAX_ROWS,
                             );
                             local_change_outcome(
                                 self.id(),
@@ -3349,7 +3660,15 @@ impl SlipwayLogic for AdmissionWidget {
                 let Some(region) = nested_scroll_region_index(&scroll.region_id) else {
                     return EventOutcome::ignored();
                 };
-                let next_rows = (scroll.offset_y / 18.0).round().clamp(0.0, 7.0) as i32;
+                // The outer and inner regions quantize on their own row steps
+                // (the outer travel is anchoring-capped; see the constants).
+                let (row_step, max_rows) = match region {
+                    None => (NESTED_OUTER_ROW_STEP, NESTED_OUTER_MAX_ROWS),
+                    Some(_) => (NESTED_SCROLL_ROW_STEP, NESTED_SCROLL_MAX_ROWS),
+                };
+                let next_rows = (scroll.offset_y / row_step)
+                    .round()
+                    .clamp(0.0, max_rows as f32) as i32;
                 if let AdmissionLocal::NestedScroll {
                     outer_scroll_rows,
                     inner_scroll_rows,
@@ -3366,7 +3685,7 @@ impl SlipwayLogic for AdmissionWidget {
                             )
                         }
                         Some(index) => {
-                            inner_scroll_rows[index] = next_rows.min(4);
+                            inner_scroll_rows[index] = next_rows.min(NESTED_SCROLL_MAX_ROWS);
                             local_change_outcome(
                                 self.id(),
                                 "nested-scroll-inner",
@@ -3581,11 +3900,11 @@ impl SlipwayView for AdmissionWidget {
             .constraints
             .max
             .width
-            .min(560.0)
+            .min(CARD_MAX_WIDTH)
             .max(input.constraints.min.width)
             .max(220.0);
         let height = match self {
-            Self::List(_) => 168.0,
+            Self::List(_) => LIST_CARD_HEIGHT,
             Self::Overlay(_) => 228.0,
             Self::OverlayStack(_) => 276.0,
             Self::NestedScroll(_) => 292.0,
@@ -3774,12 +4093,15 @@ impl SlipwayView for AdmissionWidget {
         }
 
         if matches!(self, Self::List(_)) {
-            for i in 0..5 {
+            // Painted row geometry MUST derive from the same LIST_ROW_*
+            // constants as the hit regions and the pointer math (see the
+            // constants' comment).
+            for i in 0..LIST_ROW_COUNT {
                 ops.push(PaintOp::Text {
                     bounds: Rect {
                         origin: Point {
                             x: 24.0,
-                            y: 44.0 + i as f32 * 20.0,
+                            y: LIST_ROW_TOP + i as f32 * LIST_ROW_STEP,
                         },
                         size: Size {
                             width: bounds.size.width - 48.0,
@@ -4181,6 +4503,36 @@ mod tests {
         count
     }
 
+    fn collect_text_ops(ops: &[PaintOp], into: &mut Vec<(Rect, String)>) {
+        for op in ops {
+            match op {
+                PaintOp::Text {
+                    bounds, content, ..
+                } => into.push((*bounds, content.clone())),
+                PaintOp::Group { ops, .. } | PaintOp::Layer { ops, .. } => {
+                    collect_text_ops(ops, into);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn group_text_ops(ops: &[PaintOp], group_id: &str) -> Vec<(Rect, String)> {
+        let mut texts = Vec::new();
+        for op in ops {
+            if let PaintOp::Group { id, ops, .. } = op {
+                if id.as_deref() == Some(group_id) {
+                    collect_text_ops(ops, &mut texts);
+                } else {
+                    texts.extend(group_text_ops(ops, group_id));
+                }
+            } else if let PaintOp::Layer { ops, .. } = op {
+                texts.extend(group_text_ops(ops, group_id));
+            }
+        }
+        texts
+    }
+
     fn overlay_stack_layer_labels(ops: &[PaintOp]) -> Vec<String> {
         let mut labels = Vec::new();
         for op in ops {
@@ -4287,7 +4639,7 @@ mod tests {
             assert_eq!(layers[rank].1, spec.key);
             assert_eq!(layers[rank].2, PaintInputTransparency::Opaque);
 
-            let hit = view
+            let drag_hit = view
                 .hit_regions
                 .iter()
                 .find(|region| {
@@ -4297,7 +4649,22 @@ mod tests {
                         .contains(&format!(":overlay-{overlay}:drag"))
                 })
                 .expect("overlay drag hit region is declared");
-            assert_eq!(hit.order, spec.hit_order());
+            let absorb_hit = view
+                .hit_regions
+                .iter()
+                .find(|region| {
+                    region
+                        .id
+                        .as_str()
+                        .contains(&format!(":overlay-{overlay}:absorb"))
+                })
+                .expect("overlay absorb hit region is declared");
+            assert_eq!(drag_hit.order, spec.drag_hit_order());
+            assert_eq!(absorb_hit.order, spec.absorb_hit_order());
+            assert!(
+                drag_hit.order.traversal_order > absorb_hit.order.traversal_order,
+                "titlebar drag must win over same-card body absorption"
+            );
         }
     }
 
@@ -4599,7 +4966,7 @@ mod tests {
                 target_bounds: Some(TargetLocalRect::new(view.layout.bounds.into_rect())),
                 kind: slipway_core::PointerEventKind::Move,
                 button: Some(slipway_core::PointerButton::Primary),
-                details: slipway_core::PointerDetails::default(),
+                details: primary_pointer_details(),
             }),
         );
         assert!(moved.handled);
@@ -4652,8 +5019,18 @@ mod tests {
             })),
             kind,
             button: Some(slipway_core::PointerButton::Primary),
-            details: slipway_core::PointerDetails::default(),
+            details: primary_pointer_details(),
         })
+    }
+
+    fn primary_pointer_details() -> slipway_core::PointerDetails {
+        slipway_core::PointerDetails {
+            buttons: slipway_core::PointerButtons {
+                primary: true,
+                ..slipway_core::PointerButtons::default()
+            },
+            ..slipway_core::PointerDetails::default()
+        }
     }
 
     fn target_route_for_widget(widget: &AdmissionWidget) -> EventRoute {
@@ -4733,6 +5110,51 @@ mod tests {
     }
 
     #[test]
+    fn overlay_stack_stale_drag_move_without_primary_button_cancels_dragging() {
+        let state = AdmissionState::default();
+        let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
+        let offsets = AdmissionWidget::overlay_stack_default_offsets();
+        let order = AdmissionWidget::overlay_stack_default_order();
+        let mut local = AdmissionLocal::OverlayStack {
+            offsets,
+            order,
+            dragging: Some(0),
+            drag_anchor: Point { x: 12.0, y: 8.0 },
+        };
+
+        let outcome = stack.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: stack.id(),
+                target_slot: None,
+                position: Point { x: 340.0, y: 180.0 },
+                target_bounds: Some(TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 560.0,
+                        height: 276.0,
+                    },
+                })),
+                kind: slipway_core::PointerEventKind::Move,
+                button: None,
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+
+        assert!(outcome.handled);
+        assert_eq!(
+            local,
+            AdmissionLocal::OverlayStack {
+                offsets,
+                order,
+                dragging: None,
+                drag_anchor: Point { x: 12.0, y: 8.0 },
+            }
+        );
+    }
+
+    #[test]
     fn overlay_stack_declares_multiple_ordered_overlays_and_changes_front() {
         let state = AdmissionState::default();
         let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
@@ -4765,7 +5187,16 @@ mod tests {
         assert_eq!(
             view.hit_regions
                 .iter()
-                .filter(|region| region.id.as_str().contains(":overlay-"))
+                .filter(|region| region.id.as_str().contains(":overlay-")
+                    && region.id.as_str().contains(":drag"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            view.hit_regions
+                .iter()
+                .filter(|region| region.id.as_str().contains(":overlay-")
+                    && region.id.as_str().contains(":absorb"))
                 .count(),
             4
         );
@@ -4783,6 +5214,13 @@ mod tests {
             .expect("overlay 0 drag region is declared")
             .order
             .clone();
+        let overlay_0_absorb_order = view
+            .hit_regions
+            .iter()
+            .find(|region| region.id.as_str().contains(":overlay-0:absorb"))
+            .expect("overlay 0 absorb region is declared")
+            .order
+            .clone();
         let overlay_3_order = view
             .hit_regions
             .iter()
@@ -4792,12 +5230,17 @@ mod tests {
             .clone();
         assert_eq!(
             overlay_0_order,
-            AdmissionWidget::overlay_stack_layer_spec(0, 0).hit_order()
+            AdmissionWidget::overlay_stack_layer_spec(0, 0).drag_hit_order()
+        );
+        assert_eq!(
+            overlay_0_absorb_order,
+            AdmissionWidget::overlay_stack_layer_spec(0, 0).absorb_hit_order()
         );
         assert_eq!(
             overlay_3_order,
-            AdmissionWidget::overlay_stack_layer_spec(3, 3).hit_order()
+            AdmissionWidget::overlay_stack_layer_spec(3, 3).drag_hit_order()
         );
+        assert!(overlay_0_order.traversal_order > overlay_0_absorb_order.traversal_order);
         assert!(overlay_3_order.paint_order > overlay_0_order.paint_order);
         for index in 0..4 {
             let button_order = view
@@ -4846,9 +5289,36 @@ mod tests {
             _ => AdmissionWidget::overlay_stack_default_offsets(),
         };
         let drag_card = AdmissionWidget::overlay_stack_rect(drag_bounds, drag_offsets, 0);
+        let body_press = stack.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: stack.id(),
+                target_slot: None,
+                position: Point {
+                    x: drag_card.origin.x + 40.0,
+                    y: drag_card.origin.y + 52.0,
+                },
+                target_bounds: Some(TargetLocalRect::new(drag_bounds)),
+                kind: slipway_core::PointerEventKind::Press,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+        assert!(body_press.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::OverlayStack {
+                dragging: Some(0),
+                ..
+            }
+        ));
+        if let AdmissionLocal::OverlayStack { dragging, .. } = &mut local {
+            *dragging = None;
+        }
         let drag_start_position = Point {
-            x: drag_card.origin.x + drag_card.size.width - 18.0,
-            y: drag_card.origin.y + drag_card.size.height - 18.0,
+            x: drag_card.origin.x + 24.0,
+            y: drag_card.origin.y + 12.0,
         };
         let drag_start = stack.handle_event(
             &state,
@@ -4874,7 +5344,7 @@ mod tests {
                 target_bounds: Some(TargetLocalRect::new(drag_bounds)),
                 kind: slipway_core::PointerEventKind::Move,
                 button: Some(slipway_core::PointerButton::Primary),
-                details: slipway_core::PointerDetails::default(),
+                details: primary_pointer_details(),
             }),
         );
         assert!(drag_move.handled);
@@ -4885,6 +5355,85 @@ mod tests {
                 dragging: Some(0),
                 ..
             } if offsets[0].x > drag_offsets[0].x && offsets[0].y < drag_offsets[0].y
+        ));
+    }
+
+    #[test]
+    fn overlay_stack_drag_preserves_order_and_moves_only_offset() {
+        let state = AdmissionState::default();
+        let stack = AdmissionWidget::OverlayStack(OverlayStackWidget);
+        let mut local = stack.initial_local_state();
+        let initial_order = AdmissionWidget::overlay_stack_default_order();
+        let initial_offsets = AdmissionWidget::overlay_stack_default_offsets();
+        let layout_input = widget_layout_input(560.0, 276.0);
+        let view = stack.view_definition(
+            &state,
+            &local,
+            ViewDefinitionInput {
+                frame: FrameIdentity {
+                    surface_id: "test-surface".to_string(),
+                    surface_instance_id: "test-instance".to_string(),
+                    revision: 0,
+                    frame_index: 0,
+                    viewport: layout_input.viewport.into_rect(),
+                },
+                layout_input,
+            },
+        );
+        let bounds = view.layout.bounds.into_rect();
+        let overlay_0 = AdmissionWidget::overlay_stack_titlebar_rect(bounds, initial_offsets, 0);
+
+        let drag_start = stack.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: stack.id(),
+                target_slot: None,
+                position: Point {
+                    x: overlay_0.origin.x + 24.0,
+                    y: overlay_0.origin.y + 12.0,
+                },
+                target_bounds: Some(TargetLocalRect::new(bounds)),
+                kind: slipway_core::PointerEventKind::Press,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: slipway_core::PointerDetails::default(),
+            }),
+        );
+        assert!(drag_start.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::OverlayStack {
+                order,
+                dragging: Some(0),
+                ..
+            } if order == initial_order
+        ));
+
+        let drag_move = stack.handle_event(
+            &state,
+            &mut local,
+            InputEvent::Pointer(slipway_core::PointerEvent {
+                target: stack.id(),
+                target_slot: None,
+                position: Point {
+                    x: overlay_0.origin.x + 64.0,
+                    y: overlay_0.origin.y + 36.0,
+                },
+                target_bounds: Some(TargetLocalRect::new(bounds)),
+                kind: slipway_core::PointerEventKind::Move,
+                button: Some(slipway_core::PointerButton::Primary),
+                details: primary_pointer_details(),
+            }),
+        );
+        assert!(drag_move.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::OverlayStack {
+                offsets,
+                order,
+                dragging: Some(0),
+                ..
+            } if order == initial_order && offsets[0] != initial_offsets[0]
         ));
     }
 
@@ -4920,7 +5469,7 @@ mod tests {
         ]));
         let control_text = labels
             .iter()
-            .position(|label| label == "front buttons; drag title bars")
+            .position(|label| label == "front buttons; drag cards")
             .expect("overlay-stack default control text is painted");
         let first_layer = labels
             .iter()
@@ -5267,78 +5816,178 @@ mod tests {
         );
     }
 
+    // The inner panels are routed (non-native) scroll regions whose rows
+    // virtualize: the labels carry the scroll offset, so the painted row
+    // positions must stay anchored to the panel. The pre-fix painting also
+    // subtracted the raw offset (applying the scroll twice), which slid the
+    // painted window out of the clip: visible labels skipped ahead two per
+    // notch and the panel went completely blank from offset 4 on while it
+    // still consumed wheels — the intermittently "collapsing" nested panel.
     #[test]
-    fn nested_scroll_wheel_routes_to_topmost_visible_region_and_respects_direction() {
+    fn nested_inner_panel_rows_stay_visible_across_all_inner_offsets() {
         let state = AdmissionState::default();
         let nested = AdmissionWidget::NestedScroll(NestedScrollWidget);
-        let mut local = nested.initial_local_state();
         let layout_input = widget_layout_input(560.0, 292.0);
-        let mut view = nested.view_definition(
-            &state,
-            &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
-                    surface_id: "test-surface".to_string(),
-                    surface_instance_id: "test-instance".to_string(),
-                    revision: 0,
-                    frame_index: 0,
-                    viewport: layout_input.viewport.into_rect(),
-                },
-                layout_input: layout_input.clone(),
-            },
-        );
+        let panel = AdmissionWidget::nested_inner_content_viewport(0, 0.0);
+        for rows in 0..=NESTED_SCROLL_MAX_ROWS {
+            let local = AdmissionLocal::NestedScroll {
+                outer_scroll_rows: 0,
+                inner_scroll_rows: [rows, 0, 0],
+            };
+            let layout = nested.layout(&state, &local, layout_input.clone());
+            let paint = nested.paint(&state, &local, &layout);
+            let visible = group_text_ops(&paint, "nested-inner-0-rows")
+                .into_iter()
+                .filter(|(bounds, _)| intersect_rect(*bounds, panel).is_some())
+                .collect::<Vec<_>>();
+            assert!(
+                visible.len() >= 3,
+                "inner panel must keep showing rows at offset {rows}, saw {}",
+                visible.len()
+            );
+            assert_eq!(
+                visible[0].1,
+                format!("inner 1 row {}", rows + 1),
+                "visible rows must advance exactly one row per scrolled row"
+            );
+        }
+    }
 
-        let inner_down = wheel_backend_input_for_view(&view, Point { x: 42.0, y: 70.0 }, -1.0);
-        assert_eq!(
-            inner_down
+    // The outer declares `nested_outer_content_height()` of content so the
+    // outer's travel spans `NESTED_OUTER_MAX_ROWS` rows (the Step 194
+    // extent/handler alignment), so the painted content must actually span
+    // that extent: at every outer offset the bottom band of the outer
+    // viewport shows painted content. Pre-fix the panels ended well above
+    // the declared extent, so deeper offsets scrolled into a blank band — the
+    // "collapsed" outer region.
+    #[test]
+    fn nested_outer_paints_content_through_declared_extent() {
+        let state = AdmissionState::default();
+        let nested = AdmissionWidget::NestedScroll(NestedScrollWidget);
+        let layout_input = widget_layout_input(560.0, 292.0);
+        let outer = AdmissionWidget::nested_outer_viewport(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 560.0,
+                height: 292.0,
+            },
+        });
+        let bottom_band = Rect {
+            origin: Point {
+                x: outer.origin.x,
+                y: outer.origin.y + outer.size.height - 56.0,
+            },
+            size: Size {
+                width: outer.size.width,
+                height: 56.0,
+            },
+        };
+        for rows in 0..=NESTED_OUTER_MAX_ROWS {
+            let local = AdmissionLocal::NestedScroll {
+                outer_scroll_rows: rows,
+                inner_scroll_rows: [0, 0, 0],
+            };
+            let layout = nested.layout(&state, &local, layout_input.clone());
+            let paint = nested.paint(&state, &local, &layout);
+            let in_band = group_text_ops(&paint, "nested-scroll-content")
+                .into_iter()
+                .filter(|(bounds, _)| intersect_rect(*bounds, bottom_band).is_some())
+                .count();
+            assert!(
+                in_band > 0,
+                "outer viewport bottom band must show painted content at outer offset {rows}"
+            );
+        }
+    }
+
+    // The demo-contract pin for the DEFAULT wheel routing (NearestScrollable
+    // everywhere): wheel over an inner panel scrolls THAT inner first, chains
+    // to the outer exactly at the inner's limit, and an up-wheel returns to
+    // the inner as soon as it has room again. Step 194 authored `SelfFirst`
+    // on the outer and this test then encoded the outer-first contract; the
+    // architect's live UX check REJECTED that authoring (2026-07-11: pointing
+    // the wheel at an inner panel moved the outer), so the demo is back on
+    // the routed default. The authored modes stay proven by the
+    // synthetic-fixture suites, not by this example.
+    #[test]
+    fn nested_scroll_wheel_routes_inner_first_and_chains_to_outer_at_inner_limit() {
+        let state = AdmissionState::default();
+        let nested = AdmissionWidget::NestedScroll(NestedScrollWidget);
+        // Pin the starting state (the initial local staggers the inner rows).
+        let mut local = AdmissionLocal::NestedScroll {
+            outer_scroll_rows: 0,
+            inner_scroll_rows: [0, 0, 0],
+        };
+        let layout_input = widget_layout_input(560.0, 292.0);
+        let view_for = |local: &AdmissionLocal, revision: u64| {
+            nested.view_definition(
+                &state,
+                local,
+                ViewDefinitionInput {
+                    frame: FrameIdentity {
+                        surface_id: "test-surface".to_string(),
+                        surface_instance_id: "test-instance".to_string(),
+                        revision,
+                        frame_index: revision,
+                        viewport: layout_input.viewport.into_rect(),
+                    },
+                    layout_input: layout_input.clone(),
+                },
+            )
+        };
+        let selected = |input: &slipway_core::BackendInputEvent| {
+            input
                 .dispatch_evidence
                 .as_ref()
                 .and_then(|evidence| evidence.selected_region.as_ref())
-                .map(PresentationRegionId::as_str),
+                .map(PresentationRegionId::as_str)
+                .map(str::to_owned)
+        };
+
+        // Phase 1: wheel down OVER INNER-0 with everything at rest — the
+        // fronter inner panel under the cursor wins by default order and the
+        // outer does not move.
+        let view = view_for(&local, 0);
+        let over_inner_down = wheel_backend_input_for_view(&view, Point { x: 42.0, y: 70.0 }, -1.0);
+        assert_eq!(
+            selected(&over_inner_down).as_deref(),
+            Some("admission.nested-scroll:inner-0"),
+            "default routing must scroll the inner panel under the cursor first"
+        );
+        let outcome = nested.handle_event(&state, &mut local, over_inner_down.event);
+        assert!(outcome.handled);
+        assert!(matches!(
+            local,
+            AdmissionLocal::NestedScroll {
+                outer_scroll_rows: 0,
+                inner_scroll_rows: [1, 0, 0],
+            }
+        ));
+
+        // Phase 2: wheel up over the same point — the inner has room upward,
+        // so it consumes the reverse direction too.
+        let view = view_for(&local, 1);
+        let over_inner_up = wheel_backend_input_for_view(&view, Point { x: 42.0, y: 70.0 }, 1.0);
+        assert_eq!(
+            selected(&over_inner_up).as_deref(),
             Some("admission.nested-scroll:inner-0")
         );
-        let outcome = nested.handle_event(&state, &mut local, inner_down.event);
+        let outcome = nested.handle_event(&state, &mut local, over_inner_up.event);
         assert!(outcome.handled);
         assert!(matches!(
             local,
             AdmissionLocal::NestedScroll {
                 outer_scroll_rows: 0,
-                inner_scroll_rows,
-            } if inner_scroll_rows[0] == 1
+                inner_scroll_rows: [0, 0, 0],
+            }
         ));
 
-        view = nested.view_definition(
-            &state,
-            &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
-                    surface_id: "test-surface".to_string(),
-                    surface_instance_id: "test-instance".to_string(),
-                    revision: 1,
-                    frame_index: 1,
-                    viewport: layout_input.viewport.into_rect(),
-                },
-                layout_input: layout_input.clone(),
-            },
-        );
-        let inner_up = wheel_backend_input_for_view(&view, Point { x: 42.0, y: 70.0 }, 1.0);
-        let outcome = nested.handle_event(&state, &mut local, inner_up.event);
-        assert!(outcome.handled);
-        assert!(matches!(
-            local,
-            AdmissionLocal::NestedScroll {
-                outer_scroll_rows: 0,
-                inner_scroll_rows,
-            } if inner_scroll_rows[0] == 0
-        ));
-
+        // Phase 3: wheel over the outer body (outside every inner panel)
+        // scrolls the outer itself.
+        let view = view_for(&local, 2);
         let outer_down = wheel_backend_input_for_view(&view, Point { x: 260.0, y: 70.0 }, -1.0);
         assert_eq!(
-            outer_down
-                .dispatch_evidence
-                .as_ref()
-                .and_then(|evidence| evidence.selected_region.as_ref())
-                .map(PresentationRegionId::as_str),
+            selected(&outer_down).as_deref(),
             Some("admission.nested-scroll:outer")
         );
         let outcome = nested.handle_event(&state, &mut local, outer_down.event);
@@ -5351,30 +6000,258 @@ mod tests {
             }
         ));
 
-        view = nested.view_definition(
-            &state,
-            &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
-                    surface_id: "test-surface".to_string(),
-                    surface_instance_id: "test-instance".to_string(),
-                    revision: 2,
-                    frame_index: 2,
-                    viewport: layout_input.viewport.into_rect(),
-                },
-                layout_input: layout_input.clone(),
-            },
+        // Phase 4: with INNER-0 AT ITS LIMIT the at-limit inner drops out of
+        // the eligible pool and the down-wheel over it chains to the outer
+        // (nothing is black-holed at the inner's limit).
+        local = AdmissionLocal::NestedScroll {
+            outer_scroll_rows: 0,
+            inner_scroll_rows: [NESTED_SCROLL_MAX_ROWS, 0, 0],
+        };
+        let view = view_for(&local, 3);
+        let at_inner_limit_down =
+            wheel_backend_input_for_view(&view, Point { x: 42.0, y: 70.0 }, -1.0);
+        assert_eq!(
+            selected(&at_inner_limit_down).as_deref(),
+            Some("admission.nested-scroll:outer"),
+            "at the inner's limit the wheel must chain to the outer scroll owner"
         );
-        let outer_up = wheel_backend_input_for_view(&view, Point { x: 260.0, y: 70.0 }, 1.0);
-        let outcome = nested.handle_event(&state, &mut local, outer_up.event);
+        let outcome = nested.handle_event(&state, &mut local, at_inner_limit_down.event);
         assert!(outcome.handled);
         assert!(matches!(
             local,
             AdmissionLocal::NestedScroll {
-                outer_scroll_rows: 0,
-                ..
+                outer_scroll_rows: 1,
+                inner_scroll_rows: [NESTED_SCROLL_MAX_ROWS, 0, 0],
             }
         ));
+
+        // Phase 5: wheel UP at the same point — the inner can consume upward
+        // again, so default routing immediately returns to the inner under
+        // the cursor and the outer keeps its position. The anchoring-capped
+        // outer travel (at most 24px, under half a panel height) keeps the
+        // SAME panel under the (42, 70) anchor at its displaced position.
+        let view = view_for(&local, 4);
+        let after_chain_up = wheel_backend_input_for_view(&view, Point { x: 42.0, y: 70.0 }, 1.0);
+        assert_eq!(
+            selected(&after_chain_up).as_deref(),
+            Some("admission.nested-scroll:inner-0"),
+            "an up-wheel must return to the inner as soon as it has room again"
+        );
+        let outcome = nested.handle_event(&state, &mut local, after_chain_up.event);
+        assert!(outcome.handled);
+        let reclaimed_rows = NESTED_SCROLL_MAX_ROWS - 1;
+        assert!(matches!(
+            local,
+            AdmissionLocal::NestedScroll {
+                outer_scroll_rows: 1,
+                inner_scroll_rows: [rows, 0, 0],
+            } if rows == reclaimed_rows
+        ));
+    }
+
+    // The regression pin for the live symptom "the third nested panel never
+    // scrolls" (Step 198): the outer's travel displaces the panels while it
+    // consumes (a wheel over the outer body, or default chaining at an
+    // inner's limit), and every later wheel resolves the inner at its
+    // DISPLACED position. The travel must therefore stay under half a panel
+    // height: at the outer's limit, the wheel anchored at EACH panel's
+    // fresh-view center must select THAT panel (identity preserved) and
+    // scroll its rows. With the old two-pitch travel (126px) the center
+    // anchor of panel 0 landed on panel 2, and the anchors of panels 1 and 2
+    // resolved no inner at all — a silently dead wheel over the
+    // visually-third panel.
+    #[test]
+    fn nested_outer_limit_keeps_wheel_anchored_to_each_panel_center() {
+        let state = AdmissionState::default();
+        let nested = AdmissionWidget::NestedScroll(NestedScrollWidget);
+        let layout_input = widget_layout_input(560.0, 292.0);
+        for index in 0..3usize {
+            let mut local = AdmissionLocal::NestedScroll {
+                outer_scroll_rows: NESTED_OUTER_MAX_ROWS,
+                inner_scroll_rows: [0, 0, 0],
+            };
+            let view = nested.view_definition(
+                &state,
+                &local,
+                ViewDefinitionInput {
+                    frame: FrameIdentity {
+                        surface_id: "test-surface".to_string(),
+                        surface_instance_id: "test-instance".to_string(),
+                        revision: index as u64,
+                        frame_index: index as u64,
+                        viewport: layout_input.viewport.into_rect(),
+                    },
+                    layout_input: layout_input.clone(),
+                },
+            );
+            // The fresh-view (outer offset 0) center of panel `index`.
+            let fresh_center = AdmissionWidget::nested_inner_content_viewport(index, 0.0);
+            let anchor = Point {
+                x: fresh_center.origin.x + fresh_center.size.width / 2.0,
+                y: fresh_center.origin.y + fresh_center.size.height / 2.0,
+            };
+            let down = wheel_backend_input_for_view(&view, anchor, -1.0);
+            assert_eq!(
+                down.dispatch_evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.selected_region.as_ref())
+                    .map(PresentationRegionId::as_str),
+                Some(format!("admission.nested-scroll:inner-{index}").as_str()),
+                "the panel-{index} center anchor must stay over panel {index} at the outer's limit"
+            );
+            let outcome = nested.handle_event(&state, &mut local, down.event);
+            assert!(outcome.handled);
+            let AdmissionLocal::NestedScroll {
+                inner_scroll_rows, ..
+            } = local
+            else {
+                panic!("nested local state expected");
+            };
+            assert_eq!(
+                inner_scroll_rows[index], 1,
+                "the anchored panel {index} must scroll its own rows"
+            );
+        }
+    }
+
+    #[test]
+    fn composed_view_carries_only_default_wheel_routing_declarations() {
+        let mut runtime = SlipwayRuntime::new(
+            AdmissionRuntimeAppWidget::new(AdmissionApp {
+                widgets: admission_widget_tuple(),
+            }),
+            AdmissionState::default(),
+        );
+        // A frame tall enough (1300) to keep the nested card (root-local
+        // y 1164..1456) inside the root page region's band while the page
+        // content (~1472) still overflows it: this harness resolves in
+        // composed content space, so the declared chain-to-page hop below is
+        // only expressible when the anchor sits inside the root region's
+        // viewport. The live 700-tall window reaches the same chain through
+        // the backend's presented-space translation (live-verified).
+        let frame = admission_test_frame(640.0, 1300.0);
+        let view = admission_view(&runtime, frame.clone());
+
+        // The declaration snapshot: EVERY scroll region in the composed app
+        // (nested outer AND inners, list, root page) declares the
+        // `NearestScrollable` default — the example authors no non-default
+        // wheel routing at all. This is the control that the demo runs on
+        // the routed default after the Step 194 `SelfFirst`-on-outer
+        // authoring was reverted (architect live-UX decision 2026-07-11:
+        // the region under the cursor scrolls first); the authored modes
+        // stay covered by the synthetic-fixture suites.
+        let non_default: Vec<_> = view
+            .scroll_regions
+            .iter()
+            .filter(|region| region.wheel_routing != WheelRouting::NearestScrollable)
+            .map(|region| (region.id.as_str(), region.wheel_routing))
+            .collect();
+        assert_eq!(
+            non_default,
+            Vec::new(),
+            "the example must carry only default wheel-routing declarations"
+        );
+
+        let selected = |input: &slipway_core::BackendInputEvent| {
+            input
+                .dispatch_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.selected_region.as_ref())
+                .map(PresentationRegionId::as_str)
+                .map(str::to_owned)
+        };
+
+        // End-to-end selection over the real composed view: wheel over an
+        // inner panel picks THAT inner. The nested card sits at root-local
+        // y 1164 (layout_plan); inner-0 maps to (48, 1222)-(204, 1284) and
+        // the outer to (34, 1208)-(558, 1432).
+        let over_inner = wheel_backend_input_for_view(&view, Point { x: 58.0, y: 1234.0 }, -1.0);
+        assert_eq!(
+            selected(&over_inner).as_deref(),
+            Some("admission.nested-scroll:inner-0"),
+            "composed-view wheel over an inner panel must pick that inner first"
+        );
+
+        // Control: wheel over the list picks the list itself (front-most
+        // containing consumable owner, unchanged default order).
+        let over_list = wheel_backend_input_for_view(&view, Point { x: 300.0, y: 500.0 }, -1.0);
+        assert_eq!(
+            selected(&over_list).as_deref(),
+            Some("admission.list:scroll"),
+            "the list control case must keep default front-most selection"
+        );
+
+        // Chain hop 1: with inner-0 at its limit the down-wheel over it
+        // chains to the outer.
+        runtime.local_state_mut().widgets.8 = AdmissionLocal::NestedScroll {
+            outer_scroll_rows: 0,
+            inner_scroll_rows: [NESTED_SCROLL_MAX_ROWS, 1, 2],
+        };
+        let view = admission_view(&runtime, frame.clone());
+        let at_inner_limit =
+            wheel_backend_input_for_view(&view, Point { x: 58.0, y: 1234.0 }, -1.0);
+        assert_eq!(
+            selected(&at_inner_limit).as_deref(),
+            Some("admission.nested-scroll:outer"),
+            "at the inner's limit the composed-view wheel must chain to the outer"
+        );
+
+        // Chain hop 2: with the outer ALSO at its limit the down-wheel
+        // chains to the page (the root scroll owner). The anchoring-capped
+        // outer travel (24px, under half a panel height) keeps inner-0 under
+        // the (58, 1234) anchor at its displaced position, so this proves
+        // the at-limit chain and not a hit-test miss.
+        runtime.local_state_mut().widgets.8 = AdmissionLocal::NestedScroll {
+            outer_scroll_rows: NESTED_OUTER_MAX_ROWS,
+            inner_scroll_rows: [NESTED_SCROLL_MAX_ROWS, 1, 2],
+        };
+        let view = admission_view(&runtime, frame);
+        let at_outer_limit =
+            wheel_backend_input_for_view(&view, Point { x: 58.0, y: 1234.0 }, -1.0);
+        assert_eq!(
+            selected(&at_outer_limit).as_deref(),
+            Some("admission.app:root-scroll"),
+            "at the outer's limit the composed-view wheel must chain to the page"
+        );
+    }
+
+    #[test]
+    fn nested_outer_scroll_declared_extent_matches_handler_boundary() {
+        // Mirror of `nested_inner_scroll_declared_extent_matches_handler_
+        // boundary` for the outer region: the declared content extent must
+        // put `NESTED_OUTER_MAX_ROWS` exactly at the declared limit, or the
+        // outer would keep reporting consumable room after the handler
+        // saturates and the at-limit chaining to the page would never
+        // engage — wheels over a saturated outer would be silently dead.
+        let bounds = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 560.0,
+                height: 292.0,
+            },
+        };
+        let viewport_height = AdmissionWidget::nested_outer_viewport(bounds).size.height;
+        let content_height = AdmissionWidget::nested_outer_content_height();
+        let max_offset = (content_height - viewport_height).max(0.0);
+        let bottom_offset = AdmissionWidget::nested_scroll_offset_y(
+            NESTED_OUTER_MAX_ROWS,
+            NESTED_OUTER_ROW_STEP,
+            viewport_height,
+            content_height,
+        );
+        let before_bottom_offset = AdmissionWidget::nested_scroll_offset_y(
+            NESTED_OUTER_MAX_ROWS - 1,
+            NESTED_OUTER_ROW_STEP,
+            viewport_height,
+            content_height,
+        );
+
+        assert_eq!(bottom_offset, max_offset);
+        assert!(before_bottom_offset < max_offset);
+        // The anchoring rule itself: the whole outer travel stays under
+        // half a panel height, so no panel-center anchor can escape its
+        // panel anywhere across the outer's travel.
+        assert!(max_offset < NESTED_INNER_VIEWPORT_HEIGHT / 2.0);
     }
 
     #[test]
@@ -5471,6 +6348,151 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "view_contract.scroll_offset_out_of_range"),
             "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn runtime_list_bottom_wheel_dispatches_to_root_scroll() {
+        let widget = AdmissionRuntimeAppWidget::new(AdmissionApp {
+            widgets: admission_widget_tuple(),
+        });
+        let mut runtime = SlipwayRuntime::new(widget, AdmissionState::default());
+        runtime.local_state_mut().widgets.5 = AdmissionLocal::List { scroll_rows: 5 };
+        runtime.record_presented_viewport(admission_test_frame(640.0, 480.0).viewport);
+
+        let frame = runtime.last_frame_identity();
+        let view = admission_view(&runtime, frame);
+        let input = wheel_backend_input_for_view(&view, Point { x: 42.0, y: 464.0 }, -1.0);
+
+        let InputEvent::Wheel(wheel) = &input.event else {
+            panic!("expected wheel backend input");
+        };
+        assert_eq!(
+            wheel.region_id.as_ref(),
+            Some(&AdmissionAppLocal::root_scroll_region_id()),
+            "down-wheel over a list already at its bottom must bubble to the root scroll owner"
+        );
+
+        let report = apply_test_backend_input(&mut runtime, input);
+        assert!(report.handled, "{:?}", report.diagnostics);
+        assert!(
+            runtime.local_state().app.root_scroll_y > 0.0,
+            "root scroll local state must move when the list cannot consume the down-wheel"
+        );
+    }
+
+    #[test]
+    fn runtime_refreshes_stale_wheel_evidence_at_list_boundary() {
+        let widget = AdmissionRuntimeAppWidget::new(AdmissionApp {
+            widgets: admission_widget_tuple(),
+        });
+        let mut runtime = SlipwayRuntime::new(widget, AdmissionState::default());
+        runtime.record_presented_viewport(admission_test_frame(640.0, 480.0).viewport);
+
+        let frame = runtime.last_frame_identity();
+        let view = admission_view(&runtime, frame);
+        let stale_list_wheel =
+            wheel_backend_input_for_view(&view, Point { x: 42.0, y: 464.0 }, -1.0);
+
+        for _ in 0..6 {
+            let report = apply_test_backend_input(&mut runtime, stale_list_wheel.clone());
+            assert!(report.handled, "{:?}", report.diagnostics);
+        }
+
+        assert_eq!(
+            runtime.local_state().widgets.5,
+            AdmissionLocal::List { scroll_rows: 5 }
+        );
+        assert!(
+            runtime.local_state().app.root_scroll_y > 0.0,
+            "stale backend wheel evidence must be refreshed against current declarations and bubble to root at list bottom"
+        );
+    }
+
+    #[test]
+    fn runtime_refreshes_stale_native_scroll_evidence_before_apply() {
+        let widget = AdmissionRuntimeAppWidget::new(AdmissionApp {
+            widgets: admission_widget_tuple(),
+        });
+        let mut runtime = SlipwayRuntime::new(widget, AdmissionState::default());
+        runtime.record_presented_viewport(admission_test_frame(640.0, 480.0).viewport);
+
+        let frame = runtime.last_frame_identity();
+        let view = admission_view(&runtime, frame.clone());
+        let root_scroll = view
+            .scroll_regions
+            .iter()
+            .find(|region| region.id == AdmissionAppLocal::root_scroll_region_id())
+            .expect("root scroll exists");
+        let stale_event = InputEvent::Scroll(slipway_core::ScrollEvent {
+            target: root_scroll.target.clone(),
+            target_slot: root_scroll.address.clone(),
+            region_id: root_scroll.id.clone(),
+            offset_x: 0.0,
+            offset_y: 60.0,
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 1.0,
+                    height: 1.0,
+                },
+            }),
+            content_bounds: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 1.0,
+                    height: 1.0,
+                },
+            }),
+        });
+        let stale_evidence = slipway_core::declared_scroll_dispatch_evidence(
+            slipway_core::EvidenceSource::backend_presented("iced", "native-scroll"),
+            frame,
+            &view.scroll_regions,
+            Some(root_scroll),
+            stale_event.clone(),
+        );
+
+        let report = apply_test_backend_input(
+            &mut runtime,
+            slipway_core::BackendInputEvent::declared(stale_event, stale_evidence),
+        );
+
+        assert!(report.handled, "{:?}", report.diagnostics);
+        assert_eq!(runtime.local_state().app.root_scroll_y, 60.0);
+    }
+
+    #[test]
+    fn nested_inner_scroll_declared_extent_matches_handler_boundary() {
+        let viewport_height = NESTED_INNER_VIEWPORT_HEIGHT;
+        let content_height = AdmissionWidget::nested_inner_content_height(viewport_height);
+        let max_offset = (content_height - viewport_height).max(0.0);
+        let bottom_offset = AdmissionWidget::nested_scroll_offset_y(
+            NESTED_SCROLL_MAX_ROWS,
+            NESTED_SCROLL_ROW_STEP,
+            viewport_height,
+            content_height,
+        );
+        let before_bottom_offset = AdmissionWidget::nested_scroll_offset_y(
+            NESTED_SCROLL_MAX_ROWS - 1,
+            NESTED_SCROLL_ROW_STEP,
+            viewport_height,
+            content_height,
+        );
+
+        assert_eq!(bottom_offset, max_offset);
+        assert!(before_bottom_offset < max_offset);
+        assert_eq!(
+            nested_scroll_rows_after_wheel(NESTED_SCROLL_MAX_ROWS, -1.0, NESTED_SCROLL_MAX_ROWS),
+            NESTED_SCROLL_MAX_ROWS
+        );
+        assert_eq!(
+            nested_scroll_rows_after_wheel(
+                NESTED_SCROLL_MAX_ROWS - 1,
+                -1.0,
+                NESTED_SCROLL_MAX_ROWS
+            ),
+            NESTED_SCROLL_MAX_ROWS
         );
     }
 
@@ -5628,6 +6650,64 @@ mod tests {
             3,
             "runtime app view must preserve nested inner scroll declarations"
         );
+    }
+
+    #[test]
+    fn runtime_render_packet_applies_root_scroll_to_canonical_viewport() {
+        let widget = AdmissionRuntimeAppWidget::new(AdmissionApp {
+            widgets: admission_widget_tuple(),
+        });
+        let mut runtime = SlipwayRuntime::new(widget, AdmissionState::default());
+        runtime.local_state_mut().app.root_scroll_y = 220.0;
+
+        let packet = runtime.render_packet_for_frame(FrameIdentity {
+            surface_id: "test-surface".to_string(),
+            surface_instance_id: "test-instance".to_string(),
+            revision: 1,
+            frame_index: 1,
+            viewport: Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 640.0,
+                    height: 480.0,
+                },
+            },
+        });
+
+        let PaintOp::Group { clip, ops, .. } = packet
+            .paint
+            .first()
+            .expect("canonical root scroll wraps paint in a viewport clip")
+        else {
+            panic!("canonical root scroll must clip the visible viewport");
+        };
+        assert_eq!(
+            clip.as_ref().map(|clip| clip.bounds.size.height),
+            Some(480.0)
+        );
+        let action_label_y = first_text_y_containing(ops, "action | Counter button")
+            .expect("action card label remains present in scrolled canonical paint");
+        assert!(
+            action_label_y < 0.0,
+            "root scroll must translate top content out of the visible viewport, got y={action_label_y}"
+        );
+    }
+
+    fn first_text_y_containing(ops: &[PaintOp], needle: &str) -> Option<f32> {
+        for op in ops {
+            match op {
+                PaintOp::Text {
+                    bounds, content, ..
+                } if content.contains(needle) => return Some(bounds.origin.y),
+                PaintOp::Group { ops, .. } | PaintOp::Layer { ops, .. } => {
+                    if let Some(y) = first_text_y_containing(ops, needle) {
+                        return Some(y);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     #[test]
@@ -5967,5 +7047,257 @@ mod tests {
         );
         assert!(report.handled, "{:?}", report.diagnostics);
         assert_eq!(runtime.external().selected_item, 1);
+    }
+
+    fn admission_dispatch_graphs() -> (
+        slipway_core::DispatchGraph,
+        slipway_core::DispatchGraph,
+        ViewDefinition,
+    ) {
+        let mut runtime = SlipwayRuntime::new(
+            AdmissionRuntimeAppWidget::new(AdmissionApp {
+                widgets: admission_widget_tuple(),
+            }),
+            AdmissionState::default(),
+        );
+        runtime.record_presented_viewport(admission_test_frame(640.0, 700.0).viewport);
+        let frame = runtime.last_frame_identity();
+        let view = admission_view(&runtime, frame.clone());
+
+        let iced_graph = slipway_backend_iced::iced_dispatch_graph_for_widget(
+            runtime.widget(),
+            runtime.external(),
+            runtime.local_state(),
+            widget_layout_input(640.0, 700.0),
+            Some(&frame),
+        );
+        let egui_graph = slipway_backend_egui::egui_dispatch_graph_for_widget(
+            runtime.widget(),
+            runtime.external(),
+            runtime.local_state(),
+            widget_layout_input(640.0, 700.0),
+            Some(&frame),
+        );
+        (iced_graph, egui_graph, view)
+    }
+
+    #[test]
+    fn dispatch_graph_parity_between_iced_and_egui_presentation_pipelines() {
+        let (iced_graph, egui_graph, view) = admission_dispatch_graphs();
+
+        assert!(
+            iced_graph.nodes.iter().any(|node| node.kind
+                == slipway_core::DispatchGraphNodeKind::Scroll
+                && node.id == "admission.app:root-scroll"),
+            "iced graph must include the root scroll node"
+        );
+        assert!(
+            !view.hit_regions.is_empty(),
+            "admission view must declare hit regions"
+        );
+
+        // Golden parity: both backend presentation pipelines derive the SAME
+        // dispatch graph from the admission view. Raw equality is intended;
+        // any divergence here is a parity finding, not test noise.
+        assert_eq!(iced_graph, egui_graph);
+    }
+
+    #[test]
+    fn dispatch_graph_wheel_transparent_overlays_occlude_pointer_but_not_wheel() {
+        let (iced_graph, egui_graph, _view) = admission_dispatch_graphs();
+
+        for graph in [&iced_graph, &egui_graph] {
+            // The composed root view attributes paint units to the app
+            // target, so overlay-window occluders are identified by the
+            // admission overlay z-layer (ADMISSION_OVERLAY_GLOBAL_Z).
+            let overlay_occluders: Vec<_> = graph
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.kind == slipway_core::DispatchGraphNodeKind::Occlusion
+                        && node.order.z_index == ADMISSION_OVERLAY_GLOBAL_Z
+                })
+                .collect();
+            assert!(
+                !overlay_occluders.is_empty(),
+                "overlay windows must materialize occlusion nodes"
+            );
+            // de24dda0a semantics: every admission overlay window is authored
+            // pointer-opaque + wheel-pass-through.
+            for occluder in &overlay_occluders {
+                assert_eq!(occluder.blocks_pointer, Some(true));
+                assert_eq!(
+                    occluder.blocks_wheel,
+                    Some(false),
+                    "overlay occluder {} must be wheel-transparent",
+                    occluder.id
+                );
+            }
+
+            // Pointer channel: the overlay-stack occluders block the hit
+            // regions beneath them (lower cards' absorb/drag regions).
+            let pointer_occlusion_from_overlays = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == slipway_core::DispatchGraphEdgeKind::Occlusion
+                        && edge.channel == slipway_core::DispatchGraphChannel::Pointer
+                        && overlay_occluders.iter().any(|node| node.id == edge.from)
+                })
+                .count();
+            assert!(
+                pointer_occlusion_from_overlays > 0,
+                "overlay occluders must have pointer occlusion edges to regions beneath"
+            );
+
+            // Wheel channel: wheel-transparent occluders must have NO wheel
+            // occlusion edges; structurally, every wheel occlusion edge must
+            // originate from a blocks_wheel occluder.
+            for edge in &graph.edges {
+                if edge.kind == slipway_core::DispatchGraphEdgeKind::Occlusion
+                    && edge.channel == slipway_core::DispatchGraphChannel::Wheel
+                {
+                    let from = graph
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == edge.from)
+                        .expect("wheel occlusion edge source node exists");
+                    assert_eq!(
+                        from.blocks_wheel,
+                        Some(true),
+                        "wheel occlusion edges may only originate from wheel-blocking occluders"
+                    );
+                }
+            }
+            assert!(
+                !graph.edges.iter().any(|edge| {
+                    edge.kind == slipway_core::DispatchGraphEdgeKind::Occlusion
+                        && edge.channel == slipway_core::DispatchGraphChannel::Wheel
+                        && overlay_occluders.iter().any(|node| node.id == edge.from)
+                }),
+                "wheel-transparent overlays must not block the wheel to the scroll owners beneath"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_graph_chaining_edges_reach_ancestor_scroll_owners() {
+        let (iced_graph, egui_graph, _view) = admission_dispatch_graphs();
+
+        for graph in [&iced_graph, &egui_graph] {
+            let chaining: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == slipway_core::DispatchGraphEdgeKind::Chaining
+                        && edge.channel == slipway_core::DispatchGraphChannel::Wheel
+                })
+                .collect();
+
+            // The list scroll region chains to the root scroll owner: the
+            // 177-191 bug-class scenario "at-limit list wheel bubbles to the
+            // root" as structure.
+            assert!(
+                chaining.iter().any(|edge| {
+                    edge.from == "admission.list:scroll" && edge.to == "admission.app:root-scroll"
+                }),
+                "list scroll must chain to the root scroll owner; edges: {chaining:?}"
+            );
+
+            // The nested inner scroll chains to its outer ancestor.
+            assert!(
+                chaining.iter().any(|edge| {
+                    edge.from == "admission.nested-scroll:inner-0"
+                        && edge.to == "admission.nested-scroll:outer"
+                }),
+                "nested inner scroll must chain to the outer scroll; edges: {chaining:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_graph_wheel_hit_order_keeps_default_inner_in_front_of_outer() {
+        // The derived graph (ADR-0002 B1) over the routing-aware selector
+        // (B2) on an all-default view: with every declaration on
+        // `NearestScrollable` the fronter inner panels win their wheel
+        // HitOrder pairs against the outer, so the edges run inner -> outer
+        // in BOTH backend graphs. (Step 194's authored SelfFirst flipped
+        // these to outer -> inner; that authoring was reverted per the
+        // architect's live UX decision, 2026-07-11, and the flip contract
+        // stays proven by the core/backend synthetic-fixture graph tests.)
+        let (iced_graph, egui_graph, _view) = admission_dispatch_graphs();
+
+        for graph in [&iced_graph, &egui_graph] {
+            let wheel_hit_order: Vec<_> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == slipway_core::DispatchGraphEdgeKind::HitOrder
+                        && edge.channel == slipway_core::DispatchGraphChannel::Wheel
+                })
+                .collect();
+            for inner in ["inner-0", "inner-1", "inner-2"] {
+                let inner_id = format!("admission.nested-scroll:{inner}");
+                assert!(
+                    wheel_hit_order.iter().any(|edge| {
+                        edge.from == inner_id && edge.to == "admission.nested-scroll:outer"
+                    }),
+                    "the fronter {inner_id} must win the default wheel HitOrder pair over the outer; edges: {wheel_hit_order:?}"
+                );
+                assert!(
+                    !wheel_hit_order.iter().any(|edge| {
+                        edge.from == "admission.nested-scroll:outer" && edge.to == inner_id
+                    }),
+                    "the Step 194 authored outer-first edge direction must be gone for {inner_id}"
+                );
+            }
+
+            // Control: the list region keeps the default front-most edge
+            // over the root scroll owner.
+            assert!(
+                wheel_hit_order.iter().any(|edge| {
+                    edge.from == "admission.list:scroll" && edge.to == "admission.app:root-scroll"
+                }),
+                "list control must keep default front-most wheel order; edges: {wheel_hit_order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_graph_capture_edges_cover_overlay_drag_regions() {
+        let (iced_graph, egui_graph, _view) = admission_dispatch_graphs();
+
+        for graph in [&iced_graph, &egui_graph] {
+            for overlay in 0..4 {
+                let drag_id = format!("admission.overlay-stack:overlay-{overlay}:drag");
+                assert!(
+                    graph.edges.iter().any(|edge| {
+                        edge.kind == slipway_core::DispatchGraphEdgeKind::Capture
+                            && edge.channel == slipway_core::DispatchGraphChannel::Pointer
+                            && edge.from == drag_id
+                            && edge.to == "admission.overlay-stack"
+                    }),
+                    "overlay drag region {drag_id} must have a capture edge"
+                );
+                let drag_node = graph
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == drag_id)
+                    .expect("overlay drag hit node exists");
+                assert_eq!(
+                    drag_node.capture,
+                    Some(slipway_core::PointerCaptureIntent::DuringDrag)
+                );
+            }
+
+            // The movable overlay titlebar drag region also captures.
+            assert!(
+                graph.edges.iter().any(|edge| {
+                    edge.kind == slipway_core::DispatchGraphEdgeKind::Capture
+                        && edge.from == "admission.overlay:hit"
+                }),
+                "movable overlay titlebar must have a capture edge"
+            );
+        }
     }
 }

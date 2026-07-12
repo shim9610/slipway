@@ -8,3 +8,6 @@ repository.workspace = true
 [dependencies]
 crossbeam-channel = "0.5.15"
 slipway-core = { version = "0.1.1", path = "../slipway-core" }
+
+[lints]
+workspace = true

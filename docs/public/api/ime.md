@@ -64,7 +64,10 @@ selection, background, border, and icon colors plus border metrics. The
 typography policy converts the author's tokens into
 `TextInputTypographyDeclaration`, which carries `TextStyle` and may carry a font
 source. `SlipwayFontResolutionPolicy` resolves that source for the selected
-backend.
+backend. At the app root, `SlipwayAppWidget` provides that policy by
+delegating to `SlipwayApp::resolve_app_font`; the default refuses honestly
+(`app-font-resolution-refused`) — override it only when the app declares a
+loadable font source, and never claim a resolution that was not validated.
 
 Widget local state should only choose variants such as focused, disabled,
 selected, invalid, read-only, compact, or large. Use the builder-style override

@@ -16,9 +16,14 @@ Start with the quickstart:
 2. [LLM contract checklist](llm-contract-checklist.md)
 3. [Authoring layout](authoring-layout.md)
 4. [Core API map](api/core.md)
-5. [Backend API map](api/backends.md)
-6. [IME and Korean text input](api/ime.md)
-7. [Debug MCP](api/debug-mcp.md)
+5. [Routing and scroll](api/routing-and-scroll.md)
+6. [Backend API map](api/backends.md)
+7. [IME and Korean text input](api/ime.md)
+8. [Debug MCP](api/debug-mcp.md)
+
+When admission refuses a view or a diagnostic code needs reading, use the
+[Diagnostics catalog](api/diagnostics.md). When a trait bound looks unused,
+check [Trait surface](api/trait-surface.md) before writing logic in it.
 
 Depend on the public facade crate, not on individual internal crates. Prefer
 `cargo add`:
@@ -36,11 +41,11 @@ and provider-wrapper APIs that are not part of the normal authoring surface.
 
 If the task is to mirror a web UI, also read:
 
-8. [Web UI mirroring task guide](tasks/mirror-web-ui.md)
+9. [Web UI mirroring task guide](tasks/mirror-web-ui.md)
 
 If the task uses canvas, plots, media, or an existing renderer, also read:
 
-9. [Provider surfaces](api/provider-surfaces.md)
+10. [Provider surfaces](api/provider-surfaces.md)
 
 ## Required Output Shape
 
@@ -55,6 +60,13 @@ app_runner.rs
 ```
 
 Equivalent file names are acceptable only when the mapping is explicit.
+
+The designated COPY TARGET for this shape is the reference example crate
+`crates/slipway-example-authored`: facade-only, exactly these five
+modules, every pattern site marked with a `PATTERN:` comment naming the
+rule it models, pre-flight admission asserted in its tests. Start new
+apps from it. (`crates/slipway-example-admission` is an internal
+admission stress fixture, not a template — do not copy it.)
 
 ## Mental Model
 
@@ -78,9 +90,13 @@ or provider contract is missing, treat that as useful guidance. Fix the
 authored contract or report `API_GAP`; do not route around it with direct state
 mutation, backend defaults, stale evidence, or internal imports.
 
-If the only apparent solution is to inspect private project notes or old
-evaluation crates, first report `PUBLIC_DOC_GAP` with the missing public
-operation. Public docs are the authority for user-side app authoring.
+When the public pages end and a contract detail is still missing, the
+sanctioned retrieval route is rustdoc and the `slipway-core` source itself
+(grep the symbol, read the range) — see
+[Finding the full contract](api/README.md). If that route does not answer it
+either, report `PUBLIC_DOC_GAP` with the missing public operation. Private
+project notes and old evaluation crates stay out of bounds; public docs are
+the authority for user-side app authoring.
 
 ## Do Not Do This
 
@@ -114,7 +130,8 @@ For UI mirroring or backend acceptance work, complete means:
 - scroll regions are derived after layout from the final `LayoutOutput`, not
   from a wider incoming `LayoutInput`;
 - nested scroll paint is clipped to the declared inner viewport, and wheel
-  routing evidence identifies the region that consumed the event;
+  routing evidence identifies the region that consumed the event (see
+  [Routing and scroll](api/routing-and-scroll.md));
 - overlay/popup z-order is explicitly declared and testable through hit regions
   and paint order, not inferred from incidental draw order;
 - debug MCP can report status/probes and exercise supported control paths;

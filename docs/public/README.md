@@ -36,10 +36,30 @@ For an LLM worker that must author or mirror a UI:
 3. [LLM contract checklist](llm-contract-checklist.md)
 4. [Authoring layout](authoring-layout.md)
 5. [Core API map](api/core.md)
-6. [Backend API map](api/backends.md)
-7. [IME and Korean text input](api/ime.md)
-8. [Web UI mirroring task guide](tasks/mirror-web-ui.md)
-9. [Debug MCP](api/debug-mcp.md)
+6. [Routing and scroll](api/routing-and-scroll.md)
+7. [Backend API map](api/backends.md)
+8. [IME and Korean text input](api/ime.md)
+9. [Web UI mirroring task guide](tasks/mirror-web-ui.md)
+10. [Debug MCP](api/debug-mcp.md)
+
+Reference pages for specific situations: the
+[Diagnostics catalog](api/diagnostics.md) when admission refuses a view, and
+[Trait surface](api/trait-surface.md) for load-bearing vs RESERVED trait
+status.
+
+## Reference Example
+
+The designated copy source for a new app is the reference example crate
+`crates/slipway-example-authored`: facade-only (`use slipway::prelude::*`),
+the five-file split, every pattern site marked with a `PATTERN:` comment,
+and pre-flight admission asserted in its tests. It runs on both backends
+(`--iced` / `--egui`) from the same authored modules.
+
+`crates/slipway-example-admission` is an INTERNAL admission stress fixture
+and regression harness, not an authoring template. It intentionally
+predates the documented rules (single-file, direct internal-crate imports);
+do not copy it and do not read it as authority (LLM-ergonomics audit
+2026-07-11, LE-H2/LE-H6).
 
 For custom rendering or already-owned renderer integration:
 
