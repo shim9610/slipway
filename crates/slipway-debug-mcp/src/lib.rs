@@ -7,14 +7,23 @@ use slipway_core::{
     EvidenceSource, FocusEvent, FrameIdentity, InputEvent, KeyEventKind, KeyLocation,
     KeyboardDetails, KeyboardEvent, LayoutOutput, Modifiers, Point, PointerButton, PointerButtons,
     PointerDetails, PointerDeviceKind, PointerEvent, PointerEventKind, PresentationRegionId,
-    ProbeKind, ProbeProduct, ProbeRequest, Rect, RenderPacket, Size, TargetLocalRect, TextEditKind,
-    TextInputEvent, TextSelectionRange, WheelEvent, WidgetId, WidgetSlotAddress,
+    ProbeKind, ProbeProduct, ProbeRequest, Rect, RenderPacket, Size, TargetLocalRect,
+    TextCompositionPhase, TextEditKind, TextInputEvent, TextSelectionRange, WheelEvent, WidgetId,
+    WidgetSlotAddress,
 };
 use slipway_debug_bridge::{
-    DebugBridgeClient, DebugBridgeError, DebugCommand, DebugFailure, DebugPhysicalControl,
+    CompositionPhaseProvenance, DebugBridgeClient, DebugBridgeError, DebugCommand,
+    DebugCompositionIngressObservation, DebugFailure, DebugPhysicalControl,
     DebugPhysicalControlDeclarationSelector, DebugReply, DebugReplyProduct, DebugRequestHandle,
-    DebugStatus, McpProbeMethod, RenderProduct, SlipwayDebugCommandHandler,
+    DebugStatus, DebugTextCompositionUpdate, McpProbeMethod, PresentedAlphaMode,
+    PresentedCapturePath, PresentedScreenshotAdmission, PresentedScreenshotProduct,
+    PresentedScreenshotRefusal, PresentedScreenshotRequest, PresentedScreenshotSelector,
+    PresentedSurfaceFormat, PresentedTransferFunction, RenderProduct, SlipwayDebugCommandHandler,
+    validate_presented_screenshot_product,
 };
+#[cfg(test)]
+use slipway_debug_bridge::{PRESENTED_PIXELS_PASS_ID, PresentedPixels};
+use slipway_debug_renderer::{DebugPngArtifactError, write_debug_rgba8_png_artifact};
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
 const SERVER_NAME: &str = "slipway-debug-mcp";
@@ -33,12 +42,28 @@ const EVENT_TRACE_LIMIT_FIELDS: &[&str] = &[
     "event_limit",
     "eventLimit",
 ];
+const PRESENTED_ARTIFACT_PROVIDER_ID: &str = "slipway-debug-renderer.presented.v1";
+const MAX_COMPOSITION_UPDATES: usize = 16;
+const MAX_COMPOSITION_UTF8_BYTES: usize = 65_536;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeScreenshotSelector {
+    Exact,
+    Current,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScreenshotParseOrigin {
+    Direct,
+    RuntimeNormalized(RuntimeScreenshotSelector),
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DebugMcpConfig {
     pub allow_status: bool,
     pub allow_probe: bool,
     pub allow_render: bool,
+    pub allow_screenshot: bool,
     pub allow_control: bool,
     pub allow_resize: bool,
 }
@@ -53,6 +78,7 @@ impl DebugMcpConfig {
             allow_status: true,
             allow_probe: true,
             allow_render: true,
+            allow_screenshot: true,
             allow_control: true,
             allow_resize: true,
         }
@@ -65,6 +91,7 @@ impl Default for DebugMcpConfig {
             allow_status: false,
             allow_probe: false,
             allow_render: false,
+            allow_screenshot: false,
             allow_control: false,
             allow_resize: false,
         }
@@ -99,11 +126,22 @@ pub struct DebugMcpRuntimeEndpoint {
 
 pub struct DebugMcpRuntimeRequest {
     request: String,
-    response_tx: Sender<Option<Value>>,
+    response_tx: Sender<DebugMcpResponseWork>,
 }
 
 pub struct DebugMcpRuntimeResponseHandle {
-    response_rx: Receiver<Option<Value>>,
+    response_rx: Receiver<DebugMcpResponseWork>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DebugMcpResponseWork {
+    Ready(Option<Value>),
+    PresentedScreenshot {
+        rpc_id: Option<Value>,
+        tool: String,
+        method: McpProbeMethod,
+        reply: DebugReply,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,8 +209,15 @@ impl DebugMcpRuntimeRequest {
     }
 
     pub fn respond(self, response: Option<Value>) -> Result<(), DebugMcpRuntimeTransportError> {
+        self.respond_work(DebugMcpResponseWork::Ready(response))
+    }
+
+    pub fn respond_work(
+        self,
+        work: DebugMcpResponseWork,
+    ) -> Result<(), DebugMcpRuntimeTransportError> {
         self.response_tx
-            .try_send(response)
+            .try_send(work)
             .map_err(|error| match error {
                 TrySendError::Full(_) => DebugMcpRuntimeTransportError::ResponseQueueFull,
                 TrySendError::Disconnected(_) => {
@@ -185,7 +230,7 @@ impl DebugMcpRuntimeRequest {
 impl DebugMcpRuntimeResponseHandle {
     pub fn try_recv(&self) -> Result<Option<Option<Value>>, DebugMcpRuntimeTransportError> {
         match self.response_rx.try_recv() {
-            Ok(response) => Ok(Some(response)),
+            Ok(work) => Ok(Some(finalize_response_work(work))),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 Err(DebugMcpRuntimeTransportError::ResponseQueueDisconnected)
@@ -196,6 +241,7 @@ impl DebugMcpRuntimeResponseHandle {
     pub fn recv(&self) -> Result<Option<Value>, DebugMcpRuntimeTransportError> {
         self.response_rx
             .recv()
+            .map(finalize_response_work)
             .map_err(|_| DebugMcpRuntimeTransportError::ResponseQueueDisconnected)
     }
 }
@@ -218,15 +264,28 @@ impl DebugMcpPendingToolCall {
     }
 
     pub fn try_finish(&self) -> Result<Option<Value>, DebugBridgeError> {
+        Ok(self.try_finish_work()?.and_then(finalize_response_work))
+    }
+
+    pub fn try_finish_work(&self) -> Result<Option<DebugMcpResponseWork>, DebugBridgeError> {
         let reply = match self.handle.try_recv()? {
             Some(reply) => reply,
             None => return Ok(None),
         };
 
-        Ok(Some(json_rpc_result(
-            self.id.clone(),
-            tool_result(reply_payload(&self.tool, self.method, reply, true)),
-        )))
+        if self.method == McpProbeMethod::Screenshot {
+            Ok(Some(DebugMcpResponseWork::PresentedScreenshot {
+                rpc_id: self.id.clone(),
+                tool: self.tool.clone(),
+                method: self.method,
+                reply,
+            }))
+        } else {
+            Ok(Some(DebugMcpResponseWork::Ready(Some(json_rpc_result(
+                self.id.clone(),
+                tool_result(reply_payload(&self.tool, self.method, reply, true)),
+            )))))
+        }
     }
 }
 
@@ -255,6 +314,18 @@ impl DebugMcpServer {
     where
         H: SlipwayDebugCommandHandler,
     {
+        self.handle_message_with_origin(message, ScreenshotParseOrigin::Direct, handler)
+    }
+
+    fn handle_message_with_origin<H>(
+        &self,
+        message: Value,
+        origin: ScreenshotParseOrigin,
+        handler: &mut H,
+    ) -> Option<Value>
+    where
+        H: SlipwayDebugCommandHandler,
+    {
         let id = message.get("id").cloned();
         let method = match message.get("method").and_then(Value::as_str) {
             Some(method) => method,
@@ -278,7 +349,9 @@ impl DebugMcpServer {
             )),
             "ping" => Some(json_rpc_result(id, json!({}))),
             "tools/list" => Some(json_rpc_result(id, json!({ "tools": default_tools() }))),
-            "tools/call" => Some(self.handle_tools_call(id, message.get("params"), handler)),
+            "tools/call" => {
+                Some(self.handle_tools_call(id, message.get("params"), origin, handler))
+            }
             _ => Some(json_rpc_error(
                 id,
                 -32601,
@@ -305,6 +378,27 @@ impl DebugMcpServer {
     pub fn begin_bridge_value(
         &self,
         message: Value,
+        bridge: &DebugBridgeClient,
+    ) -> DebugMcpBridgeMessage {
+        self.begin_bridge_value_with_origin(message, ScreenshotParseOrigin::Direct, bridge)
+    }
+
+    pub fn begin_runtime_bridge_value(
+        &self,
+        message: Value,
+        screenshot: Option<RuntimeScreenshotSelector>,
+        bridge: &DebugBridgeClient,
+    ) -> DebugMcpBridgeMessage {
+        let origin = screenshot.map_or(ScreenshotParseOrigin::Direct, |selector| {
+            ScreenshotParseOrigin::RuntimeNormalized(selector)
+        });
+        self.begin_bridge_value_with_origin(message, origin, bridge)
+    }
+
+    fn begin_bridge_value_with_origin(
+        &self,
+        message: Value,
+        origin: ScreenshotParseOrigin,
         bridge: &DebugBridgeClient,
     ) -> DebugMcpBridgeMessage {
         let id = message.get("id").cloned();
@@ -339,7 +433,7 @@ impl DebugMcpServer {
                 id,
                 json!({ "tools": default_tools() }),
             ))),
-            "tools/call" => self.begin_bridge_tools_call(id, message.get("params"), bridge),
+            "tools/call" => self.begin_bridge_tools_call(id, message.get("params"), origin, bridge),
             _ => DebugMcpBridgeMessage::Immediate(Some(json_rpc_error(
                 id,
                 -32601,
@@ -352,6 +446,7 @@ impl DebugMcpServer {
         &self,
         id: Option<Value>,
         params: Option<&Value>,
+        origin: ScreenshotParseOrigin,
         handler: &mut H,
     ) -> Value
     where
@@ -371,8 +466,8 @@ impl DebugMcpServer {
         let result = match tool {
             TOOL_STATUS => self.call_status(&request_id, arguments, handler),
             TOOL_PROBE => self.call_probe(&request_id, arguments, handler),
-            TOOL_RENDER => self.call_render(TOOL_RENDER, &request_id, arguments, handler),
-            TOOL_SCREENSHOT => self.call_render(TOOL_SCREENSHOT, &request_id, arguments, handler),
+            TOOL_RENDER => self.call_render(&request_id, arguments, handler),
+            TOOL_SCREENSHOT => self.call_screenshot(&request_id, arguments, origin, handler),
             TOOL_CONTROL => self.call_control(&request_id, arguments, handler),
             TOOL_PHYSICAL_CONTROL => self.call_physical_control(&request_id, arguments, handler),
             TOOL_RESIZE => self.call_resize(&request_id, arguments, handler),
@@ -391,6 +486,7 @@ impl DebugMcpServer {
         &self,
         id: Option<Value>,
         params: Option<&Value>,
+        origin: ScreenshotParseOrigin,
         bridge: &DebugBridgeClient,
     ) -> DebugMcpBridgeMessage {
         let params = match params.and_then(Value::as_object) {
@@ -419,16 +515,10 @@ impl DebugMcpServer {
         let pending = match tool {
             TOOL_STATUS => self.begin_bridge_status(id.clone(), &request_id, arguments, bridge),
             TOOL_PROBE => self.begin_bridge_probe(id.clone(), &request_id, arguments, bridge),
-            TOOL_RENDER => {
-                self.begin_bridge_render(TOOL_RENDER, id.clone(), &request_id, arguments, bridge)
+            TOOL_RENDER => self.begin_bridge_render(id.clone(), &request_id, arguments, bridge),
+            TOOL_SCREENSHOT => {
+                self.begin_bridge_screenshot(id.clone(), &request_id, arguments, origin, bridge)
             }
-            TOOL_SCREENSHOT => self.begin_bridge_render(
-                TOOL_SCREENSHOT,
-                id.clone(),
-                &request_id,
-                arguments,
-                bridge,
-            ),
             TOOL_CONTROL => self.begin_bridge_control(id.clone(), &request_id, arguments, bridge),
             TOOL_PHYSICAL_CONTROL => {
                 self.begin_bridge_physical_control(id.clone(), &request_id, arguments, bridge)
@@ -518,7 +608,6 @@ impl DebugMcpServer {
 
     fn begin_bridge_render(
         &self,
-        tool: &'static str,
         id: Option<Value>,
         request_id: &str,
         arguments: &Value,
@@ -529,7 +618,7 @@ impl DebugMcpServer {
             return Ok(DebugMcpBridgeMessage::Immediate(Some(json_rpc_result(
                 id,
                 tool_result(refusal_payload(
-                    tool,
+                    TOOL_RENDER,
                     McpProbeMethod::Render,
                     request_id,
                     &frame,
@@ -542,9 +631,58 @@ impl DebugMcpServer {
         let packet = parse_render_packet(arguments)?;
         Ok(submit_bridge_tool(
             id,
-            tool,
+            TOOL_RENDER,
             McpProbeMethod::Render,
             DebugCommand::render(request_id, packet),
+            bridge,
+        ))
+    }
+
+    fn begin_bridge_screenshot(
+        &self,
+        id: Option<Value>,
+        request_id: &str,
+        arguments: &Value,
+        origin: ScreenshotParseOrigin,
+        bridge: &DebugBridgeClient,
+    ) -> Result<DebugMcpBridgeMessage, RpcError> {
+        let request = parse_presented_screenshot_request(arguments, origin)?;
+        if !self.config.allow_screenshot {
+            return Ok(DebugMcpBridgeMessage::Immediate(Some(json_rpc_result(
+                id,
+                tool_result(screenshot_refusal_payload(
+                    request_id,
+                    &request.selector,
+                    "screenshot-denied",
+                    "presented screenshot capture is not admitted by this server configuration",
+                )),
+            ))));
+        }
+
+        if optional_string_field(arguments, "target")?.is_some_and(|target| {
+            target
+                != request
+                    .selector
+                    .correlation_frame()
+                    .surface_instance_id
+                    .as_str()
+        }) {
+            return Ok(DebugMcpBridgeMessage::Immediate(Some(json_rpc_result(
+                id,
+                tool_result(screenshot_refusal_payload(
+                    request_id,
+                    &request.selector,
+                    "screenshot-target-unsupported",
+                    "presented screenshot captures only the root surface instance",
+                )),
+            ))));
+        }
+
+        Ok(submit_bridge_tool(
+            id,
+            TOOL_SCREENSHOT,
+            McpProbeMethod::Screenshot,
+            DebugCommand::screenshot(request_id, request),
             bridge,
         ))
     }
@@ -714,7 +852,6 @@ impl DebugMcpServer {
 
     fn call_render<H>(
         &self,
-        tool: &str,
         request_id: &str,
         arguments: &Value,
         handler: &mut H,
@@ -725,7 +862,7 @@ impl DebugMcpServer {
         let frame = parse_render_frame(arguments)?;
         if !self.config.allow_render {
             return Ok(tool_result(refusal_payload(
-                tool,
+                TOOL_RENDER,
                 McpProbeMethod::Render,
                 request_id,
                 &frame,
@@ -737,10 +874,53 @@ impl DebugMcpServer {
         let packet = parse_render_packet(arguments)?;
         let command = DebugCommand::render(request_id, packet);
         Ok(tool_result(reply_payload(
-            tool,
+            TOOL_RENDER,
             McpProbeMethod::Render,
             handler_reply(handler, command),
             true,
+        )))
+    }
+
+    fn call_screenshot<H>(
+        &self,
+        request_id: &str,
+        arguments: &Value,
+        origin: ScreenshotParseOrigin,
+        handler: &mut H,
+    ) -> Result<Value, RpcError>
+    where
+        H: SlipwayDebugCommandHandler,
+    {
+        let request = parse_presented_screenshot_request(arguments, origin)?;
+        if !self.config.allow_screenshot {
+            return Ok(tool_result(screenshot_refusal_payload(
+                request_id,
+                &request.selector,
+                "screenshot-denied",
+                "presented screenshot capture is not admitted by this server configuration",
+            )));
+        }
+        if optional_string_field(arguments, "target")?.is_some_and(|target| {
+            target
+                != request
+                    .selector
+                    .correlation_frame()
+                    .surface_instance_id
+                    .as_str()
+        }) {
+            return Ok(tool_result(screenshot_refusal_payload(
+                request_id,
+                &request.selector,
+                "screenshot-target-unsupported",
+                "presented screenshot captures only the root surface instance",
+            )));
+        }
+
+        let reply = handler_reply(handler, DebugCommand::screenshot(request_id, request));
+        Ok(tool_result(finalize_screenshot_reply_payload(
+            TOOL_SCREENSHOT,
+            McpProbeMethod::Screenshot,
+            reply,
         )))
     }
 
@@ -943,9 +1123,9 @@ fn default_tools() -> Vec<Value> {
             TOOL_RENDER,
             "Request offscreen render evidence through the app runtime.",
         ),
-        render_tool_schema(
+        screenshot_tool_schema(
             TOOL_SCREENSHOT,
-            "Render the app's declared paint offscreen from the current declarations (alias of slipway.debug.render); NOT a framebuffer capture of the presented window pixels.",
+            "Capture the root window pixels directly from the next acquired surface texture presentation.",
         ),
         tool_schema(
             TOOL_CONTROL,
@@ -1020,7 +1200,19 @@ where
 {
     let request_id = command.request_id.clone();
     let frame = command.frame_identity().clone();
-    let product = handler.handle_debug_command(command);
+    let screenshot_admission = command.screenshot_admission();
+    let mut product = handler.handle_debug_command(command);
+    if let DebugReplyProduct::Screenshot(screenshot) = &product {
+        product = match screenshot_admission {
+            Some(admitted) => validate_presented_screenshot_product(&frame, admitted, screenshot)
+                .map_or_else(DebugReplyProduct::Error, |_| product),
+            None => DebugReplyProduct::Error(DebugFailure {
+                code: "screenshot-admission-missing".to_string(),
+                message: "screenshot product returned for a non-screenshot command".to_string(),
+                dispatch_evidence: None,
+            }),
+        };
+    }
     DebugReply {
         request_id,
         frame,
@@ -1058,6 +1250,203 @@ fn tool_result(payload: Value) -> Value {
     })
 }
 
+fn screenshot_tool_schema(name: &str, description: &str) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "frame": {
+                    "oneOf": [
+                        frame_schema(),
+                        { "type": "string", "enum": ["current", "last"] }
+                    ]
+                },
+                "target": { "type": "string" },
+            },
+            "additionalProperties": true,
+        },
+    })
+}
+
+fn finalize_response_work(work: DebugMcpResponseWork) -> Option<Value> {
+    match work {
+        DebugMcpResponseWork::Ready(response) => response,
+        DebugMcpResponseWork::PresentedScreenshot {
+            rpc_id,
+            tool,
+            method,
+            reply,
+        } => Some(json_rpc_result(
+            rpc_id,
+            tool_result(finalize_screenshot_reply_payload(&tool, method, reply)),
+        )),
+    }
+}
+
+fn finalize_screenshot_reply_payload(
+    tool: &str,
+    method: McpProbeMethod,
+    mut reply: DebugReply,
+) -> Value {
+    if let DebugReplyProduct::Screenshot(product) = &reply.product {
+        let admitted = match product {
+            PresentedScreenshotProduct::Captured(pixels) => pixels.selector.admission(),
+            PresentedScreenshotProduct::Refusal(refusal) => refusal.selector.admission(),
+        };
+        if let Err(failure) = validate_presented_screenshot_product(&reply.frame, admitted, product)
+        {
+            reply.product = DebugReplyProduct::Error(failure);
+        }
+    }
+    let receipt = match &reply.product {
+        DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Captured(pixels)) => {
+            match write_debug_rgba8_png_artifact(
+                PRESENTED_ARTIFACT_PROVIDER_ID,
+                &pixels.captured_frame.surface_instance_id,
+                &pixels.captured_frame,
+                pixels.width,
+                pixels.height,
+                &pixels.bytes,
+            ) {
+                Ok(receipt) => Some(receipt),
+                Err(error) => {
+                    let invalid_rgba = matches!(
+                        error,
+                        DebugPngArtifactError::ZeroSize
+                            | DebugPngArtifactError::ByteLengthOverflow
+                            | DebugPngArtifactError::ByteLengthMismatch { .. }
+                    );
+                    reply.product = DebugReplyProduct::Screenshot(
+                        PresentedScreenshotProduct::Refusal(PresentedScreenshotRefusal {
+                            selector: pixels.selector.clone(),
+                            captured_frame: Some(pixels.captured_frame.clone()),
+                            backend_id: pixels.source.backend_id.clone(),
+                            code: if invalid_rgba {
+                                "screenshot-artifact-invalid-rgba".to_string()
+                            } else {
+                                "screenshot-artifact-write-failed".to_string()
+                            },
+                            reason: format!(
+                                "presented screenshot artifact finalization failed: {error:?}"
+                            ),
+                            diagnostics: pixels.diagnostics.clone(),
+                        }),
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let (product_kind, product, refused) = match &reply.product {
+        DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Captured(pixels)) => {
+            let receipt = receipt.expect("captured screenshot artifact was finalized above");
+            (
+                "presented_screenshot",
+                json!({
+                    "admission": screenshot_admission_name(pixels.selector.admission()),
+                    "requested_frame": frame_json(pixels.selector.correlation_frame()),
+                    "selector": screenshot_selector_json(&pixels.selector),
+                    "captured_frame": frame_json(&pixels.captured_frame),
+                    "source": evidence_source_summary(&pixels.source),
+                    "capture_path": presented_capture_path_name(pixels.capture_path),
+                    "source_format": presented_surface_format_name(pixels.source_format),
+                    "transfer": presented_transfer_name(pixels.transfer),
+                    "alpha": presented_alpha_name(pixels.alpha),
+                    "width": pixels.width,
+                    "height": pixels.height,
+                    "artifact_ref": receipt.artifact_ref,
+                    "artifact_path": receipt.artifact_path,
+                    "pixel_hash": receipt.pixel_hash,
+                    "diagnostics": diagnostics_summary(&pixels.diagnostics),
+                }),
+                false,
+            )
+        }
+        DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Refusal(refusal)) => (
+            "screenshot_refusal",
+            json!({
+                "admission": screenshot_admission_name(refusal.selector.admission()),
+                "requested_frame": frame_json(refusal.selector.correlation_frame()),
+                "selector": screenshot_selector_json(&refusal.selector),
+                "captured_frame": refusal.captured_frame.as_ref().map(frame_json),
+                "backend_id": refusal.backend_id,
+                "code": refusal.code,
+                "reason": refusal.reason,
+                "diagnostics": diagnostics_summary(&refusal.diagnostics),
+            }),
+            true,
+        ),
+        _ => return reply_payload(tool, method, reply, true),
+    };
+
+    json!({
+        "method": "tools/call",
+        "tool": tool,
+        "bridge_method": bridge_method_name(method),
+        "request_id": reply.request_id,
+        "frame": frame_json(&reply.frame),
+        "admitted": true,
+        "refused": refused,
+        "product_kind": product_kind,
+        "product": product,
+    })
+}
+
+fn presented_capture_path_name(path: PresentedCapturePath) -> &'static str {
+    match path {
+        PresentedCapturePath::DirectAcquiredSurfaceTextureCopy => {
+            "direct_acquired_surface_texture_copy"
+        }
+    }
+}
+
+fn presented_surface_format_name(format: PresentedSurfaceFormat) -> &'static str {
+    match format {
+        PresentedSurfaceFormat::Rgba8Unorm => "rgba8_unorm",
+        PresentedSurfaceFormat::Rgba8UnormSrgb => "rgba8_unorm_srgb",
+        PresentedSurfaceFormat::Bgra8Unorm => "bgra8_unorm",
+        PresentedSurfaceFormat::Bgra8UnormSrgb => "bgra8_unorm_srgb",
+    }
+}
+
+fn presented_transfer_name(transfer: PresentedTransferFunction) -> &'static str {
+    match transfer {
+        PresentedTransferFunction::Linear => "linear",
+        PresentedTransferFunction::Srgb => "srgb",
+    }
+}
+
+fn presented_alpha_name(alpha: PresentedAlphaMode) -> &'static str {
+    match alpha {
+        PresentedAlphaMode::Opaque => "opaque",
+        PresentedAlphaMode::Premultiplied => "premultiplied",
+    }
+}
+
+fn screenshot_admission_name(admission: PresentedScreenshotAdmission) -> &'static str {
+    match admission {
+        PresentedScreenshotAdmission::Exact => "exact",
+        PresentedScreenshotAdmission::Current => "current",
+    }
+}
+
+fn screenshot_selector_json(selector: &PresentedScreenshotSelector) -> Value {
+    match selector {
+        PresentedScreenshotSelector::Exact { expected_frame } => json!({
+            "kind": "exact",
+            "expected_frame": frame_json(expected_frame),
+        }),
+        PresentedScreenshotSelector::Current { request_context } => json!({
+            "kind": "current",
+            "request_context": frame_json(request_context),
+        }),
+    }
+}
+
 fn refusal_payload(
     tool: &str,
     method: McpProbeMethod,
@@ -1075,6 +1464,32 @@ fn refusal_payload(
         "admitted": false,
         "refused": true,
         "product_kind": "refusal",
+        "refusal": {
+            "code": code,
+            "message": message,
+        },
+    })
+}
+
+fn screenshot_refusal_payload(
+    request_id: &str,
+    selector: &PresentedScreenshotSelector,
+    code: &str,
+    message: &str,
+) -> Value {
+    json!({
+        "method": "tools/call",
+        "tool": TOOL_SCREENSHOT,
+        "bridge_method": bridge_method_name(McpProbeMethod::Screenshot),
+        "request_id": request_id,
+        "frame": frame_json(selector.correlation_frame()),
+        "admitted": false,
+        "refused": true,
+        "product_kind": "refusal",
+        "admission": screenshot_admission_name(selector.admission()),
+        "requested_frame": frame_json(selector.correlation_frame()),
+        "selector": screenshot_selector_json(selector),
+        "captured_frame": Value::Null,
         "refusal": {
             "code": code,
             "message": message,
@@ -1140,6 +1555,36 @@ fn product_summary(product: &DebugReplyProduct) -> (&'static str, Value) {
                 "diagnostics": diagnostics_summary(&refusal.diagnostics),
             }),
         ),
+        DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Captured(pixels)) => (
+            "presented_screenshot_unfinalized",
+            json!({
+                "admission": screenshot_admission_name(pixels.selector.admission()),
+                "requested_frame": frame_json(pixels.selector.correlation_frame()),
+                "selector": screenshot_selector_json(&pixels.selector),
+                "captured_frame": frame_json(&pixels.captured_frame),
+                "source": evidence_source_summary(&pixels.source),
+                "capture_path": presented_capture_path_name(pixels.capture_path),
+                "source_format": presented_surface_format_name(pixels.source_format),
+                "transfer": presented_transfer_name(pixels.transfer),
+                "alpha": presented_alpha_name(pixels.alpha),
+                "width": pixels.width,
+                "height": pixels.height,
+                "diagnostics": diagnostics_summary(&pixels.diagnostics),
+            }),
+        ),
+        DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Refusal(refusal)) => (
+            "screenshot_refusal",
+            json!({
+                "admission": screenshot_admission_name(refusal.selector.admission()),
+                "requested_frame": frame_json(refusal.selector.correlation_frame()),
+                "selector": screenshot_selector_json(&refusal.selector),
+                "captured_frame": refusal.captured_frame.as_ref().map(frame_json),
+                "backend_id": refusal.backend_id,
+                "code": refusal.code,
+                "reason": refusal.reason,
+                "diagnostics": diagnostics_summary(&refusal.diagnostics),
+            }),
+        ),
         DebugReplyProduct::Diagnostics(diagnostics) => (
             "diagnostics",
             json!({
@@ -1148,7 +1593,78 @@ fn product_summary(product: &DebugReplyProduct) -> (&'static str, Value) {
             }),
         ),
         DebugReplyProduct::ControlTrace(trace) => ("control_trace", control_trace_summary(trace)),
+        DebugReplyProduct::CompositionTrace(trace) => {
+            ("text_composition_trace", composition_trace_summary(trace))
+        }
         DebugReplyProduct::Error(error) => ("error", failure_summary(error)),
+    }
+}
+
+fn composition_trace_summary(trace: &slipway_debug_bridge::DebugCompositionTrace) -> Value {
+    json!({
+        "request_id": trace.request_id,
+        "frame": frame_json(&trace.frame),
+        "backend_id": trace.backend_id,
+        "target": trace.target.as_str(),
+        "selected_region": trace.selected_region.as_str(),
+        "focused_before": trace.focused_before,
+        "focused_after": trace.focused_after,
+        "phases": trace.phases.iter().map(|phase| json!({
+            "phase": composition_phase_name(phase.phase),
+            "backend_event": phase.backend_event,
+            "provenance": match phase.provenance {
+                CompositionPhaseProvenance::Native => json!({ "kind": "native" }),
+                CompositionPhaseProvenance::Derived { from } => json!({
+                    "kind": "derived",
+                    "from": composition_phase_name(from),
+                }),
+            },
+            "event": {
+                "target": phase.event.target.as_str(),
+                "target_slot": phase.event.target_slot.as_ref().map(widget_slot_json),
+                "phase": composition_phase_name(phase.event.phase),
+                "preedit_text": phase.event.preedit_text,
+                "cursor_range": phase.event.cursor_range.as_ref().map(text_selection_range_json),
+            },
+            "ingress_observation": composition_ingress_summary(phase.ingress_observation),
+            "dispatch_evidence": dispatch_evidence_summary(&phase.dispatch_evidence),
+            "app_handled": phase.app_handled,
+            "result_identity": phase.result_identity.as_ref().map(result_identity_summary),
+        })).collect::<Vec<_>>(),
+        "commit_mutation": trace.commit_mutation.as_ref().map(|mutation| json!({
+            "trace": control_trace_summary(&mutation.trace),
+            "before": mutation.before,
+            "after": mutation.after,
+        })),
+        "completed": trace.completed,
+        "failure": trace.failure.as_ref().map(failure_summary),
+    })
+}
+
+fn composition_ingress_summary(observation: DebugCompositionIngressObservation) -> Value {
+    match observation {
+        DebugCompositionIngressObservation::IcedQueueSlice { sequence_index } => {
+            json!({ "kind": "iced_queue_slice", "sequence_index": sequence_index })
+        }
+        DebugCompositionIngressObservation::EguiRawInputSpan { event_index } => {
+            json!({ "kind": "egui_raw_input_span", "event_index": event_index })
+        }
+        DebugCompositionIngressObservation::Derived {
+            from_sequence_index,
+        } => json!({
+            "kind": "derived",
+            "from_sequence_index": from_sequence_index,
+        }),
+    }
+}
+
+fn composition_phase_name(phase: TextCompositionPhase) -> &'static str {
+    match phase {
+        TextCompositionPhase::Start => "start",
+        TextCompositionPhase::Update => "update",
+        TextCompositionPhase::Commit => "commit",
+        TextCompositionPhase::End => "end",
+        TextCompositionPhase::Cancel => "cancel",
     }
 }
 
@@ -1819,6 +2335,7 @@ fn bridge_method_name(method: McpProbeMethod) -> &'static str {
         McpProbeMethod::Status => "status",
         McpProbeMethod::Probe => "probe",
         McpProbeMethod::Render => "render",
+        McpProbeMethod::Screenshot => "screenshot",
         McpProbeMethod::Control => "control",
         McpProbeMethod::Resize => "resize",
     }
@@ -1835,6 +2352,35 @@ fn request_id_string(id: Option<&Value>) -> String {
 
 fn parse_frame_from_arguments(arguments: &Value) -> Result<FrameIdentity, RpcError> {
     parse_frame(required_object_field(arguments, "frame")?)
+}
+
+fn parse_presented_screenshot_request(
+    arguments: &Value,
+    origin: ScreenshotParseOrigin,
+) -> Result<PresentedScreenshotRequest, RpcError> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| RpcError::invalid_params("tool arguments must be an object"))?;
+    if object.contains_key("_slipway_frame_admission") {
+        return Err(RpcError::invalid_params(
+            "field `_slipway_frame_admission` is not supported",
+        ));
+    }
+    let frame = parse_frame(required_object_field(arguments, "frame")?)?;
+    let selector = match origin {
+        ScreenshotParseOrigin::Direct
+        | ScreenshotParseOrigin::RuntimeNormalized(RuntimeScreenshotSelector::Exact) => {
+            PresentedScreenshotSelector::Exact {
+                expected_frame: frame,
+            }
+        }
+        ScreenshotParseOrigin::RuntimeNormalized(RuntimeScreenshotSelector::Current) => {
+            PresentedScreenshotSelector::Current {
+                request_context: frame,
+            }
+        }
+    };
+    Ok(PresentedScreenshotRequest { selector })
 }
 
 fn parse_render_frame(arguments: &Value) -> Result<FrameIdentity, RpcError> {
@@ -2053,6 +2599,64 @@ fn parse_physical_control(operation: &Value) -> Result<DebugPhysicalControl, Rpc
             selection_before: optional_text_selection_range(operation, "selection_before")?,
             selection_after: optional_text_selection_range(operation, "selection_after")?,
         }),
+        "text_composition" | "TextComposition" | "textComposition" => {
+            let selector = parse_physical_control_selector(operation)?;
+            let updates_value = required_array_field(operation, "updates")?;
+            if updates_value.is_empty() || updates_value.len() > MAX_COMPOSITION_UPDATES {
+                return Err(RpcError::invalid_params(format!(
+                    "text composition requires 1 through {MAX_COMPOSITION_UPDATES} updates"
+                )));
+            }
+
+            let commit = required_string_field(operation, "commit")?;
+            if commit.is_empty() {
+                return Err(RpcError::invalid_params(
+                    "text composition commit must be non-empty",
+                ));
+            }
+            let mut total_bytes = commit.len();
+            let mut updates = Vec::with_capacity(updates_value.len());
+            for (index, update) in updates_value.iter().enumerate() {
+                if !update.is_object() {
+                    return Err(RpcError::invalid_params(format!(
+                        "text composition updates[{index}] must be an object"
+                    )));
+                }
+                let preedit_text = required_string_field(update, "preedit_text")?;
+                if preedit_text.is_empty() {
+                    return Err(RpcError::invalid_params(format!(
+                        "text composition updates[{index}].preedit_text must be non-empty"
+                    )));
+                }
+                total_bytes = total_bytes.checked_add(preedit_text.len()).ok_or_else(|| {
+                    RpcError::invalid_params("text composition UTF-8 byte count overflowed")
+                })?;
+                if total_bytes > MAX_COMPOSITION_UTF8_BYTES {
+                    return Err(RpcError::invalid_params(format!(
+                        "text composition exceeds {MAX_COMPOSITION_UTF8_BYTES} total UTF-8 bytes"
+                    )));
+                }
+                let cursor_range = optional_text_selection_range(update, "cursor_range")?;
+                if let Some(range) = &cursor_range {
+                    let scalar_count = preedit_text.chars().count();
+                    if range.anchor > scalar_count || range.focus > scalar_count {
+                        return Err(RpcError::invalid_params(format!(
+                            "text composition updates[{index}].cursor_range must use Unicode scalar indices within the preedit text"
+                        )));
+                    }
+                }
+                updates.push(DebugTextCompositionUpdate {
+                    preedit_text: preedit_text.to_string(),
+                    cursor_range,
+                });
+            }
+
+            Ok(DebugPhysicalControl::TextComposition {
+                selector,
+                updates,
+                commit: commit.to_string(),
+            })
+        }
         "keyboard" | "Keyboard" => Ok(DebugPhysicalControl::Keyboard {
             selector: parse_physical_control_selector(operation)?,
             key: required_string_field(operation, "key")?.to_string(),
@@ -2619,6 +3223,7 @@ mod tests {
             allow_status: true,
             allow_probe: false,
             allow_render: false,
+            allow_screenshot: false,
             allow_control: true,
             allow_resize: false,
         })
@@ -2629,6 +3234,7 @@ mod tests {
             allow_status: true,
             allow_probe: false,
             allow_render: true,
+            allow_screenshot: true,
             allow_control: false,
             allow_resize: false,
         })
@@ -2688,6 +3294,18 @@ mod tests {
                         reason: "fake handler has no renderer".to_string(),
                         diagnostics: Vec::new(),
                     }))
+                }
+                slipway_debug_bridge::DebugCommandKind::Screenshot { request } => {
+                    DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Refusal(
+                        PresentedScreenshotRefusal {
+                            selector: request.selector,
+                            captured_frame: None,
+                            backend_id: Some("fake-backend".to_string()),
+                            code: "screenshot-no-window".to_string(),
+                            reason: "fake handler has no visible window".to_string(),
+                            diagnostics: Vec::new(),
+                        },
+                    ))
                 }
                 slipway_debug_bridge::DebugCommandKind::Control {
                     frame,
@@ -2841,16 +3459,196 @@ mod tests {
             .expect("tools/list has response");
 
         let tools = response["result"]["tools"].as_array().expect("tools array");
-        for name in [TOOL_RENDER, TOOL_SCREENSHOT] {
-            let schema = tools
-                .iter()
-                .find(|tool| tool["name"] == name)
-                .expect("render tool exists")
-                .get("inputSchema")
-                .expect("schema exists");
-            assert_eq!(schema["required"], json!(["frame"]));
-            assert_eq!(schema["properties"]["target"]["type"], "string");
+        let render = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_RENDER)
+            .expect("render tool exists")["inputSchema"]
+            .clone();
+        assert_eq!(render["required"], json!(["frame"]));
+        assert_eq!(render["properties"]["target"]["type"], "string");
+
+        let screenshot = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_SCREENSHOT)
+            .expect("screenshot tool exists")["inputSchema"]
+            .clone();
+        assert!(screenshot.get("required").is_none());
+        assert_eq!(screenshot["properties"]["target"]["type"], "string");
+        assert_eq!(
+            screenshot["properties"]["frame"]["oneOf"][1]["enum"],
+            json!(["current", "last"])
+        );
+        let schema_text = screenshot.to_string();
+        assert!(!schema_text.contains("_slipway_frame_admission"));
+        assert!(!schema_text.contains("continu"));
+    }
+
+    #[test]
+    fn screenshot_parser_enforces_out_of_band_origin() {
+        let exact = parse_presented_screenshot_request(
+            &json!({ "frame": frame_json_value() }),
+            ScreenshotParseOrigin::Direct,
+        )
+        .expect("direct concrete frame parses");
+        assert_eq!(
+            exact.selector,
+            PresentedScreenshotSelector::Exact {
+                expected_frame: frame()
+            }
+        );
+
+        for frame_value in [None, Some(json!("current")), Some(json!("last"))] {
+            let mut arguments = json!({});
+            if let Some(frame_value) = frame_value {
+                arguments["frame"] = frame_value;
+            }
+            assert!(
+                parse_presented_screenshot_request(&arguments, ScreenshotParseOrigin::Direct)
+                    .is_err()
+            );
         }
+
+        let forged = json!({
+            "frame": frame_json_value(),
+            "_slipway_frame_admission": "current"
+        });
+        assert!(
+            parse_presented_screenshot_request(&forged, ScreenshotParseOrigin::Direct).is_err()
+        );
+
+        let current = parse_presented_screenshot_request(
+            &json!({ "frame": frame_json_value() }),
+            ScreenshotParseOrigin::RuntimeNormalized(RuntimeScreenshotSelector::Current),
+        )
+        .expect("trusted runtime origin parses");
+        assert_eq!(
+            current.selector,
+            PresentedScreenshotSelector::Current {
+                request_context: frame()
+            }
+        );
+    }
+
+    #[test]
+    fn screenshot_sync_async_refusals_preserve_identical_selectors() {
+        let vectors = [
+            (ScreenshotParseOrigin::Direct, "exact", "expected_frame"),
+            (
+                ScreenshotParseOrigin::RuntimeNormalized(RuntimeScreenshotSelector::Current),
+                "current",
+                "request_context",
+            ),
+        ];
+
+        for (origin, admission, selector_field) in vectors {
+            for (config, target, expected_code) in [
+                (DebugMcpConfig::default(), None, "screenshot-denied"),
+                (
+                    DebugMcpConfig::admitted(),
+                    Some("not-the-root"),
+                    "screenshot-target-unsupported",
+                ),
+            ] {
+                let server = DebugMcpServer::new(config);
+                let mut arguments = json!({ "frame": frame_json_value() });
+                if let Some(target) = target {
+                    arguments["target"] = json!(target);
+                }
+                let message = call_request(json!("selector-vector"), TOOL_SCREENSHOT, arguments);
+                let mut handler = FakeHandler::default();
+                let sync = server
+                    .handle_message_with_origin(message.clone(), origin, &mut handler)
+                    .expect("sync refusal responds");
+                assert!(handler.calls.is_empty());
+
+                let (client, runtime) = bounded_debug_bridge(1);
+                let asynchronous =
+                    match server.begin_bridge_value_with_origin(message, origin, &client) {
+                        DebugMcpBridgeMessage::Immediate(Some(response)) => response,
+                        DebugMcpBridgeMessage::Immediate(None) => panic!("refusal must respond"),
+                        DebugMcpBridgeMessage::Pending(_) => panic!("refusal must not lease"),
+                    };
+                assert!(runtime.take_one().expect("bridge readable").is_none());
+
+                let sync = tool_payload(&sync);
+                let asynchronous = tool_payload(&asynchronous);
+                assert_eq!(sync, asynchronous);
+                assert_eq!(sync["admission"], admission);
+                assert_eq!(sync["selector"]["kind"], admission);
+                assert!(sync["selector"].get(selector_field).is_some());
+                assert_eq!(sync["requested_frame"], frame_json_value());
+                assert!(sync["captured_frame"].is_null());
+                assert_eq!(sync["refusal"]["code"], expected_code);
+            }
+        }
+    }
+
+    #[test]
+    fn screenshot_sync_async_malformed_vectors_match() {
+        let server = DebugMcpServer::new(DebugMcpConfig::admitted());
+        for arguments in [
+            json!({}),
+            json!({ "frame": "current" }),
+            json!({
+                "frame": frame_json_value(),
+                "_slipway_frame_admission": "current"
+            }),
+        ] {
+            let message = call_request(json!("malformed-vector"), TOOL_SCREENSHOT, arguments);
+            let mut handler = FakeHandler::default();
+            let sync = server
+                .handle_message(message.clone(), &mut handler)
+                .expect("sync parse error responds");
+            let (client, runtime) = bounded_debug_bridge(1);
+            let asynchronous = match server.begin_bridge_value(message, &client) {
+                DebugMcpBridgeMessage::Immediate(Some(response)) => response,
+                DebugMcpBridgeMessage::Immediate(None) => panic!("parse error must respond"),
+                DebugMcpBridgeMessage::Pending(_) => panic!("parse error must not lease"),
+            };
+            assert_eq!(sync["error"], asynchronous["error"]);
+            assert!(handler.calls.is_empty());
+            assert!(runtime.take_one().expect("bridge readable").is_none());
+        }
+    }
+
+    #[test]
+    fn synchronous_handler_retains_admitted_screenshot_origin() {
+        struct WrongAdmissionHandler;
+
+        impl SlipwayDebugCommandHandler for WrongAdmissionHandler {
+            fn handle_debug_command(&mut self, command: DebugCommand) -> DebugReplyProduct {
+                let correlation = command.frame_identity().clone();
+                DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Refusal(
+                    PresentedScreenshotRefusal {
+                        selector: PresentedScreenshotSelector::Exact {
+                            expected_frame: correlation,
+                        },
+                        captured_frame: None,
+                        backend_id: None,
+                        code: "wrong-admission".to_string(),
+                        reason: "test handler changed selector admission".to_string(),
+                        diagnostics: Vec::new(),
+                    },
+                ))
+            }
+        }
+
+        let server = DebugMcpServer::new(DebugMcpConfig::admitted());
+        let message = call_request(
+            json!("handler-origin"),
+            TOOL_SCREENSHOT,
+            json!({ "frame": frame_json_value() }),
+        );
+        let response = server
+            .handle_message_with_origin(
+                message,
+                ScreenshotParseOrigin::RuntimeNormalized(RuntimeScreenshotSelector::Current),
+                &mut WrongAdmissionHandler,
+            )
+            .expect("synchronous call responds");
+        let payload = tool_payload(&response);
+        assert_eq!(payload["product_kind"], "error");
+        assert_eq!(payload["product"]["code"], "screenshot-admission-mismatch");
     }
 
     #[test]
@@ -2873,12 +3671,12 @@ mod tests {
             .as_str()
             .expect("screenshot description");
         assert!(
-            description.contains("declared paint offscreen"),
-            "screenshot description must say it renders declarations: {description}"
+            description.contains("acquired surface texture"),
+            "screenshot description must name direct presented capture: {description}"
         );
         assert!(
-            description.contains("NOT a framebuffer capture"),
-            "screenshot description must deny framebuffer capture: {description}"
+            !description.contains("offscreen"),
+            "screenshot description must stay distinct from canonical render: {description}"
         );
 
         let resize = tools
@@ -2901,7 +3699,7 @@ mod tests {
             (TOOL_STATUS, "status-denied"),
             (TOOL_PROBE, "probe-denied"),
             (TOOL_RENDER, "render-denied"),
-            (TOOL_SCREENSHOT, "render-denied"),
+            (TOOL_SCREENSHOT, "screenshot-denied"),
             (TOOL_CONTROL, "control-denied"),
             (TOOL_PHYSICAL_CONTROL, "control-denied"),
             (TOOL_RESIZE, "resize-denied"),
@@ -2933,7 +3731,7 @@ mod tests {
             (TOOL_STATUS, "status-denied"),
             (TOOL_PROBE, "probe-denied"),
             (TOOL_RENDER, "render-denied"),
-            (TOOL_SCREENSHOT, "render-denied"),
+            (TOOL_SCREENSHOT, "screenshot-denied"),
             (TOOL_CONTROL, "control-denied"),
             (TOOL_PHYSICAL_CONTROL, "control-denied"),
             (TOOL_RESIZE, "resize-denied"),
@@ -2963,13 +3761,17 @@ mod tests {
     }
 
     #[test]
-    fn admitted_screenshot_alias_uses_render_command_and_reports_alias_tool() {
-        let server = render_server();
+    fn admitted_screenshot_uses_distinct_command_and_method() {
+        let server = DebugMcpServer::new(DebugMcpConfig::admitted());
         let mut handler = FakeHandler::default();
 
         let response = server
             .handle_message(
-                call_request(json!("shot-direct"), TOOL_SCREENSHOT, render_arguments()),
+                call_request(
+                    json!("shot-direct"),
+                    TOOL_SCREENSHOT,
+                    render_arguments_without_target(),
+                ),
                 &mut handler,
             )
             .expect("tools/call has response");
@@ -2977,44 +3779,49 @@ mod tests {
 
         assert_eq!(handler.calls.len(), 1);
         match &handler.calls[0].kind {
-            slipway_debug_bridge::DebugCommandKind::Render { packet } => {
-                assert_eq!(packet.frame, frame());
+            slipway_debug_bridge::DebugCommandKind::Screenshot { request } => {
+                assert_eq!(
+                    request.selector,
+                    PresentedScreenshotSelector::Exact {
+                        expected_frame: frame()
+                    }
+                );
             }
-            other => panic!("expected render command, got {other:?}"),
+            other => panic!("expected screenshot command, got {other:?}"),
         }
         assert_eq!(payload["tool"], TOOL_SCREENSHOT);
-        assert_eq!(payload["bridge_method"], "render");
+        assert_eq!(payload["bridge_method"], "screenshot");
         assert_eq!(payload["request_id"], "shot-direct");
         assert_eq!(payload["admitted"], true);
-        assert_eq!(payload["refused"], false);
-        assert_eq!(payload["product_kind"], "render_refusal");
+        assert_eq!(payload["refused"], true);
+        assert_eq!(payload["product_kind"], "screenshot_refusal");
+        assert_eq!(payload["product"]["admission"], "exact");
+        assert_eq!(payload["product"]["selector"]["kind"], "exact");
+        assert_eq!(
+            payload["product"]["selector"]["expected_frame"],
+            frame_json_value()
+        );
+        assert!(payload["product"]["captured_frame"].is_null());
     }
 
     #[test]
-    fn admitted_render_and_screenshot_accept_frame_only_and_default_target() {
-        for tool in [TOOL_RENDER, TOOL_SCREENSHOT] {
-            let server = render_server();
-            let mut handler = FakeHandler::default();
+    fn admitted_screenshot_refuses_non_root_target_before_handler() {
+        let server = render_server();
+        let mut handler = FakeHandler::default();
+        let response = server
+            .handle_message(
+                call_request(
+                    json!("shot-target"),
+                    TOOL_SCREENSHOT,
+                    json!({ "frame": frame_json_value(), "target": "widget" }),
+                ),
+                &mut handler,
+            )
+            .expect("tools/call has response");
+        let payload = tool_payload(&response);
 
-            let response = server
-                .handle_message(
-                    call_request(json!(tool), tool, render_arguments_without_target()),
-                    &mut handler,
-                )
-                .expect("tools/call has response");
-            let payload = tool_payload(&response);
-
-            assert_eq!(handler.calls.len(), 1);
-            match &handler.calls[0].kind {
-                slipway_debug_bridge::DebugCommandKind::Render { packet } => {
-                    assert_eq!(packet.frame, frame());
-                    assert_eq!(packet.target, WidgetId::from("instance"));
-                }
-                other => panic!("expected render command, got {other:?}"),
-            }
-            assert_eq!(payload["tool"], tool);
-            assert_eq!(payload["admitted"], true);
-        }
+        assert!(handler.calls.is_empty());
+        assert_eq!(payload["refusal"]["code"], "screenshot-target-unsupported");
     }
 
     #[test]
@@ -3053,11 +3860,15 @@ mod tests {
     }
 
     #[test]
-    fn bridged_screenshot_alias_uses_render_method_and_payload_shape() {
+    fn bridged_screenshot_uses_screenshot_method_and_payload_shape() {
         let server = render_server();
         let (client, runtime) = bounded_debug_bridge(1);
-        let message =
-            call_request(json!("shot-bridge"), TOOL_SCREENSHOT, render_arguments()).to_string();
+        let message = call_request(
+            json!("shot-bridge"),
+            TOOL_SCREENSHOT,
+            render_arguments_without_target(),
+        )
+        .to_string();
 
         let pending = match server.begin_bridge_message(&message, &client) {
             DebugMcpBridgeMessage::Pending(pending) => pending,
@@ -3067,19 +3878,24 @@ mod tests {
         };
 
         assert_eq!(pending.tool_name(), TOOL_SCREENSHOT);
-        assert_eq!(pending.method(), McpProbeMethod::Render);
+        assert_eq!(pending.method(), McpProbeMethod::Screenshot);
         assert_eq!(pending.request_id(), "shot-bridge");
 
         let mut handler = FakeHandler::default();
         runtime
             .drain_one(&mut handler)
             .expect("runtime drains")
-            .expect("screenshot alias reply generated");
+            .expect("screenshot reply generated");
         match &handler.calls[0].kind {
-            slipway_debug_bridge::DebugCommandKind::Render { packet } => {
-                assert_eq!(packet.frame, frame());
+            slipway_debug_bridge::DebugCommandKind::Screenshot { request } => {
+                assert_eq!(
+                    request.selector,
+                    PresentedScreenshotSelector::Exact {
+                        expected_frame: frame()
+                    }
+                );
             }
-            other => panic!("expected render command, got {other:?}"),
+            other => panic!("expected screenshot command, got {other:?}"),
         }
         let response = pending
             .try_finish()
@@ -3088,8 +3904,8 @@ mod tests {
         let payload = tool_payload(&response);
 
         assert_eq!(payload["tool"], TOOL_SCREENSHOT);
-        assert_eq!(payload["bridge_method"], "render");
-        assert_eq!(payload["product_kind"], "render_refusal");
+        assert_eq!(payload["bridge_method"], "screenshot");
+        assert_eq!(payload["product_kind"], "screenshot_refusal");
     }
 
     #[test]
@@ -3114,13 +3930,17 @@ mod tests {
         runtime
             .drain_one(&mut handler)
             .expect("runtime drains")
-            .expect("screenshot alias reply generated");
+            .expect("screenshot reply generated");
         match &handler.calls[0].kind {
-            slipway_debug_bridge::DebugCommandKind::Render { packet } => {
-                assert_eq!(packet.frame, frame());
-                assert_eq!(packet.target, WidgetId::from("instance"));
+            slipway_debug_bridge::DebugCommandKind::Screenshot { request } => {
+                assert_eq!(
+                    request.selector,
+                    PresentedScreenshotSelector::Exact {
+                        expected_frame: frame()
+                    }
+                );
             }
-            other => panic!("expected render command, got {other:?}"),
+            other => panic!("expected screenshot command, got {other:?}"),
         }
         let response = pending
             .try_finish()
@@ -3129,7 +3949,72 @@ mod tests {
         let payload = tool_payload(&response);
 
         assert_eq!(payload["tool"], TOOL_SCREENSHOT);
-        assert_eq!(payload["bridge_method"], "render");
+        assert_eq!(payload["bridge_method"], "screenshot");
+    }
+
+    #[test]
+    fn presented_screenshot_finalizer_writes_artifact_without_serializing_raw_bytes() {
+        struct CapturedHandler;
+
+        impl SlipwayDebugCommandHandler for CapturedHandler {
+            fn handle_debug_command(&mut self, command: DebugCommand) -> DebugReplyProduct {
+                let slipway_debug_bridge::DebugCommandKind::Screenshot { request } = command.kind
+                else {
+                    panic!("captured handler only accepts screenshot commands")
+                };
+                let mut captured_frame = request.selector.correlation_frame().clone();
+                captured_frame.frame_index += 1;
+                DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Captured(
+                    PresentedPixels {
+                        selector: request.selector,
+                        captured_frame,
+                        source: EvidenceSource::backend_presented(
+                            "test-backend",
+                            PRESENTED_PIXELS_PASS_ID,
+                        ),
+                        capture_path: PresentedCapturePath::DirectAcquiredSurfaceTextureCopy,
+                        source_format: PresentedSurfaceFormat::Rgba8UnormSrgb,
+                        transfer: PresentedTransferFunction::Srgb,
+                        alpha: PresentedAlphaMode::Opaque,
+                        width: 1,
+                        height: 1,
+                        bytes: std::sync::Arc::from([17, 34, 51, 255]),
+                        diagnostics: Vec::new(),
+                    },
+                ))
+            }
+        }
+
+        let server = render_server();
+        let mut handler = CapturedHandler;
+        let response = server
+            .handle_message(
+                call_request(
+                    json!("shot-artifact"),
+                    TOOL_SCREENSHOT,
+                    render_arguments_without_target(),
+                ),
+                &mut handler,
+            )
+            .expect("screenshot responds");
+        let payload = tool_payload(&response);
+        assert_eq!(payload["product_kind"], "presented_screenshot");
+        assert_eq!(payload["bridge_method"], "screenshot");
+        assert_eq!(payload["product"]["admission"], "exact");
+        assert_eq!(payload["product"]["selector"]["kind"], "exact");
+        assert_eq!(payload["product"]["width"], 1);
+        assert!(
+            payload["product"]["artifact_ref"]
+                .as_str()
+                .expect("artifact ref")
+                .starts_with("slipway-debug-renderer://")
+        );
+        let artifact_path = payload["product"]["artifact_path"]
+            .as_str()
+            .expect("artifact path");
+        assert!(std::path::Path::new(artifact_path).is_file());
+        assert!(!payload.to_string().contains("\"bytes\""));
+        let _ = std::fs::remove_file(artifact_path);
     }
 
     #[test]
@@ -3631,6 +4516,227 @@ mod tests {
         let _first = client.submit("one").expect("first request queued");
         let second = client.submit("two").err().expect("second request rejected");
         assert_eq!(second, DebugMcpRuntimeTransportError::RequestQueueFull);
+    }
+
+    #[test]
+    fn enabled_but_idle_runtime_transport_creates_no_response_work() {
+        let (_client, endpoint) = bounded_runtime_mcp(1);
+        assert!(
+            endpoint
+                .try_recv()
+                .expect("idle endpoint is readable")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn presented_screenshot_response_work_finalizes_on_receiving_thread() {
+        let (client, endpoint) = bounded_runtime_mcp(1);
+        let handle = client
+            .submit("deferred screenshot")
+            .expect("request queued");
+        let request = endpoint
+            .try_recv()
+            .expect("endpoint readable")
+            .expect("request available");
+        let mut requested_frame = frame();
+        requested_frame.surface_instance_id = format!("connection-thread-{}", std::process::id());
+        let mut captured_frame = requested_frame.clone();
+        captured_frame.frame_index += 1;
+        let reply = DebugReply {
+            request_id: "deferred-screenshot".to_string(),
+            frame: requested_frame.clone(),
+            product: DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Captured(
+                PresentedPixels {
+                    selector: PresentedScreenshotSelector::Exact {
+                        expected_frame: requested_frame,
+                    },
+                    captured_frame,
+                    source: EvidenceSource::backend_presented(
+                        "test-backend",
+                        PRESENTED_PIXELS_PASS_ID,
+                    ),
+                    capture_path: PresentedCapturePath::DirectAcquiredSurfaceTextureCopy,
+                    source_format: PresentedSurfaceFormat::Rgba8Unorm,
+                    transfer: PresentedTransferFunction::Linear,
+                    alpha: PresentedAlphaMode::Opaque,
+                    width: 1,
+                    height: 1,
+                    bytes: std::sync::Arc::from([4, 3, 2, 255]),
+                    diagnostics: Vec::new(),
+                },
+            )),
+        };
+        request
+            .respond_work(DebugMcpResponseWork::PresentedScreenshot {
+                rpc_id: Some(json!("deferred-screenshot")),
+                tool: TOOL_SCREENSHOT.to_string(),
+                method: McpProbeMethod::Screenshot,
+                reply,
+            })
+            .expect("response work queued without finalizing");
+
+        let response = std::thread::spawn(move || handle.recv())
+            .join()
+            .expect("connection thread joins")
+            .expect("response work finalizes")
+            .expect("screenshot returns response");
+        let payload = tool_payload(&response);
+        let artifact_path = payload["product"]["artifact_path"]
+            .as_str()
+            .expect("artifact path");
+        assert!(std::path::Path::new(artifact_path).is_file());
+        assert_eq!(payload["product_kind"], "presented_screenshot");
+        let _ = std::fs::remove_file(artifact_path);
+    }
+
+    #[test]
+    fn text_composition_parser_accepts_bounded_multibyte_scalar_ranges() {
+        let operation = json!({
+            "type": "text_composition",
+            "target": "editor",
+            "updates": [
+                {
+                    "preedit_text": "한a",
+                    "cursor_range": { "anchor": 1, "focus": 2 }
+                }
+            ],
+            "commit": "한"
+        });
+        let parsed = parse_physical_control(&operation).expect("valid composition parses");
+        let DebugPhysicalControl::TextComposition {
+            selector,
+            updates,
+            commit,
+        } = parsed
+        else {
+            panic!("expected text composition operation")
+        };
+        assert_eq!(
+            selector,
+            DebugPhysicalControlDeclarationSelector::Target {
+                target: WidgetId::from("editor")
+            }
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].cursor_range.as_ref().expect("range").focus, 2);
+        assert_eq!(commit, "한");
+    }
+
+    #[test]
+    fn text_composition_serializer_preserves_end_and_derived_provenance() {
+        let event = slipway_core::TextCompositionEvent {
+            target: WidgetId::from("editor"),
+            target_slot: None,
+            phase: TextCompositionPhase::End,
+            preedit_text: String::new(),
+            cursor_range: None,
+        };
+        let dispatch_evidence = DeclaredEventDispatchEvidence {
+            source: EvidenceSource::backend_presented(
+                "egui",
+                slipway_debug_bridge::DEBUG_COMPOSITION_PASS_ID,
+            ),
+            frame: frame(),
+            kind: DeclaredEventDispatchKind::Text,
+            input_position: None,
+            input_position_space: None,
+            candidate_regions: vec![PresentationRegionId::from("editor-region")],
+            selected_region: Some(PresentationRegionId::from("editor-region")),
+            refusal_reason: None,
+            generated_event: Some(InputEvent::TextComposition(event.clone())),
+            route: None,
+            capture_event: false,
+            diagnostics: Vec::new(),
+        };
+        let trace = slipway_debug_bridge::DebugCompositionTrace {
+            request_id: "composition-json".to_string(),
+            frame: frame(),
+            backend_id: "egui".to_string(),
+            target: WidgetId::from("editor"),
+            selected_region: PresentationRegionId::from("editor-region"),
+            focused_before: true,
+            focused_after: true,
+            phases: vec![slipway_debug_bridge::DebugCompositionPhaseTrace {
+                phase: TextCompositionPhase::End,
+                backend_event: "derived-end".to_string(),
+                provenance: CompositionPhaseProvenance::Derived {
+                    from: TextCompositionPhase::Commit,
+                },
+                event,
+                ingress_observation: DebugCompositionIngressObservation::Derived {
+                    from_sequence_index: 0,
+                },
+                dispatch_evidence,
+                app_handled: false,
+                result_identity: Some(slipway_core::EventResultIdentity {
+                    handled: Some(false),
+                    emitted_messages: Vec::new(),
+                    change_shapes: Vec::new(),
+                    diagnostics: Vec::new(),
+                }),
+            }],
+            commit_mutation: None,
+            completed: false,
+            failure: None,
+        };
+
+        let json = composition_trace_summary(&trace);
+        assert_eq!(json["phases"][0]["phase"], "end");
+        assert_eq!(json["phases"][0]["provenance"]["kind"], "derived");
+        assert_eq!(json["phases"][0]["provenance"]["from"], "commit");
+    }
+
+    #[test]
+    fn text_composition_parser_rejects_update_byte_and_scalar_bounds_before_leasing() {
+        let server = DebugMcpServer::new(DebugMcpConfig::admitted());
+        let (client, runtime) = bounded_debug_bridge(1);
+        let invalid = call_request(
+            json!("composition-invalid"),
+            TOOL_PHYSICAL_CONTROL,
+            json!({
+                "frame": frame_json_value(),
+                "operation": {
+                    "type": "text_composition",
+                    "target": "editor",
+                    "updates": [{
+                        "preedit_text": "한",
+                        "cursor_range": { "anchor": 0, "focus": 3 }
+                    }],
+                    "commit": "한"
+                }
+            }),
+        )
+        .to_string();
+        let response = match server.begin_bridge_message(&invalid, &client) {
+            DebugMcpBridgeMessage::Immediate(Some(response)) => response,
+            DebugMcpBridgeMessage::Immediate(None) => panic!("invalid params must respond"),
+            DebugMcpBridgeMessage::Pending(_) => panic!("invalid composition must not lease"),
+        };
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(runtime.take_one().expect("bridge readable").is_none());
+
+        let too_many = (0..=MAX_COMPOSITION_UPDATES)
+            .map(|_| json!({ "preedit_text": "x" }))
+            .collect::<Vec<_>>();
+        assert!(
+            parse_physical_control(&json!({
+                "type": "text_composition",
+                "target": "editor",
+                "updates": too_many,
+                "commit": "x"
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_physical_control(&json!({
+                "type": "text_composition",
+                "target": "editor",
+                "updates": [{ "preedit_text": "x".repeat(MAX_COMPOSITION_UTF8_BYTES) }],
+                "commit": "x"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

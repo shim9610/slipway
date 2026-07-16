@@ -15,10 +15,11 @@ use slipway_core::{
     SlipwayProviderHitTestPolicy, SlipwayProviderSnapshotPolicy, SlipwayRenderSurfaces,
     SlipwayScrollableContainerCapability, SlipwaySsot, SlipwayTextInputCapability,
     SlipwayUnsupportedCapabilityEvidence, SlipwayView, SlipwayViewDefinition, SlipwayWidget,
-    SlipwayWidgetTypes, StateObservation, TargetLocalRect, TextEditKind, TextLineMode,
-    TextMeasurementEvidence, TextStyle, TopologyNode, UnsupportedCapabilityEvidence,
-    ViewDefinition, ViewDefinitionInput, WidgetId, WidgetSlot, WidgetSlotAddress,
-    expand_paint_unit_layers, paint_unit_sort_key, scroll_region_from_scrollable_capability,
+    SlipwayWidgetTypes, StateObservation, TargetLocalRect, TextCompositionEvent,
+    TextCompositionPhase, TextEditKind, TextLineMode, TextMeasurementEvidence, TextStyle,
+    TopologyNode, UnsupportedCapabilityEvidence, ViewDefinition, ViewDefinitionInput, WidgetId,
+    WidgetSlot, WidgetSlotAddress, expand_paint_unit_layers, mount_widget_slot_address,
+    paint_unit_sort_key, scroll_region_from_scrollable_capability,
     scroll_region_from_scrollable_capability_with_order, text_edit_focus_region_from_capability,
     view_definition_contract_diagnostics_for_capabilities,
     view_definition_has_blocking_contract_diagnostic,
@@ -441,6 +442,65 @@ pub trait SlipwayIcedWidgetListVisitor<ExternalState, AppMessage> {
         slot: WidgetSlotAddress,
     ) where
         N: SlipwayIcedNativeChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>;
+}
+
+struct IcedMountedVisitor<'a, V> {
+    mounted_parent: Option<&'a WidgetSlotAddress>,
+    visitor: &'a mut V,
+}
+
+impl<V> IcedMountedVisitor<'_, V> {
+    fn mount(&self, slot: WidgetSlotAddress) -> WidgetSlotAddress {
+        match self.mounted_parent {
+            Some(parent) => mount_widget_slot_address(slot, parent),
+            None => slot,
+        }
+    }
+}
+
+impl<ExternalState, AppMessage, V> SlipwayIcedWidgetListVisitor<ExternalState, AppMessage>
+    for IcedMountedVisitor<'_, V>
+where
+    V: SlipwayIcedWidgetListVisitor<ExternalState, AppMessage>,
+{
+    fn set_iced_child_order_index(&mut self, index: usize) {
+        self.visitor.set_iced_child_order_index(index);
+    }
+
+    fn iced_child_cached_paint_sort_key(
+        &self,
+        slot: &WidgetSlotAddress,
+    ) -> Option<(i32, usize, usize)> {
+        let slot = self.mount(slot.clone());
+        self.visitor.iced_child_cached_paint_sort_key(&slot)
+    }
+
+    fn visit_iced_child<W>(
+        &mut self,
+        widget: &W,
+        external: &ExternalState,
+        local: &W::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        W: SlipwayIcedBackendChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+        let slot = self.mount(slot);
+        self.visitor.visit_iced_child(widget, external, local, slot);
+    }
+
+    fn visit_iced_native_child<N>(
+        &mut self,
+        widget: &N,
+        external: &ExternalState,
+        local: &N::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        N: SlipwayIcedNativeChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+        let slot = self.mount(slot);
+        self.visitor
+            .visit_iced_native_child(widget, external, local, slot);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1216,6 +1276,50 @@ impl<W> SlipwayIcedBackendContract for W where
 {
 }
 
+fn visit_iced_authored_children_mounted<W, V>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    mounted_parent: Option<&WidgetSlotAddress>,
+    visitor: &mut V,
+) where
+    W: SlipwayIcedBackendChildWidget,
+    V: SlipwayIcedWidgetListVisitor<W::ExternalState, W::AppMessage>,
+{
+    let mut mounted = IcedMountedVisitor {
+        mounted_parent,
+        visitor,
+    };
+    widget.visit_iced_authored_children(external, local, &mut mounted);
+}
+
+fn visit_iced_authored_children_in_paint_order_mounted<W, V>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    frame: &FrameIdentity,
+    placements: &[slipway_core::ChildPlacement],
+    traversal_order: IcedChildTraversalOrder,
+    mounted_parent: Option<&WidgetSlotAddress>,
+    visitor: &mut V,
+) where
+    W: SlipwayIcedBackendChildWidget,
+    V: SlipwayIcedWidgetListVisitor<W::ExternalState, W::AppMessage>,
+{
+    let mut mounted = IcedMountedVisitor {
+        mounted_parent,
+        visitor,
+    };
+    widget.visit_iced_authored_children_in_paint_order(
+        external,
+        local,
+        frame,
+        placements,
+        traversal_order,
+        &mut mounted,
+    );
+}
+
 impl<A> SlipwayIcedAuthoredChildren for slipway_core::SlipwayAppWidget<A>
 where
     A: slipway_core::SlipwayApp,
@@ -1725,6 +1829,7 @@ pub struct SlipwayIcedRuntimeWidget<'a, W: SlipwayIcedBackendChildWidget> {
     presented_viewport_sink: Option<&'a Cell<Rect>>,
     frame_seed: Option<FrameIdentity>,
     dirty_scopes: Option<Cow<'a, [IcedDirtyScope]>>,
+    iced_native_commit_mutation_gate: Option<&'a IcedNativeCommitMutationGate>,
 }
 
 pub struct SlipwayIcedRuntimeLayoutIntentWidget<'a, W>
@@ -1748,9 +1853,54 @@ pub struct IcedPreeditOverlayStyle {
     pub size: f32,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct IcedNativeTextMutation {
+    pub(crate) target: WidgetId,
+    pub(crate) target_slot: Option<WidgetSlotAddress>,
+    pub(crate) region_id: PresentationRegionId,
+    pub(crate) before: String,
+    pub(crate) after: String,
+    pub(crate) input: BackendInputEvent,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct IcedNativeCommitMutationGate {
+    pub(crate) token: u64,
+    pub(crate) commit_sequence_index: usize,
+    pub(crate) target: WidgetId,
+    pub(crate) target_slot: Option<WidgetSlotAddress>,
+    pub(crate) region_id: PresentationRegionId,
+}
+
+impl IcedNativeCommitMutationGate {
+    fn matches(
+        &self,
+        presentation: &IcedPresentationState,
+        region: &FocusRegionDeclaration,
+    ) -> bool {
+        self.target == region.target
+            && self.target_slot.as_ref() == region.address.as_ref()
+            && self.region_id == region.id
+            && focus_region_belongs_to_presentation(presentation, region)
+    }
+}
+
+#[cfg(test)]
+static ICED_COMMIT_GATE_ROOT_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static ICED_NATIVE_BEFORE_SNAPSHOTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static ICED_NATIVE_MUTATION_CARRIERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SlipwayIcedRuntimeMessage {
     BackendInput(BackendInputEvent),
+    #[doc(hidden)]
+    NativeTextMutation(IcedNativeTextMutation),
     /// No-consumer dispatch refusal evidence (audit finding MF-H3), published
     /// so the runtime retains it in its bounded refusal ring.
     DispatchRefusal(slipway_core::DeclaredEventDispatchEvidence),
@@ -1965,6 +2115,26 @@ where
     {
         iced_runtime_widget(&self.assembled.runtime)
             .record_presented_viewport_in(&self.presented_viewport)
+            .into()
+    }
+
+    pub(crate) fn view_with_iced_native_commit_mutation_gate<'a, Theme, Renderer>(
+        &'a self,
+        gate: &'a IcedNativeCommitMutationGate,
+    ) -> iced::Element<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
+    where
+        W: SlipwayViewDefinition + 'a,
+        W::ExternalState: 'a,
+        W::LocalState: 'a,
+        W::AppMessage: Clone + 'a,
+        Theme: SlipwayIcedThemeContract + 'a,
+        Renderer: iced::advanced::text::Renderer<Font = iced::Font>
+            + iced::advanced::graphics::geometry::Renderer
+            + 'a + 'static,
+    {
+        iced_runtime_widget(&self.assembled.runtime)
+            .record_presented_viewport_in(&self.presented_viewport)
+            .with_iced_native_commit_mutation_gate(gate)
             .into()
     }
 
@@ -2714,28 +2884,18 @@ fn apply_runtime_slot_to_view_definition(view: &mut ViewDefinition, slot: &Widge
     for region in &mut view.hit_regions {
         mount_runtime_slot_address(&mut region.address, slot);
         mount_runtime_slot_address(&mut region.route.address, slot);
-        region.route.path = mount_runtime_event_route_path(&region.route.path, slot);
+        region.route.path = region
+            .route
+            .address
+            .as_ref()
+            .map(|address| address.path.clone())
+            .unwrap_or_default();
     }
     for region in &mut view.focus_regions {
         mount_runtime_slot_address(&mut region.address, slot);
     }
     for region in &mut view.scroll_regions {
         mount_runtime_slot_address(&mut region.address, slot);
-    }
-}
-
-fn mount_runtime_event_route_path(
-    route_path: &[WidgetId],
-    runtime_slot: &WidgetSlotAddress,
-) -> Vec<WidgetId> {
-    if route_path.first() == Some(&runtime_slot.widget) {
-        let mut mounted = runtime_slot.path.clone();
-        mounted.extend(route_path.iter().skip(1).cloned());
-        mounted
-    } else {
-        let mut mounted = runtime_slot.path.clone();
-        mounted.extend(route_path.iter().cloned());
-        mounted
     }
 }
 
@@ -2746,35 +2906,9 @@ fn mount_runtime_slot_address(
     *address = Some(
         address
             .take()
-            .map(|address| mount_existing_runtime_slot(address, runtime_slot))
+            .map(|address| mount_widget_slot_address(address, runtime_slot))
             .unwrap_or_else(|| runtime_slot.clone()),
     );
-}
-
-fn mount_existing_runtime_slot(
-    slot: WidgetSlotAddress,
-    runtime_slot: &WidgetSlotAddress,
-) -> WidgetSlotAddress {
-    if slot.path.starts_with(&runtime_slot.path) {
-        return slot;
-    }
-
-    if slot.widget == runtime_slot.widget {
-        return runtime_slot.clone();
-    }
-
-    let mut path = runtime_slot.path.clone();
-    let mut suffix = slot.path;
-    if suffix.first() == Some(&runtime_slot.widget) {
-        suffix.remove(0);
-    }
-    path.extend(suffix);
-
-    WidgetSlotAddress {
-        widget: slot.widget,
-        path,
-        ordinal: slot.ordinal,
-    }
 }
 
 fn iced_node_for_presentation(
@@ -2861,6 +2995,9 @@ fn iced_child_placement_matches_slot(
 ) -> bool {
     if let Some(placement_slot) = &placement.local_state_slot {
         placement_slot == child_slot
+            || (placement_slot.widget == child_slot.widget
+                && placement_slot.ordinal == child_slot.ordinal
+                && child_slot.path.ends_with(&placement_slot.path))
     } else {
         placement.child == *child
     }
@@ -3863,6 +4000,7 @@ fn iced_runtime_child_trees<W, Theme, Renderer>(
     widget: &W,
     external: &W::ExternalState,
     local: &W::LocalState,
+    mounted_parent: Option<&WidgetSlotAddress>,
     frame_seed: Option<&FrameIdentity>,
     dirty_scopes: Option<&[IcedDirtyScope]>,
     order_context: Option<(&FrameIdentity, &[slipway_core::ChildPlacement])>,
@@ -3881,7 +4019,7 @@ where
         Point { x: 0.0, y: 0.0 },
     );
     let _ = order_context;
-    widget.visit_iced_authored_children(external, local, &mut visitor);
+    visit_iced_authored_children_mounted(widget, external, local, mounted_parent, &mut visitor);
     visitor.trees
 }
 
@@ -3988,6 +4126,7 @@ fn reconcile_iced_runtime_child_trees<W, Theme, Renderer>(
     external: &W::ExternalState,
     local: &W::LocalState,
     trees: &mut Vec<iced::advanced::widget::Tree>,
+    mounted_parent: Option<&WidgetSlotAddress>,
     frame_seed: Option<&FrameIdentity>,
     dirty_scopes: Option<&[IcedDirtyScope]>,
     order_context: Option<(&FrameIdentity, &[slipway_core::ChildPlacement])>,
@@ -4006,7 +4145,7 @@ fn reconcile_iced_runtime_child_trees<W, Theme, Renderer>(
         Point { x: 0.0, y: 0.0 },
     );
     let _ = order_context;
-    widget.visit_iced_authored_children(external, local, &mut visitor);
+    visit_iced_authored_children_mounted(widget, external, local, mounted_parent, &mut visitor);
     let visited = visitor.next_index;
     visitor.trees.truncate(visited);
 }
@@ -4157,6 +4296,119 @@ where
     } else {
         input
     }
+}
+
+fn iced_native_text_mutation_message(
+    presentation: &IcedPresentationState,
+    region: &FocusRegionDeclaration,
+    before: String,
+    after: String,
+) -> SlipwayIcedRuntimeMessage {
+    let event = InputEvent::TextEdit(slipway_core::TextEditEvent {
+        target: region.target.clone(),
+        target_slot: region.address.clone(),
+        kind: TextEditKind::ReplaceBuffer,
+        text: Some(after.clone()),
+        selection_before: region
+            .text_edit
+            .as_ref()
+            .and_then(|text_edit| text_edit.selection.selection.clone()),
+        selection_after: None,
+    });
+    let input = backend_focus_input_event(
+        presentation,
+        region,
+        DeclaredEventDispatchKind::Text,
+        None,
+        event,
+    );
+    #[cfg(test)]
+    ICED_NATIVE_MUTATION_CARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SlipwayIcedRuntimeMessage::NativeTextMutation(IcedNativeTextMutation {
+        target: region.target.clone(),
+        target_slot: region.address.clone(),
+        region_id: region.id.clone(),
+        before,
+        after,
+        input,
+    })
+}
+
+fn iced_text_input_widget_for_region_with_commit_mutation_gate<'a, AppMessage, Theme, Renderer>(
+    presentation: &'a IcedPresentationState,
+    region: &'a FocusRegionDeclaration,
+    gate: &'a IcedNativeCommitMutationGate,
+) -> iced::widget::TextInput<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
+where
+    AppMessage: Clone + 'a,
+    Theme: SlipwayIcedThemeContract + 'a,
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>
+        + iced::advanced::graphics::geometry::Renderer
+        + 'a + 'static,
+{
+    let text_edit = region
+        .text_edit
+        .as_ref()
+        .expect("text input widget requires text edit region");
+    let visual_style = text_edit.visual_style.clone();
+    let input = iced::widget::text_input::<SlipwayIcedRuntimeMessage, Theme, Renderer>(
+        "",
+        &text_edit.buffer.text,
+    )
+    .id(iced_text_input_id(region))
+    .width(iced::Length::Fixed(region.bounds.size.width.max(0.0)))
+    .padding(iced::Padding::ZERO)
+    .font(iced_font(&text_edit.typography.style))
+    .size(iced::Pixels(normalized_text_size(
+        &text_edit.typography.style,
+    )))
+    .line_height(iced::advanced::text::LineHeight::Relative(1.2))
+    .class(Theme::slipway_text_input_class(Box::new(
+        move |_theme: &Theme, _status| iced_text_input_style_from_decl(&visual_style),
+    )));
+
+    if !text_edit.selection.editable {
+        return input;
+    }
+    if !gate.matches(presentation, region) {
+        let target = region.target.clone();
+        let target_slot = region.address.clone();
+        let selection_before = text_edit.selection.selection.clone();
+        let frame = presentation.frame.clone();
+        let geometry_index = presentation.geometry_index.clone();
+        let focus_regions = presentation.focus_regions.clone();
+        let selected_region = region.clone();
+        return input.on_input(move |value| {
+            let event = InputEvent::TextEdit(slipway_core::TextEditEvent {
+                target: target.clone(),
+                target_slot: target_slot.clone(),
+                kind: TextEditKind::ReplaceBuffer,
+                text: Some(value),
+                selection_before: selection_before.clone(),
+                selection_after: None,
+            });
+            SlipwayIcedRuntimeMessage::BackendInput(backend_focus_input_event_from_parts(
+                frame.clone(),
+                &geometry_index,
+                &focus_regions,
+                &selected_region,
+                DeclaredEventDispatchKind::Text,
+                None,
+                event,
+            ))
+        });
+    }
+
+    #[cfg(test)]
+    ICED_NATIVE_BEFORE_SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let before = text_edit.buffer.text.clone();
+    input.on_input(move |after| {
+        if before == after {
+            SlipwayIcedRuntimeMessage::Noop
+        } else {
+            iced_native_text_mutation_message(presentation, region, before.clone(), after)
+        }
+    })
 }
 
 fn reconcile_iced_text_input_trees<AppMessage, Theme, Renderer>(
@@ -4419,6 +4671,7 @@ fn layout_iced_runtime_children<W, Theme, Renderer>(
     external: &W::ExternalState,
     local: &W::LocalState,
     tree_children: &mut Vec<iced::advanced::widget::Tree>,
+    mounted_parent: Option<&WidgetSlotAddress>,
     renderer: &Renderer,
     placements: &[slipway_core::ChildPlacement],
     frame: &FrameIdentity,
@@ -4440,6 +4693,7 @@ where
         external,
         local,
         tree_children,
+        mounted_parent,
         frame_seed,
         dirty_scopes,
         Some((frame, placements)),
@@ -4454,7 +4708,7 @@ where
         dispatch_context,
     );
     let _ = frame;
-    widget.visit_iced_authored_children(external, local, &mut visitor);
+    visit_iced_authored_children_mounted(widget, external, local, mounted_parent, &mut visitor);
     visitor.nodes
 }
 
@@ -4463,6 +4717,7 @@ fn merge_child_explicit_layer_occlusions_into_presentation<W>(
     external: &W::ExternalState,
     local: &W::LocalState,
     presentation: &mut IcedPresentationState,
+    mounted_parent: Option<&WidgetSlotAddress>,
     placements: &[slipway_core::ChildPlacement],
     tree_children: &[iced::advanced::widget::Tree],
 ) where
@@ -4474,7 +4729,7 @@ fn merge_child_explicit_layer_occlusions_into_presentation<W>(
         placements,
         tree_children,
     );
-    widget.visit_iced_authored_children(external, local, &mut visitor);
+    visit_iced_authored_children_mounted(widget, external, local, mounted_parent, &mut visitor);
 
     let mut merged = iced_paint_occlusion_regions(&presentation.explicit_layer_paint_units);
     merged.extend(visitor.regions);
@@ -4558,8 +4813,15 @@ fn refresh_composite_child_hit_regions(
     let mut refreshed_any = false;
     for region in &mut presentation.hit_regions {
         if let Some(current) = child_hit_regions_by_id.get(&region.id) {
-            if region != current {
-                *region = current.clone();
+            if region.address == current.address
+                && region.route.address == current.route.address
+                && (region.bounds != current.bounds
+                    || region.order != current.order
+                    || region.cursor != current.cursor)
+            {
+                region.bounds = current.bounds;
+                region.order = current.order.clone();
+                region.cursor = current.cursor.clone();
                 refreshed_any = true;
             }
         }
@@ -4713,6 +4975,7 @@ fn draw_iced_runtime_children<W, Theme, Renderer>(
     external: &W::ExternalState,
     local: &W::LocalState,
     tree_children: &[iced::advanced::widget::Tree],
+    mounted_parent: Option<&WidgetSlotAddress>,
     layout: iced::advanced::Layout<'_>,
     renderer: &mut Renderer,
     theme: &Theme,
@@ -4752,7 +5015,7 @@ fn draw_iced_runtime_children<W, Theme, Renderer>(
         _phantom: std::marker::PhantomData,
     };
     let _ = frame;
-    widget.visit_iced_authored_children(external, local, &mut visitor);
+    visit_iced_authored_children_mounted(widget, external, local, mounted_parent, &mut visitor);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4792,6 +5055,7 @@ fn draw_iced_runtime_widget_local<W, Theme, Renderer>(
         widget.external,
         widget.local,
         &tree.children,
+        widget.runtime_slot.as_ref(),
         layout,
         renderer,
         theme,
@@ -5015,6 +5279,7 @@ fn operate_iced_runtime_children<W, Theme, Renderer>(
     external: &W::ExternalState,
     local: &W::LocalState,
     tree_children: &mut [iced::advanced::widget::Tree],
+    mounted_parent: Option<&WidgetSlotAddress>,
     layout: iced::advanced::Layout<'_>,
     renderer: &Renderer,
     operation: &mut dyn iced::advanced::widget::Operation,
@@ -5047,12 +5312,14 @@ fn operate_iced_runtime_children<W, Theme, Renderer>(
         dispatch_context,
         _phantom: std::marker::PhantomData,
     };
-    widget.visit_iced_authored_children_in_paint_order(
+    visit_iced_authored_children_in_paint_order_mounted(
+        widget,
         external,
         local,
         frame,
         placements,
         IcedChildTraversalOrder::BackToFront,
+        mounted_parent,
         &mut visitor,
     );
 }
@@ -5214,6 +5481,7 @@ fn iced_runtime_children_mouse_interaction<W, Theme, Renderer>(
     external: &W::ExternalState,
     local: &W::LocalState,
     tree_children: &[iced::advanced::widget::Tree],
+    mounted_parent: Option<&WidgetSlotAddress>,
     layout: iced::advanced::Layout<'_>,
     cursor: iced::advanced::mouse::Cursor,
     viewport: &iced::Rectangle,
@@ -5250,12 +5518,14 @@ where
         dispatch_context,
         _phantom: std::marker::PhantomData,
     };
-    widget.visit_iced_authored_children_in_paint_order(
+    visit_iced_authored_children_in_paint_order_mounted(
+        widget,
         external,
         local,
         frame,
         placements,
         IcedChildTraversalOrder::FrontToBack,
+        mounted_parent,
         &mut visitor,
     );
     visitor.interaction
@@ -5278,6 +5548,7 @@ struct IcedRuntimeChildUpdateVisitor<'a, 'b, 'c, Theme, Renderer> {
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
     root_origin: Point,
     dispatch_context: Option<&'a IcedDispatchContext>,
+    iced_native_commit_mutation_gate: Option<&'a IcedNativeCommitMutationGate>,
     _phantom: std::marker::PhantomData<Theme>,
 }
 
@@ -5351,6 +5622,9 @@ where
             child_root_origin,
             self.dispatch_context,
         );
+        if let Some(gate) = self.iced_native_commit_mutation_gate {
+            child = child.with_iced_native_commit_mutation_gate(gate);
+        }
         <SlipwayIcedRuntimeWidget<'_, W> as iced::advanced::Widget<
             SlipwayIcedRuntimeMessage,
             Theme,
@@ -5427,6 +5701,7 @@ fn update_iced_runtime_children<W, Theme, Renderer>(
     external: &W::ExternalState,
     local: &W::LocalState,
     tree_children: &mut [iced::advanced::widget::Tree],
+    mounted_parent: Option<&WidgetSlotAddress>,
     event: &iced::Event,
     layout: iced::advanced::Layout<'_>,
     cursor: iced::advanced::mouse::Cursor,
@@ -5465,14 +5740,78 @@ fn update_iced_runtime_children<W, Theme, Renderer>(
         dirty_scopes,
         root_origin,
         dispatch_context,
+        iced_native_commit_mutation_gate: None,
         _phantom: std::marker::PhantomData,
     };
-    widget.visit_iced_authored_children_in_paint_order(
+    visit_iced_authored_children_in_paint_order_mounted(
+        widget,
         external,
         local,
         frame,
         placements,
         IcedChildTraversalOrder::FrontToBack,
+        mounted_parent,
+        &mut visitor,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_iced_runtime_children_with_commit_mutation_gate<W, Theme, Renderer>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    tree_children: &mut [iced::advanced::widget::Tree],
+    mounted_parent: Option<&WidgetSlotAddress>,
+    event: &iced::Event,
+    layout: iced::advanced::Layout<'_>,
+    cursor: iced::advanced::mouse::Cursor,
+    renderer: &Renderer,
+    clipboard: &mut dyn iced::advanced::Clipboard,
+    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
+    viewport: &iced::Rectangle,
+    placements: &[slipway_core::ChildPlacement],
+    frame: &FrameIdentity,
+    frame_seed: Option<&FrameIdentity>,
+    dirty_scopes: Option<&[IcedDirtyScope]>,
+    root_origin: Point,
+    dispatch_context: Option<&IcedDispatchContext>,
+    gate: &IcedNativeCommitMutationGate,
+) where
+    W: SlipwayIcedBackendChildWidget,
+    W::AppMessage: Clone,
+    Theme: SlipwayIcedThemeContract,
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>
+        + iced::advanced::graphics::geometry::Renderer
+        + 'static,
+{
+    let mut visitor = IcedRuntimeChildUpdateVisitor::<Theme, Renderer> {
+        tree_children,
+        event,
+        layout,
+        cursor,
+        renderer,
+        clipboard,
+        shell,
+        viewport,
+        placements,
+        next_tree_index: 0,
+        next_layout_index: 0,
+        current_order_index: None,
+        frame_seed,
+        dirty_scopes,
+        root_origin,
+        dispatch_context,
+        iced_native_commit_mutation_gate: Some(gate),
+        _phantom: std::marker::PhantomData,
+    };
+    visit_iced_authored_children_in_paint_order_mounted(
+        widget,
+        external,
+        local,
+        frame,
+        placements,
+        IcedChildTraversalOrder::FrontToBack,
+        mounted_parent,
         &mut visitor,
     );
 }
@@ -5591,6 +5930,75 @@ fn update_iced_text_input_regions<AppMessage, Theme, Renderer>(
             // so an unconditional publish here re-marks the runner dirty each
             // tick and locks a focused text input into a repaint loop. Only
             // republish when the preedit style value actually changed.
+            *published_preedit_style = Some(style.clone());
+            shell.publish(SlipwayIcedRuntimeMessage::PreeditStyle(style));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_iced_text_input_regions_with_commit_mutation_gate<AppMessage, Theme, Renderer>(
+    trees: &mut [iced::advanced::widget::Tree],
+    presentation: &IcedPresentationState,
+    regions: &[FocusRegionDeclaration],
+    event: &iced::Event,
+    layout: iced::advanced::Layout<'_>,
+    cursor: iced::advanced::mouse::Cursor,
+    renderer: &Renderer,
+    clipboard: &mut dyn iced::advanced::Clipboard,
+    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
+    viewport: &iced::Rectangle,
+    published_preedit_style: &mut Option<IcedPreeditOverlayStyle>,
+    gate: &IcedNativeCommitMutationGate,
+) where
+    AppMessage: Clone,
+    Theme: SlipwayIcedThemeContract,
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>
+        + iced::advanced::graphics::geometry::Renderer
+        + 'static,
+{
+    let Some(start) = text_input_layout_start(layout, regions.len()) else {
+        return;
+    };
+    for (index, region) in regions.iter().enumerate() {
+        if shell.is_event_captured() {
+            return;
+        }
+        let Some(tree) = trees.get_mut(index) else {
+            continue;
+        };
+        let mut input = iced_text_input_widget_for_region_with_commit_mutation_gate::<
+            AppMessage,
+            Theme,
+            Renderer,
+        >(presentation, region, gate);
+        let child_layout = layout.child(start + index);
+        let input_method_before = shell.input_method().clone();
+        <iced::widget::TextInput<
+            '_,
+            SlipwayIcedRuntimeMessage,
+            Theme,
+            Renderer,
+        > as iced::advanced::Widget<
+            SlipwayIcedRuntimeMessage,
+            Theme,
+            Renderer,
+        >>::update(
+            &mut input,
+            tree,
+            event,
+            child_layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        if shell.input_method() != &input_method_before
+            && matches!(shell.input_method(), iced_core::InputMethod::Enabled { .. })
+            && let Some(style) = preedit_overlay_style_for_region(region)
+            && published_preedit_style.as_ref() != Some(&style)
+        {
             *published_preedit_style = Some(style.clone());
             shell.publish(SlipwayIcedRuntimeMessage::PreeditStyle(style));
         }
@@ -5765,6 +6173,7 @@ where
 struct IcedTextEditorRegionWidget<'a, AppMessage> {
     presentation: &'a IcedPresentationState,
     region: &'a FocusRegionDeclaration,
+    commit_mutation_gate: Option<&'a IcedNativeCommitMutationGate>,
     _phantom: std::marker::PhantomData<AppMessage>,
 }
 
@@ -5773,6 +6182,20 @@ impl<'a, AppMessage> IcedTextEditorRegionWidget<'a, AppMessage> {
         Self {
             presentation,
             region,
+            commit_mutation_gate: None,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn new_with_commit_mutation_gate(
+        presentation: &'a IcedPresentationState,
+        region: &'a FocusRegionDeclaration,
+        gate: &'a IcedNativeCommitMutationGate,
+    ) -> Self {
+        Self {
+            presentation,
+            region,
+            commit_mutation_gate: Some(gate),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -6000,28 +6423,45 @@ where
             );
         }
         if let Some(action) = captured_action.into_inner() {
-            let before = state.content.text();
+            let gated_before = self
+                .commit_mutation_gate
+                .filter(|gate| gate.matches(self.presentation, self.region))
+                .map(|_| {
+                    #[cfg(test)]
+                    ICED_NATIVE_BEFORE_SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    state.content.text()
+                });
             state.content.perform(action);
             let after = state.content.text();
+            let changed = state.source_text != after;
             state.source_text = after.clone();
-            if before != after {
-                let event = InputEvent::TextEdit(slipway_core::TextEditEvent {
-                    target,
-                    target_slot,
-                    kind: TextEditKind::ReplaceBuffer,
-                    text: Some(after),
-                    selection_before,
-                    selection_after: None,
-                });
-                shell.publish(SlipwayIcedRuntimeMessage::BackendInput(
-                    backend_focus_input_event(
+            if changed {
+                if let Some(before) = gated_before {
+                    shell.publish(iced_native_text_mutation_message(
                         self.presentation,
                         self.region,
-                        DeclaredEventDispatchKind::Text,
-                        None,
-                        event,
-                    ),
-                ));
+                        before,
+                        after,
+                    ));
+                } else {
+                    let event = InputEvent::TextEdit(slipway_core::TextEditEvent {
+                        target,
+                        target_slot,
+                        kind: TextEditKind::ReplaceBuffer,
+                        text: Some(after),
+                        selection_before,
+                        selection_after: None,
+                    });
+                    shell.publish(SlipwayIcedRuntimeMessage::BackendInput(
+                        backend_focus_input_event(
+                            self.presentation,
+                            self.region,
+                            DeclaredEventDispatchKind::Text,
+                            None,
+                            event,
+                        ),
+                    ));
+                }
                 shell.request_redraw();
             }
         }
@@ -6299,6 +6739,70 @@ fn update_iced_text_editor_regions<AppMessage, Theme, Renderer>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn update_iced_text_editor_regions_with_commit_mutation_gate<AppMessage, Theme, Renderer>(
+    trees: &mut [iced::advanced::widget::Tree],
+    presentation: &IcedPresentationState,
+    regions: &[FocusRegionDeclaration],
+    singleline_count: usize,
+    event: &iced::Event,
+    layout: iced::advanced::Layout<'_>,
+    cursor: iced::advanced::mouse::Cursor,
+    renderer: &Renderer,
+    clipboard: &mut dyn iced::advanced::Clipboard,
+    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
+    viewport: &iced::Rectangle,
+    published_preedit_style: &mut Option<IcedPreeditOverlayStyle>,
+    gate: &IcedNativeCommitMutationGate,
+) where
+    AppMessage: Clone,
+    Theme: SlipwayIcedThemeContract,
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>
+        + iced::advanced::graphics::geometry::Renderer
+        + 'static,
+{
+    let Some(start) = text_editor_layout_start(layout, singleline_count, regions.len()) else {
+        return;
+    };
+    for (index, region) in regions.iter().enumerate() {
+        if shell.is_event_captured() {
+            return;
+        }
+        let Some(tree) = trees.get_mut(index) else {
+            continue;
+        };
+        let mut widget = IcedTextEditorRegionWidget::<AppMessage>::new_with_commit_mutation_gate(
+            presentation,
+            region,
+            gate,
+        );
+        let input_method_before = shell.input_method().clone();
+        <IcedTextEditorRegionWidget<'_, AppMessage> as iced::advanced::Widget<
+            SlipwayIcedRuntimeMessage,
+            Theme,
+            Renderer,
+        >>::update(
+            &mut widget,
+            tree,
+            event,
+            layout.child(start + index),
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        if shell.input_method() != &input_method_before
+            && matches!(shell.input_method(), iced_core::InputMethod::Enabled { .. })
+            && let Some(style) = preedit_overlay_style_for_region(region)
+            && published_preedit_style.as_ref() != Some(&style)
+        {
+            *published_preedit_style = Some(style.clone());
+            shell.publish(SlipwayIcedRuntimeMessage::PreeditStyle(style));
+        }
+    }
+}
+
 fn draw_iced_text_editor_regions<AppMessage, Theme, Renderer>(
     trees: &[iced::advanced::widget::Tree],
     presentation: &IcedPresentationState,
@@ -6404,6 +6908,7 @@ where
     dirty_scopes: Option<&'a [IcedDirtyScope]>,
     suppress_descendant_wheel_update: bool,
     active_wheel_region: Option<PresentationRegionId>,
+    commit_mutation_gate: Option<&'a IcedNativeCommitMutationGate>,
 }
 
 impl<'a, W, Theme, Renderer> From<IcedScrollContentWidget<'a, W>>
@@ -6449,6 +6954,7 @@ where
             self.widget,
             self.external,
             self.local,
+            self.presentation.runtime_slot.as_ref(),
             self.frame_seed,
             self.dirty_scopes,
             Some((&self.presentation.frame, &placements)),
@@ -6466,6 +6972,7 @@ where
             self.external,
             self.local,
             &mut tree.children,
+            self.presentation.runtime_slot.as_ref(),
             self.frame_seed,
             self.dirty_scopes,
             Some((
@@ -6495,6 +7002,7 @@ where
             self.external,
             self.local,
             &mut tree.children,
+            self.presentation.runtime_slot.as_ref(),
             renderer,
             &placements,
             &self.presentation.frame,
@@ -6531,6 +7039,7 @@ where
             self.external,
             self.local,
             &mut tree.children,
+            self.presentation.runtime_slot.as_ref(),
             layout,
             renderer,
             operation,
@@ -6576,25 +7085,50 @@ where
             }
         }
         let root_origin = scroll_content_root_origin(self.presentation, self.scroll);
-        update_iced_runtime_children::<W, Theme, Renderer>(
-            self.widget,
-            self.external,
-            self.local,
-            &mut tree.children,
-            event,
-            layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-            &placements,
-            &self.presentation.frame,
-            self.frame_seed,
-            self.dirty_scopes,
-            root_origin,
-            Some(&self.presentation.dispatch_context),
-        );
+        if let Some(gate) = self.commit_mutation_gate {
+            update_iced_runtime_children_with_commit_mutation_gate::<W, Theme, Renderer>(
+                self.widget,
+                self.external,
+                self.local,
+                &mut tree.children,
+                self.presentation.runtime_slot.as_ref(),
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+                &placements,
+                &self.presentation.frame,
+                self.frame_seed,
+                self.dirty_scopes,
+                root_origin,
+                Some(&self.presentation.dispatch_context),
+                gate,
+            );
+        } else {
+            update_iced_runtime_children::<W, Theme, Renderer>(
+                self.widget,
+                self.external,
+                self.local,
+                &mut tree.children,
+                self.presentation.runtime_slot.as_ref(),
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+                &placements,
+                &self.presentation.frame,
+                self.frame_seed,
+                self.dirty_scopes,
+                root_origin,
+                Some(&self.presentation.dispatch_context),
+            );
+        }
     }
 
     fn draw(
@@ -6616,6 +7150,7 @@ where
                 self.external,
                 self.local,
                 &tree.children,
+                self.presentation.runtime_slot.as_ref(),
                 layout,
                 renderer,
                 theme,
@@ -6647,6 +7182,7 @@ where
             self.external,
             self.local,
             &tree.children,
+            self.presentation.runtime_slot.as_ref(),
             layout,
             cursor,
             viewport,
@@ -6880,6 +7416,84 @@ where
         dirty_scopes,
         suppress_descendant_wheel_update,
         active_wheel_region,
+        commit_mutation_gate: None,
+    };
+
+    iced::widget::scrollable::<SlipwayIcedRuntimeMessage, Theme, Renderer>(content)
+        .id(iced_scrollable_id(region))
+        .width(iced::Length::Fixed(region.viewport.size.width.max(0.0)))
+        .height(iced::Length::Fixed(region.viewport.size.height.max(0.0)))
+        .direction(iced_scroll_direction(region))
+        .on_scroll(move |viewport| {
+            let offset = viewport.absolute_offset();
+            let event = InputEvent::Scroll(ScrollEvent {
+                target: target.clone(),
+                target_slot: target_slot.clone(),
+                region_id: region_id.clone(),
+                offset_x: offset.x,
+                offset_y: offset.y,
+                viewport: declared_viewport,
+                content_bounds: declared_content,
+            });
+            SlipwayIcedRuntimeMessage::BackendInput(backend_scroll_input_event_from_parts(
+                frame.clone(),
+                &scroll_regions,
+                &selected_region,
+                event,
+                Some(evidence_position),
+            ))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iced_scrollable_widget_for_region_with_commit_mutation_gate<'a, W, Theme, Renderer>(
+    widget: &'a W,
+    external: &'a W::ExternalState,
+    local: &'a W::LocalState,
+    presentation: &'a IcedPresentationState,
+    region: &'a ScrollRegionDeclaration,
+    frame_seed: Option<&'a FrameIdentity>,
+    dirty_scopes: Option<&'a [IcedDirtyScope]>,
+    suppress_descendant_wheel_update: bool,
+    active_wheel_region: Option<PresentationRegionId>,
+    gate: &'a IcedNativeCommitMutationGate,
+) -> iced::widget::Scrollable<'a, SlipwayIcedRuntimeMessage, Theme, Renderer>
+where
+    W: SlipwayIcedBackendChildWidget + 'a,
+    W::ExternalState: 'a,
+    W::LocalState: 'a,
+    W::AppMessage: Clone + 'a,
+    Theme: SlipwayIcedThemeContract + 'a,
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>
+        + iced::advanced::graphics::geometry::Renderer
+        + 'a + 'static,
+{
+    let target = region.target.clone();
+    let target_slot = region.address.clone();
+    let region_id = region.id.clone();
+    let selected_region = iced_dispatch_scroll_region_for_event(presentation, region).clone();
+    let declared_viewport = selected_region.viewport;
+    let declared_content = selected_region.content_bounds;
+    let frame = presentation.frame.clone();
+    let scroll_regions = iced_scroll_dispatch_regions_for_event(presentation, region);
+    let evidence_position = slipway_core::declared_region_root_local_rect_with_geometry_index(
+        &presentation.geometry_index,
+        &selected_region.target,
+        selected_region.address.as_ref(),
+        selected_region.viewport.into_rect(),
+    )
+    .origin;
+    let content = IcedScrollContentWidget {
+        widget,
+        external,
+        local,
+        presentation,
+        scroll: region,
+        frame_seed,
+        dirty_scopes,
+        suppress_descendant_wheel_update,
+        active_wheel_region,
+        commit_mutation_gate: Some(gate),
     };
 
     iced::widget::scrollable::<SlipwayIcedRuntimeMessage, Theme, Renderer>(content)
@@ -7152,6 +7766,90 @@ fn update_iced_scroll_regions<W, Theme, Renderer>(
                 .is_some_and(|selected| selected == &region.id),
             selected_wheel_region.clone(),
         );
+        <iced::widget::Scrollable<
+            '_,
+            SlipwayIcedRuntimeMessage,
+            Theme,
+            Renderer,
+        > as iced::advanced::Widget<
+            SlipwayIcedRuntimeMessage,
+            Theme,
+            Renderer,
+        >>::update(
+            &mut scrollable,
+            tree,
+            event,
+            layout.child(start + index),
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_iced_scroll_regions_with_commit_mutation_gate<W, Theme, Renderer>(
+    trees: &mut [iced::advanced::widget::Tree],
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    presentation: &IcedPresentationState,
+    event: &iced::Event,
+    layout: iced::advanced::Layout<'_>,
+    cursor: iced::advanced::mouse::Cursor,
+    renderer: &Renderer,
+    clipboard: &mut dyn iced::advanced::Clipboard,
+    shell: &mut iced::advanced::Shell<'_, SlipwayIcedRuntimeMessage>,
+    viewport: &iced::Rectangle,
+    text_count: usize,
+    frame_seed: Option<&FrameIdentity>,
+    dirty_scopes: Option<&[IcedDirtyScope]>,
+    gate: &IcedNativeCommitMutationGate,
+) where
+    W: SlipwayIcedBackendChildWidget,
+    W::AppMessage: Clone,
+    Theme: SlipwayIcedThemeContract,
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>
+        + iced::advanced::graphics::geometry::Renderer
+        + 'static,
+{
+    let regions = native_iced_scroll_regions(presentation);
+    let Some(start) = scroll_layout_start(layout, regions.len(), text_count) else {
+        return;
+    };
+    let selected_wheel_region =
+        iced_declared_wheel_region_id_for_event(presentation, event, layout.bounds(), cursor);
+    for (index, region) in regions.iter().enumerate() {
+        if !should_update_native_scroll_region_for_event(
+            event,
+            selected_wheel_region.as_ref(),
+            region,
+        ) {
+            continue;
+        }
+        if shell.is_event_captured() {
+            return;
+        }
+        let Some(tree) = trees.get_mut(index) else {
+            continue;
+        };
+        let mut scrollable =
+            iced_scrollable_widget_for_region_with_commit_mutation_gate::<W, Theme, Renderer>(
+                widget,
+                external,
+                local,
+                presentation,
+                region,
+                frame_seed,
+                dirty_scopes,
+                selected_wheel_region
+                    .as_ref()
+                    .is_some_and(|selected| selected == &region.id),
+                selected_wheel_region.clone(),
+                gate,
+            );
         <iced::widget::Scrollable<
             '_,
             SlipwayIcedRuntimeMessage,
@@ -7476,6 +8174,98 @@ fn operate_iced_root_container(
     operation.container(Some(&id), layout.bounds());
 }
 
+struct IcedDeclaredFocusState<'a> {
+    focused_region: &'a mut Option<PresentationRegionId>,
+    region_id: &'a PresentationRegionId,
+}
+
+impl iced::advanced::widget::operation::Focusable for IcedDeclaredFocusState<'_> {
+    fn is_focused(&self) -> bool {
+        self.focused_region.as_ref() == Some(self.region_id)
+    }
+
+    fn focus(&mut self) {
+        if self.focused_region.as_ref() != Some(self.region_id) {
+            *self.focused_region = Some(self.region_id.clone());
+        }
+    }
+
+    fn unfocus(&mut self) {
+        if self.focused_region.as_ref() == Some(self.region_id) {
+            *self.focused_region = None;
+        }
+    }
+}
+
+fn operate_iced_declared_focus_regions(
+    state: &mut IcedRuntimeTreeState,
+    operation: &mut dyn iced::advanced::widget::Operation,
+) {
+    let IcedRuntimeTreeState {
+        presentation,
+        focused_region,
+        ..
+    } = state;
+    let Some(presentation) = presentation.as_ref() else {
+        return;
+    };
+    for region in presentation
+        .focus_regions
+        .iter()
+        .filter(|region| region.enabled)
+    {
+        let id = iced_focus_widget_id_for_region(region)
+            .expect("enabled iced focus regions always expose an operation id");
+        let bounds = region_root_local_rect(
+            presentation,
+            &region.target,
+            region.address.as_ref(),
+            region.bounds.into_rect(),
+        );
+        let mut focus_state = IcedDeclaredFocusState {
+            focused_region,
+            region_id: &region.id,
+        };
+        operation.focusable(
+            Some(&id),
+            iced::Rectangle {
+                x: bounds.origin.x,
+                y: bounds.origin.y,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            },
+            &mut focus_state,
+        );
+    }
+}
+
+pub(crate) struct IcedFocusedRegionQuery<'a> {
+    focused_region: &'a mut Option<PresentationRegionId>,
+}
+
+impl iced::advanced::widget::Operation for IcedFocusedRegionQuery<'_> {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation)) {
+        operate(self);
+    }
+
+    fn custom(
+        &mut self,
+        _id: Option<&iced::advanced::widget::Id>,
+        _bounds: iced::Rectangle,
+        state: &mut dyn std::any::Any,
+    ) {
+        if let Some(state) = state.downcast_ref::<IcedRuntimeTreeState>() {
+            *self.focused_region = state.focused_region.clone();
+        }
+    }
+}
+
+pub(crate) fn iced_focused_region_query(
+    focused_region: &mut Option<PresentationRegionId>,
+) -> IcedFocusedRegionQuery<'_> {
+    IcedFocusedRegionQuery { focused_region }
+}
+
 pub fn iced_runtime_widget<W>(runtime: &SlipwayRuntime<W>) -> SlipwayIcedRuntimeWidget<'_, W>
 where
     W: SlipwayIcedBackendWidget,
@@ -7508,6 +8298,19 @@ where
         SlipwayIcedRuntimeMessage::BackendInput(event) => {
             let report = runtime.apply_backend_input_event_for_backend_with_app_reducer(
                 event,
+                ICED_BACKEND_ID,
+                apply_app_messages,
+            );
+
+            SlipwayIcedRuntimeUpdate::Input {
+                handled: report.handled,
+                applied_messages: report.applied_messages,
+                diagnostics: report.diagnostics,
+            }
+        }
+        SlipwayIcedRuntimeMessage::NativeTextMutation(mutation) => {
+            let report = runtime.apply_backend_input_event_for_backend_with_app_reducer(
+                mutation.input,
                 ICED_BACKEND_ID,
                 apply_app_messages,
             );
@@ -7589,6 +8392,7 @@ impl<'a, W: SlipwayIcedBackendChildWidget> SlipwayIcedRuntimeWidget<'a, W> {
             presented_viewport_sink: None,
             frame_seed: None,
             dirty_scopes: None,
+            iced_native_commit_mutation_gate: None,
         }
     }
 
@@ -7636,6 +8440,16 @@ impl<'a, W: SlipwayIcedBackendChildWidget> SlipwayIcedRuntimeWidget<'a, W> {
 
     fn with_dispatch_context(mut self, dispatch_context: &'a IcedDispatchContext) -> Self {
         self.dispatch_context = Some(Cow::Borrowed(dispatch_context));
+        self
+    }
+
+    fn with_iced_native_commit_mutation_gate(
+        mut self,
+        gate: &'a IcedNativeCommitMutationGate,
+    ) -> Self {
+        self.iced_native_commit_mutation_gate = Some(gate);
+        #[cfg(test)]
+        ICED_COMMIT_GATE_ROOT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
@@ -7844,6 +8658,7 @@ where
             self.widget,
             self.external,
             self.local,
+            self.runtime_slot.as_ref(),
             self.frame_seed.as_ref(),
             self.dirty_scopes.as_deref(),
             None,
@@ -7877,6 +8692,7 @@ where
             self.external,
             self.local,
             &mut tree.children,
+            self.runtime_slot.as_ref(),
             self.frame_seed.as_ref(),
             self.dirty_scopes.as_deref(),
             previous_child_context
@@ -7963,6 +8779,7 @@ where
             self.external,
             self.local,
             &mut tree.children,
+            self.runtime_slot.as_ref(),
             renderer,
             root_placements.as_ref(),
             &child_frame,
@@ -7982,6 +8799,7 @@ where
                 self.external,
                 self.local,
                 presentation,
+                self.runtime_slot.as_ref(),
                 root_placements.as_ref(),
                 &tree.children,
             );
@@ -8106,6 +8924,12 @@ where
             )
         };
         let text_region_count = text_input_regions.len() + text_editor_regions.len();
+        {
+            let state = tree.state.downcast_mut::<IcedRuntimeTreeState>();
+            let root_id = iced_widget_id(&self.widget.id());
+            operation.custom(Some(&root_id), layout.bounds(), state);
+            operate_iced_declared_focus_regions(state, operation);
+        }
         operate_iced_root_container(&self.widget.id(), layout, operation);
         operation.traverse(&mut |operation| {
             operate_iced_runtime_children::<W, Theme, Renderer>(
@@ -8113,6 +8937,7 @@ where
                 self.external,
                 self.local,
                 &mut tree.children,
+                self.runtime_slot.as_ref(),
                 layout,
                 renderer,
                 operation,
@@ -8208,20 +9033,42 @@ where
                 .presentation
                 .as_ref()
                 .expect("runtime update must have presentation before text editor update");
-            update_iced_text_editor_regions::<W::AppMessage, Theme, Renderer>(
-                &mut state.text_editor_trees,
-                presentation,
-                text_editor_regions.as_ref(),
-                text_input_regions.len(),
-                event,
-                layout,
-                cursor,
-                renderer,
-                clipboard,
-                shell,
-                viewport,
-                &mut state.published_preedit_style,
-            );
+            if let Some(gate) = self.iced_native_commit_mutation_gate {
+                update_iced_text_editor_regions_with_commit_mutation_gate::<
+                    W::AppMessage,
+                    Theme,
+                    Renderer,
+                >(
+                    &mut state.text_editor_trees,
+                    presentation,
+                    text_editor_regions.as_ref(),
+                    text_input_regions.len(),
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                    &mut state.published_preedit_style,
+                    gate,
+                );
+            } else {
+                update_iced_text_editor_regions::<W::AppMessage, Theme, Renderer>(
+                    &mut state.text_editor_trees,
+                    presentation,
+                    text_editor_regions.as_ref(),
+                    text_input_regions.len(),
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                    &mut state.published_preedit_style,
+                );
+            }
         }
 
         if shell.is_event_captured() {
@@ -8234,10 +9081,53 @@ where
                 .presentation
                 .as_ref()
                 .expect("runtime update must have presentation before text input update");
-            update_iced_text_input_regions::<W::AppMessage, Theme, Renderer>(
-                &mut state.text_edit_trees,
-                presentation,
-                text_input_regions.as_ref(),
+            if let Some(gate) = self.iced_native_commit_mutation_gate {
+                update_iced_text_input_regions_with_commit_mutation_gate::<
+                    W::AppMessage,
+                    Theme,
+                    Renderer,
+                >(
+                    &mut state.text_edit_trees,
+                    presentation,
+                    text_input_regions.as_ref(),
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                    &mut state.published_preedit_style,
+                    gate,
+                );
+            } else {
+                update_iced_text_input_regions::<W::AppMessage, Theme, Renderer>(
+                    &mut state.text_edit_trees,
+                    presentation,
+                    text_input_regions.as_ref(),
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                    &mut state.published_preedit_style,
+                );
+            }
+        }
+
+        if shell.is_event_captured() {
+            return;
+        }
+
+        if let Some(gate) = self.iced_native_commit_mutation_gate {
+            update_iced_runtime_children_with_commit_mutation_gate::<W, Theme, Renderer>(
+                self.widget,
+                self.external,
+                self.local,
+                &mut tree.children,
+                self.runtime_slot.as_ref(),
                 event,
                 layout,
                 cursor,
@@ -8245,33 +9135,36 @@ where
                 clipboard,
                 shell,
                 viewport,
-                &mut state.published_preedit_style,
+                root_placements.as_ref(),
+                &frame,
+                self.frame_seed.as_ref(),
+                self.dirty_scopes.as_deref(),
+                root_origin,
+                Some(&dispatch_context),
+                gate,
+            );
+        } else {
+            update_iced_runtime_children::<W, Theme, Renderer>(
+                self.widget,
+                self.external,
+                self.local,
+                &mut tree.children,
+                self.runtime_slot.as_ref(),
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+                root_placements.as_ref(),
+                &frame,
+                self.frame_seed.as_ref(),
+                self.dirty_scopes.as_deref(),
+                root_origin,
+                Some(&dispatch_context),
             );
         }
-
-        if shell.is_event_captured() {
-            return;
-        }
-
-        update_iced_runtime_children::<W, Theme, Renderer>(
-            self.widget,
-            self.external,
-            self.local,
-            &mut tree.children,
-            event,
-            layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-            root_placements.as_ref(),
-            &frame,
-            self.frame_seed.as_ref(),
-            self.dirty_scopes.as_deref(),
-            root_origin,
-            Some(&dispatch_context),
-        );
 
         if shell.is_event_captured() {
             return;
@@ -8283,23 +9176,44 @@ where
                 .presentation
                 .as_ref()
                 .expect("runtime update must have presentation before scroll update");
-            update_iced_scroll_regions::<W, Theme, Renderer>(
-                &mut state.scroll_region_trees,
-                self.widget,
-                self.external,
-                self.local,
-                presentation,
-                event,
-                layout,
-                cursor,
-                renderer,
-                clipboard,
-                shell,
-                viewport,
-                text_region_count,
-                self.frame_seed.as_ref(),
-                self.dirty_scopes.as_deref(),
-            );
+            if let Some(gate) = self.iced_native_commit_mutation_gate {
+                update_iced_scroll_regions_with_commit_mutation_gate::<W, Theme, Renderer>(
+                    &mut state.scroll_region_trees,
+                    self.widget,
+                    self.external,
+                    self.local,
+                    presentation,
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                    text_region_count,
+                    self.frame_seed.as_ref(),
+                    self.dirty_scopes.as_deref(),
+                    gate,
+                );
+            } else {
+                update_iced_scroll_regions::<W, Theme, Renderer>(
+                    &mut state.scroll_region_trees,
+                    self.widget,
+                    self.external,
+                    self.local,
+                    presentation,
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                    text_region_count,
+                    self.frame_seed.as_ref(),
+                    self.dirty_scopes.as_deref(),
+                );
+            }
         }
 
         if shell.is_event_captured() {
@@ -8354,6 +9268,7 @@ where
                 self.external,
                 self.local,
                 &tree.children,
+                self.runtime_slot.as_ref(),
                 layout,
                 cursor,
                 viewport,
@@ -8489,6 +9404,7 @@ where
             self.widget,
             self.external,
             self.local,
+            self.runtime_slot.as_ref(),
             self.frame_seed.as_ref(),
             None,
             None,
@@ -8522,6 +9438,7 @@ where
             self.external,
             self.local,
             &mut tree.children,
+            self.runtime_slot.as_ref(),
             self.frame_seed.as_ref(),
             None,
             previous_child_context
@@ -8595,6 +9512,7 @@ where
             self.external,
             self.local,
             &mut tree.children,
+            self.runtime_slot.as_ref(),
             renderer,
             root_placements.as_ref(),
             &child_frame,
@@ -8614,6 +9532,7 @@ where
                 self.external,
                 self.local,
                 presentation,
+                self.runtime_slot.as_ref(),
                 root_placements.as_ref(),
                 &tree.children,
             );
@@ -8745,6 +9664,7 @@ where
                 self.external,
                 self.local,
                 &mut tree.children,
+                self.runtime_slot.as_ref(),
                 layout,
                 renderer,
                 operation,
@@ -8890,6 +9810,7 @@ where
             self.external,
             self.local,
             &mut tree.children,
+            self.runtime_slot.as_ref(),
             event,
             layout,
             cursor,
@@ -8971,6 +9892,7 @@ where
             dirty_scopes: None,
             root_origin: Point { x: 0.0, y: 0.0 },
             dispatch_context: None,
+            iced_native_commit_mutation_gate: None,
         };
         with_iced_surface_global_paint_queue(renderer, |renderer| {
             draw_iced_runtime_widget_local::<W, Theme, Renderer>(
@@ -9006,6 +9928,7 @@ where
                 self.external,
                 self.local,
                 &tree.children,
+                self.runtime_slot.as_ref(),
                 layout,
                 cursor,
                 viewport,
@@ -9554,6 +10477,37 @@ fn publish_iced_routed_input(
     }
 }
 
+fn iced_composition_routed_input(
+    presentation: &IcedPresentationState,
+    region: &FocusRegionDeclaration,
+    phase: TextCompositionPhase,
+    preedit_text: String,
+    cursor_range: Option<slipway_core::TextSelectionRange>,
+) -> IcedRoutedInput {
+    let event = InputEvent::TextComposition(TextCompositionEvent {
+        target: region.target.clone(),
+        target_slot: region.address.clone(),
+        phase,
+        preedit_text,
+        cursor_range,
+    });
+    IcedRoutedInput {
+        input: Some(backend_focus_input_event(
+            presentation,
+            region,
+            DeclaredEventDispatchKind::Text,
+            None,
+            event,
+        )),
+        capture_event: false,
+        request_redraw: matches!(
+            phase,
+            TextCompositionPhase::Update | TextCompositionPhase::End
+        ),
+        refusal: None,
+    }
+}
+
 fn route_iced_event(
     event: &iced::Event,
     layout_bounds: iced::Rectangle,
@@ -10056,6 +11010,53 @@ fn route_iced_event(
                 input: Some(BackendInputEvent::declared(dispatch.input, evidence)),
             })
         }
+        iced::Event::InputMethod(iced_core::input_method::Event::Opened) => {
+            if !presentation.can_route_text_edit() {
+                return None;
+            }
+            let focus = focused_text_edit_region(presentation, focused_region.as_ref())?;
+            Some(iced_composition_routed_input(
+                presentation,
+                focus,
+                TextCompositionPhase::Start,
+                String::new(),
+                None,
+            ))
+        }
+        iced::Event::InputMethod(iced_core::input_method::Event::Preedit(text, range)) => {
+            if !presentation.can_route_text_edit() {
+                return None;
+            }
+            let focus = focused_text_edit_region(presentation, focused_region.as_ref())?;
+            let cursor_range = range.as_ref().and_then(|range| {
+                if !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) {
+                    return None;
+                }
+                let anchor = text[..range.start].chars().count();
+                let focus = text[..range.end].chars().count();
+                Some(slipway_core::TextSelectionRange { anchor, focus })
+            });
+            Some(iced_composition_routed_input(
+                presentation,
+                focus,
+                TextCompositionPhase::Update,
+                text.clone(),
+                cursor_range,
+            ))
+        }
+        iced::Event::InputMethod(iced_core::input_method::Event::Closed) => {
+            if !presentation.can_route_text_edit() {
+                return None;
+            }
+            let focus = focused_text_edit_region(presentation, focused_region.as_ref())?;
+            Some(iced_composition_routed_input(
+                presentation,
+                focus,
+                TextCompositionPhase::End,
+                String::new(),
+                None,
+            ))
+        }
         iced::Event::InputMethod(iced_core::input_method::Event::Commit(text)) => {
             if text.is_empty() {
                 return Some(IcedRoutedInput {
@@ -10068,7 +11069,7 @@ fn route_iced_event(
             if !presentation.can_route_text_edit() {
                 return None;
             }
-            let focus = focused_focus_region(presentation, focused_region.as_ref())?;
+            let focus = focused_text_edit_region(presentation, focused_region.as_ref())?;
             let selection_before = focus
                 .text_edit
                 .as_ref()
@@ -10237,11 +11238,10 @@ fn route_iced_event(
             text,
             ..
         }) => {
-            if !presentation.can_route_text_edit() {
-                return None;
-            }
             let focus = focused_focus_region(presentation, focused_region.as_ref())?;
-            if let Some(text) = text {
+            if let Some(text) = text
+                && focus.text_edit.is_some()
+            {
                 let event = InputEvent::Text(slipway_core::TextInputEvent {
                     target: focus_target(focus),
                     target_slot: focus.address.clone(),
@@ -10289,9 +11289,6 @@ fn route_iced_event(
             }
         }
         iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { key, modifiers, .. }) => {
-            if !presentation.can_route_text_edit() {
-                return None;
-            }
             let focus = focused_focus_region(presentation, focused_region.as_ref())?;
             let event = InputEvent::Keyboard(slipway_core::KeyboardEvent {
                 target: focus_target(focus),
@@ -10855,7 +11852,11 @@ fn iced_focus_widget_id_for_region(
     {
         Some(TextLineMode::SingleLine) => Some(iced_text_input_id(region)),
         Some(TextLineMode::MultiLine) => Some(iced_text_editor_id(region)),
-        None => None,
+        None => Some(iced::advanced::widget::Id::from(format!(
+            "slipway-focus:{}:{}",
+            region.target.as_str(),
+            region.id.as_str()
+        ))),
     }
 }
 
@@ -11226,7 +12227,14 @@ fn focused_focus_region<'a>(
     presentation
         .focus_regions
         .iter()
-        .find(|region| region.enabled && region.text_edit.is_some() && &region.id == id)
+        .find(|region| region.enabled && &region.id == id)
+}
+
+fn focused_text_edit_region<'a>(
+    presentation: &'a IcedPresentationState,
+    id: Option<&slipway_core::PresentationRegionId>,
+) -> Option<&'a FocusRegionDeclaration> {
+    focused_focus_region(presentation, id).filter(|region| region.text_edit.is_some())
 }
 
 fn iced_view_root_local_point(layout_bounds: iced::Rectangle, position: iced::Point) -> Point {
@@ -13157,7 +14165,7 @@ mod tests {
     }
 
     #[derive(Clone, Debug, PartialEq)]
-    struct TestWidget;
+    pub(crate) struct TestWidget;
 
     #[derive(Clone, Debug, PartialEq)]
     struct FocusedInputWidget;
@@ -13179,13 +14187,834 @@ mod tests {
     }
 
     #[derive(Clone, Debug, PartialEq)]
-    struct Local {
+    pub(crate) struct Local {
         clicks: u32,
     }
 
     #[derive(Clone, Debug, PartialEq)]
-    enum Message {
+    pub(crate) enum Message {
         Clicked,
+    }
+
+    #[test]
+    fn iced_mounted_collectors_keep_rooted_slots_through_three_app_hops() {
+        let app_ids = ["app-1", "app-2", "app-3"];
+        for depth in 1..=app_ids.len() {
+            let app_id = app_ids[depth - 1];
+            let widget = slipway_core::SlipwayAppWidget::new(MountedCollectorApp {
+                id: WidgetId::from(app_id),
+                widgets: (TestWidget,),
+            });
+            let local = widget.initial_local_state();
+            let mut mounted_parent = WidgetSlotAddress::new(WidgetId::from("root"), 0);
+            for id in &app_ids[..depth] {
+                mounted_parent = mounted_parent.child(WidgetId::from(*id), 0);
+            }
+            let expected = mounted_parent.child(WidgetId::from("iced.test"), 0);
+
+            let mut mounted_view = widget.visible_backend_view_definition(
+                &(),
+                &local,
+                ViewDefinitionInput {
+                    frame: frame(221),
+                    layout_input: iced_child_layout_input(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 40.0,
+                        },
+                    }),
+                },
+            );
+            apply_runtime_slot_to_view_definition(&mut mounted_view, &mounted_parent);
+            assert_eq!(mounted_view.hit_regions[0].address, Some(expected.clone()));
+            assert_eq!(
+                mounted_view.hit_regions[0].route.address,
+                Some(expected.clone())
+            );
+            assert_eq!(
+                mounted_view.hit_regions[0].route.path,
+                expected.path.clone()
+            );
+            let local_child = WidgetSlotAddress::new(WidgetId::from(app_id), 0)
+                .child(WidgetId::from("iced.test"), 0);
+            assert!(
+                iced_child_placement_for_slot(
+                    &mounted_view.layout.child_placements,
+                    &WidgetId::from("iced.test"),
+                    &local_child,
+                )
+                .is_some()
+            );
+            assert!(
+                iced_child_placement_for_slot(
+                    &mounted_view.layout.child_placements,
+                    &WidgetId::from("iced.test"),
+                    &expected,
+                )
+                .is_some(),
+                "a self-rooted placement must select its fully rooted mounted child at depth {depth}"
+            );
+            let wrong_terminal = mounted_parent.child(WidgetId::from("iced.other"), 0);
+            assert!(
+                iced_child_placement_for_slot(
+                    &mounted_view.layout.child_placements,
+                    &WidgetId::from("iced.other"),
+                    &wrong_terminal,
+                )
+                .is_none(),
+                "mounted placement selection must refuse the wrong terminal"
+            );
+
+            let mut normal = MountedSlotTrace::default();
+            visit_iced_authored_children_mounted(
+                &widget,
+                &(),
+                &local,
+                Some(&mounted_parent),
+                &mut normal,
+            );
+            assert_eq!(normal.slots, vec![expected.clone()]);
+
+            let mut paint = MountedSlotTrace::default();
+            visit_iced_authored_children_in_paint_order_mounted(
+                &widget,
+                &(),
+                &local,
+                &frame(222),
+                &[],
+                IcedChildTraversalOrder::BackToFront,
+                Some(&mounted_parent),
+                &mut paint,
+            );
+            assert_eq!(paint.slots, vec![expected]);
+        }
+    }
+
+    fn set_nc9_target_slot(event: &mut InputEvent, slot: WidgetSlotAddress) {
+        let InputEvent::Pointer(pointer) = event else {
+            panic!("NC-9 fixture must generate pointer input");
+        };
+        pointer.target_slot = Some(slot);
+    }
+
+    fn run_iced_nc9_row<W>(
+        widget: W,
+        cursor_x: f32,
+        expected_slot: WidgetSlotAddress,
+        expected_counter: Nc9Counter,
+        assert_local: impl FnOnce(&W::LocalState),
+        wrong_branch: Option<WidgetSlotAddress>,
+    ) where
+        W: SlipwayIcedBackendChildWidget<ExternalState = Nc9Counters, AppMessage = Nc9Message>,
+    {
+        let mut runtime = SlipwayRuntime::new(widget, Nc9Counters::default());
+        runtime.record_presented_viewport(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 40.0,
+            },
+        });
+        let mut renderer = RecordingRenderer::default();
+        let cache = iced_winit::runtime::user_interface::Cache::new();
+        let bounds = iced::Size::new(100.0, 40.0);
+        let cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(cursor_x, 5.0));
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+
+        {
+            let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >::build(
+                SlipwayIcedRuntimeWidget::from_runtime(&runtime),
+                bounds,
+                cache,
+                &mut renderer,
+            );
+            let _ = ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                    iced::mouse::Button::Left,
+                ))],
+                cursor,
+                &mut renderer,
+                &mut clipboard,
+                &mut messages,
+            );
+        }
+
+        assert_eq!(messages.len(), 1, "one native press must emit one input");
+        let SlipwayIcedRuntimeMessage::BackendInput(input) = messages.remove(0) else {
+            panic!("NC-9 native press must produce backend input");
+        };
+        assert_eq!(input.event.target_slot(), Some(&expected_slot));
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("NC-9 input carries backend dispatch evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(
+                Nc9Leaf {
+                    counter: expected_counter
+                }
+                .region_id()
+            )
+        );
+        assert_eq!(evidence.generated_event.as_ref(), Some(&input.event));
+        let route = evidence
+            .route
+            .as_ref()
+            .expect("NC-9 evidence carries route");
+        assert_eq!(route.address.as_ref(), Some(&expected_slot));
+        assert_eq!(route.path, expected_slot.path);
+        let selected_region = evidence.selected_region.clone();
+
+        if let Some(wrong_branch) = wrong_branch {
+            for wrong_slot in [
+                wrong_branch,
+                WidgetSlotAddress {
+                    ordinal: 99,
+                    ..expected_slot.clone()
+                },
+            ] {
+                let mut wrong_event = input.event.clone();
+                set_nc9_target_slot(&mut wrong_event, wrong_slot);
+                let mut wrong_local = runtime.widget().initial_local_state();
+                let outcome = runtime.widget().handle_event(
+                    runtime.external(),
+                    &mut wrong_local,
+                    wrong_event,
+                );
+                assert!(!outcome.handled);
+                assert!(outcome.emitted_messages.is_empty());
+                assert!(outcome.changes.is_empty());
+            }
+        }
+
+        let mut reducer = reduce_nc9;
+        let report = runtime.apply_backend_input_event_for_backend_with_app_reducer(
+            input,
+            ICED_BACKEND_ID,
+            &mut reducer,
+        );
+        assert!(report.handled, "NC-9 input must be handled: {report:?}");
+        assert_eq!(report.emitted_messages, 1);
+        assert_eq!(report.applied_messages, 1);
+        assert_local(runtime.local_state());
+        assert_eq!(runtime.external().value(expected_counter), 1);
+        assert_eq!(
+            runtime.external().total(),
+            1,
+            "sibling counters stay unchanged"
+        );
+
+        let trace = runtime
+            .last_backend_input_trace()
+            .expect("NC-9 runtime records backend input trace");
+        assert!(trace.handled);
+        assert_eq!(trace.input.event.target_slot(), Some(&expected_slot));
+        let trace_evidence = trace
+            .input
+            .dispatch_evidence
+            .as_ref()
+            .expect("NC-9 trace retains evidence");
+        assert_eq!(trace_evidence.selected_region, selected_region);
+        assert_eq!(
+            trace_evidence
+                .route
+                .as_ref()
+                .and_then(|route| route.address.as_ref()),
+            Some(&expected_slot)
+        );
+        assert!(trace.revision_after > trace.revision_before);
+        assert!(trace.changes.iter().any(|change| {
+            change.target == Nc9Leaf::id_value() && change.slot.as_ref() == Some(&expected_slot)
+        }));
+    }
+
+    #[test]
+    fn iced_nc9_recursive_backend_pointer_runtime_matrix() {
+        let leaf = Nc9Leaf::id_value();
+
+        let non_nested_root = WidgetId::from("nc9.root.non-nested");
+        run_iced_nc9_row(
+            nc9_app(
+                non_nested_root.as_str(),
+                (Nc9Leaf {
+                    counter: Nc9Counter::NonNested,
+                },),
+            ),
+            5.0,
+            WidgetSlotAddress::new(non_nested_root, 0).child(leaf.clone(), 0),
+            Nc9Counter::NonNested,
+            |local| assert_eq!(local.widgets.0, 1),
+            None,
+        );
+
+        let one_root = WidgetId::from("nc9.root.one");
+        let app_1 = WidgetId::from("nc9.app-1");
+        run_iced_nc9_row(
+            nc9_app(
+                one_root.as_str(),
+                (nc9_app(
+                    app_1.as_str(),
+                    (Nc9Leaf {
+                        counter: Nc9Counter::One,
+                    },),
+                ),),
+            ),
+            5.0,
+            WidgetSlotAddress::new(one_root, 0)
+                .child(app_1.clone(), 0)
+                .child(leaf.clone(), 0),
+            Nc9Counter::One,
+            |local| assert_eq!(local.widgets.0.widgets.0, 1),
+            None,
+        );
+
+        let two_root = WidgetId::from("nc9.root.two");
+        let app_2 = WidgetId::from("nc9.app-2");
+        run_iced_nc9_row(
+            nc9_app(
+                two_root.as_str(),
+                (nc9_app(
+                    app_1.as_str(),
+                    (nc9_app(
+                        app_2.as_str(),
+                        (Nc9Leaf {
+                            counter: Nc9Counter::Two,
+                        },),
+                    ),),
+                ),),
+            ),
+            5.0,
+            WidgetSlotAddress::new(two_root, 0)
+                .child(app_1.clone(), 0)
+                .child(app_2.clone(), 0)
+                .child(leaf.clone(), 0),
+            Nc9Counter::Two,
+            |local| assert_eq!(local.widgets.0.widgets.0.widgets.0, 1),
+            None,
+        );
+
+        let three_root = WidgetId::from("nc9.root.three");
+        let app_3 = WidgetId::from("nc9.app-3");
+        let three_slot = WidgetSlotAddress::new(three_root.clone(), 0)
+            .child(app_1.clone(), 0)
+            .child(app_2.clone(), 0)
+            .child(app_3.clone(), 0)
+            .child(leaf.clone(), 0);
+        let wrong_branch = WidgetSlotAddress::new(three_root.clone(), 0)
+            .child(app_1.clone(), 0)
+            .child(WidgetId::from("nc9.wrong-app"), 0)
+            .child(app_3.clone(), 0)
+            .child(leaf.clone(), 0);
+        run_iced_nc9_row(
+            nc9_app(
+                three_root.as_str(),
+                (nc9_app(
+                    app_1.as_str(),
+                    (nc9_app(
+                        app_2.as_str(),
+                        (nc9_app(
+                            app_3.as_str(),
+                            (Nc9Leaf {
+                                counter: Nc9Counter::Three,
+                            },),
+                        ),),
+                    ),),
+                ),),
+            ),
+            5.0,
+            three_slot,
+            Nc9Counter::Three,
+            |local| assert_eq!(local.widgets.0.widgets.0.widgets.0.widgets.0, 1),
+            Some(wrong_branch),
+        );
+
+        let sibling_root = WidgetId::from("nc9.root.siblings");
+        let left_app = WidgetId::from("nc9.left-app");
+        let right_app = WidgetId::from("nc9.right-app");
+        let sibling_fixture = || {
+            nc9_app(
+                sibling_root.as_str(),
+                (
+                    nc9_app(
+                        left_app.as_str(),
+                        (Nc9Leaf {
+                            counter: Nc9Counter::Left,
+                        },),
+                    ),
+                    nc9_app(
+                        right_app.as_str(),
+                        (Nc9Leaf {
+                            counter: Nc9Counter::Right,
+                        },),
+                    ),
+                ),
+            )
+        };
+        run_iced_nc9_row(
+            sibling_fixture(),
+            5.0,
+            WidgetSlotAddress::new(sibling_root.clone(), 0)
+                .child(left_app.clone(), 0)
+                .child(leaf.clone(), 0),
+            Nc9Counter::Left,
+            |local| {
+                assert_eq!(local.widgets.0.widgets.0, 1);
+                assert_eq!(local.widgets.1.widgets.0, 0);
+            },
+            None,
+        );
+        run_iced_nc9_row(
+            sibling_fixture(),
+            55.0,
+            WidgetSlotAddress::new(sibling_root, 0)
+                .child(right_app.clone(), 1)
+                .child(leaf, 0),
+            Nc9Counter::Right,
+            |local| {
+                assert_eq!(local.widgets.0.widgets.0, 0);
+                assert_eq!(local.widgets.1.widgets.0, 1);
+            },
+            None,
+        );
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct MountedCollectorApp {
+        id: WidgetId,
+        widgets: (TestWidget,),
+    }
+
+    impl slipway_core::SlipwayApp for MountedCollectorApp {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = Message;
+        type Widgets = (TestWidget,);
+
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+    }
+
+    #[derive(Default)]
+    struct MountedSlotTrace {
+        slots: Vec<WidgetSlotAddress>,
+    }
+
+    impl SlipwayIcedWidgetListVisitor<(), Message> for MountedSlotTrace {
+        fn visit_iced_child<W>(
+            &mut self,
+            _widget: &W,
+            _external: &(),
+            _local: &W::LocalState,
+            slot: WidgetSlotAddress,
+        ) where
+            W: SlipwayIcedBackendChildWidget<ExternalState = (), AppMessage = Message>,
+        {
+            self.slots.push(slot);
+        }
+
+        fn visit_iced_native_child<N>(
+            &mut self,
+            _widget: &N,
+            _external: &(),
+            _local: &N::LocalState,
+            slot: WidgetSlotAddress,
+        ) where
+            N: SlipwayIcedNativeChildWidget<ExternalState = (), AppMessage = Message>,
+        {
+            self.slots.push(slot);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Nc9Counter {
+        NonNested,
+        One,
+        Two,
+        Three,
+        Left,
+        Right,
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    struct Nc9Counters {
+        non_nested: u32,
+        one: u32,
+        two: u32,
+        three: u32,
+        left: u32,
+        right: u32,
+    }
+
+    impl Nc9Counters {
+        fn increment(&mut self, counter: Nc9Counter) {
+            *self.value_mut(counter) += 1;
+        }
+
+        fn value(&self, counter: Nc9Counter) -> u32 {
+            match counter {
+                Nc9Counter::NonNested => self.non_nested,
+                Nc9Counter::One => self.one,
+                Nc9Counter::Two => self.two,
+                Nc9Counter::Three => self.three,
+                Nc9Counter::Left => self.left,
+                Nc9Counter::Right => self.right,
+            }
+        }
+
+        fn value_mut(&mut self, counter: Nc9Counter) -> &mut u32 {
+            match counter {
+                Nc9Counter::NonNested => &mut self.non_nested,
+                Nc9Counter::One => &mut self.one,
+                Nc9Counter::Two => &mut self.two,
+                Nc9Counter::Three => &mut self.three,
+                Nc9Counter::Left => &mut self.left,
+                Nc9Counter::Right => &mut self.right,
+            }
+        }
+
+        fn total(&self) -> u32 {
+            self.non_nested + self.one + self.two + self.three + self.left + self.right
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Nc9Message {
+        Increment(Nc9Counter),
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Nc9Leaf {
+        counter: Nc9Counter,
+    }
+
+    impl Nc9Leaf {
+        fn id_value() -> WidgetId {
+            WidgetId::from("nc9.leaf")
+        }
+
+        fn region_id(&self) -> PresentationRegionId {
+            PresentationRegionId::from(format!("nc9.hit.{:?}", self.counter))
+        }
+    }
+
+    impl SlipwayWidgetTypes for Nc9Leaf {
+        type ExternalState = Nc9Counters;
+        type LocalState = u32;
+        type AppMessage = Nc9Message;
+    }
+
+    impl SlipwaySsot for Nc9Leaf {
+        fn id(&self) -> WidgetId {
+            Self::id_value()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![
+                Capability::PointerInput,
+                Capability::Paint,
+                Capability::StateObservation,
+            ]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode {
+                id: self.id(),
+                children: Vec::new(),
+                local_state_slot: Some(WidgetSlotAddress::new(self.id(), 0)),
+            }
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for Nc9Leaf {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            let before = *local;
+            *local += 1;
+            EventOutcome {
+                handled: true,
+                propagate: false,
+                emitted_messages: vec![EmittedMessage {
+                    target: self.id(),
+                    name: "nc9-increment".to_string(),
+                    message: Nc9Message::Increment(self.counter),
+                }],
+                changes: vec![slipway_core::ChangeEvidence {
+                    target: self.id(),
+                    slot: Some(WidgetSlotAddress::new(self.id(), 0)),
+                    field: "count".to_string(),
+                    before: Some(before.to_string()),
+                    after: Some(local.to_string()),
+                }],
+                observations: self.observe_state(_external, local),
+                probes: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayView for Nc9Leaf {
+        fn initial_local_state(&self) -> Self::LocalState {
+            0
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            vec![StateObservation {
+                target: self.id(),
+                slot: Some(WidgetSlotAddress::new(self.id(), 0)),
+                name: "count".to_string(),
+                value: local.to_string(),
+            }]
+        }
+    }
+
+    impl slipway_core::SlipwayEventRoutingPolicy for Nc9Leaf {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+        ) -> slipway_core::EventRoutingPolicyDeclaration {
+            let address = event.target_slot().cloned();
+            slipway_core::EventRoutingPolicyDeclaration {
+                target: self.id(),
+                event_target: event.target().clone(),
+                route: slipway_core::EventRoute {
+                    route_id: Some(format!("nc9.route.{:?}", self.counter)),
+                    path: address
+                        .as_ref()
+                        .map(|address| address.path.clone())
+                        .unwrap_or_else(|| vec![self.id()]),
+                    address,
+                    phase: slipway_core::EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayEventDispositionPolicy for Nc9Leaf {
+        fn event_disposition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+            route: &slipway_core::EventRoute,
+        ) -> slipway_core::EventPropagationEvidence {
+            let handled = event.target() == &self.id();
+            let disposition = slipway_core::EventDisposition {
+                handled,
+                propagate: false,
+                default_action_allowed: true,
+            };
+            slipway_core::EventPropagationEvidence {
+                target: self.id(),
+                event: event.clone(),
+                steps: vec![slipway_core::EventPropagationStep {
+                    stage: slipway_core::EventPropagationStage::Target,
+                    node: route.path.last().cloned(),
+                    disposition,
+                    emitted_messages: Vec::new(),
+                    changes: Vec::new(),
+                }],
+                final_disposition: disposition,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayViewDefinition for Nc9Leaf {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: vec![slipway_core::hit_region_from_pointer_capability(
+                    self,
+                    external,
+                    local,
+                    self.region_id(),
+                    None,
+                    layout.bounds,
+                    slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                    HitRegionOrder {
+                        z_index: 0,
+                        paint_order: 0,
+                        traversal_order: 0,
+                    },
+                    Some(format!("nc9.route.{:?}", self.counter)),
+                    CursorCapability::Pointer,
+                    true,
+                    slipway_core::PointerCaptureIntent::OnPress,
+                )],
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+                layout,
+            }
+        }
+    }
+
+    impl SlipwayIcedAuthoredChildren for Nc9Leaf {
+        fn visit_iced_authored_children<V>(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _visitor: &mut V,
+        ) where
+            V: SlipwayIcedWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Nc9App<Widgets> {
+        id: WidgetId,
+        widgets: Widgets,
+    }
+
+    impl<Widgets> slipway_core::SlipwayApp for Nc9App<Widgets>
+    where
+        Widgets: slipway_core::SlipwayWidgetList<ExternalState = Nc9Counters, AppMessage = Nc9Message>
+            + slipway_core::SlipwayWidgetListViewDefinition<
+                ExternalState = Nc9Counters,
+                AppMessage = Nc9Message,
+            >,
+    {
+        type ExternalState = Nc9Counters;
+        type LocalState = ();
+        type AppMessage = Nc9Message;
+        type Widgets = Widgets;
+
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout_plan(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+            children: Vec<slipway_core::ChildLayoutSeed>,
+        ) -> slipway_core::AppLayoutPlan {
+            let siblings = self.id.as_str() == "nc9.root.siblings";
+            slipway_core::AppLayoutPlan {
+                bounds: input.viewport,
+                children: children
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, seed)| {
+                        let bounds = if siblings {
+                            Rect {
+                                origin: Point {
+                                    x: index as f32 * 50.0,
+                                    y: 0.0,
+                                },
+                                size: Size {
+                                    width: 40.0,
+                                    height: 40.0,
+                                },
+                            }
+                        } else {
+                            input.viewport.into_rect()
+                        };
+                        slipway_core::ChildLayoutPlan::placed_for_seed(
+                            seed,
+                            iced_child_layout_input(bounds),
+                            slipway_core::ParentLocalRect::new(bounds),
+                        )
+                    })
+                    .collect(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    fn nc9_app<Widgets>(
+        id: &str,
+        widgets: Widgets,
+    ) -> slipway_core::SlipwayAppWidget<Nc9App<Widgets>>
+    where
+        Widgets: slipway_core::SlipwayWidgetList<ExternalState = Nc9Counters, AppMessage = Nc9Message>
+            + slipway_core::SlipwayWidgetListViewDefinition<
+                ExternalState = Nc9Counters,
+                AppMessage = Nc9Message,
+            >,
+    {
+        slipway_core::SlipwayAppWidget::new(Nc9App {
+            id: WidgetId::from(id),
+            widgets,
+        })
+    }
+
+    fn reduce_nc9(external: &mut Nc9Counters, messages: Vec<Nc9Message>) {
+        for message in messages {
+            let Nc9Message::Increment(counter) = message;
+            external.increment(counter);
+        }
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -14874,6 +16703,465 @@ mod tests {
                 scroll_regions: Vec::new(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct CommitGateTextWidget<const MULTILINE: bool>;
+
+    fn commit_gate_text_widget_id<const MULTILINE: bool>() -> WidgetId {
+        WidgetId::from(if MULTILINE {
+            "iced.commit-gate-editor"
+        } else {
+            "iced.commit-gate-input"
+        })
+    }
+
+    impl<const MULTILINE: bool> SlipwayWidgetTypes for CommitGateTextWidget<MULTILINE> {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = Message;
+    }
+
+    impl<const MULTILINE: bool> SlipwaySsot for CommitGateTextWidget<MULTILINE> {
+        fn id(&self) -> WidgetId {
+            commit_gate_text_widget_id::<MULTILINE>()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![Capability::Paint, Capability::TextInput]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode::leaf(self.id())
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl<const MULTILINE: bool> SlipwayLogic for CommitGateTextWidget<MULTILINE> {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            EventOutcome::ignored()
+        }
+    }
+
+    impl<const MULTILINE: bool> SlipwayView for CommitGateTextWidget<MULTILINE> {
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            Vec::new()
+        }
+    }
+
+    impl<const MULTILINE: bool> SlipwayViewDefinition for CommitGateTextWidget<MULTILINE> {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout_input = input.layout_input.clone();
+            let layout = self.layout(external, local, layout_input.clone());
+            let bounds = layout.bounds;
+            let target = self.id();
+            let mut region = slipway_core::text_edit_focus_region_from_capability(
+                &InteractionCapabilityWidget { id: target.clone() },
+                &(),
+                &(),
+                PresentationRegionId::from("commit-gate-text"),
+                None,
+                bounds,
+                None,
+                true,
+                &layout_input,
+                None,
+            );
+            if MULTILINE {
+                region
+                    .text_edit
+                    .as_mut()
+                    .expect("commit fixture is editable")
+                    .line_mode = TextLineMode::MultiLine;
+            }
+            ViewDefinition {
+                target: target.clone(),
+                frame: input.frame,
+                layout,
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(target),
+                hit_regions: Vec::new(),
+                focus_regions: vec![region],
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl<const MULTILINE: bool> SlipwayIcedAuthoredChildren for CommitGateTextWidget<MULTILINE> {
+        fn visit_iced_authored_children<V>(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _visitor: &mut V,
+        ) where
+            V: SlipwayIcedWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+        }
+    }
+
+    impl<const MULTILINE: bool> slipway_core::SlipwayEventRoutingPolicy
+        for CommitGateTextWidget<MULTILINE>
+    {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+        ) -> slipway_core::EventRoutingPolicyDeclaration {
+            let id = self.id();
+            let address = event.target_slot().cloned();
+            let path = address
+                .as_ref()
+                .map(|address| address.path.clone())
+                .unwrap_or_else(|| vec![id.clone()]);
+            slipway_core::EventRoutingPolicyDeclaration {
+                target: id,
+                event_target: event.target().clone(),
+                route: slipway_core::EventRoute {
+                    route_id: None,
+                    address,
+                    path,
+                    phase: slipway_core::EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl<const MULTILINE: bool> slipway_core::SlipwayEventDispositionPolicy
+        for CommitGateTextWidget<MULTILINE>
+    {
+        fn event_disposition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+            _route: &slipway_core::EventRoute,
+        ) -> slipway_core::EventPropagationEvidence {
+            let id = self.id();
+            let disposition = slipway_core::EventDisposition {
+                handled: event.target() == &id,
+                propagate: event.target() != &id,
+                default_action_allowed: true,
+            };
+            slipway_core::EventPropagationEvidence {
+                target: id,
+                event: event.clone(),
+                steps: Vec::new(),
+                final_disposition: disposition,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct CommitGateParentWidget<const MULTILINE: bool, const NATIVE_SCROLL: bool>;
+
+    fn commit_gate_parent_id<const MULTILINE: bool, const NATIVE_SCROLL: bool>() -> WidgetId {
+        WidgetId::from(match (MULTILINE, NATIVE_SCROLL) {
+            (false, false) => "iced.commit-gate-child-input-parent",
+            (true, false) => "iced.commit-gate-child-editor-parent",
+            (false, true) => "iced.commit-gate-scroll-input-parent",
+            (true, true) => "iced.commit-gate-scroll-editor-parent",
+        })
+    }
+
+    fn commit_gate_child_slot<const MULTILINE: bool, const NATIVE_SCROLL: bool>()
+    -> WidgetSlotAddress {
+        WidgetSlotAddress::new(commit_gate_parent_id::<MULTILINE, NATIVE_SCROLL>(), 0)
+            .child(commit_gate_text_widget_id::<MULTILINE>(), 0)
+    }
+
+    impl<const MULTILINE: bool, const NATIVE_SCROLL: bool> SlipwayWidgetTypes
+        for CommitGateParentWidget<MULTILINE, NATIVE_SCROLL>
+    {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = Message;
+    }
+
+    impl<const MULTILINE: bool, const NATIVE_SCROLL: bool> SlipwaySsot
+        for CommitGateParentWidget<MULTILINE, NATIVE_SCROLL>
+    {
+        fn id(&self) -> WidgetId {
+            commit_gate_parent_id::<MULTILINE, NATIVE_SCROLL>()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            let mut capabilities = vec![Capability::ChildTraversal, Capability::Layout];
+            if NATIVE_SCROLL {
+                capabilities.push(Capability::ScrollRegionPresentation);
+            }
+            capabilities
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            let child = commit_gate_text_widget_id::<MULTILINE>();
+            TopologyNode {
+                id: self.id(),
+                local_state_slot: Some(WidgetSlotAddress::new(self.id(), 0)),
+                children: vec![TopologyNode {
+                    id: child,
+                    local_state_slot: Some(commit_gate_child_slot::<MULTILINE, NATIVE_SCROLL>()),
+                    children: Vec::new(),
+                }],
+            }
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+
+        fn visit_authored_children<V>(
+            &self,
+            external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            visitor: &mut V,
+        ) where
+            V: SlipwayWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+            visitor.visit_child(
+                &CommitGateTextWidget::<MULTILINE>,
+                external,
+                &(),
+                commit_gate_child_slot::<MULTILINE, NATIVE_SCROLL>(),
+            );
+        }
+    }
+
+    impl<const MULTILINE: bool, const NATIVE_SCROLL: bool> SlipwayIcedAuthoredChildren
+        for CommitGateParentWidget<MULTILINE, NATIVE_SCROLL>
+    {
+        fn visit_iced_authored_children<V>(
+            &self,
+            external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            visitor: &mut V,
+        ) where
+            V: SlipwayIcedWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+            visitor.visit_iced_child(
+                &CommitGateTextWidget::<MULTILINE>,
+                external,
+                &(),
+                commit_gate_child_slot::<MULTILINE, NATIVE_SCROLL>(),
+            );
+        }
+    }
+
+    impl<const MULTILINE: bool, const NATIVE_SCROLL: bool> SlipwayLogic
+        for CommitGateParentWidget<MULTILINE, NATIVE_SCROLL>
+    {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            EventOutcome::ignored()
+        }
+    }
+
+    impl<const MULTILINE: bool, const NATIVE_SCROLL: bool> SlipwayView
+        for CommitGateParentWidget<MULTILINE, NATIVE_SCROLL>
+    {
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: vec![slipway_core::ChildPlacement {
+                    child: commit_gate_text_widget_id::<MULTILINE>(),
+                    local_state_slot: Some(commit_gate_child_slot::<MULTILINE, NATIVE_SCROLL>()),
+                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                        origin: Point { x: 10.0, y: 10.0 },
+                        size: Size {
+                            width: 80.0,
+                            height: 28.0,
+                        },
+                    }),
+                }],
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            Vec::new()
+        }
+    }
+
+    impl<const MULTILINE: bool, const NATIVE_SCROLL: bool> SlipwayViewDefinition
+        for CommitGateParentWidget<MULTILINE, NATIVE_SCROLL>
+    {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            let mut view = ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                layout,
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: Vec::new(),
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+            };
+            if NATIVE_SCROLL {
+                view.scroll_regions.push(test_scroll_region_from_capability(
+                    self.id(),
+                    "commit-gate-scroll",
+                    Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 45.0,
+                        },
+                    },
+                    Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 100.0,
+                        },
+                    },
+                    slipway_core::ScrollConsumptionPolicy {
+                        wheel: true,
+                        drag: false,
+                        keyboard: false,
+                        programmatic: false,
+                    },
+                ));
+                view.scroll_regions[0].address = Some(WidgetSlotAddress::new(self.id(), 0));
+            }
+            view
+        }
+    }
+
+    impl<const MULTILINE: bool, const NATIVE_SCROLL: bool> slipway_core::SlipwayEventRoutingPolicy
+        for CommitGateParentWidget<MULTILINE, NATIVE_SCROLL>
+    {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+        ) -> slipway_core::EventRoutingPolicyDeclaration {
+            let id = self.id();
+            let address = event.target_slot().cloned();
+            let path = address
+                .as_ref()
+                .map(|address| address.path.clone())
+                .unwrap_or_else(|| vec![id.clone()]);
+            slipway_core::EventRoutingPolicyDeclaration {
+                target: id,
+                event_target: event.target().clone(),
+                route: slipway_core::EventRoute {
+                    route_id: None,
+                    address,
+                    path,
+                    phase: slipway_core::EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl<const MULTILINE: bool, const NATIVE_SCROLL: bool>
+        slipway_core::SlipwayEventDispositionPolicy
+        for CommitGateParentWidget<MULTILINE, NATIVE_SCROLL>
+    {
+        fn event_disposition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+            _route: &slipway_core::EventRoute,
+        ) -> slipway_core::EventPropagationEvidence {
+            let id = self.id();
+            let disposition = slipway_core::EventDisposition {
+                handled: event.target() == &id,
+                propagate: event.target() != &id,
+                default_action_allowed: true,
+            };
+            slipway_core::EventPropagationEvidence {
+                target: id,
+                event: event.clone(),
+                steps: Vec::new(),
+                final_disposition: disposition,
                 diagnostics: Vec::new(),
             }
         }
@@ -18283,6 +20571,126 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct RecordingEditor {
+        text: String,
+        bounds: iced::Size,
+    }
+
+    impl iced::advanced::text::Editor for RecordingEditor {
+        type Font = iced::Font;
+
+        fn with_text(text: &str) -> Self {
+            Self {
+                text: text.to_string(),
+                bounds: iced::Size::ZERO,
+            }
+        }
+
+        fn is_empty(&self) -> bool {
+            self.text.is_empty()
+        }
+
+        fn cursor(&self) -> iced::advanced::text::editor::Cursor {
+            let line = self.text.split('\n').count().saturating_sub(1);
+            let column = self
+                .text
+                .rsplit('\n')
+                .next()
+                .map_or(0, |line| line.chars().count());
+            iced::advanced::text::editor::Cursor {
+                position: iced::advanced::text::editor::Position { line, column },
+                selection: None,
+            }
+        }
+
+        fn selection(&self) -> iced::advanced::text::editor::Selection {
+            iced::advanced::text::editor::Selection::Caret(iced::Point::ORIGIN)
+        }
+
+        fn copy(&self) -> Option<String> {
+            None
+        }
+
+        fn line(&self, index: usize) -> Option<iced::advanced::text::editor::Line<'_>> {
+            self.text
+                .split('\n')
+                .nth(index)
+                .map(|text| iced::advanced::text::editor::Line {
+                    text: std::borrow::Cow::Borrowed(text),
+                    ending: if index + 1 < self.line_count() {
+                        iced::advanced::text::editor::LineEnding::Lf
+                    } else {
+                        iced::advanced::text::editor::LineEnding::None
+                    },
+                })
+        }
+
+        fn line_count(&self) -> usize {
+            self.text.split('\n').count()
+        }
+
+        fn perform(&mut self, action: iced::advanced::text::editor::Action) {
+            use iced::advanced::text::editor::{Action, Edit};
+            match action {
+                Action::Edit(Edit::Insert(character)) => self.text.push(character),
+                Action::Edit(Edit::Paste(text)) => self.text.push_str(&text),
+                Action::Edit(Edit::Enter) => self.text.push('\n'),
+                Action::Edit(Edit::Indent) => self.text.push('\t'),
+                Action::Edit(Edit::Unindent) => {
+                    if self.text.ends_with('\t') {
+                        self.text.pop();
+                    }
+                }
+                Action::Edit(Edit::Backspace) => {
+                    self.text.pop();
+                }
+                Action::Edit(Edit::Delete)
+                | Action::Move(_)
+                | Action::Select(_)
+                | Action::SelectWord
+                | Action::SelectLine
+                | Action::SelectAll
+                | Action::Click(_)
+                | Action::Drag(_)
+                | Action::Scroll { .. } => {}
+            }
+        }
+
+        fn move_to(&mut self, _cursor: iced::advanced::text::editor::Cursor) {}
+
+        fn bounds(&self) -> iced::Size {
+            self.bounds
+        }
+
+        fn min_bounds(&self) -> iced::Size {
+            self.bounds
+        }
+
+        fn update(
+            &mut self,
+            new_bounds: iced::Size,
+            _new_font: Self::Font,
+            _new_size: iced::Pixels,
+            _new_line_height: iced::advanced::text::LineHeight,
+            _new_wrapping: iced::advanced::text::Wrapping,
+            _new_highlighter: &mut impl iced::advanced::text::highlighter::Highlighter,
+        ) {
+            self.bounds = new_bounds;
+        }
+
+        fn highlight<H: iced::advanced::text::highlighter::Highlighter>(
+            &mut self,
+            _font: Self::Font,
+            _highlighter: &mut H,
+            _format_highlight: impl Fn(
+                &H::Highlight,
+            )
+                -> iced::advanced::text::highlighter::Format<Self::Font>,
+        ) {
+        }
+    }
+
+    #[derive(Default)]
     struct RecordingRenderer {
         paragraphs: Vec<RecordedParagraphDraw>,
         text_calls: Vec<RecordedParagraphDraw>,
@@ -18342,7 +20750,7 @@ mod tests {
     impl iced::advanced::text::Renderer for RecordingRenderer {
         type Font = iced::Font;
         type Paragraph = RecordedParagraph;
-        type Editor = ();
+        type Editor = RecordingEditor;
 
         const ICON_FONT: Self::Font = iced::Font::DEFAULT;
         const CHECKMARK_ICON: char = '0';
@@ -20271,6 +22679,567 @@ mod tests {
             ),
             "focused Slipway text edit region must keep the native iced TextInput focused so Windows IME can emit preedit/commit events"
         );
+    }
+
+    fn focus_root_native_text_input(
+        runtime: &SlipwayRuntime<TextEditUnsupportedWidget>,
+        renderer: &mut RecordingRenderer,
+    ) -> iced_winit::runtime::user_interface::Cache {
+        let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >::build(
+            SlipwayIcedRuntimeWidget::from_runtime(runtime),
+            iced::Size::new(100.0, 40.0),
+            iced_winit::runtime::user_interface::Cache::new(),
+            renderer,
+        );
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Left,
+            ))],
+            iced::advanced::mouse::Cursor::Available(iced::Point::new(10.0, 10.0)),
+            renderer,
+            &mut clipboard,
+            &mut messages,
+        );
+        ui.into_cache()
+    }
+
+    #[test]
+    fn matching_commit_gate_reaches_native_text_input_before_one_snapshot_and_carrier() {
+        let runtime = SlipwayRuntime::new(TextEditUnsupportedWidget, ());
+        let mut renderer = RecordingRenderer::default();
+        let cache = focus_root_native_text_input(&runtime, &mut renderer);
+        let gate = IcedNativeCommitMutationGate {
+            token: 17,
+            commit_sequence_index: 2,
+            target: WidgetId::from("iced.text-edit-unsupported"),
+            target_slot: None,
+            region_id: PresentationRegionId::from("text-edit-focus"),
+        };
+        let root_before = ICED_COMMIT_GATE_ROOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+        let snapshots_before =
+            ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed);
+        let carriers_before =
+            ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >::build(
+            SlipwayIcedRuntimeWidget::from_runtime(&runtime)
+                .with_iced_native_commit_mutation_gate(&gate),
+            iced::Size::new(100.0, 40.0),
+            cache,
+            &mut renderer,
+        );
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[iced::Event::InputMethod(
+                iced_core::input_method::Event::Commit("han".to_string()),
+            )],
+            iced::advanced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard,
+            &mut messages,
+        );
+
+        let mutations = messages
+            .iter()
+            .filter_map(|message| match message {
+                SlipwayIcedRuntimeMessage::NativeTextMutation(mutation) => Some(mutation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].before, "");
+        assert_eq!(mutations[0].after, "han");
+        assert_eq!(
+            ICED_COMMIT_GATE_ROOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed) - root_before,
+            1
+        );
+        assert_eq!(
+            ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed)
+                - snapshots_before,
+            1
+        );
+        assert_eq!(
+            ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed)
+                - carriers_before,
+            1
+        );
+
+        let cache = ui.into_cache();
+        let post_snapshot = ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed);
+        let post_carrier = ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >::build(
+            SlipwayIcedRuntimeWidget::from_runtime(&runtime),
+            iced::Size::new(100.0, 40.0),
+            cache,
+            &mut renderer,
+        );
+        let mut redraw_messages = Vec::new();
+        let _ = ui.update(
+            &[iced::Event::Window(iced::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            ))],
+            iced::advanced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard,
+            &mut redraw_messages,
+        );
+        assert_eq!(
+            ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed),
+            post_snapshot,
+            "the request gate must not leak into the next slice/redraw"
+        );
+        assert_eq!(
+            ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed),
+            post_carrier,
+            "the request gate must not leak into the next slice/redraw"
+        );
+
+        assert_absent_and_nonmatching_commit_gates_preserve_ordinary_input_with_zero_debug_work();
+    }
+
+    fn assert_absent_and_nonmatching_commit_gates_preserve_ordinary_input_with_zero_debug_work() {
+        for gate in [
+            None,
+            Some(IcedNativeCommitMutationGate {
+                token: 19,
+                commit_sequence_index: 1,
+                target: WidgetId::from("iced.text-edit-unsupported"),
+                target_slot: None,
+                region_id: PresentationRegionId::from("wrong-region"),
+            }),
+        ] {
+            let runtime = SlipwayRuntime::new(TextEditUnsupportedWidget, ());
+            let mut renderer = RecordingRenderer::default();
+            let cache = focus_root_native_text_input(&runtime, &mut renderer);
+            let root_before =
+                ICED_COMMIT_GATE_ROOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+            let snapshots_before =
+                ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed);
+            let carriers_before =
+                ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+            let element = match gate.as_ref() {
+                Some(gate) => SlipwayIcedRuntimeWidget::from_runtime(&runtime)
+                    .with_iced_native_commit_mutation_gate(gate),
+                None => SlipwayIcedRuntimeWidget::from_runtime(&runtime),
+            };
+            let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >::build(
+                element, iced::Size::new(100.0, 40.0), cache, &mut renderer
+            );
+            let mut clipboard = iced::advanced::clipboard::Null;
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[iced::Event::InputMethod(
+                    iced_core::input_method::Event::Commit("plain".to_string()),
+                )],
+                iced::advanced::mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard,
+                &mut messages,
+            );
+            assert!(
+                messages.iter().any(|message| {
+                    matches!(message, SlipwayIcedRuntimeMessage::BackendInput(_))
+                })
+            );
+            assert!(!messages.iter().any(|message| {
+                matches!(message, SlipwayIcedRuntimeMessage::NativeTextMutation(_))
+            }));
+            assert_eq!(
+                ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed),
+                snapshots_before
+            );
+            assert_eq!(
+                ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed),
+                carriers_before
+            );
+            assert_eq!(
+                ICED_COMMIT_GATE_ROOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
+                    - root_before,
+                usize::from(gate.is_some())
+            );
+        }
+    }
+
+    fn focus_commit_gate_fixture<W>(
+        runtime: &SlipwayRuntime<W>,
+        renderer: &mut RecordingRenderer,
+        cursor: iced::advanced::mouse::Cursor,
+        focus_id: iced::advanced::widget::Id,
+    ) -> iced_winit::runtime::user_interface::Cache
+    where
+        W: SlipwayIcedBackendWidget,
+        W::LocalState: Clone,
+        W::AppMessage: Clone,
+    {
+        let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >::build(
+            SlipwayIcedRuntimeWidget::from_runtime(runtime),
+            iced::Size::new(100.0, 60.0),
+            iced_winit::runtime::user_interface::Cache::new(),
+            renderer,
+        );
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let mut focus = iced::advanced::widget::operation::focusable::focus(focus_id);
+        ui.operate(renderer, &mut focus);
+        let _ = ui.update(
+            &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                iced::mouse::Button::Left,
+            ))],
+            cursor,
+            renderer,
+            &mut clipboard,
+            &mut messages,
+        );
+        let cache = ui.into_cache();
+        let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >::build(
+            SlipwayIcedRuntimeWidget::from_runtime(runtime),
+            iced::Size::new(100.0, 60.0),
+            cache,
+            renderer,
+        );
+        let mut redraw_messages = Vec::new();
+        let (state, _) = ui.update(
+            &[iced::Event::Window(iced::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            ))],
+            cursor,
+            renderer,
+            &mut clipboard,
+            &mut redraw_messages,
+        );
+        let iced_winit::runtime::user_interface::State::Updated { input_method, .. } = state else {
+            panic!("commit-gate focus fixture became outdated");
+        };
+        assert!(matches!(
+            input_method,
+            iced_core::InputMethod::Enabled { .. }
+        ));
+        ui.into_cache()
+    }
+
+    fn assert_real_commit_gate_fixture<W>(
+        case: &'static str,
+        widget: W,
+        target: WidgetId,
+        target_slot: Option<WidgetSlotAddress>,
+        cursor: iced::advanced::mouse::Cursor,
+        focus_id: iced::advanced::widget::Id,
+    ) where
+        W: SlipwayIcedBackendWidget<ExternalState = ()> + Clone,
+        W::LocalState: Clone,
+        W::AppMessage: Clone,
+    {
+        let runtime = SlipwayRuntime::new(widget.clone(), ());
+        let mut renderer = RecordingRenderer::default();
+        let cache = focus_commit_gate_fixture(&runtime, &mut renderer, cursor, focus_id.clone());
+        let gate = IcedNativeCommitMutationGate {
+            token: 223,
+            commit_sequence_index: 1,
+            target: target.clone(),
+            target_slot: target_slot.clone(),
+            region_id: PresentationRegionId::from("commit-gate-text"),
+        };
+        let snapshots_before =
+            ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed);
+        let carriers_before =
+            ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >::build(
+            SlipwayIcedRuntimeWidget::from_runtime(&runtime)
+                .with_iced_native_commit_mutation_gate(&gate),
+            iced::Size::new(100.0, 60.0),
+            cache,
+            &mut renderer,
+        );
+        let mut clipboard = iced::advanced::clipboard::Null;
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[iced::Event::InputMethod(
+                iced_core::input_method::Event::Commit("matrix".to_string()),
+            )],
+            iced::advanced::mouse::Cursor::Unavailable,
+            &mut renderer,
+            &mut clipboard,
+            &mut messages,
+        );
+        let mutations = messages
+            .iter()
+            .filter_map(|message| match message {
+                SlipwayIcedRuntimeMessage::NativeTextMutation(mutation) => Some(mutation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if mutations.len() != 1 {
+            let snapshots = ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed)
+                - snapshots_before;
+            let carriers = ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed)
+                - carriers_before;
+            panic!(
+                "{case}: expected one mutation, got {}; snapshots={snapshots}, carriers={carriers}, messages={}",
+                mutations.len(),
+                messages.len(),
+            );
+        }
+        if mutations[0].before == mutations[0].after {
+            panic!("{case}: mutation did not change text");
+        }
+        if !mutations[0].after.contains("matrix") {
+            panic!("{case}: committed text is absent from the after snapshot");
+        }
+        let snapshot_count = ICED_NATIVE_BEFORE_SNAPSHOTS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - snapshots_before;
+        if snapshot_count != 1 {
+            panic!("{case}: expected one before snapshot, got {snapshot_count}");
+        }
+        let carrier_count = ICED_NATIVE_MUTATION_CARRIERS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - carriers_before;
+        if carrier_count != 1 {
+            panic!("{case}: expected one mutation carrier, got {carrier_count}");
+        }
+
+        let cache = ui.into_cache();
+        let snapshots_after =
+            ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed);
+        let carriers_after =
+            ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+            SlipwayIcedRuntimeMessage,
+            iced::Theme,
+            RecordingRenderer,
+        >::build(
+            SlipwayIcedRuntimeWidget::from_runtime(&runtime),
+            iced::Size::new(100.0, 60.0),
+            cache,
+            &mut renderer,
+        );
+        let mut redraw_messages = Vec::new();
+        let _ = ui.update(
+            &[iced::Event::Window(iced::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            ))],
+            cursor,
+            &mut renderer,
+            &mut clipboard,
+            &mut redraw_messages,
+        );
+        assert_eq!(
+            ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed),
+            snapshots_after
+        );
+        assert_eq!(
+            ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed),
+            carriers_after
+        );
+
+        for nonmatching in [false, true] {
+            let runtime = SlipwayRuntime::new(widget.clone(), ());
+            let mut renderer = RecordingRenderer::default();
+            let cache =
+                focus_commit_gate_fixture(&runtime, &mut renderer, cursor, focus_id.clone());
+            let wrong_gate = IcedNativeCommitMutationGate {
+                token: 224,
+                commit_sequence_index: 1,
+                target: target.clone(),
+                target_slot: target_slot.clone(),
+                region_id: PresentationRegionId::from("wrong-commit-gate-text"),
+            };
+            let snapshots_before =
+                ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed);
+            let carriers_before =
+                ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+            let element = if nonmatching {
+                SlipwayIcedRuntimeWidget::from_runtime(&runtime)
+                    .with_iced_native_commit_mutation_gate(&wrong_gate)
+            } else {
+                SlipwayIcedRuntimeWidget::from_runtime(&runtime)
+            };
+            let mut ui = iced_winit::runtime::user_interface::UserInterface::<
+                SlipwayIcedRuntimeMessage,
+                iced::Theme,
+                RecordingRenderer,
+            >::build(
+                element, iced::Size::new(100.0, 60.0), cache, &mut renderer
+            );
+            let mut clipboard = iced::advanced::clipboard::Null;
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[iced::Event::InputMethod(
+                    iced_core::input_method::Event::Commit("ordinary".to_string()),
+                )],
+                iced::advanced::mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard,
+                &mut messages,
+            );
+            assert!(
+                messages.iter().any(|message| {
+                    matches!(message, SlipwayIcedRuntimeMessage::BackendInput(_))
+                })
+            );
+            assert!(!messages.iter().any(|message| {
+                matches!(message, SlipwayIcedRuntimeMessage::NativeTextMutation(_))
+            }));
+            assert_eq!(
+                ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed),
+                snapshots_before
+            );
+            assert_eq!(
+                ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed),
+                carriers_before
+            );
+        }
+    }
+
+    fn commit_gate_focus_id(
+        multiline: bool,
+        target: WidgetId,
+        target_slot: Option<WidgetSlotAddress>,
+    ) -> iced::advanced::widget::Id {
+        let layout_input = iced_child_layout_input(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 80.0,
+                height: 28.0,
+            },
+        });
+        let mut region = slipway_core::text_edit_focus_region_from_capability(
+            &InteractionCapabilityWidget { id: target },
+            &(),
+            &(),
+            PresentationRegionId::from("commit-gate-text"),
+            None,
+            layout_input.viewport,
+            None,
+            true,
+            &layout_input,
+            None,
+        );
+        region.address = target_slot;
+        if multiline {
+            region
+                .text_edit
+                .as_mut()
+                .expect("commit fixture is editable")
+                .line_mode = TextLineMode::MultiLine;
+            iced_text_editor_id(&region)
+        } else {
+            iced_text_input_id(&region)
+        }
+    }
+
+    #[test]
+    fn step223_commit_gate_matrix_covers_root_child_and_native_scroll_text_widgets() {
+        let root_cursor = iced::advanced::mouse::Cursor::Available(iced::Point::new(20.0, 20.0));
+        assert_real_commit_gate_fixture(
+            "root TextInput",
+            CommitGateTextWidget::<false>,
+            commit_gate_text_widget_id::<false>(),
+            None,
+            root_cursor,
+            commit_gate_focus_id(false, commit_gate_text_widget_id::<false>(), None),
+        );
+        assert_real_commit_gate_fixture(
+            "root TextEditor",
+            CommitGateTextWidget::<true>,
+            commit_gate_text_widget_id::<true>(),
+            None,
+            root_cursor,
+            commit_gate_focus_id(true, commit_gate_text_widget_id::<true>(), None),
+        );
+        assert_real_commit_gate_fixture(
+            "direct-child TextInput",
+            CommitGateParentWidget::<false, false>,
+            commit_gate_text_widget_id::<false>(),
+            Some(commit_gate_child_slot::<false, false>()),
+            root_cursor,
+            commit_gate_focus_id(
+                false,
+                commit_gate_text_widget_id::<false>(),
+                Some(commit_gate_child_slot::<false, false>()),
+            ),
+        );
+        assert_real_commit_gate_fixture(
+            "direct-child TextEditor",
+            CommitGateParentWidget::<true, false>,
+            commit_gate_text_widget_id::<true>(),
+            Some(commit_gate_child_slot::<true, false>()),
+            root_cursor,
+            commit_gate_focus_id(
+                true,
+                commit_gate_text_widget_id::<true>(),
+                Some(commit_gate_child_slot::<true, false>()),
+            ),
+        );
+        assert_real_commit_gate_fixture(
+            "native-scroll TextInput",
+            CommitGateParentWidget::<false, true>,
+            commit_gate_text_widget_id::<false>(),
+            Some(commit_gate_child_slot::<false, true>()),
+            root_cursor,
+            commit_gate_focus_id(
+                false,
+                commit_gate_text_widget_id::<false>(),
+                Some(commit_gate_child_slot::<false, true>()),
+            ),
+        );
+        assert_real_commit_gate_fixture(
+            "native-scroll TextEditor",
+            CommitGateParentWidget::<true, true>,
+            commit_gate_text_widget_id::<true>(),
+            Some(commit_gate_child_slot::<true, true>()),
+            root_cursor,
+            commit_gate_focus_id(
+                true,
+                commit_gate_text_widget_id::<true>(),
+                Some(commit_gate_child_slot::<true, true>()),
+            ),
+        );
+    }
+
+    #[test]
+    fn step223_commit_gate_source_guards_name_every_handoff() {
+        let source = include_str!("lib.rs");
+        for handoff in [
+            "update_iced_text_editor_regions_with_commit_mutation_gate",
+            "update_iced_runtime_children_with_commit_mutation_gate",
+            "iced_scrollable_widget_for_region_with_commit_mutation_gate",
+        ] {
+            assert!(source.matches(handoff).count() >= 2, "missing {handoff}");
+        }
+        assert!(source.contains("child = child.with_iced_native_commit_mutation_gate(gate)"));
+        assert!(source.contains("commit_mutation_gate: Some(gate)"));
     }
 
     #[test]
@@ -22991,6 +25960,7 @@ mod tests {
             &(),
             &Local { clicks: 0 },
             &mut child_presentation,
+            None,
             &[],
             &[],
         );

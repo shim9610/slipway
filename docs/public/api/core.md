@@ -127,11 +127,11 @@ wrapper around the adapter is ever needed — the reference example's
 in the internal admission fixture (`AdmissionRuntimeAppWidget`) is
 historical, not a requirement.
 
-Composition caution: nesting a `SlipwayAppWidget` as a CHILD of another
-app compiles and admits, but live press dispatch to the inner app's
-widgets is a known open defect on both backends (2026-07-13). Keep one
-`SlipwayAppWidget` at the root and compose plain widgets or explicit
-container widgets under it.
+Nested `SlipwayAppWidget` composition is supported on both backends. The
+mounting pass preserves the fully rooted slot address through layout, hit
+selection, backend dispatch, reducer routing, and evidence. Child views still
+declare local slot identities; do not pre-compose parent paths or flatten a
+nested app to work around routing.
 
 Authoring rule: an app with N widgets should expose N authored child widgets.
 Do not fake child widgets by painting all children inside one root view.

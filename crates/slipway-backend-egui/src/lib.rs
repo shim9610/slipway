@@ -26,18 +26,22 @@ use slipway_core::{
     TextEditKind, TextEditRegionDeclaration, TextInputEvent, TextInputVisualStyleDeclaration,
     TextMeasurementEvidence, TextSelectionRange, TextStyle, TopologyNode, TopologyProbe,
     UnsupportedCapabilityEvidence, ViewDefinition, ViewDefinitionInput, WidgetId, WidgetSlot,
-    WidgetSlotAddress, expand_paint_unit_layers, paint_unit_sort_key,
+    WidgetSlotAddress, expand_paint_unit_layers, mount_widget_slot_address, paint_unit_sort_key,
     scroll_region_from_scrollable_capability, scroll_region_from_scrollable_capability_with_order,
     text_edit_focus_region_from_capability, view_definition_contract_diagnostics_for_capabilities,
     view_definition_has_blocking_contract_diagnostic,
 };
 use slipway_debug_bridge::{
-    DebugCommand, DebugCommandKind, DebugFailure, DebugPhysicalControl, DebugReplyProduct,
-    VisibleFrameTimingRecorder,
+    CompositionPhaseProvenance, DebugCommand, DebugCommandKind, DebugCompositionCommitMutation,
+    DebugCompositionIngressObservation, DebugCompositionPhaseTrace, DebugCompositionTrace,
+    DebugControlMode, DebugControlTrace, DebugFailure, DebugPhysicalControl, DebugReplyProduct,
+    PresentedAlphaMode, PresentedCapturePath, PresentedPixels, PresentedScreenshotProduct,
+    PresentedScreenshotRefusal, PresentedScreenshotSelector, PresentedSurfaceFormat,
+    PresentedTransferFunction, VisibleFrameTimingRecorder,
 };
 use slipway_runtime::{
-    SlipwayRuntime, SlipwayRuntimeDrainBudget, SlipwayRuntimeMcpTransport,
-    SlipwayRuntimePendingNativeMcpCall,
+    DebugEguiCompositionIngressCustody, SlipwayRuntime, SlipwayRuntimeDrainBudget,
+    SlipwayRuntimeMcpTransport, SlipwayRuntimePendingNativeMcpCall,
 };
 use std::fs;
 use std::net::SocketAddr;
@@ -50,6 +54,10 @@ mod native_runner;
 
 pub const EGUI_BACKEND_ID: &str = "slipway-backend-egui";
 const EGUI_PROVIDER_SURFACE_REQUIREMENT: &str = "egui.provider_surface.native_wrapper";
+const EGUI_NATIVE_OS_INPUT_PASS: &str = "physical-input/native-os";
+const EGUI_DEBUG_INPUT_PASS: &str = "physical-input/debug-injected";
+const EGUI_DEBUG_COMPOSITION_PASS: &str = "physical-input/debug-injected/composition";
+const EGUI_CAPTURE_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Default)]
 pub struct EguiBackendAdmission;
@@ -360,6 +368,53 @@ pub trait SlipwayEguiWidgetListVisitor<ExternalState, AppMessage> {
         slot: WidgetSlotAddress,
     ) where
         N: SlipwayEguiNativeChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>;
+}
+
+struct EguiMountedVisitor<'a, V> {
+    mounted_parent: Option<&'a WidgetSlotAddress>,
+    visitor: &'a mut V,
+}
+
+impl<V> EguiMountedVisitor<'_, V> {
+    fn mount(&self, slot: WidgetSlotAddress) -> WidgetSlotAddress {
+        match self.mounted_parent {
+            Some(parent) => mount_widget_slot_address(slot, parent),
+            None => slot,
+        }
+    }
+}
+
+impl<ExternalState, AppMessage, V> SlipwayEguiWidgetListVisitor<ExternalState, AppMessage>
+    for EguiMountedVisitor<'_, V>
+where
+    V: SlipwayEguiWidgetListVisitor<ExternalState, AppMessage>,
+{
+    fn visit_egui_child<W>(
+        &mut self,
+        widget: &W,
+        external: &ExternalState,
+        local: &W::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        W: SlipwayEguiBackendChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+        let slot = self.mount(slot);
+        self.visitor.visit_egui_child(widget, external, local, slot);
+    }
+
+    fn visit_egui_native_child<N>(
+        &mut self,
+        widget: &N,
+        external: &ExternalState,
+        local: &N::LocalState,
+        slot: WidgetSlotAddress,
+    ) where
+        N: SlipwayEguiNativeChildWidget<ExternalState = ExternalState, AppMessage = AppMessage>,
+    {
+        let slot = self.mount(slot);
+        self.visitor
+            .visit_egui_native_child(widget, external, local, slot);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1081,6 +1136,41 @@ impl<W> SlipwayEguiBackendContract for W where
 {
 }
 
+fn visit_egui_authored_children_mounted<W, V>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    mounted_parent: Option<&WidgetSlotAddress>,
+    visitor: &mut V,
+) where
+    W: SlipwayEguiBackendChildWidget,
+    V: SlipwayEguiWidgetListVisitor<W::ExternalState, W::AppMessage>,
+{
+    let mut mounted = EguiMountedVisitor {
+        mounted_parent,
+        visitor,
+    };
+    widget.visit_egui_authored_children(external, local, &mut mounted);
+}
+
+fn visit_egui_authored_children_in_paint_order_mounted<W, V>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    parent_view: &ViewDefinition,
+    mounted_parent: Option<&WidgetSlotAddress>,
+    visitor: &mut V,
+) where
+    W: SlipwayEguiBackendChildWidget,
+    V: SlipwayEguiWidgetListVisitor<W::ExternalState, W::AppMessage>,
+{
+    let mut mounted = EguiMountedVisitor {
+        mounted_parent,
+        visitor,
+    };
+    widget.visit_egui_authored_children_in_paint_order(external, local, parent_view, &mut mounted);
+}
+
 impl<A> SlipwayEguiAuthoredChildren for slipway_core::SlipwayAppWidget<A>
 where
     A: slipway_core::SlipwayApp,
@@ -1279,6 +1369,121 @@ fn egui_raw_input_snapshot(ui: &egui::Ui) -> EguiRawInputSnapshot {
     })
 }
 
+fn egui_raw_event_source(
+    span: Option<eframe::egui_winit::SlipwayDebugInputSpan>,
+    composition: bool,
+    event_index: usize,
+    event: &egui::Event,
+) -> EvidenceSource {
+    let in_debug_span = span.is_some_and(|span| {
+        span.start_event_index <= event_index && event_index < span.end_event_index
+    });
+    let pass = if !in_debug_span {
+        EGUI_NATIVE_OS_INPUT_PASS
+    } else if composition && matches!(event, egui::Event::Ime(_)) {
+        EGUI_DEBUG_COMPOSITION_PASS
+    } else {
+        EGUI_DEBUG_INPUT_PASS
+    };
+    EvidenceSource::backend_presented(EGUI_BACKEND_ID, pass)
+}
+
+fn egui_accepted_composition_commit_key(
+    events: &[egui::Event],
+    span: Option<eframe::egui_winit::SlipwayDebugInputSpan>,
+    composition: bool,
+    operation: Option<&DebugPhysicalControl>,
+) -> Option<(EguiAcceptedCommitKey, usize)> {
+    if !composition {
+        return None;
+    }
+    let span = span?;
+    let DebugPhysicalControl::TextComposition {
+        updates, commit, ..
+    } = operation?
+    else {
+        return None;
+    };
+    let event_count = updates.len().checked_add(1)?;
+    if span.token == 0
+        || span.end_event_index.checked_sub(span.start_event_index) != Some(event_count)
+        || span.end_event_index > events.len()
+    {
+        return None;
+    }
+    if events.iter().enumerate().any(|(index, event)| {
+        (index < span.start_event_index || index >= span.end_event_index)
+            && egui_event_may_mutate_focused_text(event)
+    }) {
+        return None;
+    }
+    for (ordinal, event) in events[span.start_event_index..span.end_event_index]
+        .iter()
+        .enumerate()
+    {
+        let matches_request = if let Some(update) = updates.get(ordinal) {
+            matches!(
+                event,
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text,
+                    active_range_chars,
+                }) if text == &update.preedit_text
+                    && active_range_chars.as_ref().map(|range| TextSelectionRange {
+                        anchor: range.start,
+                        focus: range.end,
+                    }) == update.cursor_range
+            )
+        } else {
+            matches!(event, egui::Event::Ime(egui::ImeEvent::Commit(text)) if text == commit)
+        };
+        if !matches_request {
+            return None;
+        }
+    }
+    let event_index = span.end_event_index.checked_sub(1)?;
+    Some((
+        EguiAcceptedCommitKey {
+            token: span.token,
+            start_event_index: span.start_event_index,
+            end_event_index: span.end_event_index,
+            event_index,
+        },
+        event_count,
+    ))
+}
+
+fn egui_event_may_mutate_focused_text(event: &egui::Event) -> bool {
+    match event {
+        egui::Event::Key { pressed, .. } => *pressed,
+        egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut => true,
+        egui::Event::Ime(egui::ImeEvent::Commit(_)) => true,
+        egui::Event::Copy
+        | egui::Event::PointerMoved(_)
+        | egui::Event::MouseMoved(_)
+        | egui::Event::PointerButton { .. }
+        | egui::Event::PointerGone
+        | egui::Event::Zoom(_)
+        | egui::Event::Rotate(_)
+        | egui::Event::MouseWheel { .. }
+        | egui::Event::WindowFocused(_)
+        | egui::Event::AccessKitActionRequest(_)
+        | egui::Event::Screenshot { .. }
+        | egui::Event::Ime(_)
+        | egui::Event::Touch { .. } => false,
+    }
+}
+
+fn push_egui_backend_input_with_source(
+    events: &mut Vec<BackendInputEvent>,
+    mut event: BackendInputEvent,
+    source: EvidenceSource,
+) {
+    if let Some(evidence) = event.dispatch_evidence.as_mut() {
+        evidence.source = source;
+    }
+    events.push(event);
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum EguiPresentedRegionKind {
     Hit,
@@ -1347,6 +1552,44 @@ pub struct EguiPresentedRegion {
     pub blocks_wheel: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct EguiCompositionPreflight {
+    target: WidgetId,
+    target_slot: Option<WidgetSlotAddress>,
+    selected_region: PresentationRegionId,
+    focused: bool,
+    editable: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct EguiNativeTextMutationEvidence {
+    target: WidgetId,
+    target_slot: Option<WidgetSlotAddress>,
+    selected_region: PresentationRegionId,
+    before: String,
+    after: String,
+    commit: EguiAcceptedCommitKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct EguiAcceptedCompositionEvent {
+    token: u64,
+    start_event_index: usize,
+    end_event_index: usize,
+    event_index: usize,
+    phase: TextCompositionPhase,
+    dispatch_ordinal: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EguiAcceptedCommitKey {
+    token: u64,
+    start_event_index: usize,
+    end_event_index: usize,
+    event_index: usize,
+}
+
 /// Egui-facing context used to translate Slipway paint declarations into egui paint calls.
 pub struct EguiPaintContext<'a> {
     pub ui: &'a egui::Ui,
@@ -1380,6 +1623,25 @@ pub trait EguiSlipwayBridge<W: SlipwayAuthoredWidget> {
     fn paint(&mut self, context: EguiPaintContext<'_>, ops: &[PaintOp]);
 
     fn messages(&mut self, outcome: EventOutcome<W::AppMessage>) -> Vec<W::AppMessage>;
+
+    fn set_slipway_debug_input_span(
+        &mut self,
+        _span: Option<eframe::egui_winit::SlipwayDebugInputSpan>,
+        _composition: bool,
+    ) {
+    }
+
+    fn take_slipway_composition_preflight(&mut self) -> Option<EguiCompositionPreflight> {
+        None
+    }
+
+    fn take_slipway_native_text_mutation(&mut self) -> Option<EguiNativeTextMutationEvidence> {
+        None
+    }
+
+    fn drain_slipway_accepted_composition_events(&mut self) -> Vec<EguiAcceptedCompositionEvent> {
+        Vec::new()
+    }
 
     fn visible_admission_refused(&mut self, _admission: BackendParityAdmission) {}
 
@@ -1442,6 +1704,11 @@ pub struct DefaultEguiBridge {
     indicator_drag: Option<EguiIndicatorDragState>,
     refused_admissions: Vec<BackendParityAdmission>,
     dispatch_refusals: Vec<slipway_core::DeclaredEventDispatchEvidence>,
+    debug_input_span: Option<eframe::egui_winit::SlipwayDebugInputSpan>,
+    debug_composition: bool,
+    composition_preflight: Option<EguiCompositionPreflight>,
+    native_text_mutation: Option<EguiNativeTextMutationEvidence>,
+    accepted_composition_events: Vec<EguiAcceptedCompositionEvent>,
 }
 
 impl DefaultEguiBridge {
@@ -1470,6 +1737,27 @@ impl<W> EguiSlipwayBridge<W> for DefaultEguiBridge
 where
     W: SlipwayEguiBackendChildWidget,
 {
+    fn set_slipway_debug_input_span(
+        &mut self,
+        span: Option<eframe::egui_winit::SlipwayDebugInputSpan>,
+        composition: bool,
+    ) {
+        self.debug_input_span = span;
+        self.debug_composition = composition;
+    }
+
+    fn take_slipway_composition_preflight(&mut self) -> Option<EguiCompositionPreflight> {
+        self.composition_preflight.take()
+    }
+
+    fn take_slipway_native_text_mutation(&mut self) -> Option<EguiNativeTextMutationEvidence> {
+        self.native_text_mutation.take()
+    }
+
+    fn drain_slipway_accepted_composition_events(&mut self) -> Vec<EguiAcceptedCompositionEvent> {
+        std::mem::take(&mut self.accepted_composition_events)
+    }
+
     fn layout_input(&mut self, context: EguiLayoutContext<'_>) -> LayoutInput {
         let width = context.available_size.x.max(0.0);
         let height = context.available_size.y.max(0.0);
@@ -1500,12 +1788,44 @@ where
         let mut events = Vec::new();
         let root_target = context.widget_id.clone();
         let raw_input = egui_raw_input_snapshot(context.ui);
+        self.composition_preflight = None;
+        self.native_text_mutation = None;
+        self.accepted_composition_events.clear();
+        let accepted_commit = egui_accepted_composition_commit_key(
+            &raw_input.events,
+            self.debug_input_span,
+            self.debug_composition,
+            context.native_physical_operation,
+        );
+        if let Some((_, event_count)) = accepted_commit {
+            self.accepted_composition_events = Vec::with_capacity(event_count);
+        }
+        if let Some(DebugPhysicalControl::TextComposition { selector, .. }) =
+            context.native_physical_operation
+            && let Some(region) =
+                egui_text_edit_region_for_native_selector(context.regions, selector)
+        {
+            self.composition_preflight = Some(EguiCompositionPreflight {
+                target: region.target.clone(),
+                target_slot: region.address.clone(),
+                selected_region: region.region_id.clone(),
+                focused: region.response.has_focus(),
+                editable: region.enabled
+                    && region.response.enabled()
+                    && region.response.sense.is_focusable(),
+            });
+        }
         let has_mouse_wheel = raw_input
             .events
             .iter()
             .any(|event| matches!(event, egui::Event::MouseWheel { .. }));
 
         for region in context.regions {
+            let native_effect_source = if context.native_physical_operation.is_some() {
+                EvidenceSource::backend_presented(EGUI_BACKEND_ID, EGUI_DEBUG_INPUT_PASS)
+            } else {
+                EvidenceSource::backend_presented(EGUI_BACKEND_ID, EGUI_NATIVE_OS_INPUT_PASS)
+            };
             if region.response.gained_focus() {
                 self.focused_target = Some(region.target.clone());
                 let event = InputEvent::Focus(slipway_core::FocusEvent {
@@ -1513,12 +1833,16 @@ where
                     target_slot: region.address.clone(),
                     focused: true,
                 });
-                events.push(egui_focus_backend_input_event(
-                    &context,
-                    region,
-                    DeclaredEventDispatchKind::Focus,
-                    event,
-                ));
+                push_egui_backend_input_with_source(
+                    &mut events,
+                    egui_focus_backend_input_event(
+                        &context,
+                        region,
+                        DeclaredEventDispatchKind::Focus,
+                        event,
+                    ),
+                    native_effect_source.clone(),
+                );
             }
 
             if region.response.lost_focus() {
@@ -1530,12 +1854,16 @@ where
                     target_slot: region.address.clone(),
                     focused: false,
                 });
-                events.push(egui_focus_backend_input_event(
-                    &context,
-                    region,
-                    DeclaredEventDispatchKind::Focus,
-                    event,
-                ));
+                push_egui_backend_input_with_source(
+                    &mut events,
+                    egui_focus_backend_input_event(
+                        &context,
+                        region,
+                        DeclaredEventDispatchKind::Focus,
+                        event,
+                    ),
+                    native_effect_source.clone(),
+                );
             }
 
             if region.response.clicked() && egui_region_can_request_focus(region) {
@@ -1544,6 +1872,13 @@ where
             }
 
             if let Some(change) = &region.text_edit_change {
+                let text_change_source = if self.debug_composition
+                    && self.debug_input_span.is_some()
+                {
+                    EvidenceSource::backend_presented(EGUI_BACKEND_ID, EGUI_DEBUG_COMPOSITION_PASS)
+                } else {
+                    native_effect_source.clone()
+                };
                 let event = InputEvent::TextEdit(TextEditEvent {
                     target: region.target.clone(),
                     target_slot: region.address.clone(),
@@ -1552,12 +1887,41 @@ where
                     selection_before: change.selection_before.clone(),
                     selection_after: change.selection_after.clone(),
                 });
-                events.push(egui_focus_backend_input_event(
-                    &context,
-                    region,
-                    DeclaredEventDispatchKind::Text,
-                    event,
-                ));
+                if let Some((commit, _)) = accepted_commit
+                    && self
+                        .composition_preflight
+                        .as_ref()
+                        .is_some_and(|preflight| {
+                            preflight.target == region.target
+                                && preflight.target_slot == region.address
+                                && preflight.selected_region == region.region_id
+                                && preflight.focused == region.response.has_focus()
+                                && preflight.editable
+                                    == (region.enabled
+                                        && region.response.enabled()
+                                        && region.response.sense.is_focusable())
+                        })
+                    && change.before != change.after
+                {
+                    self.native_text_mutation = Some(EguiNativeTextMutationEvidence {
+                        target: region.target.clone(),
+                        target_slot: region.address.clone(),
+                        selected_region: region.region_id.clone(),
+                        before: change.before.clone(),
+                        after: change.after.clone(),
+                        commit,
+                    });
+                }
+                push_egui_backend_input_with_source(
+                    &mut events,
+                    egui_focus_backend_input_event(
+                        &context,
+                        region,
+                        DeclaredEventDispatchKind::Text,
+                        event,
+                    ),
+                    text_change_source,
+                );
             }
 
             if let Some(scroll) = &region.scroll_state
@@ -1579,18 +1943,32 @@ where
                         }),
                     });
                     if let Some(event) = egui_scroll_backend_input_event(&context, region, event) {
-                        events.push(event);
+                        push_egui_backend_input_with_source(
+                            &mut events,
+                            event,
+                            native_effect_source.clone(),
+                        );
                     }
                 }
             }
         }
 
         let mut focus_request_after_input = None;
-        let focused_native_text_edit = context.native_physical_operation.is_none()
+        let focused_native_text_edit = (context.native_physical_operation.is_none()
+            || matches!(
+                context.native_physical_operation,
+                Some(DebugPhysicalControl::TextComposition { .. })
+            ))
             && focused_region(context.regions, self.focused_target.as_ref())
                 .is_some_and(|region| region.kind == EguiPresentedRegionKind::TextEdit);
 
-        for event in &raw_input.events {
+        for (event_index, event) in raw_input.events.iter().enumerate() {
+            let event_source = egui_raw_event_source(
+                self.debug_input_span,
+                self.debug_composition,
+                event_index,
+                event,
+            );
             match event {
                 egui::Event::PointerMoved(position) => {
                     // Active declared-indicator thumb drag (Step 212): the
@@ -1607,7 +1985,11 @@ where
                                     && let Some(event) =
                                         egui_scroll_backend_input_event(&context, region, event)
                                 {
-                                    events.push(event);
+                                    push_egui_backend_input_with_source(
+                                        &mut events,
+                                        event,
+                                        event_source.clone(),
+                                    );
                                 }
                             }
                             None => {
@@ -1631,7 +2013,11 @@ where
                             egui_pointer_details(raw_input.modifiers, self.pointer_capture_button),
                             true,
                         ) {
-                            events.push(event);
+                            push_egui_backend_input_with_source(
+                                &mut events,
+                                event,
+                                event_source.clone(),
+                            );
                         }
                         continue;
                     }
@@ -1653,7 +2039,11 @@ where
                                     egui_pointer_details(raw_input.modifiers, None),
                                     false,
                                 ) {
-                                    events.push(event);
+                                    push_egui_backend_input_with_source(
+                                        &mut events,
+                                        event,
+                                        event_source.clone(),
+                                    );
                                 }
                             }
                         }
@@ -1668,7 +2058,11 @@ where
                                 egui_pointer_details(raw_input.modifiers, None),
                                 false,
                             ) {
-                                events.push(event);
+                                push_egui_backend_input_with_source(
+                                    &mut events,
+                                    event,
+                                    event_source.clone(),
+                                );
                             }
                         }
                         self.hovered_region = next_hovered;
@@ -1684,7 +2078,11 @@ where
                             egui_pointer_details(raw_input.modifiers, None),
                             false,
                         ) {
-                            events.push(event);
+                            push_egui_backend_input_with_source(
+                                &mut events,
+                                event,
+                                event_source.clone(),
+                            );
                         }
                     }
                 }
@@ -1721,7 +2119,11 @@ where
                             && let Some(event) =
                                 egui_scroll_backend_input_event(&context, region, event)
                         {
-                            events.push(event);
+                            push_egui_backend_input_with_source(
+                                &mut events,
+                                event,
+                                event_source.clone(),
+                            );
                         }
                         self.indicator_drag = Some(drag);
                         continue;
@@ -1741,7 +2143,11 @@ where
                                 egui_pointer_details(raw_input.modifiers, Some(*button)),
                                 false,
                             ) {
-                                events.push(event);
+                                push_egui_backend_input_with_source(
+                                    &mut events,
+                                    event,
+                                    event_source.clone(),
+                                );
                             }
                             self.pointer_capture_region = None;
                             self.pointer_capture_button = None;
@@ -1759,18 +2165,19 @@ where
                         if let Some(occlusion) =
                             egui_occlusion_region_at_position(context.regions, *pos)
                         {
-                            self.dispatch_refusals
-                                .push(egui_blocked_pointer_refusal_evidence(
-                                    &context,
-                                    occlusion,
-                                    *pos,
-                                    if *pressed {
-                                        PointerEventKind::Press
-                                    } else {
-                                        PointerEventKind::Release
-                                    },
-                                    Some(egui_pointer_button(*button)),
-                                ));
+                            let mut refusal = egui_blocked_pointer_refusal_evidence(
+                                &context,
+                                occlusion,
+                                *pos,
+                                if *pressed {
+                                    PointerEventKind::Press
+                                } else {
+                                    PointerEventKind::Release
+                                },
+                                Some(egui_pointer_button(*button)),
+                            );
+                            refusal.source = event_source.clone();
+                            self.dispatch_refusals.push(refusal);
                         }
                         continue;
                     };
@@ -1806,7 +2213,11 @@ where
                             self.pointer_capture_region = Some(region.region_id.clone());
                             self.pointer_capture_button = Some(*button);
                         }
-                        events.push(event);
+                        push_egui_backend_input_with_source(
+                            &mut events,
+                            event,
+                            event_source.clone(),
+                        );
                     }
                 }
                 egui::Event::PointerGone => {
@@ -1834,7 +2245,11 @@ where
                             egui_pointer_details(raw_input.modifiers, None),
                             false,
                         ) {
-                            events.push(event);
+                            push_egui_backend_input_with_source(
+                                &mut events,
+                                event,
+                                event_source.clone(),
+                            );
                         }
                     }
                     self.pointer_capture_region = None;
@@ -1861,7 +2276,11 @@ where
                         DeclaredEventDispatchKind::Text,
                         event,
                     ) {
-                        events.push(event);
+                        push_egui_backend_input_with_source(
+                            &mut events,
+                            event,
+                            event_source.clone(),
+                        );
                     }
                 }
                 egui::Event::Paste(text)
@@ -1883,7 +2302,11 @@ where
                         DeclaredEventDispatchKind::Text,
                         event,
                     ) {
-                        events.push(event);
+                        push_egui_backend_input_with_source(
+                            &mut events,
+                            event,
+                            event_source.clone(),
+                        );
                     }
                 }
                 egui::Event::Key {
@@ -1923,7 +2346,11 @@ where
                         DeclaredEventDispatchKind::Keyboard,
                         event,
                     ) {
-                        events.push(event);
+                        push_egui_backend_input_with_source(
+                            &mut events,
+                            event,
+                            event_source.clone(),
+                        );
                     }
                 }
                 egui::Event::Ime(ime) if self.focused_target.is_some() => {
@@ -1946,17 +2373,48 @@ where
                             DeclaredEventDispatchKind::Text,
                             event,
                         ) {
-                            events.push(event);
+                            push_egui_backend_input_with_source(
+                                &mut events,
+                                event,
+                                event_source.clone(),
+                            );
                         }
                     }
-                    if let Some(event) = egui_composition_event(Some(target), target_slot, ime) {
+                    if let Some(composition_event) =
+                        egui_composition_event(Some(target), target_slot, ime)
+                    {
                         if let Some(event) = egui_focused_backend_input_event(
                             &context,
                             self.focused_target.as_ref(),
                             DeclaredEventDispatchKind::Text,
-                            InputEvent::TextComposition(event),
+                            InputEvent::TextComposition(composition_event.clone()),
                         ) {
-                            events.push(event);
+                            let dispatch_ordinal = events.len();
+                            push_egui_backend_input_with_source(
+                                &mut events,
+                                event,
+                                event_source.clone(),
+                            );
+                            if let Some(span) = self.debug_input_span
+                                && accepted_commit.is_some()
+                                && span.start_event_index <= event_index
+                                && event_index < span.end_event_index
+                                && matches!(
+                                    composition_event.phase,
+                                    TextCompositionPhase::Update | TextCompositionPhase::Commit
+                                )
+                            {
+                                self.accepted_composition_events.push(
+                                    EguiAcceptedCompositionEvent {
+                                        token: span.token,
+                                        start_event_index: span.start_event_index,
+                                        end_event_index: span.end_event_index,
+                                        event_index,
+                                        phase: composition_event.phase,
+                                        dispatch_ordinal,
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -1964,6 +2422,7 @@ where
                     let Some(position) = raw_input.hover_pos else {
                         continue;
                     };
+                    let refusal_start = self.dispatch_refusals.len();
                     if let Some(event) = egui_backend_wheel_input_event(
                         &context,
                         position,
@@ -1971,7 +2430,14 @@ where
                         delta.y,
                         &mut self.dispatch_refusals,
                     ) {
-                        events.push(event);
+                        push_egui_backend_input_with_source(
+                            &mut events,
+                            event,
+                            event_source.clone(),
+                        );
+                    }
+                    for refusal in &mut self.dispatch_refusals[refusal_start..] {
+                        refusal.source = event_source.clone();
                     }
                 }
                 egui::Event::Copy if self.focused_target.is_some() => {
@@ -1993,7 +2459,11 @@ where
                         DeclaredEventDispatchKind::Command,
                         event,
                     ) {
-                        events.push(event);
+                        push_egui_backend_input_with_source(
+                            &mut events,
+                            event,
+                            event_source.clone(),
+                        );
                     }
                 }
                 egui::Event::Cut if self.focused_target.is_some() => {
@@ -2015,7 +2485,11 @@ where
                         DeclaredEventDispatchKind::Command,
                         event,
                     ) {
-                        events.push(event);
+                        push_egui_backend_input_with_source(
+                            &mut events,
+                            event,
+                            event_source.clone(),
+                        );
                     }
                 }
                 _ => {}
@@ -2421,11 +2895,13 @@ where
             );
         }
         let presentation_region_start = Instant::now();
+        let root_slot = WidgetSlotAddress::new(self.widget.id(), 0);
         let mut regions = allocate_presentation_regions_with_timing(
             ui,
             self.widget,
             self.external,
             self.local,
+            Some(&root_slot),
             rect.min,
             &view,
             &geometry_index,
@@ -2448,12 +2924,13 @@ where
             regions.len(),
         );
         let child_presentation_start = Instant::now();
-        let authored_children = present_authored_children(
+        let authored_children = present_authored_children_mounted(
             ui,
             self.widget,
             self.external,
             self.local,
             &view,
+            Some(&root_slot),
             &geometry_index,
             rect.min,
             &child_assembly.claimed_slots,
@@ -2688,12 +3165,14 @@ where
             &mut child_assembly,
             None,
         );
-        let authored_children = present_authored_children(
+        let root_slot = WidgetSlotAddress::new(self.widget.id(), 0);
+        let authored_children = present_authored_children_mounted(
             ui,
             self.widget,
             self.external,
             self.local,
             &view,
+            Some(&root_slot),
             &geometry_index,
             rect.min,
             &child_assembly.claimed_slots,
@@ -2906,7 +3385,10 @@ where
 
     eframe::run_native(
         &title,
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            renderer: eframe::Renderer::Wgpu,
+            ..Default::default()
+        },
         Box::new(|_creation_context| Ok(Box::new(app))),
     )
 }
@@ -2952,10 +3434,18 @@ where
     sense: egui::Sense,
     debug_mcp_transport: Option<SlipwayRuntimeMcpTransport>,
     egui_mcp_wake_rx: Option<mpsc::Receiver<()>>,
+    native_mcp_wake_pending: bool,
     pending_native_physical: Option<PendingEguiNativePhysicalControl>,
+    pending_presented_capture: Option<PendingEguiPresentedCapture>,
+    native_debug_proxy: Option<eframe::NativeDebugProxy>,
+    next_native_debug_token: u64,
+    last_successfully_presented: Option<FrameIdentity>,
+    rendered_frame_candidate: Option<FrameIdentity>,
     root_scroll_offset: egui::Vec2,
     frame_timing: VisibleFrameTimingRecorder,
     native_create_started_at: Option<Instant>,
+    #[cfg(test)]
+    live_continuous_repaint: bool,
     /// Most recent dispatch refusal drained THIS frame (None when the frame
     /// drained none). Feeds the post-hoc diagnosis attached to the no-match
     /// physical-control failure (audit finding MF-H5).
@@ -2964,10 +3454,72 @@ where
 
 enum PendingEguiNativePhysicalControl {
     WaitingForDebugLease(SlipwayRuntimePendingNativeMcpCall),
-    WaitingForBackendTrace {
+    WaitingForCompositionPreflight {
         pending: SlipwayRuntimePendingNativeMcpCall,
         lease: slipway_debug_bridge::DebugCommandLease,
     },
+    WaitingForIngress {
+        pending: SlipwayRuntimePendingNativeMcpCall,
+        lease: slipway_debug_bridge::DebugCommandLease,
+        token: u64,
+        composition: Option<PendingEguiComposition>,
+    },
+    WaitingForBackendTrace {
+        pending: SlipwayRuntimePendingNativeMcpCall,
+        lease: slipway_debug_bridge::DebugCommandLease,
+        origin: PendingEguiTraceOrigin,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct PendingEguiComposition {
+    preflight: EguiCompositionPreflight,
+}
+
+#[derive(Clone, Debug)]
+enum PendingEguiTraceOrigin {
+    BackendNativeMutation,
+    DebugInput {
+        token: u64,
+        span: eframe::egui_winit::SlipwayDebugInputSpan,
+    },
+    DebugComposition {
+        token: u64,
+        span: eframe::egui_winit::SlipwayDebugInputSpan,
+        composition: PendingEguiComposition,
+    },
+}
+
+struct PendingEguiPresentedCapture {
+    pending: SlipwayRuntimePendingNativeMcpCall,
+    lease: slipway_debug_bridge::DebugCommandLease,
+    token: u64,
+    selector: PresentedScreenshotSelector,
+    event_rx: mpsc::Receiver<egui_wgpu::winit::DirectCaptureEvent>,
+    deadline: Instant,
+    post_presented_candidate: Option<FrameIdentity>,
+    post_presented_frame: Option<FrameIdentity>,
+    presented: Option<EguiPresentedCaptureMeta>,
+    mapped: Option<Arc<[u8]>>,
+}
+
+struct EguiPresentedCaptureMeta {
+    format: PresentedSurfaceFormat,
+    transfer: PresentedTransferFunction,
+    alpha: PresentedAlphaMode,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone)]
+struct EguiDirectCaptureWake {
+    proxy: eframe::NativeDebugProxy,
+}
+
+impl egui_wgpu::winit::DirectCaptureWake for EguiDirectCaptureWake {
+    fn wake(&self, token: u64) {
+        let _ = self.proxy.wake(egui::ViewportId::ROOT, token);
+    }
 }
 
 impl<W, B, F> SlipwayEguiRuntimeApp<W, B, F>
@@ -2985,10 +3537,18 @@ where
             sense: egui::Sense::hover(),
             debug_mcp_transport: None,
             egui_mcp_wake_rx: None,
+            native_mcp_wake_pending: false,
             pending_native_physical: None,
+            pending_presented_capture: None,
+            native_debug_proxy: None,
+            next_native_debug_token: 1,
+            last_successfully_presented: None,
+            rendered_frame_candidate: None,
             root_scroll_offset: egui::Vec2::ZERO,
             frame_timing: VisibleFrameTimingRecorder::from_env("egui"),
             native_create_started_at: None,
+            #[cfg(test)]
+            live_continuous_repaint: false,
             last_frame_dispatch_refusal: None,
         }
     }
@@ -3054,23 +3614,125 @@ where
         }
     }
 
-    fn inject_pending_native_physical_into_raw_input(
+    fn install_native_debug_proxy(&mut self, proxy: eframe::NativeDebugProxy) {
+        self.native_debug_proxy = Some(proxy);
+    }
+
+    fn next_native_debug_token(&mut self) -> u64 {
+        let token = self.next_native_debug_token;
+        self.next_native_debug_token = self.next_native_debug_token.wrapping_add(1).max(1);
+        token
+    }
+
+    fn complete_native_request(
+        pending: SlipwayRuntimePendingNativeMcpCall,
+        lease: slipway_debug_bridge::DebugCommandLease,
+        product: DebugReplyProduct,
+    ) -> Result<(), String> {
+        lease
+            .complete(product)
+            .map_err(|error| format!("{error:?}"))?;
+        pending
+            .try_finish_and_respond()
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(())
+    }
+
+    fn complete_native_refusal(
+        pending: SlipwayRuntimePendingNativeMcpCall,
+        lease: slipway_debug_bridge::DebugCommandLease,
+        code: &str,
+        message: impl Into<String>,
+    ) -> Result<(), String> {
+        Self::complete_native_request(
+            pending,
+            lease,
+            DebugReplyProduct::Error(DebugFailure {
+                code: code.to_string(),
+                message: message.into(),
+                dispatch_evidence: None,
+            }),
+        )
+    }
+
+    fn consume_slipway_debug_notice(
         &mut self,
-        raw_input: &mut egui::RawInput,
-    ) -> (usize, Option<String>) {
+        notice: Option<&eframe::egui_winit::SlipwayDebugInputNotice>,
+    ) -> Option<String> {
+        let Some(notice) = notice.copied() else {
+            return None;
+        };
+        let Some(state) = self.pending_native_physical.take() else {
+            return None;
+        };
+        let PendingEguiNativePhysicalControl::WaitingForIngress {
+            pending,
+            lease,
+            token,
+            composition,
+        } = state
+        else {
+            self.pending_native_physical = Some(state);
+            return None;
+        };
+
+        match notice {
+            eframe::egui_winit::SlipwayDebugInputNotice::Accepted(span) if span.token == token => {
+                let origin = match composition {
+                    Some(composition) => PendingEguiTraceOrigin::DebugComposition {
+                        token,
+                        span,
+                        composition,
+                    },
+                    None => PendingEguiTraceOrigin::DebugInput { token, span },
+                };
+                self.pending_native_physical =
+                    Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                        pending,
+                        lease,
+                        origin,
+                    });
+                None
+            }
+            eframe::egui_winit::SlipwayDebugInputNotice::Refused {
+                token: refused,
+                error,
+            } if refused == token => Self::complete_native_refusal(
+                pending,
+                lease,
+                "native-physical-control-egui-ingress-refused",
+                format!("egui-winit refused request-scoped native ingress: {error:?}"),
+            )
+            .err(),
+            _ => {
+                self.pending_native_physical =
+                    Some(PendingEguiNativePhysicalControl::WaitingForIngress {
+                        pending,
+                        lease,
+                        token,
+                        composition,
+                    });
+                None
+            }
+        }
+    }
+
+    fn intake_pending_native_command(&mut self, ctx: &egui::Context) -> (usize, Option<String>) {
         self.runtime.record_presenting_backend(EGUI_BACKEND_ID);
+        if self.pending_presented_capture.is_some() {
+            return (0, None);
+        }
         let mut drained = 0usize;
         loop {
             let pending = match self.pending_native_physical.take() {
-                Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
-                    pending,
-                    lease,
-                }) => {
-                    self.pending_native_physical =
-                        Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
-                            pending,
-                            lease,
-                        });
+                Some(
+                    state @ PendingEguiNativePhysicalControl::WaitingForCompositionPreflight {
+                        ..
+                    },
+                )
+                | Some(state @ PendingEguiNativePhysicalControl::WaitingForIngress { .. })
+                | Some(state @ PendingEguiNativePhysicalControl::WaitingForBackendTrace { .. }) => {
+                    self.pending_native_physical = Some(state);
                     break;
                 }
                 Some(PendingEguiNativePhysicalControl::WaitingForDebugLease(pending)) => pending,
@@ -3102,6 +3764,13 @@ where
             };
 
             let command = lease.command().clone();
+            if matches!(command.kind, DebugCommandKind::Screenshot { .. }) {
+                if let Err(error) = self.arm_presented_capture(pending, lease) {
+                    return (drained, Some(error));
+                }
+                break;
+            }
+
             let DebugCommandKind::PhysicalControl { operation, .. } = &command.kind else {
                 let product = self
                     .runtime
@@ -3115,54 +3784,501 @@ where
                 continue;
             };
 
+            if matches!(operation, DebugPhysicalControl::TextComposition { .. }) {
+                self.pending_native_physical = Some(
+                    PendingEguiNativePhysicalControl::WaitingForCompositionPreflight {
+                        pending,
+                        lease,
+                    },
+                );
+                break;
+            }
+
             let plan = match native_runner::egui_events_for_native_physical_operation(
-                operation, raw_input,
+                operation,
+                ctx.pixels_per_point(),
             ) {
                 Ok(plan) => plan,
                 Err(unsupported) => {
-                    let product = DebugReplyProduct::Error(DebugFailure {
-                        code: unsupported.code.to_string(),
-                        message: unsupported.message.to_string(),
-                        dispatch_evidence: None,
-                    });
-                    if let Err(error) = lease.complete(product) {
-                        return (drained, Some(format!("{error:?}")));
-                    }
-                    if let Err(error) = pending.try_finish_and_respond() {
-                        return (drained, Some(format!("{error:?}")));
+                    if let Err(error) = Self::complete_native_refusal(
+                        pending,
+                        lease,
+                        unsupported.code,
+                        unsupported.message,
+                    ) {
+                        return (drained, Some(error));
                     }
                     continue;
                 }
             };
 
             match plan {
-                native_runner::NativePhysicalControlPlan::RawInputEvents(events) => {
+                native_runner::NativePhysicalControlPlan::Input(events) => {
                     if events.is_empty() {
-                        let product = DebugReplyProduct::Error(DebugFailure {
-                            code: "native-physical-control-empty-events".to_string(),
-                            message: "egui native physical conversion produced no RawInput events"
-                                .to_string(),
-                            dispatch_evidence: None,
-                        });
-                        if let Err(error) = lease.complete(product) {
-                            return (drained, Some(format!("{error:?}")));
-                        }
-                        if let Err(error) = pending.try_finish_and_respond() {
-                            return (drained, Some(format!("{error:?}")));
+                        if let Err(error) = Self::complete_native_refusal(
+                            pending,
+                            lease,
+                            "native-physical-control-empty-events",
+                            "egui native physical conversion produced no native ingress events",
+                        ) {
+                            return (drained, Some(error));
                         }
                         continue;
                     }
-                    raw_input.events.extend(events);
+                    let Some(proxy) = self.native_debug_proxy.clone() else {
+                        if let Err(error) = Self::complete_native_refusal(
+                            pending,
+                            lease,
+                            "native-physical-control-window-unavailable",
+                            "egui native physical ingress requires the visible eframe event loop",
+                        ) {
+                            return (drained, Some(error));
+                        }
+                        continue;
+                    };
+                    let token = self.next_native_debug_token();
+                    let plan = eframe::egui_winit::SlipwayDebugInputPlan { token, events };
+                    if proxy.try_send_input(egui::ViewportId::ROOT, plan).is_err() {
+                        if let Err(error) = Self::complete_native_refusal(
+                            pending,
+                            lease,
+                            "native-physical-control-window-unavailable",
+                            "the eframe event loop closed before native input ingress",
+                        ) {
+                            return (drained, Some(error));
+                        }
+                        continue;
+                    }
+                    self.pending_native_physical =
+                        Some(PendingEguiNativePhysicalControl::WaitingForIngress {
+                            pending,
+                            lease,
+                            token,
+                            composition: None,
+                        });
                 }
-                native_runner::NativePhysicalControlPlan::BackendNativeMutation => {}
+                native_runner::NativePhysicalControlPlan::BackendNativeMutation => {
+                    self.pending_native_physical =
+                        Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                            pending,
+                            lease,
+                            origin: PendingEguiTraceOrigin::BackendNativeMutation,
+                        });
+                }
             }
-
-            self.pending_native_physical =
-                Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace { pending, lease });
             break;
         }
 
         (drained, None)
+    }
+
+    #[cfg(test)]
+    fn inject_pending_native_physical_into_raw_input(
+        &mut self,
+        raw_input: &mut egui::RawInput,
+    ) -> (usize, Option<String>) {
+        self.runtime.record_presenting_backend(EGUI_BACKEND_ID);
+        if self.pending_native_physical.is_some() {
+            return (0, None);
+        }
+        let pending = match self.runtime.take_pending_native_mcp_call() {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return (0, None),
+            Err(error) => return (0, Some(format!("{error:?}"))),
+        };
+        let lease = match self.runtime.take_debug_command_lease() {
+            Ok(Some(lease)) => lease,
+            Ok(None) => {
+                self.pending_native_physical = Some(
+                    PendingEguiNativePhysicalControl::WaitingForDebugLease(pending),
+                );
+                return (1, None);
+            }
+            Err(error) => return (1, Some(format!("{error:?}"))),
+        };
+        let operation = match &lease.command().kind {
+            DebugCommandKind::PhysicalControl { operation, .. } => operation,
+            _ => {
+                let product = self.runtime.handle_debug_command_with_app_reducer(
+                    lease.command().clone(),
+                    &mut self.on_messages,
+                );
+                return match Self::complete_native_request(pending, lease, product) {
+                    Ok(()) => (1, None),
+                    Err(error) => (1, Some(error)),
+                };
+            }
+        };
+        let events = match native_runner::egui_test_events_for_native_physical_operation(
+            operation, raw_input,
+        ) {
+            Ok(events) => events,
+            Err(error) => {
+                return match Self::complete_native_refusal(
+                    pending,
+                    lease,
+                    error.code,
+                    error.message,
+                ) {
+                    Ok(()) => (1, None),
+                    Err(error) => (1, Some(error)),
+                };
+            }
+        };
+        if events.is_empty() {
+            self.pending_native_physical =
+                Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                    pending,
+                    lease,
+                    origin: PendingEguiTraceOrigin::BackendNativeMutation,
+                });
+            return (1, None);
+        }
+        let start_event_index = raw_input.events.len();
+        for event in events {
+            raw_input.events.push(event);
+        }
+        let token = self.next_native_debug_token();
+        let span = eframe::egui_winit::SlipwayDebugInputSpan {
+            token,
+            start_event_index,
+            end_event_index: raw_input.events.len(),
+        };
+        self.pending_native_physical =
+            Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                pending,
+                lease,
+                origin: PendingEguiTraceOrigin::DebugInput { token, span },
+            });
+        (1, None)
+    }
+
+    fn arm_presented_capture(
+        &mut self,
+        pending: SlipwayRuntimePendingNativeMcpCall,
+        lease: slipway_debug_bridge::DebugCommandLease,
+    ) -> Result<(), String> {
+        let DebugCommandKind::Screenshot { request } = &lease.command().kind else {
+            return Self::complete_native_refusal(
+                pending,
+                lease,
+                "screenshot-command-required",
+                "egui direct capture only accepts screenshot commands",
+            );
+        };
+        let selector = request.selector.clone();
+        if !egui_screenshot_selector_matches_intake(
+            &selector,
+            self.last_successfully_presented.as_ref(),
+        ) {
+            return Self::complete_native_request(
+                pending,
+                lease,
+                egui_screenshot_refusal(
+                    selector,
+                    self.last_successfully_presented.clone(),
+                    "screenshot-frame-mismatch",
+                    "the requested frame is not the egui window's last successfully presented frame",
+                ),
+            );
+        }
+        let Some(proxy) = self.native_debug_proxy.clone() else {
+            return Self::complete_native_request(
+                pending,
+                lease,
+                egui_screenshot_refusal(
+                    selector,
+                    None,
+                    "screenshot-no-visible-window",
+                    "egui direct capture requires the visible eframe wgpu event loop",
+                ),
+            );
+        };
+
+        let token = self.next_native_debug_token();
+        let (event_tx, event_rx) = mpsc::sync_channel(3);
+        let wake = Arc::new(EguiDirectCaptureWake {
+            proxy: proxy.clone(),
+        });
+        let deadline_wake = Arc::clone(&wake);
+        let deadline_thread = thread::Builder::new()
+            .name("slipway-egui-capture-deadline".to_string())
+            .spawn(move || {
+                thread::sleep(EGUI_CAPTURE_DEADLINE);
+                egui_wgpu::winit::DirectCaptureWake::wake(deadline_wake.as_ref(), token);
+            });
+        if let Err(error) = deadline_thread {
+            return Self::complete_native_request(
+                pending,
+                lease,
+                egui_screenshot_refusal(
+                    selector,
+                    None,
+                    "screenshot-deadline-thread-failed",
+                    format!("failed to start egui capture deadline wake: {error}"),
+                ),
+            );
+        }
+
+        let request = egui_wgpu::winit::DirectCaptureRequest {
+            token,
+            event_tx,
+            wake,
+        };
+        if proxy
+            .try_send_capture(egui::ViewportId::ROOT, request)
+            .is_err()
+        {
+            return Self::complete_native_request(
+                pending,
+                lease,
+                egui_screenshot_refusal(
+                    selector,
+                    None,
+                    "screenshot-no-visible-window",
+                    "the eframe event loop closed before direct capture could be armed",
+                ),
+            );
+        }
+
+        self.pending_presented_capture = Some(PendingEguiPresentedCapture {
+            pending,
+            lease,
+            token,
+            selector,
+            event_rx,
+            deadline: Instant::now() + EGUI_CAPTURE_DEADLINE,
+            post_presented_candidate: None,
+            post_presented_frame: None,
+            presented: None,
+            mapped: None,
+        });
+        Ok(())
+    }
+
+    fn drain_pending_presented_capture(&mut self) -> (bool, Option<String>) {
+        let Some(mut capture) = self.pending_presented_capture.take() else {
+            return (false, None);
+        };
+        let mut terminal = None;
+        loop {
+            match capture.event_rx.try_recv() {
+                Ok(event) => match event {
+                    egui_wgpu::winit::DirectCaptureEvent::Presented {
+                        token,
+                        format,
+                        alpha,
+                        width,
+                        height,
+                    } if token == capture.token => {
+                        if capture.presented.is_none() {
+                            let (format, transfer) = egui_presented_format(format);
+                            capture.presented = Some(EguiPresentedCaptureMeta {
+                                format,
+                                transfer,
+                                alpha: egui_presented_alpha(alpha),
+                                width,
+                                height,
+                            });
+                        }
+                    }
+                    egui_wgpu::winit::DirectCaptureEvent::Mapped { token, result }
+                        if token == capture.token =>
+                    {
+                        match result {
+                            Ok(bytes) if capture.mapped.is_none() => capture.mapped = Some(bytes),
+                            Ok(_) => {}
+                            Err(error) => {
+                                terminal = Some(egui_screenshot_refusal(
+                                    capture.selector.clone(),
+                                    capture.post_presented_frame.as_ref().cloned(),
+                                    "screenshot-map-failed",
+                                    format!("egui direct capture map failed: {error:?}"),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    egui_wgpu::winit::DirectCaptureEvent::PollFailed { token, error }
+                        if token == capture.token =>
+                    {
+                        terminal = Some(egui_screenshot_refusal(
+                            capture.selector.clone(),
+                            capture.post_presented_frame.as_ref().cloned(),
+                            "screenshot-poll-failed",
+                            format!("egui direct capture device poll failed: {error:?}"),
+                        ));
+                        break;
+                    }
+                    egui_wgpu::winit::DirectCaptureEvent::Refused { token, reason }
+                        if token == capture.token =>
+                    {
+                        terminal = Some(egui_screenshot_refusal(
+                            capture.selector.clone(),
+                            capture.post_presented_frame.as_ref().cloned(),
+                            egui_capture_refusal_code(reason),
+                            format!("egui direct acquired-surface capture refused: {reason:?}"),
+                        ));
+                        break;
+                    }
+                    _ => {}
+                },
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if capture.presented.is_some() && capture.mapped.is_some() {
+                        break;
+                    }
+                    terminal = Some(egui_screenshot_refusal(
+                        capture.selector.clone(),
+                        capture.post_presented_frame.as_ref().cloned(),
+                        "screenshot-capture-channel-closed",
+                        "egui direct capture ended before producing a terminal result",
+                    ));
+                    break;
+                }
+            }
+        }
+
+        if terminal.is_none()
+            && let (Some(captured_frame), Some(meta), Some(bytes)) = (
+                capture.post_presented_frame.as_ref(),
+                capture.presented.as_ref(),
+                capture.mapped.as_ref(),
+            )
+        {
+            let frame_matches_selector = match &capture.selector {
+                PresentedScreenshotSelector::Exact { expected_frame } => {
+                    egui_capture_frame_is_exact_next(expected_frame, captured_frame)
+                }
+                PresentedScreenshotSelector::Current { .. } => capture
+                    .post_presented_candidate
+                    .as_ref()
+                    .is_some_and(|candidate| {
+                        egui_capture_frame_has_candidate_provenance(candidate, captured_frame)
+                    }),
+            };
+            if !frame_matches_selector {
+                terminal = Some(egui_screenshot_refusal(
+                    capture.selector.clone(),
+                    Some(captured_frame.clone()),
+                    "screenshot-frame-changed-before-capture",
+                    "the post-presented egui frame does not satisfy the admitted selector",
+                ));
+            }
+            let expected_len = u64::from(meta.width)
+                .checked_mul(u64::from(meta.height))
+                .and_then(|pixels| pixels.checked_mul(4))
+                .and_then(|len| usize::try_from(len).ok());
+            if terminal.is_none() {
+                terminal = Some(if expected_len != Some(bytes.len()) {
+                    egui_screenshot_refusal(
+                        capture.selector.clone(),
+                        Some(captured_frame.clone()),
+                        "screenshot-byte-length-invalid",
+                        "egui direct capture did not produce tightly packed RGBA8 bytes",
+                    )
+                } else {
+                    DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Captured(
+                        PresentedPixels {
+                            selector: capture.selector.clone(),
+                            captured_frame: captured_frame.clone(),
+                            source: EvidenceSource::backend_presented(
+                                EGUI_BACKEND_ID,
+                                "presented-pixels/direct-surface-copy",
+                            ),
+                            capture_path: PresentedCapturePath::DirectAcquiredSurfaceTextureCopy,
+                            source_format: meta.format,
+                            transfer: meta.transfer,
+                            alpha: meta.alpha,
+                            width: meta.width,
+                            height: meta.height,
+                            bytes: Arc::clone(bytes),
+                            diagnostics: Vec::new(),
+                        },
+                    ))
+                });
+            }
+        }
+        if terminal.is_none() && Instant::now() >= capture.deadline {
+            terminal = Some(egui_screenshot_refusal(
+                capture.selector.clone(),
+                capture.post_presented_frame.as_ref().cloned(),
+                "screenshot-deadline",
+                "egui direct capture did not present and map before its deadline",
+            ));
+        }
+
+        let Some(product) = terminal else {
+            self.pending_presented_capture = Some(capture);
+            return (true, None);
+        };
+        let result = Self::complete_native_request(capture.pending, capture.lease, product);
+        (true, result.err())
+    }
+
+    fn record_slipway_debug_post_present(&mut self, event: eframe::SlipwayDebugPostPresent) {
+        if event.viewport_id != egui::ViewportId::ROOT {
+            return;
+        }
+        if let Some(token) = event.capture_token
+            && self
+                .pending_presented_capture
+                .as_ref()
+                .is_none_or(|capture| capture.token != token)
+        {
+            return;
+        }
+        let Some(mut presented) = self.rendered_frame_candidate.take() else {
+            return;
+        };
+        let frame_index = match self.last_successfully_presented.as_ref() {
+            Some(previous) => previous.frame_index.checked_add(1),
+            None => Some(presented.frame_index),
+        };
+        let Some(frame_index) = frame_index else {
+            self.last_successfully_presented = None;
+            let matching_capture = event.capture_token.and_then(|token| {
+                self.pending_presented_capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.token == token)
+                    .then_some(token)
+            });
+            if matching_capture.is_some()
+                && let Some(capture) = self.pending_presented_capture.take()
+            {
+                let product = egui_screenshot_refusal(
+                    capture.selector,
+                    None,
+                    "screenshot-frame-index-overflow",
+                    "the captured presentation frame index overflowed",
+                );
+                let _ = Self::complete_native_request(capture.pending, capture.lease, product);
+            }
+            return;
+        };
+        presented.frame_index = frame_index;
+        self.last_successfully_presented = Some(presented.clone());
+        if let Some(token) = event.capture_token
+            && let Some(capture) = self.pending_presented_capture.as_mut()
+            && capture.token == token
+            && capture.post_presented_frame.is_none()
+        {
+            capture.post_presented_candidate = Some(presented.clone());
+            capture.post_presented_frame = Some(presented);
+        }
+    }
+
+    fn terminate_pending_presented_capture_for_teardown(&mut self) {
+        let Some(capture) = self.pending_presented_capture.take() else {
+            return;
+        };
+        let product = egui_screenshot_refusal(
+            capture.selector,
+            capture.post_presented_frame,
+            "screenshot-teardown",
+            "the egui window closed before direct capture completed",
+        );
+        let _ = Self::complete_native_request(capture.pending, capture.lease, product);
     }
 
     pub fn handle_backend_presented_physical_control(
@@ -3186,6 +4302,10 @@ where
 
     fn render_ui(&mut self, ui: &mut egui::Ui) {
         let timing_start = Instant::now();
+        #[cfg(test)]
+        if self.live_continuous_repaint {
+            ui.ctx().request_repaint();
+        }
         let background_layout_start = Instant::now();
         fill_egui_host_background(ui);
         let mut messages = Vec::new();
@@ -3196,6 +4316,26 @@ where
         let sense = self.sense;
         let revision_before = self.runtime.last_frame_identity().revision;
         let native_physical_operation = self.pending_native_physical_operation().cloned();
+        let (debug_input_span, debug_composition) = self
+            .pending_native_physical
+            .as_ref()
+            .and_then(|pending| match pending {
+                PendingEguiNativePhysicalControl::WaitingForBackendTrace { origin, .. } => {
+                    match origin {
+                        PendingEguiTraceOrigin::DebugInput { span, .. } => Some((*span, false)),
+                        PendingEguiTraceOrigin::DebugComposition { span, .. } => {
+                            Some((*span, true))
+                        }
+                        PendingEguiTraceOrigin::BackendNativeMutation => None,
+                    }
+                }
+                _ => None,
+            })
+            .map_or((None, false), |(span, composition)| {
+                (Some(span), composition)
+            });
+        self.bridge
+            .set_slipway_debug_input_span(debug_input_span, debug_composition);
 
         let available_size = ui.available_size();
         let timing_viewport = Some(Size {
@@ -3295,6 +4435,9 @@ where
         if let Some(viewport) = presented_viewport {
             self.runtime.record_presented_viewport(viewport);
         }
+        let composition_preflight = self.bridge.take_slipway_composition_preflight();
+        let native_text_mutation = self.bridge.take_slipway_native_text_mutation();
+        let accepted_composition_events = self.bridge.drain_slipway_accepted_composition_events();
         // Measurement projection (Phase 6 item 3b slice (iii), NC-4): on
         // the same cadence as the viewport projection, hand the app hook
         // the backend's REAL text layout so authored geometry can size
@@ -3304,8 +4447,35 @@ where
         self.runtime
             .project_text_metrics(&mut EguiTextMetricProvider::new(&metrics_ctx));
 
-        let app_message_apply_start = Instant::now();
         let app_message_count = messages.len();
+        let revision_after = revision_before + u64::from(app_message_count > 0);
+        let handled_wheel = backend_traces_handled_wheel(&backend_traces);
+        let backend_trace_count = backend_traces.len();
+        let retain_validated_traces = self.pending_native_physical.is_some();
+        let mut validated_pending_traces = Vec::new();
+
+        let trace_recording_start = Instant::now();
+        for mut trace in backend_traces {
+            trace.revision_before = trace.revision_before.or(Some(revision_before));
+            trace.revision_after = trace.revision_after.or(Some(revision_after));
+            self.runtime
+                .record_backend_input_trace_for_backend(trace, EGUI_BACKEND_ID);
+            if retain_validated_traces {
+                validated_pending_traces.push(
+                    self.runtime
+                        .last_backend_input_trace()
+                        .expect("the trace was just recorded")
+                        .clone(),
+                );
+            }
+        }
+        self.frame_timing.record(
+            "egui.render_ui.trace_recording",
+            trace_recording_start.elapsed(),
+            backend_trace_count,
+            timing_viewport,
+        );
+        let app_message_apply_start = Instant::now();
         self.runtime
             .apply_app_messages(messages, &mut self.on_messages);
         self.frame_timing.record(
@@ -3314,24 +4484,25 @@ where
             app_message_count,
             timing_viewport,
         );
-        let revision_after = self.runtime.last_frame_identity().revision;
-        let handled_wheel = backend_traces_handled_wheel(&backend_traces);
-        let backend_trace_count = backend_traces.len();
-
-        let trace_recording_start = Instant::now();
-        for mut trace in backend_traces {
-            trace.revision_before = trace.revision_before.or(Some(revision_before));
-            trace.revision_after = trace.revision_after.or(Some(revision_after));
-            self.try_complete_pending_native_physical(&trace);
-            self.runtime
-                .record_backend_input_trace_for_backend(trace, EGUI_BACKEND_ID);
+        debug_assert_eq!(self.runtime.last_frame_identity().revision, revision_after);
+        if matches!(
+            self.pending_native_physical,
+            Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                origin: PendingEguiTraceOrigin::DebugComposition { .. },
+                ..
+            })
+        ) {
+            self.complete_pending_native_composition(
+                &validated_pending_traces,
+                &accepted_composition_events,
+                composition_preflight.clone(),
+                native_text_mutation,
+            );
+        } else {
+            for trace in &validated_pending_traces {
+                self.try_complete_pending_native_physical(trace);
+            }
         }
-        self.frame_timing.record(
-            "egui.render_ui.trace_recording",
-            trace_recording_start.elapsed(),
-            backend_trace_count,
-            timing_viewport,
-        );
         for admission in self.bridge.drain_refused_admissions() {
             self.runtime.record_backend_admission(&admission);
         }
@@ -3349,13 +4520,409 @@ where
             );
             ui.ctx().request_repaint();
         }
-        self.fail_unmatched_pending_native_physical();
+        if matches!(
+            self.pending_native_physical,
+            Some(PendingEguiNativePhysicalControl::WaitingForCompositionPreflight { .. })
+        ) {
+            self.arm_pending_native_composition(composition_preflight, ui.ctx().pixels_per_point());
+        } else {
+            self.fail_unmatched_pending_native_physical();
+        }
+        self.rendered_frame_candidate = Some(frame_seed);
         self.frame_timing.record(
             "egui.render_ui",
             timing_start.elapsed(),
             backend_trace_count,
             timing_viewport,
         );
+    }
+
+    fn arm_pending_native_composition(
+        &mut self,
+        preflight: Option<EguiCompositionPreflight>,
+        pixels_per_point: f32,
+    ) {
+        let Some(PendingEguiNativePhysicalControl::WaitingForCompositionPreflight {
+            pending,
+            lease,
+        }) = self.pending_native_physical.take()
+        else {
+            return;
+        };
+        let Some(preflight) = preflight else {
+            let _ = Self::complete_native_refusal(
+                pending,
+                lease,
+                "native-physical-control-text-composition-region-unavailable",
+                "the composition selector did not resolve to an enabled native egui text-edit region",
+            );
+            return;
+        };
+        if !preflight.editable {
+            let _ = Self::complete_native_refusal(
+                pending,
+                lease,
+                "native-physical-control-text-composition-region-not-editable",
+                "the selected native egui text-edit region is not editable",
+            );
+            return;
+        }
+        if !preflight.focused {
+            let _ = Self::complete_native_refusal(
+                pending,
+                lease,
+                "native-physical-control-text-composition-focus-required",
+                "the selected native egui text-edit region must already be focused",
+            );
+            return;
+        }
+        let Some(proxy) = self.native_debug_proxy.clone() else {
+            let _ = Self::complete_native_refusal(
+                pending,
+                lease,
+                "native-physical-control-window-unavailable",
+                "egui composition ingress requires the visible eframe event loop",
+            );
+            return;
+        };
+        let operation = match &lease.command().kind {
+            DebugCommandKind::PhysicalControl { operation, .. } => operation,
+            _ => unreachable!("composition preflight retains a physical-control lease"),
+        };
+        let events = match native_runner::egui_events_for_native_physical_operation(
+            operation,
+            pixels_per_point,
+        ) {
+            Ok(native_runner::NativePhysicalControlPlan::Input(events)) => events,
+            Ok(native_runner::NativePhysicalControlPlan::BackendNativeMutation) => {
+                let _ = Self::complete_native_refusal(
+                    pending,
+                    lease,
+                    "native-physical-control-text-composition-ingress-invalid",
+                    "egui composition did not produce native IME ingress events",
+                );
+                return;
+            }
+            Err(error) => {
+                let _ = Self::complete_native_refusal(pending, lease, error.code, error.message);
+                return;
+            }
+        };
+        let token = self.next_native_debug_token();
+        if proxy
+            .try_send_input(
+                egui::ViewportId::ROOT,
+                eframe::egui_winit::SlipwayDebugInputPlan { token, events },
+            )
+            .is_err()
+        {
+            let _ = Self::complete_native_refusal(
+                pending,
+                lease,
+                "native-physical-control-window-unavailable",
+                "the eframe event loop closed before composition ingress",
+            );
+            return;
+        }
+        self.pending_native_physical = Some(PendingEguiNativePhysicalControl::WaitingForIngress {
+            pending,
+            lease,
+            token,
+            composition: Some(PendingEguiComposition { preflight }),
+        });
+    }
+
+    fn complete_pending_native_composition(
+        &mut self,
+        traces: &[BackendInputTrace],
+        accepted_events: &[EguiAcceptedCompositionEvent],
+        focused_after: Option<EguiCompositionPreflight>,
+        mutation: Option<EguiNativeTextMutationEvidence>,
+    ) {
+        let Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+            pending,
+            lease,
+            origin:
+                PendingEguiTraceOrigin::DebugComposition {
+                    token,
+                    span,
+                    composition,
+                },
+        }) = self.pending_native_physical.take()
+        else {
+            return;
+        };
+        debug_assert_eq!(span.token, token);
+        let command = lease.command().clone();
+        let frame = command.frame_identity().clone();
+        let request_id = command.request_id.clone();
+        let selected = &composition.preflight;
+        let DebugCommandKind::PhysicalControl {
+            operation:
+                DebugPhysicalControl::TextComposition {
+                    updates, commit, ..
+                },
+            ..
+        } = &command.kind
+        else {
+            unreachable!("composition completion retains a composition command")
+        };
+        let expected_record_count = updates.len().checked_add(1);
+        let records_valid = expected_record_count == Some(accepted_events.len())
+            && span.token == token
+            && span.end_event_index.checked_sub(span.start_event_index) == expected_record_count
+            && accepted_events
+                .iter()
+                .enumerate()
+                .all(|(ordinal, accepted)| {
+                    let expected_phase = if ordinal < updates.len() {
+                        TextCompositionPhase::Update
+                    } else {
+                        TextCompositionPhase::Commit
+                    };
+                    accepted.token == token
+                        && accepted.start_event_index == span.start_event_index
+                        && accepted.end_event_index == span.end_event_index
+                        && span.start_event_index.checked_add(ordinal) == Some(accepted.event_index)
+                        && accepted.phase == expected_phase
+                        && (ordinal == 0
+                            || accepted_events[ordinal - 1].dispatch_ordinal
+                                < accepted.dispatch_ordinal)
+                });
+
+        let mut native_phases = Vec::with_capacity(accepted_events.len());
+        let mut trace_cursor = 0usize;
+        if records_valid {
+            for (ordinal, accepted) in accepted_events.iter().enumerate() {
+                let expected_phase = accepted.phase;
+                let expected_text = updates
+                    .get(ordinal)
+                    .map_or(commit.as_str(), |update| update.preedit_text.as_str());
+                let expected_range = updates
+                    .get(ordinal)
+                    .and_then(|update| update.cursor_range.as_ref());
+                let matched = traces
+                    .iter()
+                    .enumerate()
+                    .skip(trace_cursor)
+                    .find(|(_, trace)| {
+                        let Some(dispatch) = trace.input.dispatch_evidence.as_ref() else {
+                            return false;
+                        };
+                        let InputEvent::TextComposition(event) = &trace.input.event else {
+                            return false;
+                        };
+                        dispatch.source.pass_id.as_deref() == Some(EGUI_DEBUG_COMPOSITION_PASS)
+                            && dispatch.frame == frame
+                            && dispatch.selected_region.as_ref() == Some(&selected.selected_region)
+                            && dispatch.generated_event.as_ref() == Some(&trace.input.event)
+                            && event.target == selected.target
+                            && event.target_slot == selected.target_slot
+                            && event.phase == expected_phase
+                            && event.preedit_text == expected_text
+                            && event.cursor_range.as_ref() == expected_range
+                            && trace.event_probe().result_identity.handled == Some(trace.handled)
+                    });
+                let Some((trace_index, trace)) = matched else {
+                    native_phases.clear();
+                    break;
+                };
+                trace_cursor = trace_index + 1;
+                let dispatch = trace
+                    .input
+                    .dispatch_evidence
+                    .as_ref()
+                    .expect("the matched composition trace has dispatch evidence");
+                let InputEvent::TextComposition(event) = &trace.input.event else {
+                    unreachable!("the matched trace is a composition event")
+                };
+                native_phases.push(DebugCompositionPhaseTrace {
+                    phase: event.phase,
+                    backend_event: match event.phase {
+                        TextCompositionPhase::Update => "egui::ImeEvent::Preedit".to_string(),
+                        TextCompositionPhase::Commit => "egui::ImeEvent::Commit".to_string(),
+                        _ => unreachable!(),
+                    },
+                    provenance: CompositionPhaseProvenance::Native,
+                    event: event.clone(),
+                    ingress_observation: DebugCompositionIngressObservation::EguiRawInputSpan {
+                        event_index: accepted.event_index,
+                    },
+                    dispatch_evidence: dispatch.clone(),
+                    app_handled: trace.handled,
+                    result_identity: Some(trace.event_probe().result_identity),
+                });
+            }
+        }
+        let debug_composition_trace_count = traces
+            .iter()
+            .filter(|trace| {
+                trace
+                    .input
+                    .dispatch_evidence
+                    .as_ref()
+                    .is_some_and(|dispatch| {
+                        dispatch.source.pass_id.as_deref() == Some(EGUI_DEBUG_COMPOSITION_PASS)
+                    })
+                    && matches!(
+                        trace.input.event,
+                        InputEvent::TextComposition(TextCompositionEvent {
+                            phase: TextCompositionPhase::Update | TextCompositionPhase::Commit,
+                            ..
+                        })
+                    )
+            })
+            .count();
+        if debug_composition_trace_count != accepted_events.len() {
+            native_phases.clear();
+        }
+        let consumed_commit = (native_phases.len() == accepted_events.len())
+            .then(|| {
+                accepted_events
+                    .iter()
+                    .find(|accepted| accepted.phase == TextCompositionPhase::Commit)
+                    .map(|accepted| EguiAcceptedCommitKey {
+                        token: accepted.token,
+                        start_event_index: accepted.start_event_index,
+                        end_event_index: accepted.end_event_index,
+                        event_index: accepted.event_index,
+                    })
+            })
+            .flatten();
+
+        let mut phases = Vec::with_capacity(native_phases.len().saturating_add(2));
+        if let Some(first_update) = native_phases
+            .iter()
+            .find(|phase| phase.phase == TextCompositionPhase::Update)
+        {
+            let mut start = first_update.clone();
+            start.phase = TextCompositionPhase::Start;
+            start.backend_event = "derived egui composition start".to_string();
+            start.provenance = CompositionPhaseProvenance::Derived {
+                from: TextCompositionPhase::Update,
+            };
+            start.event.phase = TextCompositionPhase::Start;
+            start.event.preedit_text.clear();
+            start.event.cursor_range = None;
+            start.ingress_observation = DebugCompositionIngressObservation::Derived {
+                from_sequence_index: 1,
+            };
+            phases.push(start);
+        }
+        phases.extend(native_phases);
+        if let Some(commit_index) = phases
+            .iter()
+            .position(|phase| phase.phase == TextCompositionPhase::Commit)
+        {
+            let mut end = phases[commit_index].clone();
+            end.phase = TextCompositionPhase::End;
+            end.backend_event = "derived egui composition end".to_string();
+            end.provenance = CompositionPhaseProvenance::Derived {
+                from: TextCompositionPhase::Commit,
+            };
+            end.event.phase = TextCompositionPhase::End;
+            end.event.preedit_text.clear();
+            end.event.cursor_range = None;
+            end.ingress_observation = DebugCompositionIngressObservation::Derived {
+                from_sequence_index: commit_index,
+            };
+            phases.push(end);
+        }
+
+        let commit_mutation = mutation.and_then(|mutation| {
+            if mutation.target != selected.target
+                || mutation.target_slot != selected.target_slot
+                || mutation.selected_region != selected.selected_region
+                || Some(mutation.commit) != consumed_commit
+            {
+                return None;
+            }
+            let mut matching_traces = traces.iter().filter(|trace| {
+                matches!(
+                    &trace.input.event,
+                    InputEvent::TextEdit(event)
+                        if event.target == mutation.target
+                            && event.target_slot == mutation.target_slot
+                ) && trace
+                    .input
+                    .dispatch_evidence
+                    .as_ref()
+                    .is_some_and(|evidence| {
+                        evidence.source.pass_id.as_deref() == Some(EGUI_DEBUG_COMPOSITION_PASS)
+                            && evidence.selected_region.as_ref() == Some(&mutation.selected_region)
+                            && evidence.frame == frame
+                            && evidence.generated_event.as_ref() == Some(&trace.input.event)
+                    })
+                    && trace.event_probe().result_identity.handled == Some(trace.handled)
+            });
+            let trace = matching_traces.next()?;
+            if matching_traces.next().is_some() {
+                return None;
+            }
+            let dispatch = trace.input.dispatch_evidence.clone();
+            let control = DebugControlTrace::new(
+                request_id.clone(),
+                frame.clone(),
+                &trace.input.event,
+                trace.handled,
+                trace.revision_before.unwrap_or(frame.revision),
+                trace.revision_after.unwrap_or(frame.revision),
+                trace.diagnostics.clone(),
+            )
+            .with_mode(DebugControlMode::PhysicalEquivalent)
+            .with_dispatch_evidence(dispatch)
+            .with_result_identity(trace.event_probe().result_identity);
+            Some(DebugCompositionCommitMutation {
+                trace: control,
+                before: mutation.before,
+                after: mutation.after,
+            })
+        });
+        let focused_after = focused_after.is_some_and(|after| {
+            after.target == selected.target
+                && after.target_slot == selected.target_slot
+                && after.selected_region == selected.selected_region
+                && after.focused
+                && after.editable
+        });
+        let trace = DebugCompositionTrace {
+            request_id,
+            frame,
+            backend_id: EGUI_BACKEND_ID.to_string(),
+            target: selected.target.clone(),
+            selected_region: selected.selected_region.clone(),
+            focused_before: selected.focused,
+            focused_after,
+            phases,
+            commit_mutation,
+            completed: false,
+            failure: None,
+        };
+        let product = DebugEguiCompositionIngressCustody::new(
+            span.token,
+            span.start_event_index,
+            span.end_event_index,
+        )
+        .map_or_else(
+            || {
+                DebugReplyProduct::Error(DebugFailure {
+                    code: "native-physical-control-text-composition-provenance-invalid".to_string(),
+                    message: "egui composition accepted span could not establish custody"
+                        .to_string(),
+                    dispatch_evidence: None,
+                })
+            },
+            |custody| {
+                self.runtime
+                    .backend_presented_text_composition_product_from_traces_for_backend_with_egui_custody(
+                        command,
+                        trace,
+                        EGUI_BACKEND_ID,
+                        custody,
+                    )
+            },
+        );
+        let _ = Self::complete_native_request(pending, lease, product);
     }
 
     fn ensure_mcp_wake_forwarder(&mut self, ctx: &egui::Context) {
@@ -3400,12 +4967,46 @@ where
         let Some(pending_state) = self.pending_native_physical.take() else {
             return;
         };
-        let PendingEguiNativePhysicalControl::WaitingForBackendTrace { pending, lease } =
-            pending_state
+        let PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+            pending,
+            lease,
+            origin,
+        } = pending_state
         else {
             self.pending_native_physical = Some(pending_state);
             return;
         };
+        let expected_pass = match &origin {
+            PendingEguiTraceOrigin::BackendNativeMutation => EGUI_DEBUG_INPUT_PASS,
+            PendingEguiTraceOrigin::DebugInput { token, span } => {
+                debug_assert_eq!(*token, span.token);
+                EGUI_DEBUG_INPUT_PASS
+            }
+            PendingEguiTraceOrigin::DebugComposition { .. } => {
+                self.pending_native_physical =
+                    Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                        pending,
+                        lease,
+                        origin,
+                    });
+                return;
+            }
+        };
+        if trace
+            .input
+            .dispatch_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.source.pass_id.as_deref())
+            != Some(expected_pass)
+        {
+            self.pending_native_physical =
+                Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                    pending,
+                    lease,
+                    origin,
+                });
+            return;
+        }
 
         let product = self
             .runtime
@@ -3416,7 +5017,11 @@ where
             );
         if matches!(product, DebugReplyProduct::Error(_)) {
             self.pending_native_physical =
-                Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace { pending, lease });
+                Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                    pending,
+                    lease,
+                    origin,
+                });
             return;
         }
 
@@ -3428,8 +5033,11 @@ where
         let Some(pending_state) = self.pending_native_physical.take() else {
             return;
         };
-        let PendingEguiNativePhysicalControl::WaitingForBackendTrace { pending, lease } =
-            pending_state
+        let PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+            pending,
+            lease,
+            origin: _origin,
+        } = pending_state
         else {
             self.pending_native_physical = Some(pending_state);
             return;
@@ -3486,15 +5094,116 @@ where
     }
 
     fn pending_native_physical_operation(&self) -> Option<&DebugPhysicalControl> {
-        let Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace { lease, .. }) =
-            self.pending_native_physical.as_ref()
-        else {
-            return None;
+        let lease = match self.pending_native_physical.as_ref()? {
+            PendingEguiNativePhysicalControl::WaitingForCompositionPreflight { lease, .. }
+            | PendingEguiNativePhysicalControl::WaitingForBackendTrace { lease, .. } => lease,
+            PendingEguiNativePhysicalControl::WaitingForDebugLease(_)
+            | PendingEguiNativePhysicalControl::WaitingForIngress { .. } => return None,
         };
         let DebugCommandKind::PhysicalControl { operation, .. } = &lease.command().kind else {
             return None;
         };
         Some(operation)
+    }
+}
+
+fn egui_screenshot_refusal(
+    selector: PresentedScreenshotSelector,
+    captured_frame: Option<FrameIdentity>,
+    code: impl Into<String>,
+    reason: impl Into<String>,
+) -> DebugReplyProduct {
+    DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Refusal(
+        PresentedScreenshotRefusal {
+            selector,
+            captured_frame,
+            backend_id: Some(EGUI_BACKEND_ID.to_string()),
+            code: code.into(),
+            reason: reason.into(),
+            diagnostics: Vec::new(),
+        },
+    ))
+}
+
+fn egui_presented_format(
+    format: egui_wgpu::winit::DirectCaptureFormat,
+) -> (PresentedSurfaceFormat, PresentedTransferFunction) {
+    match format {
+        egui_wgpu::winit::DirectCaptureFormat::Rgba8Unorm => (
+            PresentedSurfaceFormat::Rgba8Unorm,
+            PresentedTransferFunction::Linear,
+        ),
+        egui_wgpu::winit::DirectCaptureFormat::Rgba8UnormSrgb => (
+            PresentedSurfaceFormat::Rgba8UnormSrgb,
+            PresentedTransferFunction::Srgb,
+        ),
+        egui_wgpu::winit::DirectCaptureFormat::Bgra8Unorm => (
+            PresentedSurfaceFormat::Bgra8Unorm,
+            PresentedTransferFunction::Linear,
+        ),
+        egui_wgpu::winit::DirectCaptureFormat::Bgra8UnormSrgb => (
+            PresentedSurfaceFormat::Bgra8UnormSrgb,
+            PresentedTransferFunction::Srgb,
+        ),
+    }
+}
+
+fn egui_presented_alpha(alpha: egui_wgpu::winit::DirectCaptureAlphaMode) -> PresentedAlphaMode {
+    match alpha {
+        egui_wgpu::winit::DirectCaptureAlphaMode::Opaque => PresentedAlphaMode::Opaque,
+        egui_wgpu::winit::DirectCaptureAlphaMode::Premultiplied => {
+            PresentedAlphaMode::Premultiplied
+        }
+    }
+}
+
+fn egui_capture_frame_is_exact_next(expected: &FrameIdentity, captured: &FrameIdentity) -> bool {
+    expected.frame_index.checked_add(1) == Some(captured.frame_index)
+        && expected.surface_id == captured.surface_id
+        && expected.surface_instance_id == captured.surface_instance_id
+        && expected.revision == captured.revision
+        && expected.viewport == captured.viewport
+}
+
+fn egui_screenshot_selector_matches_intake(
+    selector: &PresentedScreenshotSelector,
+    last_successfully_presented: Option<&FrameIdentity>,
+) -> bool {
+    match selector {
+        PresentedScreenshotSelector::Exact { expected_frame } => {
+            last_successfully_presented == Some(expected_frame)
+        }
+        PresentedScreenshotSelector::Current { .. } => true,
+    }
+}
+
+fn egui_capture_frame_has_candidate_provenance(
+    candidate: &FrameIdentity,
+    captured: &FrameIdentity,
+) -> bool {
+    candidate.surface_id == captured.surface_id
+        && candidate.surface_instance_id == captured.surface_instance_id
+        && candidate.revision == captured.revision
+        && candidate.viewport == captured.viewport
+}
+
+fn egui_capture_refusal_code(reason: egui_wgpu::winit::DirectCaptureRefusal) -> &'static str {
+    match reason {
+        egui_wgpu::winit::DirectCaptureRefusal::CopySrcUnsupported => {
+            "screenshot-copy-src-unsupported"
+        }
+        egui_wgpu::winit::DirectCaptureRefusal::FormatUnsupported => {
+            "screenshot-format-unsupported"
+        }
+        egui_wgpu::winit::DirectCaptureRefusal::AlphaUnsupported => "screenshot-alpha-unsupported",
+        egui_wgpu::winit::DirectCaptureRefusal::ZeroSize => "screenshot-zero-size",
+        egui_wgpu::winit::DirectCaptureRefusal::ViewportUnavailable => {
+            "screenshot-viewport-unavailable"
+        }
+        egui_wgpu::winit::DirectCaptureRefusal::SurfaceAcquireFailed => {
+            "screenshot-surface-acquire-failed"
+        }
+        egui_wgpu::winit::DirectCaptureRefusal::AlreadyArmed => "screenshot-already-armed",
     }
 }
 
@@ -3523,6 +5232,9 @@ fn physical_operation_matches_refusal_kind(
             DebugPhysicalControl::Text { .. } | DebugPhysicalControl::TextEdit { .. },
             DeclaredEventDispatchKind::Text
         ) | (
+            DebugPhysicalControl::TextComposition { .. },
+            DeclaredEventDispatchKind::Text
+        ) | (
             DebugPhysicalControl::Keyboard { .. },
             DeclaredEventDispatchKind::Keyboard
         ) | (
@@ -3545,31 +5257,55 @@ where
         let timing_start = Instant::now();
         self.ensure_mcp_wake_forwarder(ctx);
         let woke = self.drain_egui_mcp_wakes();
-        let (drained, error) = if woke > 0 {
-            self.drain_debug_pending()
+        self.native_mcp_wake_pending |= woke > 0;
+        let (capture_polled, capture_error) = self.drain_pending_presented_capture();
+        if woke > 0 || capture_error.is_some() {
+            ctx.request_repaint();
+        }
+        self.frame_timing.record(
+            "egui.logic",
+            timing_start.elapsed(),
+            woke + usize::from(capture_polled),
+            None,
+        );
+    }
+
+    fn raw_input_hook_with_slipway_debug(
+        &mut self,
+        ctx: &egui::Context,
+        raw_input: &mut egui::RawInput,
+        notice: Option<&eframe::egui_winit::SlipwayDebugInputNotice>,
+    ) {
+        let timing_start = Instant::now();
+        let event_count = raw_input.events.len();
+        let notice_error = self.consume_slipway_debug_notice(notice);
+        let intake_requested = self.native_mcp_wake_pending;
+        #[cfg(test)]
+        let intake_requested = intake_requested || self.live_continuous_repaint;
+        let (drained, intake_error) = if intake_requested {
+            self.native_mcp_wake_pending = false;
+            self.intake_pending_native_command(ctx)
         } else {
             (0, None)
         };
-        if woke > 0 || drained > 0 || error.is_some() {
-            ctx.request_repaint();
-        }
-        self.frame_timing
-            .record("egui.logic", timing_start.elapsed(), woke + drained, None);
-    }
-
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        let timing_start = Instant::now();
-        let event_count = raw_input.events.len();
-        let (drained, error) = self.inject_pending_native_physical_into_raw_input(raw_input);
+        let error = notice_error.or(intake_error);
         if drained > 0 || error.is_some() {
             ctx.request_repaint();
         }
         self.frame_timing.record(
-            "egui.raw_input_hook",
+            "egui.raw_input_hook_with_slipway_debug",
             timing_start.elapsed(),
             event_count,
             None,
         );
+    }
+
+    fn on_slipway_debug_post_present(&mut self, event: eframe::SlipwayDebugPostPresent) {
+        self.record_slipway_debug_post_present(event);
+    }
+
+    fn on_exit(&mut self) {
+        self.terminate_pending_presented_capture_for_teardown();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -4217,8 +5953,21 @@ fn authored_child_slots<W>(
 where
     W: SlipwayEguiBackendChildWidget,
 {
+    let root_slot = WidgetSlotAddress::new(widget.id(), 0);
+    authored_child_slots_mounted(widget, external, local, Some(&root_slot))
+}
+
+fn authored_child_slots_mounted<W>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    mounted_parent: Option<&WidgetSlotAddress>,
+) -> Vec<EguiAuthoredChildSlot>
+where
+    W: SlipwayEguiBackendChildWidget,
+{
     let mut collector = EguiAuthoredChildSlotCollector { slots: Vec::new() };
-    widget.visit_egui_authored_children(external, local, &mut collector);
+    visit_egui_authored_children_mounted(widget, external, local, mounted_parent, &mut collector);
     collector.slots
 }
 
@@ -4353,12 +6102,47 @@ impl<ExternalState, AppMessage> SlipwayEguiWidgetListVisitor<ExternalState, AppM
     }
 }
 
+#[cfg(test)]
 fn collect_authored_children<W>(
     ui: &mut egui::Ui,
     widget: &W,
     external: &W::ExternalState,
     local: &W::LocalState,
     parent_view: &ViewDefinition,
+    parent_geometry_index: &PresentationGeometryIndex,
+    view_origin: egui::Pos2,
+    skipped_slots: &[WidgetSlotAddress],
+    scroll: Option<&ScrollRegionDeclaration>,
+    native_physical_operation: Option<&DebugPhysicalControl>,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
+) -> EguiChildAssembly
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let root_slot = WidgetSlotAddress::new(widget.id(), 0);
+    collect_authored_children_mounted(
+        ui,
+        widget,
+        external,
+        local,
+        parent_view,
+        Some(&root_slot),
+        parent_geometry_index,
+        view_origin,
+        skipped_slots,
+        scroll,
+        native_physical_operation,
+        timing_samples,
+    )
+}
+
+fn collect_authored_children_mounted<W>(
+    ui: &mut egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    parent_view: &ViewDefinition,
+    mounted_parent: Option<&WidgetSlotAddress>,
     parent_geometry_index: &PresentationGeometryIndex,
     view_origin: egui::Pos2,
     skipped_slots: &[WidgetSlotAddress],
@@ -4380,15 +6164,18 @@ where
         timing_samples,
         output: EguiChildAssembly::default(),
     };
-    widget.visit_egui_authored_children_in_paint_order(
+    visit_egui_authored_children_in_paint_order_mounted(
+        widget,
         external,
         local,
         parent_view,
+        mounted_parent,
         &mut presenter,
     );
     presenter.output
 }
 
+#[cfg(test)]
 fn present_authored_children<W>(
     ui: &mut egui::Ui,
     widget: &W,
@@ -4405,13 +6192,48 @@ fn present_authored_children<W>(
 where
     W: SlipwayEguiBackendChildWidget,
 {
-    let mut timing_samples = timing_samples;
-    let mut output = collect_authored_children(
+    let root_slot = WidgetSlotAddress::new(widget.id(), 0);
+    present_authored_children_mounted(
         ui,
         widget,
         external,
         local,
         parent_view,
+        Some(&root_slot),
+        parent_geometry_index,
+        view_origin,
+        skipped_slots,
+        scroll,
+        native_physical_operation,
+        timing_samples,
+    )
+}
+
+fn present_authored_children_mounted<W>(
+    ui: &mut egui::Ui,
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    parent_view: &ViewDefinition,
+    mounted_parent: Option<&WidgetSlotAddress>,
+    parent_geometry_index: &PresentationGeometryIndex,
+    view_origin: egui::Pos2,
+    skipped_slots: &[WidgetSlotAddress],
+    scroll: Option<&ScrollRegionDeclaration>,
+    native_physical_operation: Option<&DebugPhysicalControl>,
+    timing_samples: Option<&mut Vec<EguiFrameTimingSample>>,
+) -> EguiChildAssembly
+where
+    W: SlipwayEguiBackendChildWidget,
+{
+    let mut timing_samples = timing_samples;
+    let mut output = collect_authored_children_mounted(
+        ui,
+        widget,
+        external,
+        local,
+        parent_view,
+        mounted_parent,
         parent_geometry_index,
         view_origin,
         skipped_slots,
@@ -4685,7 +6507,7 @@ fn present_egui_child<W>(
     unit.address = Some(slot.clone());
     let child_response_sort_key = paint_unit_sort_key(&unit);
     let collect_slots_start = Instant::now();
-    let child_slots = authored_child_slots(widget, external, local);
+    let child_slots = authored_child_slots_mounted(widget, external, local, Some(&slot));
     push_egui_frame_timing(
         &mut timing_samples,
         "egui.child.collect_nested_children",
@@ -4734,6 +6556,7 @@ fn present_egui_child<W>(
         widget,
         external,
         local,
+        Some(&slot),
         child_rect.min,
         &view,
         &geometry_index,
@@ -4751,12 +6574,13 @@ fn present_egui_child<W>(
     );
     output.regions.extend(nested_regions);
     let nested_collect_start = Instant::now();
-    let nested_authored = collect_authored_children(
+    let nested_authored = collect_authored_children_mounted(
         ui,
         widget,
         external,
         local,
         &view,
+        Some(&slot),
         &geometry_index,
         child_rect.min,
         &nested_assembly.claimed_slots,
@@ -4880,11 +6704,13 @@ fn allocate_presentation_regions<W>(
 where
     W: SlipwayEguiBackendChildWidget,
 {
+    let root_slot = WidgetSlotAddress::new(widget.id(), 0);
     allocate_presentation_regions_with_timing(
         ui,
         widget,
         external,
         local,
+        Some(&root_slot),
         view_origin,
         view,
         geometry_index,
@@ -4901,6 +6727,7 @@ fn allocate_presentation_regions_with_timing<W>(
     widget: &W,
     external: &W::ExternalState,
     local: &W::LocalState,
+    mounted_parent: Option<&WidgetSlotAddress>,
     view_origin: egui::Pos2,
     view: &ViewDefinition,
     geometry_index: &PresentationGeometryIndex,
@@ -4927,6 +6754,7 @@ where
             widget,
             external,
             local,
+            mounted_parent,
             view_origin,
             view,
             geometry_index,
@@ -5323,6 +7151,7 @@ fn allocate_scroll_region_with_skips<W>(
     widget: &W,
     external: &W::ExternalState,
     local: &W::LocalState,
+    mounted_parent: Option<&WidgetSlotAddress>,
     view_origin: egui::Pos2,
     view: &ViewDefinition,
     geometry_index: &PresentationGeometryIndex,
@@ -5399,12 +7228,13 @@ where
             .max_rect(content_rect),
         |content_ui| {
             let child_present_start = Instant::now();
-            child_assembly_output.extend(present_authored_children(
+            child_assembly_output.extend(present_authored_children_mounted(
                 content_ui,
                 widget,
                 external,
                 local,
                 view,
+                mounted_parent,
                 geometry_index,
                 content_origin,
                 skipped_slots,
@@ -5839,57 +7669,50 @@ fn mount_presented_child_view_addresses(
     child_slot: &WidgetSlotAddress,
 ) -> ViewDefinition {
     for region in &mut view.hit_regions {
-        region.address = Some(mount_presented_child_slot(
-            region.address.take(),
-            child_slot,
-        ));
-        region.route.address = Some(mount_presented_child_slot(
-            region.route.address.take(),
-            child_slot,
-        ));
+        region.address = Some(
+            region
+                .address
+                .take()
+                .map(|slot| mount_widget_slot_address(slot, child_slot))
+                .unwrap_or_else(|| child_slot.clone()),
+        );
+        region.route.address = Some(
+            region
+                .route
+                .address
+                .take()
+                .map(|slot| mount_widget_slot_address(slot, child_slot))
+                .unwrap_or_else(|| child_slot.clone()),
+        );
+        region.route.path = region
+            .route
+            .address
+            .as_ref()
+            .map(|address| address.path.clone())
+            .unwrap_or_default();
     }
 
     for region in &mut view.focus_regions {
-        region.address = Some(mount_presented_child_slot(
-            region.address.take(),
-            child_slot,
-        ));
+        region.address = Some(
+            region
+                .address
+                .take()
+                .map(|slot| mount_widget_slot_address(slot, child_slot))
+                .unwrap_or_else(|| child_slot.clone()),
+        );
     }
 
     for region in &mut view.scroll_regions {
-        region.address = Some(mount_presented_child_slot(
-            region.address.take(),
-            child_slot,
-        ));
+        region.address = Some(
+            region
+                .address
+                .take()
+                .map(|slot| mount_widget_slot_address(slot, child_slot))
+                .unwrap_or_else(|| child_slot.clone()),
+        );
     }
 
     view
-}
-
-fn mount_presented_child_slot(
-    slot: Option<WidgetSlotAddress>,
-    child_slot: &WidgetSlotAddress,
-) -> WidgetSlotAddress {
-    let Some(slot) = slot else {
-        return child_slot.clone();
-    };
-
-    if slot.widget == child_slot.widget {
-        return child_slot.clone();
-    }
-
-    let mut path = child_slot.path.clone();
-    let mut suffix = slot.path;
-    if suffix.first() == Some(&child_slot.widget) {
-        suffix.remove(0);
-    }
-    path.extend(suffix);
-
-    WidgetSlotAddress {
-        widget: slot.widget,
-        path,
-        ordinal: slot.ordinal,
-    }
 }
 
 fn child_placement_matches_slot(
@@ -5899,6 +7722,9 @@ fn child_placement_matches_slot(
 ) -> bool {
     if let Some(placement_slot) = &placement.local_state_slot {
         placement_slot == child_slot
+            || (placement_slot.widget == child_slot.widget
+                && placement_slot.ordinal == child_slot.ordinal
+                && child_slot.path.ends_with(&placement_slot.path))
     } else {
         placement.child == *child
     }
@@ -6277,8 +8103,12 @@ fn egui_declared_region_over_child_response<'a>(
             region.enabled
                 && region.kind != EguiPresentedRegionKind::Occlusion
                 && !egui_region_is_child_response(region)
-                && region.target == selected.target
-                && region.address == selected.address
+                && ((region.target == selected.target && region.address == selected.address)
+                    || selected.address.as_ref().is_some_and(|selected_address| {
+                        region.address.as_ref().is_some_and(|region_address| {
+                            slot_contains_address(selected_address, region_address)
+                        })
+                    }))
                 && region.response.interact_rect.contains(position)
                 && (egui_region_has_response_authority(region)
                     || region.response.sense.interactive()
@@ -6611,6 +8441,34 @@ fn egui_focus_region_for_native_selector<'a>(
                 .max_by_key(|region| region.paint_sort_key)
         }
     }
+}
+
+fn egui_text_edit_region_for_native_selector<'a>(
+    regions: &'a [EguiPresentedRegion],
+    selector: &slipway_debug_bridge::DebugPhysicalControlDeclarationSelector,
+) -> Option<&'a EguiPresentedRegion> {
+    let matches_selector = |region: &&EguiPresentedRegion| match selector {
+        slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Target { target } => {
+            &region.event_target == target
+        }
+        slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Region { region: id } => {
+            &region.region_id == id
+        }
+        slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Position { position } => {
+            region
+                .response
+                .interact_rect
+                .contains(egui::pos2(position.x, position.y))
+        }
+    };
+    regions
+        .iter()
+        .filter(|region| {
+            region.enabled
+                && region.kind == EguiPresentedRegionKind::TextEdit
+                && matches_selector(region)
+        })
+        .max_by_key(|region| region.paint_sort_key)
 }
 
 fn egui_scroll_state_changed(scroll: &EguiScrollRegionState) -> bool {
@@ -7299,7 +9157,7 @@ fn egui_composition_event(
         egui::ImeEvent::Disabled => Some(TextCompositionEvent {
             target,
             target_slot,
-            phase: TextCompositionPhase::Cancel,
+            phase: TextCompositionPhase::End,
             preedit_text: String::new(),
             cursor_range: None,
         }),
@@ -8495,6 +10353,7 @@ mod tests {
     use std::cell::Cell;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
+    use std::process::{Command, Stdio};
     use std::rc::Rc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -8556,6 +10415,491 @@ mod tests {
     #[derive(Clone, Debug, PartialEq)]
     enum ProbeMessage {
         Routed,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct MountedCollectorApp {
+        id: WidgetId,
+        widgets: (ProbeWidget,),
+    }
+
+    impl slipway_core::SlipwayApp for MountedCollectorApp {
+        type ExternalState = ();
+        type LocalState = ();
+        type AppMessage = ProbeMessage;
+        type Widgets = (ProbeWidget,);
+
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+    }
+
+    #[derive(Default)]
+    struct MountedSlotTrace {
+        slots: Vec<WidgetSlotAddress>,
+    }
+
+    impl SlipwayEguiWidgetListVisitor<(), ProbeMessage> for MountedSlotTrace {
+        fn visit_egui_child<W>(
+            &mut self,
+            _widget: &W,
+            _external: &(),
+            _local: &W::LocalState,
+            slot: WidgetSlotAddress,
+        ) where
+            W: SlipwayEguiBackendChildWidget<ExternalState = (), AppMessage = ProbeMessage>,
+        {
+            self.slots.push(slot);
+        }
+
+        fn visit_egui_native_child<N>(
+            &mut self,
+            _widget: &N,
+            _external: &(),
+            _local: &N::LocalState,
+            slot: WidgetSlotAddress,
+        ) where
+            N: SlipwayEguiNativeChildWidget<ExternalState = (), AppMessage = ProbeMessage>,
+        {
+            self.slots.push(slot);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Nc9Counter {
+        NonNested,
+        One,
+        Two,
+        Three,
+        Left,
+        Right,
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    struct Nc9Counters {
+        non_nested: u32,
+        one: u32,
+        two: u32,
+        three: u32,
+        left: u32,
+        right: u32,
+    }
+
+    impl Nc9Counters {
+        fn increment(&mut self, counter: Nc9Counter) {
+            *self.value_mut(counter) += 1;
+        }
+
+        fn value(&self, counter: Nc9Counter) -> u32 {
+            match counter {
+                Nc9Counter::NonNested => self.non_nested,
+                Nc9Counter::One => self.one,
+                Nc9Counter::Two => self.two,
+                Nc9Counter::Three => self.three,
+                Nc9Counter::Left => self.left,
+                Nc9Counter::Right => self.right,
+            }
+        }
+
+        fn value_mut(&mut self, counter: Nc9Counter) -> &mut u32 {
+            match counter {
+                Nc9Counter::NonNested => &mut self.non_nested,
+                Nc9Counter::One => &mut self.one,
+                Nc9Counter::Two => &mut self.two,
+                Nc9Counter::Three => &mut self.three,
+                Nc9Counter::Left => &mut self.left,
+                Nc9Counter::Right => &mut self.right,
+            }
+        }
+
+        fn total(&self) -> u32 {
+            self.non_nested + self.one + self.two + self.three + self.left + self.right
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum Nc9Message {
+        Increment(Nc9Counter),
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Nc9Leaf {
+        counter: Nc9Counter,
+    }
+
+    impl Nc9Leaf {
+        fn id_value() -> WidgetId {
+            WidgetId::from("nc9.leaf")
+        }
+
+        fn region_id(&self) -> PresentationRegionId {
+            PresentationRegionId::from(format!("nc9.hit.{:?}", self.counter))
+        }
+    }
+
+    impl SlipwayWidgetTypes for Nc9Leaf {
+        type ExternalState = Nc9Counters;
+        type LocalState = u32;
+        type AppMessage = Nc9Message;
+    }
+
+    impl SlipwaySsot for Nc9Leaf {
+        fn id(&self) -> WidgetId {
+            Self::id_value()
+        }
+
+        fn capabilities(&self) -> Vec<Capability> {
+            vec![
+                Capability::PointerInput,
+                Capability::Paint,
+                Capability::StateObservation,
+            ]
+        }
+
+        fn topology(&self, _external: &Self::ExternalState) -> TopologyNode {
+            TopologyNode {
+                id: self.id(),
+                children: Vec::new(),
+                local_state_slot: Some(WidgetSlotAddress::new(self.id(), 0)),
+            }
+        }
+
+        fn unsupported(&self) -> Vec<Diagnostic> {
+            Vec::new()
+        }
+    }
+
+    impl SlipwayLogic for Nc9Leaf {
+        fn handle_event(
+            &self,
+            _external: &Self::ExternalState,
+            local: &mut Self::LocalState,
+            _event: InputEvent,
+        ) -> EventOutcome<Self::AppMessage> {
+            let before = *local;
+            *local += 1;
+            EventOutcome {
+                handled: true,
+                propagate: false,
+                emitted_messages: vec![slipway_core::EmittedMessage {
+                    target: self.id(),
+                    name: "nc9-increment".to_string(),
+                    message: Nc9Message::Increment(self.counter),
+                }],
+                changes: vec![slipway_core::ChangeEvidence {
+                    target: self.id(),
+                    slot: Some(WidgetSlotAddress::new(self.id(), 0)),
+                    field: "count".to_string(),
+                    before: Some(before.to_string()),
+                    after: Some(local.to_string()),
+                }],
+                observations: self.observe_state(_external, local),
+                probes: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayView for Nc9Leaf {
+        fn initial_local_state(&self) -> Self::LocalState {
+            0
+        }
+
+        fn layout(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+        ) -> LayoutOutput {
+            LayoutOutput {
+                bounds: input.viewport,
+                child_placements: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn paint(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _layout: &LayoutOutput,
+        ) -> Vec<PaintOp> {
+            Vec::new()
+        }
+
+        fn observe_state(
+            &self,
+            _external: &Self::ExternalState,
+            local: &Self::LocalState,
+        ) -> Vec<StateObservation> {
+            vec![StateObservation {
+                target: self.id(),
+                slot: Some(WidgetSlotAddress::new(self.id(), 0)),
+                name: "count".to_string(),
+                value: local.to_string(),
+            }]
+        }
+    }
+
+    impl slipway_core::SlipwayEventRoutingPolicy for Nc9Leaf {
+        fn event_routing_policy(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+        ) -> slipway_core::EventRoutingPolicyDeclaration {
+            let address = event.target_slot().cloned();
+            slipway_core::EventRoutingPolicyDeclaration {
+                target: self.id(),
+                event_target: event.target().clone(),
+                route: EventRoute {
+                    route_id: Some(format!("nc9.route.{:?}", self.counter)),
+                    path: address
+                        .as_ref()
+                        .map(|address| address.path.clone())
+                        .unwrap_or_else(|| vec![self.id()]),
+                    address,
+                    phase: EventRoutePhase::Target,
+                },
+                capture: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl slipway_core::SlipwayEventDispositionPolicy for Nc9Leaf {
+        fn event_disposition(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            event: &InputEvent,
+            route: &EventRoute,
+        ) -> slipway_core::EventPropagationEvidence {
+            let handled = event.target() == &self.id();
+            let disposition = slipway_core::EventDisposition {
+                handled,
+                propagate: false,
+                default_action_allowed: true,
+            };
+            slipway_core::EventPropagationEvidence {
+                target: self.id(),
+                event: event.clone(),
+                steps: vec![slipway_core::EventPropagationStep {
+                    stage: slipway_core::EventPropagationStage::Target,
+                    node: route.path.last().cloned(),
+                    disposition,
+                    emitted_messages: Vec::new(),
+                    changes: Vec::new(),
+                }],
+                final_disposition: disposition,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayFontResolutionPolicy for Nc9Leaf {
+        fn resolve_font(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            request: FontResolutionRequest,
+        ) -> FontResolutionEvidence {
+            FontResolutionEvidence {
+                request,
+                resolved_ref: None,
+                fallback_chain: Vec::new(),
+                installation: None,
+                refusal: None,
+                valid_source: None,
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    impl SlipwayViewDefinition for Nc9Leaf {
+        fn view_definition(
+            &self,
+            external: &Self::ExternalState,
+            local: &Self::LocalState,
+            input: ViewDefinitionInput,
+        ) -> ViewDefinition {
+            let layout = self.layout(external, local, input.layout_input);
+            ViewDefinition {
+                target: self.id(),
+                frame: input.frame,
+                paint: Vec::new(),
+                paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
+                hit_regions: vec![slipway_core::hit_region_from_pointer_capability(
+                    self,
+                    external,
+                    local,
+                    self.region_id(),
+                    None,
+                    layout.bounds,
+                    slipway_core::PointerEventCoordinateSpace::TargetLocal,
+                    HitRegionOrder {
+                        z_index: 0,
+                        paint_order: 0,
+                        traversal_order: 0,
+                    },
+                    Some(format!("nc9.route.{:?}", self.counter)),
+                    CursorCapability::Pointer,
+                    true,
+                    PointerCaptureIntent::OnPress,
+                )],
+                focus_regions: Vec::new(),
+                scroll_regions: Vec::new(),
+                semantic_slots: Vec::new(),
+                probe_metadata: Vec::new(),
+                diagnostics: Vec::new(),
+                layout,
+            }
+        }
+    }
+
+    impl SlipwayEguiAuthoredChildren for Nc9Leaf {
+        fn visit_egui_authored_children<V>(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            _visitor: &mut V,
+        ) where
+            V: SlipwayEguiWidgetListVisitor<Self::ExternalState, Self::AppMessage>,
+        {
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct Nc9App<Widgets> {
+        id: WidgetId,
+        widgets: Widgets,
+    }
+
+    impl<Widgets> slipway_core::SlipwayApp for Nc9App<Widgets>
+    where
+        Widgets: slipway_core::SlipwayWidgetList<ExternalState = Nc9Counters, AppMessage = Nc9Message>
+            + slipway_core::SlipwayWidgetListViewDefinition<
+                ExternalState = Nc9Counters,
+                AppMessage = Nc9Message,
+            >,
+    {
+        type ExternalState = Nc9Counters;
+        type LocalState = ();
+        type AppMessage = Nc9Message;
+        type Widgets = Widgets;
+
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+
+        fn layout_plan(
+            &self,
+            _external: &Self::ExternalState,
+            _local: &Self::LocalState,
+            input: LayoutInput,
+            children: Vec<slipway_core::ChildLayoutSeed>,
+        ) -> slipway_core::AppLayoutPlan {
+            let siblings = self.id.as_str() == "nc9.root.siblings";
+            slipway_core::AppLayoutPlan {
+                bounds: input.viewport,
+                children: children
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, seed)| {
+                        let bounds = if siblings {
+                            Rect {
+                                origin: Point {
+                                    x: index as f32 * 50.0,
+                                    y: 0.0,
+                                },
+                                size: Size {
+                                    width: 40.0,
+                                    height: 40.0,
+                                },
+                            }
+                        } else {
+                            input.viewport.into_rect()
+                        };
+                        slipway_core::ChildLayoutPlan::placed_for_seed(
+                            seed,
+                            child_layout_input(bounds),
+                            slipway_core::ParentLocalRect::new(bounds),
+                        )
+                    })
+                    .collect(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    fn nc9_app<Widgets>(
+        id: &str,
+        widgets: Widgets,
+    ) -> slipway_core::SlipwayAppWidget<Nc9App<Widgets>>
+    where
+        Widgets: slipway_core::SlipwayWidgetList<ExternalState = Nc9Counters, AppMessage = Nc9Message>
+            + slipway_core::SlipwayWidgetListViewDefinition<
+                ExternalState = Nc9Counters,
+                AppMessage = Nc9Message,
+            >,
+    {
+        slipway_core::SlipwayAppWidget::new(Nc9App {
+            id: WidgetId::from(id),
+            widgets,
+        })
+    }
+
+    fn reduce_nc9(external: &mut Nc9Counters, messages: Vec<Nc9Message>) {
+        for message in messages {
+            let Nc9Message::Increment(counter) = message;
+            external.increment(counter);
+        }
+    }
+
+    #[derive(Default)]
+    struct Nc9InputCaptureBridge {
+        inner: DefaultEguiBridge,
+        inputs: Vec<BackendInputEvent>,
+    }
+
+    impl<W> EguiSlipwayBridge<W> for Nc9InputCaptureBridge
+    where
+        W: SlipwayEguiBackendChildWidget,
+    {
+        fn layout_input(&mut self, context: EguiLayoutContext<'_>) -> LayoutInput {
+            <DefaultEguiBridge as EguiSlipwayBridge<W>>::layout_input(&mut self.inner, context)
+        }
+
+        fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
+            <DefaultEguiBridge as EguiSlipwayBridge<W>>::desired_size(&mut self.inner, layout)
+        }
+
+        fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
+            let inputs =
+                <DefaultEguiBridge as EguiSlipwayBridge<W>>::input_events(&mut self.inner, context);
+            self.inputs.extend(inputs.iter().cloned());
+            inputs
+        }
+
+        fn paint(&mut self, context: EguiPaintContext<'_>, ops: &[PaintOp]) {
+            <DefaultEguiBridge as EguiSlipwayBridge<W>>::paint(&mut self.inner, context, ops);
+        }
+
+        fn messages(&mut self, outcome: EventOutcome<W::AppMessage>) -> Vec<W::AppMessage> {
+            <DefaultEguiBridge as EguiSlipwayBridge<W>>::messages(&mut self.inner, outcome)
+        }
     }
 
     fn test_rgb(red: u8, green: u8, blue: u8) -> slipway_core::Color {
@@ -9684,6 +12028,95 @@ mod tests {
         )
     }
 
+    fn screenshot_message(id: &str, frame: &FrameIdentity) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.screenshot","arguments":{{"frame":{}}}}}}}"#,
+            id,
+            frame_json(frame),
+        )
+    }
+
+    fn current_screenshot_message(id: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.screenshot","arguments":{{"frame":"current"}}}}}}"#,
+            id,
+        )
+    }
+
+    fn live_screenshot_object_message(id: &str, frame: &str, forged_current: bool) -> String {
+        let forged = if forged_current {
+            r#", "_slipway_frame_admission":"current""#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.screenshot","arguments":{{"frame":{} {}}}}}}}"#,
+            id, frame, forged,
+        )
+    }
+
+    fn json_object_after<'a>(payload: &'a str, field: &str) -> &'a str {
+        let field_start = payload.find(field).expect("JSON field is present");
+        let object_start = payload[field_start..]
+            .find('{')
+            .map(|offset| field_start + offset)
+            .expect("JSON field contains an object");
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for (offset, byte) in payload.as_bytes()[object_start..].iter().enumerate() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if *byte == b'\\' {
+                    escaped = true;
+                } else if *byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match *byte {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &payload[object_start..=object_start + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("JSON object is terminated");
+    }
+
+    fn json_u64_after(payload: &str, field: &str) -> u64 {
+        let start = payload.find(field).expect("numeric JSON field is present") + field.len();
+        let digits = payload[start..]
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        digits.parse().expect("JSON field is an unsigned integer")
+    }
+
+    fn text_composition_message(
+        id: &str,
+        frame: &FrameIdentity,
+        target: &str,
+        preedit: &str,
+        commit: &str,
+    ) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","method":"tools/call","params":{{"name":"slipway.debug.physical_control","arguments":{{"frame":{},"operation":{{"type":"text_composition","target":"{}","updates":[{{"preedit_text":"{}","cursor_range":{{"anchor":0,"focus":1}}}}],"commit":"{}"}}}}}}}}"#,
+            id,
+            frame_json(frame),
+            target,
+            preedit,
+            commit,
+        )
+    }
+
     fn raw_wheel_input(delta_y: f32) -> egui::RawInput {
         raw_wheel_input_with_unit(egui::MouseWheelUnit::Point, egui::vec2(0.0, delta_y))
     }
@@ -9923,6 +12356,409 @@ mod tests {
             selection_before: None,
             selection_after: None,
         }
+    }
+
+    #[test]
+    fn egui_mounted_collectors_keep_rooted_slots_through_three_app_hops() {
+        let app_ids = ["app-1", "app-2", "app-3"];
+        for depth in 1..=app_ids.len() {
+            let app_id = app_ids[depth - 1];
+            let widget = slipway_core::SlipwayAppWidget::new(MountedCollectorApp {
+                id: WidgetId::from(app_id),
+                widgets: (ProbeWidget {
+                    id: WidgetId::from("leaf"),
+                },),
+            });
+            let local = widget.initial_local_state();
+            let mut mounted_parent = WidgetSlotAddress::new(WidgetId::from("root"), 0);
+            for id in &app_ids[..depth] {
+                mounted_parent = mounted_parent.child(WidgetId::from(*id), 0);
+            }
+            let expected = mounted_parent.child(WidgetId::from("leaf"), 0);
+
+            let mut normal = MountedSlotTrace::default();
+            visit_egui_authored_children_mounted(
+                &widget,
+                &(),
+                &local,
+                Some(&mounted_parent),
+                &mut normal,
+            );
+            assert_eq!(normal.slots, vec![expected.clone()]);
+
+            let parent_view = widget.visible_backend_view_definition(
+                &(),
+                &local,
+                ViewDefinitionInput {
+                    frame: frame(222),
+                    layout_input: child_layout_input(Rect {
+                        origin: Point { x: 0.0, y: 0.0 },
+                        size: Size {
+                            width: 100.0,
+                            height: 40.0,
+                        },
+                    }),
+                },
+            );
+            let parent_view = mount_presented_child_view_addresses(parent_view, &mounted_parent);
+            assert_eq!(parent_view.hit_regions[0].address, Some(expected.clone()));
+            assert_eq!(
+                parent_view.hit_regions[0].route.address,
+                Some(expected.clone())
+            );
+            assert_eq!(parent_view.hit_regions[0].route.path, expected.path.clone());
+            let local_child =
+                WidgetSlotAddress::new(WidgetId::from(app_id), 0).child(WidgetId::from("leaf"), 0);
+            assert!(parent_view.layout.child_placements.iter().any(|placement| {
+                child_placement_matches_slot(placement, &WidgetId::from("leaf"), &local_child)
+            }));
+            let mut paint = MountedSlotTrace::default();
+            visit_egui_authored_children_in_paint_order_mounted(
+                &widget,
+                &(),
+                &local,
+                &parent_view,
+                Some(&mounted_parent),
+                &mut paint,
+            );
+            assert_eq!(paint.slots, vec![expected]);
+        }
+    }
+
+    fn set_nc9_target_slot(event: &mut InputEvent, slot: WidgetSlotAddress) {
+        let InputEvent::Pointer(pointer) = event else {
+            panic!("NC-9 fixture must generate pointer input");
+        };
+        pointer.target_slot = Some(slot);
+    }
+
+    fn nc9_raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(100.0, 40.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn run_egui_nc9_row<W>(
+        widget: W,
+        pointer_x: f32,
+        expected_slot: WidgetSlotAddress,
+        expected_counter: Nc9Counter,
+        assert_local: impl FnOnce(&W::LocalState),
+        wrong_branch: Option<WidgetSlotAddress>,
+    ) where
+        W: SlipwayEguiBackendWidget<ExternalState = Nc9Counters, AppMessage = Nc9Message> + Clone,
+        W::LocalState: Clone,
+    {
+        let viewport = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 40.0,
+            },
+        };
+        let mut selection_app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(widget.clone(), Nc9Counters::default()),
+            Nc9InputCaptureBridge::default(),
+            reduce_nc9 as fn(&mut Nc9Counters, Vec<Nc9Message>),
+        );
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(nc9_raw_input(Vec::new()), |ui| selection_app.render_ui(ui));
+        let position = egui::pos2(pointer_x, 5.0);
+        let _ = ctx.run_ui(
+            nc9_raw_input(vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }]),
+            |ui| selection_app.render_ui(ui),
+        );
+
+        let input = selection_app
+            .bridge
+            .inputs
+            .iter()
+            .find(|input| {
+                input.event.target_slot() == Some(&expected_slot)
+                    && matches!(
+                        input.event,
+                        InputEvent::Pointer(ref pointer)
+                            if pointer.kind == PointerEventKind::Press
+                    )
+            })
+            .cloned()
+            .expect("NC-9 egui press produces rooted backend input");
+        assert_eq!(
+            selection_app.runtime.external().value(expected_counter),
+            1,
+            "the egui frame reducer must mutate the intended counter"
+        );
+        assert_eq!(
+            selection_app.runtime.external().total(),
+            1,
+            "the egui frame reducer must leave sibling counters unchanged"
+        );
+        let frame_trace = selection_app
+            .runtime
+            .backend_input_traces()
+            .find(|trace| {
+                trace.input.event.target_slot() == Some(&expected_slot)
+                    && matches!(
+                        trace.input.event,
+                        InputEvent::Pointer(ref pointer)
+                            if pointer.kind == PointerEventKind::Press
+                    )
+            })
+            .expect("the egui frame records the rooted press trace");
+        assert!(frame_trace.handled, "egui frame trace: {frame_trace:#?}");
+        assert!(frame_trace.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code != slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_FRAME_MISMATCH
+        }));
+        assert!(frame_trace.changes.iter().any(|change| {
+            change.target == Nc9Leaf::id_value() && change.slot.as_ref() == Some(&expected_slot)
+        }));
+        assert_eq!(input.event.target_slot(), Some(&expected_slot));
+        let evidence = input
+            .dispatch_evidence
+            .as_ref()
+            .expect("NC-9 egui input retains backend evidence");
+        assert_eq!(
+            evidence.selected_region,
+            Some(
+                Nc9Leaf {
+                    counter: expected_counter
+                }
+                .region_id()
+            )
+        );
+        assert_eq!(evidence.generated_event.as_ref(), Some(&input.event));
+        let route = evidence
+            .route
+            .as_ref()
+            .expect("NC-9 egui evidence carries route");
+        assert_eq!(route.address.as_ref(), Some(&expected_slot));
+        assert_eq!(route.path, expected_slot.path);
+        let selected_region = evidence.selected_region.clone();
+
+        let mut runtime = SlipwayRuntime::new(widget, Nc9Counters::default());
+        runtime.record_presented_viewport(viewport);
+
+        if let Some(wrong_branch) = wrong_branch {
+            for wrong_slot in [
+                wrong_branch,
+                WidgetSlotAddress {
+                    ordinal: 99,
+                    ..expected_slot.clone()
+                },
+            ] {
+                let mut wrong_event = input.event.clone();
+                set_nc9_target_slot(&mut wrong_event, wrong_slot);
+                let mut wrong_local = runtime.widget().initial_local_state();
+                let outcome = runtime.widget().handle_event(
+                    runtime.external(),
+                    &mut wrong_local,
+                    wrong_event,
+                );
+                assert!(!outcome.handled);
+                assert!(outcome.emitted_messages.is_empty());
+                assert!(outcome.changes.is_empty());
+            }
+        }
+
+        let mut reducer = reduce_nc9;
+        let report = runtime.apply_backend_input_event_for_backend_with_app_reducer(
+            input,
+            EGUI_BACKEND_ID,
+            &mut reducer,
+        );
+        assert!(report.handled, "NC-9 input must be handled: {report:?}");
+        assert_eq!(report.emitted_messages, 1);
+        assert_eq!(report.applied_messages, 1);
+        assert_local(runtime.local_state());
+        assert_eq!(runtime.external().value(expected_counter), 1);
+        assert_eq!(
+            runtime.external().total(),
+            1,
+            "sibling reducer counters stay unchanged"
+        );
+
+        let trace = runtime
+            .last_backend_input_trace()
+            .expect("NC-9 runtime records backend input trace");
+        assert!(trace.handled);
+        assert_eq!(trace.input.event.target_slot(), Some(&expected_slot));
+        let trace_evidence = trace
+            .input
+            .dispatch_evidence
+            .as_ref()
+            .expect("NC-9 trace retains evidence");
+        assert_eq!(trace_evidence.selected_region, selected_region);
+        assert_eq!(
+            trace_evidence
+                .route
+                .as_ref()
+                .and_then(|route| route.address.as_ref()),
+            Some(&expected_slot)
+        );
+        assert!(trace.revision_after > trace.revision_before);
+        assert!(trace.changes.iter().any(|change| {
+            change.target == Nc9Leaf::id_value() && change.slot.as_ref() == Some(&expected_slot)
+        }));
+    }
+
+    #[test]
+    fn egui_nc9_recursive_backend_pointer_runtime_matrix() {
+        let leaf = Nc9Leaf::id_value();
+
+        let non_nested_root = WidgetId::from("nc9.root.non-nested");
+        run_egui_nc9_row(
+            nc9_app(
+                non_nested_root.as_str(),
+                (Nc9Leaf {
+                    counter: Nc9Counter::NonNested,
+                },),
+            ),
+            5.0,
+            WidgetSlotAddress::new(non_nested_root, 0).child(leaf.clone(), 0),
+            Nc9Counter::NonNested,
+            |local| assert_eq!(local.widgets.0, 1),
+            None,
+        );
+
+        let one_root = WidgetId::from("nc9.root.one");
+        let app_1 = WidgetId::from("nc9.app-1");
+        run_egui_nc9_row(
+            nc9_app(
+                one_root.as_str(),
+                (nc9_app(
+                    app_1.as_str(),
+                    (Nc9Leaf {
+                        counter: Nc9Counter::One,
+                    },),
+                ),),
+            ),
+            5.0,
+            WidgetSlotAddress::new(one_root, 0)
+                .child(app_1.clone(), 0)
+                .child(leaf.clone(), 0),
+            Nc9Counter::One,
+            |local| assert_eq!(local.widgets.0.widgets.0, 1),
+            None,
+        );
+
+        let two_root = WidgetId::from("nc9.root.two");
+        let app_2 = WidgetId::from("nc9.app-2");
+        run_egui_nc9_row(
+            nc9_app(
+                two_root.as_str(),
+                (nc9_app(
+                    app_1.as_str(),
+                    (nc9_app(
+                        app_2.as_str(),
+                        (Nc9Leaf {
+                            counter: Nc9Counter::Two,
+                        },),
+                    ),),
+                ),),
+            ),
+            5.0,
+            WidgetSlotAddress::new(two_root, 0)
+                .child(app_1.clone(), 0)
+                .child(app_2.clone(), 0)
+                .child(leaf.clone(), 0),
+            Nc9Counter::Two,
+            |local| assert_eq!(local.widgets.0.widgets.0.widgets.0, 1),
+            None,
+        );
+
+        let three_root = WidgetId::from("nc9.root.three");
+        let app_3 = WidgetId::from("nc9.app-3");
+        let three_slot = WidgetSlotAddress::new(three_root.clone(), 0)
+            .child(app_1.clone(), 0)
+            .child(app_2.clone(), 0)
+            .child(app_3.clone(), 0)
+            .child(leaf.clone(), 0);
+        let wrong_branch = WidgetSlotAddress::new(three_root.clone(), 0)
+            .child(app_1.clone(), 0)
+            .child(WidgetId::from("nc9.wrong-app"), 0)
+            .child(app_3.clone(), 0)
+            .child(leaf.clone(), 0);
+        run_egui_nc9_row(
+            nc9_app(
+                three_root.as_str(),
+                (nc9_app(
+                    app_1.as_str(),
+                    (nc9_app(
+                        app_2.as_str(),
+                        (nc9_app(
+                            app_3.as_str(),
+                            (Nc9Leaf {
+                                counter: Nc9Counter::Three,
+                            },),
+                        ),),
+                    ),),
+                ),),
+            ),
+            5.0,
+            three_slot,
+            Nc9Counter::Three,
+            |local| assert_eq!(local.widgets.0.widgets.0.widgets.0.widgets.0, 1),
+            Some(wrong_branch),
+        );
+
+        let sibling_root = WidgetId::from("nc9.root.siblings");
+        let left_app = WidgetId::from("nc9.left-app");
+        let right_app = WidgetId::from("nc9.right-app");
+        let sibling_fixture = || {
+            nc9_app(
+                sibling_root.as_str(),
+                (
+                    nc9_app(
+                        left_app.as_str(),
+                        (Nc9Leaf {
+                            counter: Nc9Counter::Left,
+                        },),
+                    ),
+                    nc9_app(
+                        right_app.as_str(),
+                        (Nc9Leaf {
+                            counter: Nc9Counter::Right,
+                        },),
+                    ),
+                ),
+            )
+        };
+        run_egui_nc9_row(
+            sibling_fixture(),
+            5.0,
+            WidgetSlotAddress::new(sibling_root.clone(), 0)
+                .child(left_app.clone(), 0)
+                .child(leaf.clone(), 0),
+            Nc9Counter::Left,
+            |local| {
+                assert_eq!(local.widgets.0.widgets.0, 1);
+                assert_eq!(local.widgets.1.widgets.0, 0);
+            },
+            None,
+        );
+        run_egui_nc9_row(
+            sibling_fixture(),
+            55.0,
+            WidgetSlotAddress::new(sibling_root, 0)
+                .child(right_app.clone(), 1)
+                .child(leaf, 0),
+            Nc9Counter::Right,
+            |local| {
+                assert_eq!(local.widgets.0.widgets.0, 0);
+                assert_eq!(local.widgets.1.widgets.0, 1);
+            },
+            None,
+        );
     }
 
     #[test]
@@ -16792,7 +19628,7 @@ mod tests {
             .find("declared_scroll_content_origin(")
             .expect("declared scroll content origin is present");
         let child_presentation = scroll_body
-            .find("present_authored_children(")
+            .find("present_authored_children_mounted(")
             .expect("declared scroll content child presentation is present");
 
         assert!(
@@ -18174,7 +21010,7 @@ mod tests {
         };
         let raw_input = egui::RawInput::default();
 
-        let text_events = native_runner::egui_events_for_native_physical_operation(
+        let text_events = native_runner::egui_test_events_for_native_physical_operation(
             &DebugPhysicalControl::Text {
                 selector: selector.clone(),
                 text: "abc".to_string(),
@@ -18182,13 +21018,9 @@ mod tests {
             &raw_input,
         )
         .expect("text input maps to egui text event");
-        assert!(matches!(
-            text_events,
-            native_runner::NativePhysicalControlPlan::RawInputEvents(ref events)
-                if events == &vec![egui::Event::Text("abc".to_string())]
-        ));
+        assert_eq!(text_events, vec![egui::Event::Text("abc".to_string())]);
 
-        let keyboard_events = native_runner::egui_events_for_native_physical_operation(
+        let keyboard_events = native_runner::egui_test_events_for_native_physical_operation(
             &DebugPhysicalControl::Keyboard {
                 selector: selector.clone(),
                 key: "Enter".to_string(),
@@ -18207,11 +21039,6 @@ mod tests {
             &raw_input,
         )
         .expect("supported key maps to egui key event");
-        let native_runner::NativePhysicalControlPlan::RawInputEvents(keyboard_events) =
-            keyboard_events
-        else {
-            panic!("keyboard maps to raw input events");
-        };
         assert!(matches!(
             keyboard_events.as_slice(),
             [egui::Event::Key {
@@ -18223,7 +21050,7 @@ mod tests {
             }] if modifiers.shift && modifiers.ctrl && modifiers.command
         ));
 
-        let copy_events = native_runner::egui_events_for_native_physical_operation(
+        let copy_events = native_runner::egui_test_events_for_native_physical_operation(
             &DebugPhysicalControl::Command {
                 selector: selector.clone(),
                 command: "copy".to_string(),
@@ -18232,13 +21059,9 @@ mod tests {
             &raw_input,
         )
         .expect("copy maps to egui copy event");
-        assert!(matches!(
-            copy_events,
-            native_runner::NativePhysicalControlPlan::RawInputEvents(ref events)
-                if events == &vec![egui::Event::Copy]
-        ));
+        assert_eq!(copy_events, vec![egui::Event::Copy]);
 
-        let cut_events = native_runner::egui_events_for_native_physical_operation(
+        let cut_events = native_runner::egui_test_events_for_native_physical_operation(
             &DebugPhysicalControl::Command {
                 selector,
                 command: "cut".to_string(),
@@ -18247,11 +21070,7 @@ mod tests {
             &raw_input,
         )
         .expect("cut maps to egui cut event");
-        assert!(matches!(
-            cut_events,
-            native_runner::NativePhysicalControlPlan::RawInputEvents(ref events)
-                if events == &vec![egui::Event::Cut]
-        ));
+        assert_eq!(cut_events, vec![egui::Event::Cut]);
     }
 
     #[test]
@@ -18261,7 +21080,7 @@ mod tests {
         };
         let raw_input = egui::RawInput::default();
 
-        let text_edit_error = native_runner::egui_events_for_native_physical_operation(
+        let text_edit_error = native_runner::egui_test_events_for_native_physical_operation(
             &DebugPhysicalControl::TextEdit {
                 selector: selector.clone(),
                 kind: TextEditKind::ReplaceBuffer,
@@ -18277,7 +21096,7 @@ mod tests {
             "native-physical-control-text-edit-unsupported"
         );
 
-        let focus_plan = native_runner::egui_events_for_native_physical_operation(
+        let focus_plan = native_runner::egui_test_events_for_native_physical_operation(
             &DebugPhysicalControl::Focus {
                 selector: selector.clone(),
                 focused: true,
@@ -18286,14 +21105,11 @@ mod tests {
         )
         .expect("focus maps to backend-native mutation plan");
         assert!(
-            matches!(
-                focus_plan,
-                native_runner::NativePhysicalControlPlan::BackendNativeMutation
-            ),
+            focus_plan.is_empty(),
             "focus must not pretend to be RawInput"
         );
 
-        let command_error = native_runner::egui_events_for_native_physical_operation(
+        let command_error = native_runner::egui_test_events_for_native_physical_operation(
             &DebugPhysicalControl::Command {
                 selector: selector.clone(),
                 command: "submit".to_string(),
@@ -18307,7 +21123,7 @@ mod tests {
             "native-physical-control-command-payload-unsupported"
         );
 
-        let scroll_plan = native_runner::egui_events_for_native_physical_operation(
+        let scroll_plan = native_runner::egui_test_events_for_native_physical_operation(
             &DebugPhysicalControl::Scroll {
                 selector,
                 offset_x: 0.0,
@@ -18317,10 +21133,7 @@ mod tests {
         )
         .expect("scroll maps to backend-native mutation plan");
         assert!(
-            matches!(
-                scroll_plan,
-                native_runner::NativePhysicalControlPlan::BackendNativeMutation
-            ),
+            scroll_plan.is_empty(),
             "scroll must not pretend to be RawInput"
         );
     }
@@ -18648,7 +21461,10 @@ mod tests {
             payload.contains(r#""label":"backend_presented""#),
             "{payload}"
         );
-        assert!(payload.contains(r#""native-scroll""#), "{payload}");
+        assert!(
+            payload.contains(r#""physical-input/debug-injected""#),
+            "{payload}"
+        );
         assert_eq!(app.runtime().local_state().child, 8);
         assert_eq!(applied.get(), 1);
     }
@@ -19449,5 +22265,925 @@ mod tests {
         assert_eq!(calls.observe_state.get(), 1);
         assert_eq!(bridge.take_probe_products().len(), 2);
         assert!(bridge.take_probe_products().is_empty());
+    }
+
+    #[test]
+    fn step223_mixed_native_and_debug_events_keep_exact_origin_span() {
+        let span = eframe::egui_winit::SlipwayDebugInputSpan {
+            token: 41,
+            start_event_index: 1,
+            end_event_index: 2,
+        };
+        let event = egui::Event::Copy;
+        assert_eq!(
+            egui_raw_event_source(Some(span), false, 0, &event)
+                .pass_id
+                .as_deref(),
+            Some(EGUI_NATIVE_OS_INPUT_PASS)
+        );
+        assert_eq!(
+            egui_raw_event_source(Some(span), false, 1, &event)
+                .pass_id
+                .as_deref(),
+            Some(EGUI_DEBUG_INPUT_PASS)
+        );
+        assert_eq!(
+            egui_raw_event_source(Some(span), false, 2, &event)
+                .pass_id
+                .as_deref(),
+            Some(EGUI_NATIVE_OS_INPUT_PASS)
+        );
+        assert_eq!(
+            egui_raw_event_source(
+                Some(span),
+                true,
+                1,
+                &egui::Event::Ime(egui::ImeEvent::Commit("x".to_string())),
+            )
+            .pass_id
+            .as_deref(),
+            Some(EGUI_DEBUG_COMPOSITION_PASS)
+        );
+    }
+
+    fn step223_probe_reducer(_: &mut (), _: Vec<ProbeMessage>) {}
+
+    fn step223_probe_app()
+    -> SlipwayEguiRuntimeApp<ProbeWidget, DefaultEguiBridge, fn(&mut (), Vec<ProbeMessage>)> {
+        SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            step223_probe_reducer,
+        )
+    }
+
+    #[test]
+    fn step223_post_present_starts_absent_and_ui_work_only_records_candidate() {
+        let mut app = step223_probe_app();
+        assert!(app.last_successfully_presented.is_none());
+        assert!(app.rendered_frame_candidate.is_none());
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render_ui(ui));
+        let first_candidate = app
+            .rendered_frame_candidate
+            .clone()
+            .expect("UI work records a paint candidate");
+        assert!(app.last_successfully_presented.is_none());
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render_ui(ui));
+        assert_eq!(app.rendered_frame_candidate, Some(first_candidate));
+        assert!(app.last_successfully_presented.is_none());
+    }
+
+    #[test]
+    fn step223_post_present_ordinary_is_stable_and_advances_once_per_actual_present() {
+        let mut app = step223_probe_app();
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render_ui(ui));
+        let first_candidate = app.rendered_frame_candidate.clone().unwrap();
+        app.record_slipway_debug_post_present(eframe::SlipwayDebugPostPresent {
+            viewport_id: egui::ViewportId::ROOT,
+            capture_token: None,
+        });
+        assert_eq!(
+            app.last_successfully_presented,
+            Some(first_candidate.clone())
+        );
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render_ui(ui));
+        assert_eq!(
+            app.last_successfully_presented,
+            Some(first_candidate.clone())
+        );
+        let mut second_expected = app.rendered_frame_candidate.clone().unwrap();
+        second_expected.frame_index = first_candidate.frame_index + 1;
+        app.record_slipway_debug_post_present(eframe::SlipwayDebugPostPresent {
+            viewport_id: egui::ViewportId::ROOT,
+            capture_token: None,
+        });
+        assert_eq!(
+            app.last_successfully_presented,
+            Some(second_expected.clone())
+        );
+        app.record_slipway_debug_post_present(eframe::SlipwayDebugPostPresent {
+            viewport_id: egui::ViewportId::ROOT,
+            capture_token: None,
+        });
+        assert_eq!(app.last_successfully_presented, Some(second_expected));
+    }
+
+    #[test]
+    fn step223_post_present_wrong_nonroot_and_late_tokens_are_isolated() {
+        let mut app = step223_probe_app();
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render_ui(ui));
+        let candidate = app.rendered_frame_candidate.clone();
+        app.record_slipway_debug_post_present(eframe::SlipwayDebugPostPresent {
+            viewport_id: egui::ViewportId::from_hash_of("secondary"),
+            capture_token: None,
+        });
+        assert_eq!(app.rendered_frame_candidate, candidate);
+        assert!(app.last_successfully_presented.is_none());
+        app.record_slipway_debug_post_present(eframe::SlipwayDebugPostPresent {
+            viewport_id: egui::ViewportId::ROOT,
+            capture_token: Some(999),
+        });
+        assert_eq!(app.rendered_frame_candidate, candidate);
+        assert!(app.last_successfully_presented.is_none());
+    }
+
+    #[test]
+    fn step223_composition_provenance_commit_key_rejects_shift_and_ambiguous_mutation() {
+        let operation = DebugPhysicalControl::TextComposition {
+            selector: slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Target {
+                target: WidgetId::from("egui.focused"),
+            },
+            updates: vec![slipway_debug_bridge::DebugTextCompositionUpdate {
+                preedit_text: "preedit".to_string(),
+                cursor_range: Some(TextSelectionRange {
+                    anchor: 0,
+                    focus: 1,
+                }),
+            }],
+            commit: "commit".to_string(),
+        };
+        let span = eframe::egui_winit::SlipwayDebugInputSpan {
+            token: 71,
+            start_event_index: 1,
+            end_event_index: 3,
+        };
+        let debug_events = [
+            egui::Event::Copy,
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "preedit".to_string(),
+                active_range_chars: Some(0..1),
+            }),
+            egui::Event::Ime(egui::ImeEvent::Commit("commit".to_string())),
+            egui::Event::Copy,
+        ];
+        let (commit, count) =
+            egui_accepted_composition_commit_key(&debug_events, Some(span), true, Some(&operation))
+                .expect("the exact nonzero accepted span establishes commit custody");
+        assert_eq!(count, 2);
+        assert_eq!(commit.event_index, 2);
+        let shifted = eframe::egui_winit::SlipwayDebugInputSpan {
+            start_event_index: 0,
+            end_event_index: 2,
+            ..span
+        };
+        assert!(
+            egui_accepted_composition_commit_key(
+                &debug_events,
+                Some(shifted),
+                true,
+                Some(&operation),
+            )
+            .is_none()
+        );
+        let mut ambiguous = debug_events.to_vec();
+        ambiguous[0] = egui::Event::Text("native".to_string());
+        assert!(
+            egui_accepted_composition_commit_key(&ambiguous, Some(span), true, Some(&operation),)
+                .is_none()
+        );
+        assert_eq!(
+            egui_raw_event_source(Some(span), true, 0, &ambiguous[0])
+                .pass_id
+                .as_deref(),
+            Some(EGUI_NATIVE_OS_INPUT_PASS)
+        );
+    }
+
+    #[test]
+    fn step223_composition_plan_uses_logical_ime_and_multibyte_ranges() {
+        let operation = DebugPhysicalControl::TextComposition {
+            selector: slipway_debug_bridge::DebugPhysicalControlDeclarationSelector::Target {
+                target: WidgetId::from("egui.focused"),
+            },
+            updates: vec![slipway_debug_bridge::DebugTextCompositionUpdate {
+                preedit_text: "한글".to_string(),
+                cursor_range: Some(TextSelectionRange {
+                    anchor: 1,
+                    focus: 2,
+                }),
+            }],
+            commit: "界".to_string(),
+        };
+        let native_runner::NativePhysicalControlPlan::Input(events) =
+            native_runner::egui_events_for_native_physical_operation(&operation, 1.0)
+                .expect("composition maps to dependency-owned native IME ingress")
+        else {
+            panic!("composition must not use a backend mutation shortcut");
+        };
+        assert!(matches!(
+            events.as_slice(),
+            [
+                eframe::egui_winit::SlipwayDebugInputEvent::Ime(winit::event::Ime::Preedit(
+                    text,
+                    Some((3, 6))
+                )),
+                eframe::egui_winit::SlipwayDebugInputEvent::Ime(winit::event::Ime::Commit(commit)),
+            ] if text == "한글" && commit == "界"
+        ));
+    }
+
+    #[test]
+    fn step223_capture_state_completes_after_presented_and_mapped_in_either_order() {
+        let run = |mapped_first: bool, post_present_first: bool| {
+            let mut app = SlipwayEguiRuntimeApp::new(
+                SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+                DefaultEguiBridge::new(),
+                move |_, _messages: Vec<ProbeMessage>| {},
+            );
+            let expected = app.runtime().last_frame_identity();
+            app.last_successfully_presented = Some(expected.clone());
+            app.rendered_frame_candidate = Some(expected.clone());
+            let handle = app
+                .runtime()
+                .runtime_mcp_client_clone()
+                .submit(screenshot_message("egui-direct-capture", &expected))
+                .expect("screenshot MCP request queued");
+            let pending = app
+                .runtime_mut()
+                .take_pending_native_mcp_call()
+                .expect("runtime MCP receive")
+                .expect("pending screenshot call");
+            let lease = app
+                .runtime()
+                .take_debug_command_lease()
+                .expect("debug bridge receive")
+                .expect("screenshot lease");
+            let (event_tx, event_rx) = mpsc::sync_channel(3);
+            app.pending_presented_capture = Some(PendingEguiPresentedCapture {
+                pending,
+                lease,
+                token: 77,
+                selector: PresentedScreenshotSelector::Exact {
+                    expected_frame: expected.clone(),
+                },
+                event_rx,
+                deadline: Instant::now() + Duration::from_secs(1),
+                post_presented_candidate: None,
+                post_presented_frame: None,
+                presented: None,
+                mapped: None,
+            });
+            if post_present_first {
+                app.record_slipway_debug_post_present(eframe::SlipwayDebugPostPresent {
+                    viewport_id: egui::ViewportId::ROOT,
+                    capture_token: Some(77),
+                });
+            }
+            let presented = egui_wgpu::winit::DirectCaptureEvent::Presented {
+                token: 77,
+                format: egui_wgpu::winit::DirectCaptureFormat::Bgra8UnormSrgb,
+                alpha: egui_wgpu::winit::DirectCaptureAlphaMode::Opaque,
+                width: 2,
+                height: 1,
+            };
+            let mapped = egui_wgpu::winit::DirectCaptureEvent::Mapped {
+                token: 77,
+                result: Ok(Arc::<[u8]>::from(vec![1, 2, 3, 255, 4, 5, 6, 255])),
+            };
+            if mapped_first {
+                event_tx.send(mapped).expect("send mapped");
+                event_tx.send(presented).expect("send presented");
+                event_tx
+                    .send(egui_wgpu::winit::DirectCaptureEvent::Mapped {
+                        token: 77,
+                        result: Ok(Arc::<[u8]>::from(vec![9; 8])),
+                    })
+                    .expect("send duplicate mapped");
+            } else {
+                event_tx.send(presented).expect("send presented");
+                event_tx
+                    .send(egui_wgpu::winit::DirectCaptureEvent::Presented {
+                        token: 77,
+                        format: egui_wgpu::winit::DirectCaptureFormat::Bgra8UnormSrgb,
+                        alpha: egui_wgpu::winit::DirectCaptureAlphaMode::Opaque,
+                        width: 2,
+                        height: 1,
+                    })
+                    .expect("send duplicate presented");
+                event_tx.send(mapped).expect("send mapped");
+            }
+            drop(event_tx);
+            if !post_present_first {
+                let (polled, error) = app.drain_pending_presented_capture();
+                assert!(polled);
+                assert_eq!(error, None);
+                assert!(app.pending_presented_capture.is_some());
+                app.record_slipway_debug_post_present(eframe::SlipwayDebugPostPresent {
+                    viewport_id: egui::ViewportId::ROOT,
+                    capture_token: Some(77),
+                });
+            }
+            let (polled, error) = app.drain_pending_presented_capture();
+            assert!(polled);
+            assert_eq!(error, None);
+            assert!(app.pending_presented_capture.is_none());
+            let response = handle
+                .recv()
+                .expect("screenshot response channel")
+                .expect("screenshot response");
+            let payload = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("screenshot payload");
+            assert!(
+                payload.contains(r#""product_kind":"presented_screenshot""#),
+                "{payload}"
+            );
+            assert!(
+                payload.contains("direct_acquired_surface_texture_copy"),
+                "{payload}"
+            );
+            assert!(
+                payload.contains("presented-pixels/direct-surface-copy"),
+                "{payload}"
+            );
+            assert_eq!(
+                app.last_successfully_presented
+                    .as_ref()
+                    .map(|frame| frame.frame_index),
+                Some(expected.frame_index + 1)
+            );
+        };
+        run(false, true);
+        run(true, true);
+        run(false, false);
+        run(true, false);
+    }
+
+    #[test]
+    fn step223_current_capture_ignores_context_and_uses_post_present_candidate() {
+        let mut app = step223_probe_app();
+        let request_context = app.runtime().last_frame_identity();
+        let mut factual_presented = request_context.clone();
+        factual_presented.frame_index = 20;
+        app.last_successfully_presented = Some(factual_presented);
+        app.rendered_frame_candidate = Some(request_context.clone());
+
+        let handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(current_screenshot_message("egui-current-capture"))
+            .expect("current screenshot MCP request queued");
+        let pending = app
+            .runtime_mut()
+            .take_pending_native_mcp_call()
+            .expect("runtime MCP receive")
+            .expect("pending current screenshot call");
+        let lease = app
+            .runtime()
+            .take_debug_command_lease()
+            .expect("debug bridge receive")
+            .expect("current screenshot lease");
+        let selector = match &lease.command().kind {
+            DebugCommandKind::Screenshot { request } => request.selector.clone(),
+            other => panic!("expected screenshot command, got {other:?}"),
+        };
+        assert!(matches!(
+            &selector,
+            PresentedScreenshotSelector::Current {
+                request_context: context
+            } if context == &request_context
+        ));
+        assert!(egui_screenshot_selector_matches_intake(
+            &selector,
+            app.last_successfully_presented.as_ref(),
+        ));
+
+        let (event_tx, event_rx) = mpsc::sync_channel(3);
+        app.pending_presented_capture = Some(PendingEguiPresentedCapture {
+            pending,
+            lease,
+            token: 78,
+            selector,
+            event_rx,
+            deadline: Instant::now() + Duration::from_secs(1),
+            post_presented_candidate: None,
+            post_presented_frame: None,
+            presented: None,
+            mapped: None,
+        });
+        app.record_slipway_debug_post_present(eframe::SlipwayDebugPostPresent {
+            viewport_id: egui::ViewportId::ROOT,
+            capture_token: Some(78),
+        });
+        event_tx
+            .send(egui_wgpu::winit::DirectCaptureEvent::Presented {
+                token: 78,
+                format: egui_wgpu::winit::DirectCaptureFormat::Bgra8UnormSrgb,
+                alpha: egui_wgpu::winit::DirectCaptureAlphaMode::Opaque,
+                width: 1,
+                height: 1,
+            })
+            .unwrap();
+        event_tx
+            .send(egui_wgpu::winit::DirectCaptureEvent::Mapped {
+                token: 78,
+                result: Ok(Arc::<[u8]>::from([1, 2, 3, 255])),
+            })
+            .unwrap();
+        assert_eq!(app.drain_pending_presented_capture().1, None);
+
+        let response = handle.recv().unwrap().unwrap();
+        let payload = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(payload.contains(r#""admission":"current""#), "{payload}");
+        assert!(payload.contains(r#""kind":"current""#), "{payload}");
+        assert!(payload.contains(r#""frame_index":21"#), "{payload}");
+        assert!(!payload.contains("screenshot-frame-mismatch"), "{payload}");
+    }
+
+    #[test]
+    fn step223_selector_admission_and_current_candidate_provenance_are_exhaustive() {
+        let expected = frame(4);
+        let exact = PresentedScreenshotSelector::Exact {
+            expected_frame: expected.clone(),
+        };
+        let current = PresentedScreenshotSelector::Current {
+            request_context: frame(1),
+        };
+        assert!(egui_screenshot_selector_matches_intake(
+            &exact,
+            Some(&expected)
+        ));
+        assert!(!egui_screenshot_selector_matches_intake(
+            &exact,
+            Some(&frame(5))
+        ));
+        assert!(egui_screenshot_selector_matches_intake(
+            &current,
+            Some(&frame(99))
+        ));
+        assert!(egui_screenshot_selector_matches_intake(&current, None));
+
+        let mut captured = expected.clone();
+        captured.frame_index = 88;
+        assert!(egui_capture_frame_has_candidate_provenance(
+            &expected, &captured
+        ));
+        captured.surface_instance_id.push_str("-other");
+        assert!(!egui_capture_frame_has_candidate_provenance(
+            &expected, &captured
+        ));
+    }
+
+    #[test]
+    fn step223_capture_state_maps_map_poll_and_surface_acquire_terminals() {
+        let cases = [
+            (
+                egui_wgpu::winit::DirectCaptureEvent::Mapped {
+                    token: 81,
+                    result: Err(egui_wgpu::winit::DirectCaptureMapError::MapFailed),
+                },
+                "screenshot-map-failed",
+            ),
+            (
+                egui_wgpu::winit::DirectCaptureEvent::PollFailed {
+                    token: 81,
+                    error: egui_wgpu::winit::DirectCapturePollError::Device,
+                },
+                "screenshot-poll-failed",
+            ),
+            (
+                egui_wgpu::winit::DirectCaptureEvent::Refused {
+                    token: 81,
+                    reason: egui_wgpu::winit::DirectCaptureRefusal::SurfaceAcquireFailed,
+                },
+                "screenshot-surface-acquire-failed",
+            ),
+        ];
+        for (event, expected_code) in cases {
+            let mut app = step223_probe_app();
+            let expected = app.runtime().last_frame_identity();
+            let handle = app
+                .runtime()
+                .runtime_mcp_client_clone()
+                .submit(screenshot_message("egui-terminal", &expected))
+                .unwrap();
+            let pending = app
+                .runtime_mut()
+                .take_pending_native_mcp_call()
+                .unwrap()
+                .unwrap();
+            let lease = app.runtime().take_debug_command_lease().unwrap().unwrap();
+            let (event_tx, event_rx) = mpsc::sync_channel(3);
+            app.pending_presented_capture = Some(PendingEguiPresentedCapture {
+                pending,
+                lease,
+                token: 81,
+                selector: PresentedScreenshotSelector::Exact {
+                    expected_frame: expected,
+                },
+                event_rx,
+                deadline: Instant::now() + Duration::from_secs(1),
+                post_presented_candidate: None,
+                post_presented_frame: None,
+                presented: None,
+                mapped: None,
+            });
+            event_tx.send(event).unwrap();
+            assert_eq!(app.drain_pending_presented_capture().1, None);
+            let response = handle.recv().unwrap().unwrap();
+            let payload = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(payload.contains(expected_code), "{payload}");
+            assert!(app.pending_presented_capture.is_none());
+        }
+    }
+
+    #[test]
+    fn step223_capture_state_deadline_and_teardown_complete_exactly_once() {
+        let run = |teardown: bool, expected_code: &str| {
+            let mut app = step223_probe_app();
+            let expected = app.runtime().last_frame_identity();
+            let handle = app
+                .runtime()
+                .runtime_mcp_client_clone()
+                .submit(screenshot_message("egui-terminal", &expected))
+                .unwrap();
+            let pending = app
+                .runtime_mut()
+                .take_pending_native_mcp_call()
+                .unwrap()
+                .unwrap();
+            let lease = app.runtime().take_debug_command_lease().unwrap().unwrap();
+            let (_event_tx, event_rx) = mpsc::sync_channel(3);
+            app.pending_presented_capture = Some(PendingEguiPresentedCapture {
+                pending,
+                lease,
+                token: 82,
+                selector: PresentedScreenshotSelector::Exact {
+                    expected_frame: expected,
+                },
+                event_rx,
+                deadline: if teardown {
+                    Instant::now() + Duration::from_secs(1)
+                } else {
+                    Instant::now() - Duration::from_millis(1)
+                },
+                post_presented_candidate: None,
+                post_presented_frame: None,
+                presented: None,
+                mapped: None,
+            });
+            if teardown {
+                app.terminate_pending_presented_capture_for_teardown();
+                app.terminate_pending_presented_capture_for_teardown();
+            } else {
+                assert_eq!(app.drain_pending_presented_capture().1, None);
+            }
+            let response = handle.recv().unwrap().unwrap();
+            let payload = response["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(payload.contains(expected_code), "{payload}");
+            assert!(app.pending_presented_capture.is_none());
+        };
+        run(false, "screenshot-deadline");
+        run(true, "screenshot-teardown");
+    }
+
+    #[test]
+    fn step223_composition_provenance_mixed_span_carries_exact_indices_and_mutation() {
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(FocusedProbeWidget::new("egui.focused"), ()),
+            DefaultEguiBridge::new(),
+            move |_, _messages: Vec<ProbeMessage>| {},
+        );
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.render_ui(ui));
+
+        let focus_handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(physical_focus_message(
+                "egui-composition-focus",
+                &app.runtime().last_frame_identity(),
+                "egui.focused",
+                true,
+            ))
+            .expect("focus request queued");
+        let mut focus_input = egui::RawInput::default();
+        let (drained, error) = app.inject_pending_native_physical_into_raw_input(&mut focus_input);
+        assert_eq!((drained, error), (1, None));
+        let _ = ctx.run_ui(focus_input, |ui| app.render_ui(ui));
+        focus_handle
+            .recv()
+            .expect("focus response channel")
+            .expect("focus response");
+
+        let frame = app.runtime().last_frame_identity();
+        let handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(text_composition_message(
+                "egui-composition-success",
+                &frame,
+                "egui.focused",
+                "한",
+                "界",
+            ))
+            .expect("composition request queued");
+        let pending = app
+            .runtime_mut()
+            .take_pending_native_mcp_call()
+            .expect("composition MCP receive")
+            .expect("pending composition call");
+        let lease = app
+            .runtime()
+            .take_debug_command_lease()
+            .expect("composition bridge receive")
+            .expect("composition lease");
+        let token = 91;
+        let span = eframe::egui_winit::SlipwayDebugInputSpan {
+            token,
+            start_event_index: 1,
+            end_event_index: 3,
+        };
+        app.pending_native_physical =
+            Some(PendingEguiNativePhysicalControl::WaitingForBackendTrace {
+                pending,
+                lease,
+                origin: PendingEguiTraceOrigin::DebugComposition {
+                    token,
+                    span,
+                    composition: PendingEguiComposition {
+                        preflight: EguiCompositionPreflight {
+                            target: WidgetId::from("egui.focused"),
+                            target_slot: Some(WidgetSlotAddress::new(
+                                WidgetId::from("egui.focused"),
+                                0,
+                            )),
+                            selected_region: PresentationRegionId::from("text-focus"),
+                            focused: true,
+                            editable: true,
+                        },
+                    },
+                },
+            });
+        let raw_input = egui::RawInput {
+            events: vec![
+                egui::Event::Copy,
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "한".to_string(),
+                    active_range_chars: Some(0..1),
+                }),
+                egui::Event::Ime(egui::ImeEvent::Commit("界".to_string())),
+                egui::Event::Copy,
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(raw_input, |ui| app.render_ui(ui));
+
+        let response = handle
+            .recv()
+            .expect("composition response channel")
+            .expect("composition response");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("composition payload");
+        assert!(
+            payload.contains(r#""product_kind":"text_composition_trace""#),
+            "{payload}"
+        );
+        assert!(payload.contains(r#""completed":true"#), "{payload}");
+        assert!(payload.contains(r#""before":"editable""#), "{payload}");
+        assert!(payload.contains(r#""after":"editable界""#), "{payload}");
+        assert!(payload.contains(EGUI_DEBUG_COMPOSITION_PASS), "{payload}");
+        assert!(payload.contains(r#""event_index":1"#), "{payload}");
+        assert!(payload.contains(r#""event_index":2"#), "{payload}");
+    }
+
+    #[test]
+    fn step223_screenshot_frame_mismatch_refuses_before_capture_arming() {
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, _messages: Vec<ProbeMessage>| {},
+        );
+        let mut wrong = app.runtime().last_frame_identity();
+        wrong.frame_index += 9;
+        let handle = app
+            .runtime()
+            .runtime_mcp_client_clone()
+            .submit(screenshot_message("egui-capture-refusal", &wrong))
+            .expect("screenshot refusal request queued");
+        let (drained, error) = app.intake_pending_native_command(&egui::Context::default());
+        assert_eq!((drained, error), (1, None));
+        assert!(app.pending_presented_capture.is_none());
+        let response = handle
+            .recv()
+            .expect("refusal response channel")
+            .expect("refusal response");
+        let payload = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("refusal payload");
+        assert!(payload.contains("screenshot-frame-mismatch"), "{payload}");
+    }
+
+    #[test]
+    fn step223_enabled_but_idle_has_no_request_work() {
+        let mut app = SlipwayEguiRuntimeApp::new(
+            SlipwayRuntime::new(ProbeWidget::new("one"), ()),
+            DefaultEguiBridge::new(),
+            move |_, _messages: Vec<ProbeMessage>| {},
+        );
+        let mut raw_input = egui::RawInput {
+            events: vec![egui::Event::Copy],
+            ..Default::default()
+        };
+        let before = raw_input.events.clone();
+        <SlipwayEguiRuntimeApp<_, _, _> as eframe::App>::raw_input_hook_with_slipway_debug(
+            &mut app,
+            &egui::Context::default(),
+            &mut raw_input,
+            None,
+        );
+        assert_eq!(raw_input.events, before);
+        assert_eq!(app.next_native_debug_token, 1);
+        assert!(app.pending_native_physical.is_none());
+        assert!(app.pending_presented_capture.is_none());
+        assert_eq!(app.drain_pending_presented_capture(), (false, None));
+        assert!(!app.native_mcp_wake_pending);
+    }
+
+    #[test]
+    #[ignore = "requires a visible desktop and WGPU surface"]
+    fn step223_live_egui_acquired_surface_capture() {
+        const CHILD_ENV: &str = "SLIPWAY_STEP223_LIVE_EGUI_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let runtime = SlipwayRuntime::new(ProbeWidget::new("live-egui"), ());
+            let client = runtime.runtime_mcp_client_clone();
+            let mut app = SlipwayEguiRuntimeApp::new(
+                runtime,
+                DefaultEguiBridge::new(),
+                step223_probe_reducer,
+            );
+            app.live_continuous_repaint = true;
+            thread::spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    thread::sleep(Duration::from_millis(750));
+                    let capture = |id: &str| {
+                        let response = client
+                            .submit(current_screenshot_message(id))
+                            .expect("submit live current screenshot")
+                            .recv()
+                            .expect("live screenshot response channel")
+                            .expect("live screenshot response");
+                        response["result"]["content"][0]["text"]
+                            .as_str()
+                            .expect("live screenshot payload")
+                            .to_string()
+                    };
+
+                    let first = capture("live-egui-current-1");
+                    assert!(first.contains(r#""admission":"current""#), "{first}");
+                    assert!(first.contains(r#""kind":"current""#), "{first}");
+                    assert!(
+                        first.contains("direct_acquired_surface_texture_copy"),
+                        "{first}"
+                    );
+                    assert!(
+                        first.contains("presented-pixels/direct-surface-copy"),
+                        "{first}"
+                    );
+                    assert!(!first.contains("screenshot-frame-mismatch"), "{first}");
+                    let first_frame = json_object_after(&first, r#""captured_frame":"#).to_string();
+                    let first_index = json_u64_after(&first_frame, r#""frame_index":"#);
+
+                    thread::sleep(Duration::from_millis(300));
+                    let second = capture("live-egui-current-2");
+                    let second_frame =
+                        json_object_after(&second, r#""captured_frame":"#).to_string();
+                    let second_index = json_u64_after(&second_frame, r#""frame_index":"#);
+                    assert!(second.contains(r#""admission":"current""#), "{second}");
+                    assert!(
+                        second.contains("direct_acquired_surface_texture_copy"),
+                        "{second}"
+                    );
+                    assert!(
+                        second_index > first_index,
+                        "{first_frame} then {second_frame}"
+                    );
+
+                    thread::sleep(Duration::from_millis(300));
+                    for (id, forged) in [
+                        ("live-egui-stale-exact", false),
+                        ("live-egui-stale-forged", true),
+                    ] {
+                        let response = client
+                            .submit(live_screenshot_object_message(id, &first_frame, forged))
+                            .expect("submit stale exact screenshot")
+                            .recv()
+                            .expect("stale screenshot response channel")
+                            .expect("stale screenshot response");
+                        let payload = response["result"]["content"][0]["text"]
+                            .as_str()
+                            .expect("stale screenshot payload");
+                        assert!(payload.contains(r#""admission":"exact""#), "{payload}");
+                        assert!(payload.contains("screenshot-frame-mismatch"), "{payload}");
+                    }
+                }));
+                std::process::exit(if outcome.is_ok() { 0 } else { 101 });
+            });
+
+            let mut event_loop_builder =
+                winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event();
+            #[cfg(target_os = "windows")]
+            {
+                use winit::platform::windows::EventLoopBuilderExtWindows as _;
+                event_loop_builder.with_any_thread(true);
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                use winit::platform::x11::EventLoopBuilderExtX11 as _;
+                event_loop_builder.with_any_thread(true);
+            }
+            let event_loop = event_loop_builder.build().expect("live egui event loop");
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            app.install_native_debug_proxy(eframe::NativeDebugProxy::new(&event_loop));
+            app.mark_native_create_started();
+            let mut eframe_app = eframe::create_native(
+                "Step 223 live egui acquired-surface capture",
+                eframe::NativeOptions {
+                    renderer: eframe::Renderer::Wgpu,
+                    ..Default::default()
+                },
+                Box::new(move |creation_context| {
+                    let mut app = app;
+                    app.record_native_create_phase();
+                    app.prewarm_native_visible_cache(&creation_context.egui_ctx);
+                    Ok(Box::new(app))
+                }),
+                &event_loop,
+            );
+            let result = event_loop.run_app(&mut eframe_app);
+            panic!("live egui event loop exited before acceptance completed: {result:?}");
+        }
+
+        let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("tests::step223_live_egui_acquired_surface_capture")
+            .env(CHILD_ENV, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("launch live egui child process");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll live egui child") {
+                assert!(status.success(), "live egui child failed with {status}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("live egui acceptance exceeded 30 seconds");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn step223_post_present_and_composition_anti_revert_source_guard() {
+        let lib = include_str!("lib.rs");
+        let runner = include_str!("native_runner.rs");
+        assert!(lib.contains("raw_input_hook_with_slipway_debug"));
+        assert!(lib.contains("try_send_input(egui::ViewportId::ROOT"));
+        assert!(lib.contains("try_send_capture(egui::ViewportId::ROOT"));
+        assert!(lib.contains("DirectAcquiredSurfaceTextureCopy"));
+        assert!(lib.contains("selector: PresentedScreenshotSelector"));
+        assert!(lib.contains("PresentedScreenshotSelector::Current { .. } => true"));
+        assert!(lib.contains("egui_capture_frame_has_candidate_provenance"));
+        assert!(lib.contains("screenshot-surface-acquire-failed"));
+        assert!(lib.contains("last_successfully_presented: None"));
+        assert!(lib.contains("rendered_frame_candidate = Some(frame_seed)"));
+        assert!(
+            !lib.contains(
+                &[
+                    "let last_successfully_presented = Some(runtime",
+                    "last_frame_identity())"
+                ]
+                .join(".")
+            )
+        );
+        assert!(
+            !lib.contains(
+                &[
+                    "self.last_successfully_presented = Some(self.runtime",
+                    "last_frame_identity())"
+                ]
+                .join(".")
+            )
+        );
+        assert!(!lib.contains(&["event_index: native_phases", "len()"].join(".")));
+        assert!(lib.contains("Renderer::Wgpu"));
+        assert!(!lib.contains(&["raw_input.events", "extend"].join(".")));
+        assert!(!lib.contains(&["request", "expected_frame"].join(".")));
+        assert!(!lib.contains(&["requested", "frame:"].join("_")));
+        assert!(!lib.contains(&["screenshot", "backend", "unsupported"].join("-")));
+        assert!(!lib.contains(&["composition", "lifecycle", "unsupported"].join("-")));
+        assert!(!lib.contains(&["Mu", "tex"].concat()));
+        assert!(!lib.contains(&["Rw", "Lock"].concat()));
+        assert!(!runner.contains(&["un", "safe"].concat()));
     }
 }

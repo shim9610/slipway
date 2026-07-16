@@ -1,4 +1,4 @@
-﻿use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
+use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
 use slipway_core::{
     BaselineShift, ClipDeclaration, Color, Diagnostic, DiagnosticSeverity, EvidenceSource,
     FontStyle, FontWeight, FrameIdentity, PaintOp, PathCommand, PathDeclaration, Rect,
@@ -7,10 +7,26 @@ use slipway_core::{
 };
 use std::fs::{self, File};
 use std::io::BufWriter;
-use std::path::PathBuf;
 
 const DEFAULT_PROVIDER_ID: &str = "slipway-debug-renderer.cpu.v1";
 const DEFAULT_MAX_PIXELS: u64 = 16_777_216;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DebugPngArtifactReceipt {
+    pub artifact_ref: String,
+    pub artifact_path: String,
+    pub pixel_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DebugPngArtifactError {
+    ZeroSize,
+    ByteLengthOverflow,
+    ByteLengthMismatch { expected: usize, actual: usize },
+    CreateDirectory(String),
+    CreateFile(String),
+    Encode(String),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DebugRendererConfig {
@@ -168,12 +184,10 @@ impl CpuDebugRenderer {
             );
         }
 
-        let pixel_hash = pixel_hash(width, height, &target.rgba);
         Ok(RenderedPixels {
             width,
             height,
             rgba: target.rgba,
-            pixel_hash,
             diagnostics,
         })
     }
@@ -188,28 +202,36 @@ impl Default for CpuDebugRenderer {
 impl SlipwayOffscreenRenderer for CpuDebugRenderer {
     fn render_offscreen(&mut self, packet: RenderPacket) -> Result<RenderEvidence, RenderRefusal> {
         let rendered = self.render_packet(&packet)?;
-        let artifact_ref = artifact_ref(
-            &self.config.provider_id,
-            &packet.target,
-            &packet.frame,
-            &rendered.pixel_hash,
-        );
         let mut diagnostics = rendered.diagnostics;
-        let artifact_path = match write_png_artifact(
-            &artifact_ref,
+        let receipt = write_debug_rgba8_png_artifact(
+            &self.config.provider_id,
+            packet.target.as_str(),
+            &packet.frame,
             rendered.width,
             rendered.height,
             &rendered.rgba,
-        ) {
-            Ok(path) => Some(path.display().to_string()),
+        );
+        let (artifact_ref, artifact_path, pixel_hash) = match receipt {
+            Ok(receipt) => (
+                receipt.artifact_ref,
+                Some(receipt.artifact_path),
+                receipt.pixel_hash,
+            ),
             Err(error) => {
                 diagnostics.push(diagnostic(
                     Some(packet.target.clone()),
                     DiagnosticSeverity::Warning,
                     "debug-render-png-artifact-write-failed",
-                    format!("debug renderer could not write PNG artifact: {error}"),
+                    format!("debug renderer could not write PNG artifact: {error:?}"),
                 ));
-                None
+                let pixel_hash = pixel_hash(rendered.width, rendered.height, &rendered.rgba);
+                let artifact_ref = artifact_ref(
+                    &self.config.provider_id,
+                    packet.target.as_str(),
+                    &packet.frame,
+                    &pixel_hash,
+                );
+                (artifact_ref, None, pixel_hash)
             }
         };
         let artifact = DebugRenderArtifact {
@@ -220,7 +242,7 @@ impl SlipwayOffscreenRenderer for CpuDebugRenderer {
             width: rendered.width,
             height: rendered.height,
             rgba: rendered.rgba,
-            pixel_hash: rendered.pixel_hash.clone(),
+            pixel_hash: pixel_hash.clone(),
             diagnostics: diagnostics.clone(),
         };
 
@@ -241,7 +263,7 @@ impl SlipwayOffscreenRenderer for CpuDebugRenderer {
             provider_id: self.config.provider_id.clone(),
             artifact_ref: Some(artifact_ref),
             artifact_path,
-            pixel_hash: Some(rendered.pixel_hash),
+            pixel_hash: Some(pixel_hash),
             width: Some(rendered.width),
             height: Some(rendered.height),
             diagnostics,
@@ -253,7 +275,6 @@ struct RenderedPixels {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
-    pixel_hash: String,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -1438,7 +1459,7 @@ fn pixel_hash(width: u32, height: u32, rgba: &[u8]) -> String {
 
 fn artifact_ref(
     provider_id: &str,
-    target: &WidgetId,
+    artifact_key: &str,
     frame: &FrameIdentity,
     pixel_hash: &str,
 ) -> String {
@@ -1449,33 +1470,65 @@ fn artifact_ref(
         sanitize(&frame.surface_instance_id),
         frame.revision,
         frame.frame_index,
-        sanitize(&format!("{}-{pixel_hash}", target.as_str()))
+        sanitize(&format!("{artifact_key}-{pixel_hash}"))
     )
 }
 
-fn write_png_artifact(
-    artifact_ref: &str,
+pub fn write_debug_rgba8_png_artifact(
+    provider_id: &str,
+    artifact_key: &str,
+    frame: &FrameIdentity,
     width: u32,
     height: u32,
     rgba: &[u8],
-) -> Result<PathBuf, String> {
+) -> Result<DebugPngArtifactReceipt, DebugPngArtifactError> {
+    if width == 0 || height == 0 {
+        return Err(DebugPngArtifactError::ZeroSize);
+    }
+    let expected = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(DebugPngArtifactError::ByteLengthOverflow)?;
+    if rgba.len() != expected {
+        return Err(DebugPngArtifactError::ByteLengthMismatch {
+            expected,
+            actual: rgba.len(),
+        });
+    }
+
+    let pixel_hash = pixel_hash(width, height, rgba);
+    let artifact_ref = artifact_ref(provider_id, artifact_key, frame, &pixel_hash);
     let dir = std::env::temp_dir().join("slipway-debug-renderer");
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
-    let path = dir.join(format!("{}.png", sanitize(artifact_ref)));
-    let file = File::create(&path)
-        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+    fs::create_dir_all(&dir).map_err(|error| {
+        DebugPngArtifactError::CreateDirectory(format!(
+            "failed to create {}: {error}",
+            dir.display()
+        ))
+    })?;
+    let path = dir.join(format!("{}.png", sanitize(&artifact_ref)));
+    let file = File::create(&path).map_err(|error| {
+        DebugPngArtifactError::CreateFile(format!("failed to create {}: {error}", path.display()))
+    })?;
     let writer = BufWriter::new(file);
     let mut encoder = png::Encoder::new(writer, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder
-        .write_header()
-        .map_err(|error| format!("failed to write PNG header: {error}"))?;
-    writer
-        .write_image_data(rgba)
-        .map_err(|error| format!("failed to write PNG data: {error}"))?;
-    Ok(path)
+    let mut writer = encoder.write_header().map_err(|error| {
+        DebugPngArtifactError::Encode(format!("failed to write PNG header: {error}"))
+    })?;
+    writer.write_image_data(rgba).map_err(|error| {
+        DebugPngArtifactError::Encode(format!("failed to write PNG data: {error}"))
+    })?;
+    Ok(DebugPngArtifactReceipt {
+        artifact_ref,
+        artifact_path: path.display().to_string(),
+        pixel_hash,
+    })
 }
 
 fn sanitize(value: &str) -> String {
@@ -2186,6 +2239,57 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "render-surfaces-not-rasterized")
+        );
+    }
+
+    #[test]
+    fn public_rgba8_sink_preserves_hash_reference_path_and_png_metadata() {
+        let receipt = write_debug_rgba8_png_artifact(
+            "presented/provider",
+            "root instance",
+            &frame(1.0, 1.0, 77),
+            1,
+            1,
+            &[1, 2, 3, 4],
+        )
+        .expect("valid tight RGBA writes");
+
+        assert_eq!(receipt.pixel_hash, "fnv1a64:ef73dc3a80c8da6d");
+        assert!(
+            receipt
+                .artifact_ref
+                .starts_with("slipway-debug-renderer://presented_provider/surface/instance/1/77/")
+        );
+        assert!(
+            receipt
+                .artifact_ref
+                .ends_with("root_instance-fnv1a64_ef73dc3a80c8da6d")
+        );
+        assert!(receipt.artifact_path.ends_with(".png"));
+
+        let file = File::open(&receipt.artifact_path).expect("PNG artifact opens");
+        let decoder = png::Decoder::new(std::io::BufReader::new(file));
+        let reader = decoder.read_info().expect("PNG header decodes");
+        assert_eq!(reader.info().width, 1);
+        assert_eq!(reader.info().height, 1);
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        assert_eq!(reader.info().bit_depth, png::BitDepth::Eight);
+        let _ = fs::remove_file(receipt.artifact_path);
+    }
+
+    #[test]
+    fn public_rgba8_sink_rejects_zero_size_and_malformed_length_before_writing() {
+        let frame = frame(1.0, 1.0, 78);
+        assert_eq!(
+            write_debug_rgba8_png_artifact("provider", "key", &frame, 0, 1, &[]),
+            Err(DebugPngArtifactError::ZeroSize)
+        );
+        assert_eq!(
+            write_debug_rgba8_png_artifact("provider", "key", &frame, 2, 1, &[0; 4]),
+            Err(DebugPngArtifactError::ByteLengthMismatch {
+                expected: 8,
+                actual: 4,
+            })
         );
     }
 }

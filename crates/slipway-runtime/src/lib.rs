@@ -12,20 +12,24 @@ use slipway_core::{
     ScrollRegionDeclaration, ShapeDeclaration, Size, SlipwayApp, SlipwayAppLocalState,
     SlipwayAppWidget, SlipwayAuthoredWidget, SlipwayEventDispositionPolicy,
     SlipwayEventRoutingPolicy, SlipwayOffscreenRenderer, SlipwayViewDefinition, SlipwayWidgetTypes,
-    TargetLocalRect, TextEditEvent, TextEditKind, TextSelectionRange, ViewDefinition,
-    ViewDefinitionInput, WidgetId, WidgetSlot,
+    TargetLocalRect, TextCompositionPhase, TextEditEvent, TextEditKind, TextSelectionRange,
+    ViewDefinition, ViewDefinitionInput, WidgetId, WidgetSlot,
 };
+#[cfg(test)]
+use slipway_debug_bridge::DebugCompositionPhaseTrace;
 use slipway_debug_bridge::{
-    DebugBridgeClient, DebugBridgeError, DebugBridgeRuntime, DebugCommand, DebugCommandKind,
-    DebugCommandLease, DebugControlMode, DebugControlTrace, DebugControlTraceStage, DebugFailure,
-    DebugMessageTraceEntry, DebugPhysicalControl, DebugPhysicalControlDeclarationSelector,
-    DebugReply, DebugReplyProduct, DebugStatus, MessageDisposition, RenderProduct,
-    SlipwayDebugCommandHandler, bounded_debug_bridge,
+    CompositionPhaseProvenance, DEBUG_COMPOSITION_PASS_ID, DebugBridgeClient, DebugBridgeError,
+    DebugBridgeRuntime, DebugCommand, DebugCommandKind, DebugCommandLease,
+    DebugCompositionIngressObservation, DebugCompositionTrace, DebugControlMode, DebugControlTrace,
+    DebugControlTraceStage, DebugFailure, DebugMessageTraceEntry, DebugPhysicalControl,
+    DebugPhysicalControlDeclarationSelector, DebugReply, DebugReplyProduct, DebugStatus,
+    DebugTextCompositionUpdate, MessageDisposition, PresentedScreenshotProduct,
+    PresentedScreenshotRefusal, RenderProduct, SlipwayDebugCommandHandler, bounded_debug_bridge,
 };
 use slipway_debug_mcp::{
     DebugMcpBridgeMessage, DebugMcpConfig, DebugMcpPendingToolCall, DebugMcpRuntimeClient,
     DebugMcpRuntimeEndpoint, DebugMcpRuntimeRequest, DebugMcpRuntimeResponseHandle,
-    DebugMcpRuntimeTransportError, DebugMcpServer, bounded_runtime_mcp,
+    DebugMcpRuntimeTransportError, DebugMcpServer, RuntimeScreenshotSelector, bounded_runtime_mcp,
 };
 use slipway_debug_renderer::CpuDebugRenderer;
 use std::collections::VecDeque;
@@ -42,6 +46,32 @@ const ADMISSION_DIAGNOSTIC_CAPACITY: usize = 16;
 const DEFAULT_UI_TURN_DEBUG_BRIDGE_DRAIN_BUDGET: usize = 8;
 const DEFAULT_UI_TURN_RUNTIME_MCP_DRAIN_BUDGET: usize = 8;
 const DEFAULT_MCP_PENDING_DEBUG_BRIDGE_DRAIN_BUDGET: usize = 8;
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DebugEguiCompositionIngressCustody {
+    _token: u64,
+    start_event_index: usize,
+    end_event_index: usize,
+}
+
+impl DebugEguiCompositionIngressCustody {
+    pub fn new(token: u64, start_event_index: usize, end_event_index: usize) -> Option<Self> {
+        let span_len = end_event_index.checked_sub(start_event_index)?;
+        if token == 0 || span_len == 0 {
+            return None;
+        }
+        Some(Self {
+            _token: token,
+            start_event_index,
+            end_event_index,
+        })
+    }
+
+    fn span_len(self) -> usize {
+        self.end_event_index - self.start_event_index
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SlipwayRuntimeDrainBudget {
@@ -580,12 +610,16 @@ impl SlipwayRuntimePendingNativeMcpCall {
     }
 
     pub fn try_finish_and_respond(self) -> Result<Option<Value>, SlipwayRuntimeMcpPumpError> {
-        let response = self
+        let work = self
             .pending
-            .try_finish()?
+            .try_finish_work()?
             .ok_or(SlipwayRuntimeMcpError::PendingReplyUnavailable)?;
-        self.request.respond(Some(response.clone()))?;
-        Ok(Some(response))
+        let response = match &work {
+            slipway_debug_mcp::DebugMcpResponseWork::Ready(response) => response.clone(),
+            slipway_debug_mcp::DebugMcpResponseWork::PresentedScreenshot { .. } => None,
+        };
+        self.request.respond_work(work)?;
+        Ok(response)
     }
 }
 
@@ -2468,11 +2502,11 @@ where
         let Ok(mut message) = serde_json::from_str::<Value>(request) else {
             return server.begin_bridge_message(request, bridge);
         };
-        insert_live_frame_references(
+        let screenshot = insert_live_frame_references(
             &mut message,
             frame_identity_value(&self.last_frame_identity()),
         );
-        server.begin_bridge_value(message, bridge)
+        server.begin_runtime_bridge_value(message, screenshot, bridge)
     }
 
     pub fn handle_debug_command_with_app_reducer<F>(
@@ -2829,6 +2863,84 @@ where
         )
     }
 
+    pub fn backend_presented_text_composition_product_from_traces_for_backend(
+        &self,
+        command: DebugCommand,
+        trace: DebugCompositionTrace,
+        expected_backend_id: &str,
+    ) -> DebugReplyProduct {
+        self.backend_presented_text_composition_product_from_traces_with_optional_egui_custody(
+            command,
+            trace,
+            expected_backend_id,
+            None,
+        )
+    }
+
+    pub fn backend_presented_text_composition_product_from_traces_for_backend_with_egui_custody(
+        &self,
+        command: DebugCommand,
+        trace: DebugCompositionTrace,
+        expected_backend_id: &str,
+        custody: DebugEguiCompositionIngressCustody,
+    ) -> DebugReplyProduct {
+        self.backend_presented_text_composition_product_from_traces_with_optional_egui_custody(
+            command,
+            trace,
+            expected_backend_id,
+            Some(custody),
+        )
+    }
+
+    fn backend_presented_text_composition_product_from_traces_with_optional_egui_custody(
+        &self,
+        command: DebugCommand,
+        mut trace: DebugCompositionTrace,
+        expected_backend_id: &str,
+        egui_custody: Option<DebugEguiCompositionIngressCustody>,
+    ) -> DebugReplyProduct {
+        let DebugCommand {
+            request_id,
+            kind:
+                DebugCommandKind::PhysicalControl {
+                    frame,
+                    operation:
+                        DebugPhysicalControl::TextComposition {
+                            selector,
+                            updates,
+                            commit,
+                        },
+                    ..
+                },
+        } = command
+        else {
+            return DebugReplyProduct::Error(DebugFailure {
+                code: "backend-text-composition-command-required".to_string(),
+                message: "text composition completion requires a TextComposition physical-control command".to_string(),
+                dispatch_evidence: None,
+            });
+        };
+
+        trace.completed = false;
+        trace.failure = None;
+        let failure = validate_backend_text_composition_trace(
+            &request_id,
+            &frame,
+            &selector,
+            &updates,
+            &commit,
+            expected_backend_id,
+            &trace,
+            egui_custody,
+        );
+        if let Some(failure) = failure {
+            trace.failure = Some(failure);
+        } else {
+            trace.completed = true;
+        }
+        DebugReplyProduct::CompositionTrace(trace)
+    }
+
     pub fn backend_presented_physical_control_input_matches(
         &self,
         command: &DebugCommand,
@@ -2852,6 +2964,275 @@ fn diagnostics_have_blocking_contract_error(diagnostics: &[Diagnostic]) -> bool 
             diagnostic.severity,
             DiagnosticSeverity::Error | DiagnosticSeverity::Unsupported
         )
+    })
+}
+
+fn validate_backend_text_composition_trace(
+    request_id: &str,
+    frame: &FrameIdentity,
+    selector: &DebugPhysicalControlDeclarationSelector,
+    updates: &[DebugTextCompositionUpdate],
+    commit: &str,
+    expected_backend_id: &str,
+    trace: &DebugCompositionTrace,
+    egui_custody: Option<DebugEguiCompositionIngressCustody>,
+) -> Option<DebugFailure> {
+    let failure = |code: &str, message: &str| {
+        Some(DebugFailure {
+            code: code.to_string(),
+            message: message.to_string(),
+            dispatch_evidence: None,
+        })
+    };
+
+    if trace.request_id != request_id || &trace.frame != frame {
+        return failure(
+            "native-physical-control-text-composition-identity-mismatch",
+            "composition request and frame identity must exactly match the admitted command",
+        );
+    }
+    if trace.backend_id != expected_backend_id {
+        return failure(
+            "native-physical-control-text-composition-backend-mismatch",
+            "composition evidence backend does not match the completing visible backend",
+        );
+    }
+    match selector {
+        DebugPhysicalControlDeclarationSelector::Target { target } if target != &trace.target => {
+            return failure(
+                "native-physical-control-text-composition-target-mismatch",
+                "composition target does not match the requested declaration selector",
+            );
+        }
+        DebugPhysicalControlDeclarationSelector::Region { region }
+            if region != &trace.selected_region =>
+        {
+            return failure(
+                "native-physical-control-text-composition-region-mismatch",
+                "composition region does not match the requested declaration selector",
+            );
+        }
+        _ => {}
+    }
+    if !trace.focused_before || !trace.focused_after {
+        return failure(
+            "native-physical-control-text-composition-focus-unstable",
+            "the same native text-edit region must remain focused before and after composition",
+        );
+    }
+
+    if egui_custody.is_some_and(|custody| {
+        updates
+            .len()
+            .checked_add(1)
+            .is_none_or(|expected_span_len| custody.span_len() != expected_span_len)
+    }) {
+        return failure(
+            "native-physical-control-text-composition-provenance-invalid",
+            "egui composition ingress custody must cover exactly the native Updates and Commit",
+        );
+    }
+
+    let expected_phase_count = updates.len().saturating_add(3);
+    if trace.phases.len() != expected_phase_count {
+        return failure(
+            "native-physical-control-text-composition-phase-mismatch",
+            "composition evidence must contain exact Start, Updates, Commit, End phases",
+        );
+    }
+
+    let stable_slot = trace
+        .phases
+        .first()
+        .and_then(|phase| phase.event.target_slot.as_ref());
+    let mut last_iced_sequence = None;
+    let mut last_egui_event = None;
+    for (index, phase) in trace.phases.iter().enumerate() {
+        let (expected_phase, expected_text, expected_range) = if index == 0 {
+            (TextCompositionPhase::Start, "", None)
+        } else if index <= updates.len() {
+            let update = &updates[index - 1];
+            (
+                TextCompositionPhase::Update,
+                update.preedit_text.as_str(),
+                update.cursor_range.as_ref(),
+            )
+        } else if index == updates.len() + 1 {
+            (TextCompositionPhase::Commit, commit, None)
+        } else {
+            (TextCompositionPhase::End, "", None)
+        };
+
+        if phase.phase != expected_phase
+            || phase.event.phase != expected_phase
+            || phase.event.preedit_text != expected_text
+            || phase.event.cursor_range.as_ref() != expected_range
+            || phase.event.target != trace.target
+            || phase.event.target_slot.as_ref() != stable_slot
+            || phase.backend_event.is_empty()
+        {
+            return failure(
+                "native-physical-control-text-composition-phase-mismatch",
+                "composition phase event, text, range, target, and slot must exactly match the request",
+            );
+        }
+
+        let evidence = &phase.dispatch_evidence;
+        if evidence.frame != *frame
+            || evidence.source.label() != slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED
+            || evidence.source.backend_id.as_deref() != Some(expected_backend_id)
+            || evidence.source.pass_id.as_deref() != Some(DEBUG_COMPOSITION_PASS_ID)
+            || evidence.kind != DeclaredEventDispatchKind::Text
+            || evidence.selected_region.as_ref() != Some(&trace.selected_region)
+            || evidence.refusal_reason.is_some()
+            || diagnostics_have_blocking_contract_error(&evidence.diagnostics)
+        {
+            return failure(
+                "native-physical-control-text-composition-dispatch-mismatch",
+                "every composition phase requires exact token-correlated backend dispatch evidence",
+            );
+        }
+        if let DebugPhysicalControlDeclarationSelector::Position { position } = selector {
+            if evidence.input_position != Some(*position) {
+                return failure(
+                    "native-physical-control-text-composition-position-mismatch",
+                    "composition dispatch position does not match the requested selector",
+                );
+            }
+        }
+
+        match (phase.provenance, phase.ingress_observation) {
+            (
+                CompositionPhaseProvenance::Native,
+                DebugCompositionIngressObservation::IcedQueueSlice { sequence_index },
+            ) if egui_custody.is_none()
+                && last_egui_event.is_none()
+                && sequence_index == index
+                && last_iced_sequence.is_none_or(|last| sequence_index > last)
+                && phase
+                    .result_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.handled == Some(phase.app_handled))
+                && matches!(
+                    evidence.generated_event.as_ref(),
+                    Some(InputEvent::TextComposition(event)) if event == &phase.event
+                ) =>
+            {
+                last_iced_sequence = Some(sequence_index);
+            }
+            (
+                CompositionPhaseProvenance::Native,
+                DebugCompositionIngressObservation::EguiRawInputSpan { event_index },
+            ) if last_iced_sequence.is_none()
+                && matches!(
+                    expected_phase,
+                    TextCompositionPhase::Update | TextCompositionPhase::Commit
+                )
+                && egui_custody.is_some_and(|custody| {
+                    index.checked_sub(1).is_some_and(|native_ordinal| {
+                        custody.start_event_index.checked_add(native_ordinal) == Some(event_index)
+                            && event_index >= custody.start_event_index
+                            && event_index < custody.end_event_index
+                            && (!matches!(expected_phase, TextCompositionPhase::Commit)
+                                || custody.end_event_index.checked_sub(1) == Some(event_index))
+                    })
+                })
+                && last_egui_event.is_none_or(|last| event_index > last)
+                && phase
+                    .result_identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.handled == Some(phase.app_handled))
+                && matches!(
+                    evidence.generated_event.as_ref(),
+                    Some(InputEvent::TextComposition(event)) if event == &phase.event
+                ) =>
+            {
+                last_egui_event = Some(event_index);
+            }
+            (
+                CompositionPhaseProvenance::Derived { from },
+                DebugCompositionIngressObservation::Derived {
+                    from_sequence_index,
+                },
+            ) if from_sequence_index != index
+                && (matches!(
+                    (expected_phase, from, from_sequence_index),
+                    (TextCompositionPhase::Start, TextCompositionPhase::Update, 1)
+                ) || matches!(
+                    (expected_phase, from, from_sequence_index),
+                    (TextCompositionPhase::End, TextCompositionPhase::Commit, source_index)
+                        if source_index == updates.len() + 1
+                ))
+                && trace.phases.get(from_sequence_index).is_some_and(|source| {
+                    source.phase == from
+                        && source.provenance == CompositionPhaseProvenance::Native
+                        && phase.dispatch_evidence == source.dispatch_evidence
+                        && phase.result_identity == source.result_identity
+                }) => {}
+            _ => {
+                return failure(
+                    "native-physical-control-text-composition-provenance-invalid",
+                    "composition phase provenance must name a native ingress observation or its exact derived source",
+                );
+            }
+        }
+    }
+
+    let Some(mutation) = trace.commit_mutation.as_ref() else {
+        return failure(
+            "native-physical-control-text-composition-commit-not-applied",
+            "composition Commit requires native before/after mutation evidence",
+        );
+    };
+    let mutation_dispatch = mutation.trace.dispatch_evidence.as_ref();
+    let mutation_event = mutation_dispatch.and_then(|evidence| evidence.generated_event.as_ref());
+    let mutation_target_matches = matches!(
+        mutation_event,
+        Some(InputEvent::TextEdit(event))
+            if &event.target == &trace.target && event.target_slot.as_ref() == stable_slot
+    );
+    if mutation.trace.request_id != request_id
+        || mutation.trace.frame != *frame
+        || mutation.trace.mode != DebugControlMode::PhysicalEquivalent
+        || !mutation.trace.handled
+        || mutation
+            .trace
+            .result_identity
+            .as_ref()
+            .is_none_or(|identity| identity.handled != Some(true))
+        || mutation_dispatch.is_none_or(|evidence| {
+            evidence.frame != *frame
+                || evidence.source.label() != slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED
+                || evidence.source.backend_id.as_deref() != Some(expected_backend_id)
+                || evidence.source.pass_id.as_deref() != Some(DEBUG_COMPOSITION_PASS_ID)
+                || evidence.selected_region.as_ref() != Some(&trace.selected_region)
+                || diagnostics_have_blocking_contract_error(&evidence.diagnostics)
+        })
+        || !mutation_target_matches
+        || diagnostics_have_blocking_contract_error(&mutation.trace.diagnostics)
+        || mutation.before == mutation.after
+        || !buffer_change_applies_commit(&mutation.before, &mutation.after, commit)
+    {
+        return failure(
+            "native-physical-control-text-composition-commit-not-applied",
+            "composition Commit mutation must pair an exact handled native trace with a real before/after buffer change",
+        );
+    }
+
+    None
+}
+
+fn buffer_change_applies_commit(before: &str, after: &str, commit: &str) -> bool {
+    if commit.is_empty() || before == after {
+        return false;
+    }
+    after.match_indices(commit).any(|(start, _)| {
+        let suffix_start = start + commit.len();
+        let prefix = &after[..start];
+        let suffix = &after[suffix_start..];
+        prefix.len().saturating_add(suffix.len()) <= before.len()
+            && before.starts_with(prefix)
+            && before.ends_with(suffix)
     })
 }
 
@@ -2887,32 +3268,56 @@ fn insert_live_render_frame_if_requested(arguments: &mut Value, live_frame: Valu
     }
 }
 
-fn insert_live_frame_references(message: &mut Value, live_frame: Value) {
+fn insert_live_frame_references(
+    message: &mut Value,
+    live_frame: Value,
+) -> Option<RuntimeScreenshotSelector> {
     let Some(params) = message.get_mut("params").and_then(Value::as_object_mut) else {
-        return;
+        return None;
     };
     let Some(tool) = params
         .get("name")
         .and_then(Value::as_str)
         .map(str::to_owned)
     else {
-        return;
+        return None;
     };
     let Some(arguments) = params.get_mut("arguments") else {
-        return;
+        return None;
     };
 
     match tool.as_str() {
-        "slipway.debug.render" | "slipway.debug.screenshot" => {
-            insert_live_render_frame_if_requested(arguments, live_frame)
-        }
+        "slipway.debug.render" => insert_live_render_frame_if_requested(arguments, live_frame),
         "slipway.debug.status"
         | "slipway.debug.probe"
         | "slipway.debug.control"
         | "slipway.debug.physical_control"
         | "slipway.debug.resize" => insert_live_frame_if_requested(arguments, live_frame),
+        "slipway.debug.screenshot" => {
+            return Some(normalize_live_screenshot(arguments, live_frame));
+        }
         _ => {}
     }
+    None
+}
+
+fn normalize_live_screenshot(
+    arguments: &mut Value,
+    live_frame: Value,
+) -> RuntimeScreenshotSelector {
+    let Some(object) = arguments.as_object_mut() else {
+        return RuntimeScreenshotSelector::Exact;
+    };
+    object.remove("_slipway_frame_admission");
+    let selector = if should_replace_frame(object.get("frame")) {
+        RuntimeScreenshotSelector::Current
+    } else {
+        RuntimeScreenshotSelector::Exact
+    };
+    if selector == RuntimeScreenshotSelector::Current {
+        object.insert("frame".to_string(), live_frame);
+    }
+    selector
 }
 
 fn insert_live_frame_if_requested(value: &mut Value, live_frame: Value) {
@@ -3086,7 +3491,8 @@ fn physical_control_selector(
         | DebugPhysicalControl::TextEdit { selector, .. }
         | DebugPhysicalControl::Keyboard { selector, .. }
         | DebugPhysicalControl::Command { selector, .. }
-        | DebugPhysicalControl::Scroll { selector, .. } => Some(selector),
+        | DebugPhysicalControl::Scroll { selector, .. }
+        | DebugPhysicalControl::TextComposition { selector, .. } => Some(selector),
     }
 }
 
@@ -3694,6 +4100,18 @@ where
                     Err(refusal) => DebugReplyProduct::Render(RenderProduct::Refusal(refusal)),
                 }
             }
+            DebugCommandKind::Screenshot { request } => {
+                DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Refusal(
+                    PresentedScreenshotRefusal {
+                        selector: request.selector,
+                        captured_frame: None,
+                        backend_id: self.presenting_backend_id.clone(),
+                        code: "screenshot-no-visible-window".to_string(),
+                        reason: "the app runtime does not own an acquired visible surface texture; a visible backend must intercept this request".to_string(),
+                        diagnostics: Vec::new(),
+                    },
+                ))
+            }
             DebugCommandKind::Control {
                 frame,
                 event,
@@ -3850,7 +4268,6 @@ mod tests {
     };
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -6158,6 +6575,198 @@ mod tests {
         }
     }
 
+    fn composition_result_identity(handled: bool) -> EventResultIdentity {
+        EventResultIdentity {
+            handled: Some(handled),
+            emitted_messages: Vec::new(),
+            change_shapes: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn composition_dispatch_evidence(
+        frame: &FrameIdentity,
+        region: &PresentationRegionId,
+        event: InputEvent,
+    ) -> DeclaredEventDispatchEvidence {
+        DeclaredEventDispatchEvidence {
+            source: slipway_core::EvidenceSource::backend_presented(
+                "iced",
+                DEBUG_COMPOSITION_PASS_ID,
+            ),
+            frame: frame.clone(),
+            kind: DeclaredEventDispatchKind::Text,
+            input_position: None,
+            input_position_space: None,
+            candidate_regions: vec![region.clone()],
+            selected_region: Some(region.clone()),
+            refusal_reason: None,
+            generated_event: Some(event),
+            route: None,
+            capture_event: false,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn valid_composition_trace(
+        request_id: &str,
+        frame: &FrameIdentity,
+        include_mutation: bool,
+    ) -> DebugCompositionTrace {
+        let target = WidgetId::from("editor");
+        let region = PresentationRegionId::from("editor-region");
+        let specs = [
+            (TextCompositionPhase::Start, ""),
+            (TextCompositionPhase::Update, "한"),
+            (TextCompositionPhase::Commit, "한"),
+            (TextCompositionPhase::End, ""),
+        ];
+        let phases = specs
+            .into_iter()
+            .enumerate()
+            .map(|(sequence_index, (phase, text))| {
+                let event = slipway_core::TextCompositionEvent {
+                    target: target.clone(),
+                    target_slot: None,
+                    phase,
+                    preedit_text: text.to_string(),
+                    cursor_range: None,
+                };
+                DebugCompositionPhaseTrace {
+                    phase,
+                    backend_event: format!("iced::{phase:?}"),
+                    provenance: CompositionPhaseProvenance::Native,
+                    ingress_observation: DebugCompositionIngressObservation::IcedQueueSlice {
+                        sequence_index,
+                    },
+                    dispatch_evidence: composition_dispatch_evidence(
+                        frame,
+                        &region,
+                        InputEvent::TextComposition(event.clone()),
+                    ),
+                    event,
+                    app_handled: false,
+                    result_identity: Some(composition_result_identity(false)),
+                }
+            })
+            .collect();
+
+        let commit_mutation = include_mutation.then(|| {
+            let edit = InputEvent::TextEdit(TextEditEvent {
+                target: target.clone(),
+                target_slot: None,
+                kind: TextEditKind::ReplaceSelection,
+                text: Some("a한b".to_string()),
+                selection_before: None,
+                selection_after: None,
+            });
+            slipway_debug_bridge::DebugCompositionCommitMutation {
+                trace: DebugControlTrace::new(
+                    request_id,
+                    frame.clone(),
+                    &edit,
+                    true,
+                    1,
+                    2,
+                    Vec::new(),
+                )
+                .with_dispatch_evidence(Some(composition_dispatch_evidence(frame, &region, edit)))
+                .with_result_identity(composition_result_identity(true)),
+                before: "ab".to_string(),
+                after: "a한b".to_string(),
+            }
+        });
+
+        DebugCompositionTrace {
+            request_id: request_id.to_string(),
+            frame: frame.clone(),
+            backend_id: "iced".to_string(),
+            target,
+            selected_region: region,
+            focused_before: true,
+            focused_after: true,
+            phases,
+            commit_mutation,
+            completed: false,
+            failure: None,
+        }
+    }
+
+    fn valid_egui_composition_trace(
+        request_id: &str,
+        frame: &FrameIdentity,
+        start_event_index: usize,
+    ) -> DebugCompositionTrace {
+        let mut trace = valid_composition_trace(request_id, frame, true);
+        trace.backend_id = "egui".to_string();
+        for phase in &mut trace.phases {
+            phase.dispatch_evidence.source.backend_id = Some("egui".to_string());
+        }
+        if let Some(mutation) = &mut trace.commit_mutation {
+            mutation
+                .trace
+                .dispatch_evidence
+                .as_mut()
+                .expect("mutation dispatch evidence")
+                .source
+                .backend_id = Some("egui".to_string());
+        }
+
+        trace.phases[1].ingress_observation =
+            DebugCompositionIngressObservation::EguiRawInputSpan {
+                event_index: start_event_index,
+            };
+        trace.phases[2].ingress_observation =
+            DebugCompositionIngressObservation::EguiRawInputSpan {
+                event_index: start_event_index.checked_add(1).expect("test event index"),
+            };
+        trace.phases[0].provenance = CompositionPhaseProvenance::Derived {
+            from: TextCompositionPhase::Update,
+        };
+        trace.phases[0].ingress_observation = DebugCompositionIngressObservation::Derived {
+            from_sequence_index: 1,
+        };
+        trace.phases[0].dispatch_evidence = trace.phases[1].dispatch_evidence.clone();
+        trace.phases[0].result_identity = trace.phases[1].result_identity.clone();
+        trace.phases[3].provenance = CompositionPhaseProvenance::Derived {
+            from: TextCompositionPhase::Commit,
+        };
+        trace.phases[3].ingress_observation = DebugCompositionIngressObservation::Derived {
+            from_sequence_index: 2,
+        };
+        trace.phases[3].dispatch_evidence = trace.phases[2].dispatch_evidence.clone();
+        trace.phases[3].result_identity = trace.phases[2].result_identity.clone();
+        trace
+    }
+
+    fn one_update_composition_command(request_id: &str, frame: &FrameIdentity) -> DebugCommand {
+        DebugCommand::physical_control_with_trace(
+            request_id,
+            frame.clone(),
+            DebugPhysicalControl::TextComposition {
+                selector: DebugPhysicalControlDeclarationSelector::Target {
+                    target: WidgetId::from("editor"),
+                },
+                updates: vec![DebugTextCompositionUpdate {
+                    preedit_text: "한".to_string(),
+                    cursor_range: None,
+                }],
+                commit: "한".to_string(),
+            },
+        )
+    }
+
+    fn assert_composition_provenance_invalid(product: DebugReplyProduct) {
+        let DebugReplyProduct::CompositionTrace(trace) = product else {
+            panic!("invalid composition provenance must retain its aggregate trace")
+        };
+        assert!(!trace.completed);
+        assert_eq!(
+            trace.failure.as_ref().map(|failure| failure.code.as_str()),
+            Some("native-physical-control-text-composition-provenance-invalid")
+        );
+    }
+
     fn frame_json(frame: &FrameIdentity) -> String {
         format!(
             r#"{{"surface_id":"{}","surface_instance_id":"{}","revision":{},"frame_index":{},"viewport":{{"origin":{{"x":{},"y":{}}},"size":{{"width":{},"height":{}}}}}}}"#,
@@ -8380,7 +8989,84 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mcp_screenshot_alias_resolves_current_frame_and_renders() {
+    fn live_screenshot_normalization_sanitizes_before_classification() {
+        let live_frame = FrameIdentity {
+            surface_id: "surface".to_string(),
+            surface_instance_id: "instance".to_string(),
+            revision: 9,
+            frame_index: 41,
+            viewport: Rect {
+                origin: Point { x: 1.0, y: 2.0 },
+                size: Size {
+                    width: 300.0,
+                    height: 200.0,
+                },
+            },
+        };
+
+        for original in [None, Some(json!("current")), Some(json!("last"))] {
+            let mut arguments = json!({
+                "_slipway_frame_admission": "exact"
+            });
+            if let Some(original) = original {
+                arguments["frame"] = original;
+            }
+            let mut message = json!({
+                "params": {
+                    "name": "slipway.debug.screenshot",
+                    "arguments": arguments
+                }
+            });
+            assert_eq!(
+                insert_live_frame_references(&mut message, frame_identity_value(&live_frame)),
+                Some(RuntimeScreenshotSelector::Current)
+            );
+            let normalized = &message["params"]["arguments"];
+            assert_eq!(normalized["frame"], frame_identity_value(&live_frame));
+            assert!(normalized.get("_slipway_frame_admission").is_none());
+        }
+
+        let mut stale = live_frame.clone();
+        stale.frame_index -= 1;
+        let stale_value = frame_identity_value(&stale);
+        let mut explicit = json!({
+            "params": {
+                "name": "slipway.debug.screenshot",
+                "arguments": {
+                    "frame": stale_value,
+                    "_slipway_frame_admission": "current"
+                }
+            }
+        });
+        assert_eq!(
+            insert_live_frame_references(&mut explicit, frame_identity_value(&live_frame)),
+            Some(RuntimeScreenshotSelector::Exact)
+        );
+        assert_eq!(explicit["params"]["arguments"]["frame"], stale_value);
+        assert!(
+            explicit["params"]["arguments"]
+                .get("_slipway_frame_admission")
+                .is_none()
+        );
+
+        let mut malformed = json!({
+            "params": {
+                "name": "slipway.debug.screenshot",
+                "arguments": {
+                    "frame": 17,
+                    "_slipway_frame_admission": "current"
+                }
+            }
+        });
+        assert_eq!(
+            insert_live_frame_references(&mut malformed, frame_identity_value(&live_frame)),
+            Some(RuntimeScreenshotSelector::Exact)
+        );
+        assert_eq!(malformed["params"]["arguments"]["frame"], 17);
+    }
+
+    #[test]
+    fn runtime_mcp_screenshot_resolves_current_frame_without_using_canonical_render() {
         let mut runtime = SlipwayRuntime::new(ProbeWidget, ());
         runtime.record_presented_viewport(Rect {
             origin: Point { x: 14.0, y: 16.0 },
@@ -8405,33 +9091,69 @@ mod tests {
             .expect("screenshot response sent");
 
         assert_eq!(response, transport_response);
-        assert_eq!(runtime.debug_render_calls(), 1);
+        assert_eq!(runtime.debug_render_calls(), 0);
         let payload = response_tool_payload(&transport_response);
         assert_eq!(payload["tool"], "slipway.debug.screenshot");
-        assert_eq!(payload["bridge_method"], "render");
-        assert_eq!(payload["product_kind"], "render_evidence");
+        assert_eq!(payload["bridge_method"], "screenshot");
+        assert_eq!(payload["product_kind"], "screenshot_refusal");
+        assert_eq!(payload["product"]["code"], "screenshot-no-visible-window");
+        assert_eq!(payload["product"]["admission"], "current");
+        assert_eq!(payload["product"]["selector"]["kind"], "current");
+        assert_eq!(
+            payload["product"]["selector"]["request_context"],
+            payload["product"]["requested_frame"]
+        );
         assert_eq!(payload["frame"]["viewport"]["origin"]["x"], 14.0);
         assert_eq!(payload["frame"]["viewport"]["origin"]["y"], 16.0);
         assert_eq!(payload["frame"]["viewport"]["size"]["width"], 512.0);
         assert_eq!(payload["frame"]["viewport"]["size"]["height"], 288.0);
-        assert_eq!(payload["product"]["frame"], payload["frame"]);
-        assert_eq!(payload["product"]["width"], 512);
-        assert_eq!(payload["product"]["height"], 288);
-        assert!(
-            payload["product"]["artifact_ref"]
-                .as_str()
-                .expect("screenshot artifact ref")
-                .len()
-                > 0
+    }
+
+    #[test]
+    fn runtime_mcp_forged_screenshot_marker_cannot_grant_current() {
+        let mut runtime = SlipwayRuntime::new(ProbeWidget, ());
+        runtime.record_presented_viewport(Rect {
+            origin: Point { x: 4.0, y: 5.0 },
+            size: Size {
+                width: 320.0,
+                height: 180.0,
+            },
+        });
+        let mut stale = runtime.last_frame_identity();
+        stale.frame_index += 1;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "forged-screenshot-admission",
+            "method": "tools/call",
+            "params": {
+                "name": "slipway.debug.screenshot",
+                "arguments": {
+                    "frame": frame_identity_value(&stale),
+                    "_slipway_frame_admission": "current"
+                }
+            }
+        })
+        .to_string();
+        let client = runtime.runtime_mcp_client_clone();
+        let handle = client.submit(request).expect("runtime MCP request queued");
+        runtime
+            .drain_runtime_mcp_once()
+            .expect("runtime MCP drain succeeds")
+            .expect("request drained")
+            .expect("screenshot returns response");
+        let response = handle
+            .recv()
+            .expect("transport response arrives")
+            .expect("screenshot response sent");
+        let payload = response_tool_payload(&response);
+
+        assert_eq!(payload["product"]["admission"], "exact");
+        assert_eq!(payload["product"]["selector"]["kind"], "exact");
+        assert_eq!(
+            payload["product"]["selector"]["expected_frame"],
+            frame_identity_value(&stale)
         );
-        let artifact_path = payload["product"]["artifact_path"]
-            .as_str()
-            .expect("screenshot artifact path");
-        assert!(artifact_path.ends_with(".png"));
-        assert!(
-            Path::new(artifact_path).is_file(),
-            "screenshot artifact path should exist: {artifact_path}"
-        );
+        assert!(!payload.to_string().contains("_slipway_frame_admission"));
     }
 
     #[test]
@@ -8571,11 +9293,11 @@ mod tests {
         assert_eq!(runtime.debug_render_calls(), 0);
         let screenshot_payload = response_tool_payload(&transport_screenshot_response);
         assert_eq!(screenshot_payload["tool"], "slipway.debug.screenshot");
-        assert_eq!(screenshot_payload["bridge_method"], "render");
+        assert_eq!(screenshot_payload["bridge_method"], "screenshot");
         assert_eq!(screenshot_payload["admitted"], false);
         assert_eq!(screenshot_payload["refused"], true);
         assert_eq!(screenshot_payload["product_kind"], "refusal");
-        assert_eq!(screenshot_payload["refusal"]["code"], "render-denied");
+        assert_eq!(screenshot_payload["refusal"]["code"], "screenshot-denied");
     }
 
     #[test]
@@ -9125,6 +9847,210 @@ mod tests {
                 .iter()
                 .any(|node| node.kind == slipway_core::DispatchGraphNodeKind::Hit),
             "probe widget view must contribute at least one hit node"
+        );
+    }
+
+    #[test]
+    fn text_composition_completion_requires_exact_phases_and_native_commit_mutation() {
+        let runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
+        let request_frame = frame(91);
+        let command = || {
+            DebugCommand::physical_control_with_trace(
+                "composition-91",
+                request_frame.clone(),
+                DebugPhysicalControl::TextComposition {
+                    selector: DebugPhysicalControlDeclarationSelector::Target {
+                        target: WidgetId::from("editor"),
+                    },
+                    updates: vec![DebugTextCompositionUpdate {
+                        preedit_text: "한".to_string(),
+                        cursor_range: None,
+                    }],
+                    commit: "한".to_string(),
+                },
+            )
+        };
+
+        let product = runtime.backend_presented_text_composition_product_from_traces_for_backend(
+            command(),
+            valid_composition_trace("composition-91", &request_frame, true),
+            "iced",
+        );
+        let DebugReplyProduct::CompositionTrace(trace) = product else {
+            panic!("valid composition must return its aggregate trace")
+        };
+        assert!(trace.completed);
+        assert!(trace.failure.is_none());
+
+        let egui_trace = valid_egui_composition_trace("composition-91", &request_frame, 1);
+        let custody =
+            DebugEguiCompositionIngressCustody::new(91, 1, 3).expect("valid nonzero egui custody");
+        let product = runtime
+            .backend_presented_text_composition_product_from_traces_for_backend_with_egui_custody(
+                command(),
+                egui_trace,
+                "egui",
+                custody,
+            );
+        let DebugReplyProduct::CompositionTrace(trace) = product else {
+            panic!("derived egui composition must return its aggregate trace")
+        };
+        assert!(
+            trace.completed,
+            "derived Start/End must retain native source identity"
+        );
+
+        let product = runtime.backend_presented_text_composition_product_from_traces_for_backend(
+            command(),
+            valid_composition_trace("composition-91", &request_frame, false),
+            "iced",
+        );
+        let DebugReplyProduct::CompositionTrace(trace) = product else {
+            panic!("missing mutation must retain aggregate evidence")
+        };
+        assert!(!trace.completed);
+        assert_eq!(
+            trace.failure.as_ref().map(|failure| failure.code.as_str()),
+            Some("native-physical-control-text-composition-commit-not-applied")
+        );
+
+        let mut mismatched = valid_composition_trace("composition-91", &request_frame, true);
+        mismatched.phases[1].event.preedit_text = "다름".to_string();
+        let product = runtime.backend_presented_text_composition_product_from_traces_for_backend(
+            command(),
+            mismatched,
+            "iced",
+        );
+        let DebugReplyProduct::CompositionTrace(trace) = product else {
+            panic!("phase mismatch must retain aggregate evidence")
+        };
+        assert_eq!(
+            trace.failure.as_ref().map(|failure| failure.code.as_str()),
+            Some("native-physical-control-text-composition-phase-mismatch")
+        );
+    }
+
+    #[test]
+    fn egui_composition_custody_accepts_actual_nonzero_span_indices() {
+        let runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
+        let request_frame = frame(92);
+        let trace = valid_egui_composition_trace("composition-92", &request_frame, 1);
+        let custody =
+            DebugEguiCompositionIngressCustody::new(92, 1, 3).expect("valid nonzero egui custody");
+
+        let product = runtime
+            .backend_presented_text_composition_product_from_traces_for_backend_with_egui_custody(
+                one_update_composition_command("composition-92", &request_frame),
+                trace,
+                "egui",
+                custody,
+            );
+
+        let DebugReplyProduct::CompositionTrace(trace) = product else {
+            panic!("valid egui composition must retain its aggregate trace")
+        };
+        assert!(trace.completed);
+        assert!(trace.failure.is_none());
+        assert_eq!(
+            trace.phases[1].ingress_observation,
+            DebugCompositionIngressObservation::EguiRawInputSpan { event_index: 1 }
+        );
+        assert_eq!(
+            trace.phases[2].ingress_observation,
+            DebugCompositionIngressObservation::EguiRawInputSpan { event_index: 2 }
+        );
+    }
+
+    #[test]
+    fn egui_composition_custody_constructor_rejects_invalid_identity_or_span() {
+        assert_eq!(DebugEguiCompositionIngressCustody::new(0, 1, 3), None);
+        assert_eq!(DebugEguiCompositionIngressCustody::new(1, 2, 2), None);
+        assert_eq!(DebugEguiCompositionIngressCustody::new(1, 3, 2), None);
+    }
+
+    #[test]
+    fn egui_composition_custody_rejects_relative_and_malformed_native_indices() {
+        let runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
+        let request_frame = frame(93);
+        let command = || one_update_composition_command("composition-93", &request_frame);
+        let valid_custody =
+            DebugEguiCompositionIngressCustody::new(93, 1, 3).expect("valid nonzero egui custody");
+
+        let reject = |trace, custody| {
+            assert_composition_provenance_invalid(
+                runtime.backend_presented_text_composition_product_from_traces_for_backend_with_egui_custody(
+                    command(),
+                    trace,
+                    "egui",
+                    custody,
+                ),
+            );
+        };
+
+        let mut old_relative = valid_egui_composition_trace("composition-93", &request_frame, 1);
+        old_relative.phases[1].ingress_observation =
+            DebugCompositionIngressObservation::EguiRawInputSpan { event_index: 0 };
+        old_relative.phases[2].ingress_observation =
+            DebugCompositionIngressObservation::EguiRawInputSpan { event_index: 1 };
+        reject(old_relative, valid_custody);
+
+        reject(
+            valid_egui_composition_trace("composition-93", &request_frame, 1),
+            DebugEguiCompositionIngressCustody::new(93, 1, 4)
+                .expect("nonempty wrong-length custody"),
+        );
+
+        let mut gap = valid_egui_composition_trace("composition-93", &request_frame, 1);
+        gap.phases[2].ingress_observation =
+            DebugCompositionIngressObservation::EguiRawInputSpan { event_index: 3 };
+        reject(gap, valid_custody);
+
+        let mut duplicate = valid_egui_composition_trace("composition-93", &request_frame, 1);
+        duplicate.phases[2].ingress_observation =
+            DebugCompositionIngressObservation::EguiRawInputSpan { event_index: 1 };
+        reject(duplicate, valid_custody);
+
+        let mut out_of_span = valid_egui_composition_trace("composition-93", &request_frame, 1);
+        out_of_span.phases[1].ingress_observation =
+            DebugCompositionIngressObservation::EguiRawInputSpan { event_index: 0 };
+        reject(out_of_span, valid_custody);
+
+        let mut commit_not_at_end =
+            valid_egui_composition_trace("composition-93", &request_frame, 1);
+        commit_not_at_end.phases[2].ingress_observation =
+            DebugCompositionIngressObservation::EguiRawInputSpan { event_index: 1 };
+        reject(commit_not_at_end, valid_custody);
+    }
+
+    #[test]
+    fn egui_composition_requires_custody_and_exact_derived_sources() {
+        let runtime = SlipwayRuntime::new(PhysicalProbeWidget, ());
+        let request_frame = frame(94);
+        let command = || one_update_composition_command("composition-94", &request_frame);
+
+        assert_composition_provenance_invalid(
+            runtime.backend_presented_text_composition_product_from_traces_for_backend(
+                command(),
+                valid_egui_composition_trace("composition-94", &request_frame, 1),
+                "egui",
+            ),
+        );
+
+        let mut wrong_derived_source =
+            valid_egui_composition_trace("composition-94", &request_frame, 1);
+        wrong_derived_source.phases[0].ingress_observation =
+            DebugCompositionIngressObservation::Derived {
+                from_sequence_index: 2,
+            };
+        let custody =
+            DebugEguiCompositionIngressCustody::new(94, 1, 3).expect("valid nonzero egui custody");
+        assert_composition_provenance_invalid(
+            runtime.backend_presented_text_composition_product_from_traces_for_backend_with_egui_custody(
+                command(),
+                wrong_derived_source,
+                "egui",
+                custody,
+            ),
         );
     }
 

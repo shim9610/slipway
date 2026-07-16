@@ -3,12 +3,13 @@ use slipway_core::{
     DeclaredEventDispatchEvidence, Diagnostic, EVIDENCE_SOURCE_BACKEND_PRESENTED,
     EventResultIdentity, FrameIdentity, InputEvent, KeyEventKind, KeyboardDetails, Modifiers,
     Point, PointerButton, PointerDetails, PointerEventKind, PresentationRegionId, ProbeProduct,
-    ProbeRequest, RenderEvidence, RenderPacket, RenderRefusal, Size, TextEditKind,
-    TextSelectionRange, WidgetId,
+    ProbeRequest, RenderEvidence, RenderPacket, RenderRefusal, Size, TextCompositionEvent,
+    TextCompositionPhase, TextEditKind, TextSelectionRange, WidgetId,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const VISIBLE_FRAME_TRACE_FILE_ENV: &str = "SLIPWAY_VISIBLE_FRAME_TRACE_FILE";
@@ -16,6 +17,9 @@ pub const VISIBLE_FRAME_TRACE_CAPACITY_ENV: &str = "SLIPWAY_VISIBLE_FRAME_TRACE_
 pub const VISIBLE_FRAME_BUDGET_HZ: u64 = 240;
 pub const VISIBLE_FRAME_BUDGET_NS: u128 = 1_000_000_000u128 / VISIBLE_FRAME_BUDGET_HZ as u128;
 const DEFAULT_VISIBLE_FRAME_TRACE_CAPACITY: usize = 8192;
+
+pub const PRESENTED_PIXELS_PASS_ID: &str = "presented-pixels/direct-surface-copy";
+pub const DEBUG_COMPOSITION_PASS_ID: &str = "physical-input/debug-injected/composition";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VisibleFrameTimingSummary {
@@ -275,6 +279,95 @@ fn write_visible_frame_timing_file(
     std::fs::write(path, output)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentedScreenshotAdmission {
+    Exact,
+    Current,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PresentedScreenshotSelector {
+    Exact { expected_frame: FrameIdentity },
+    Current { request_context: FrameIdentity },
+}
+
+impl PresentedScreenshotSelector {
+    pub fn admission(&self) -> PresentedScreenshotAdmission {
+        match self {
+            Self::Exact { .. } => PresentedScreenshotAdmission::Exact,
+            Self::Current { .. } => PresentedScreenshotAdmission::Current,
+        }
+    }
+
+    pub fn correlation_frame(&self) -> &FrameIdentity {
+        match self {
+            Self::Exact { expected_frame } => expected_frame,
+            Self::Current { request_context } => request_context,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresentedScreenshotRequest {
+    pub selector: PresentedScreenshotSelector,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentedTransferFunction {
+    Linear,
+    Srgb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentedAlphaMode {
+    Opaque,
+    Premultiplied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentedSurfaceFormat {
+    Rgba8Unorm,
+    Rgba8UnormSrgb,
+    Bgra8Unorm,
+    Bgra8UnormSrgb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PresentedCapturePath {
+    DirectAcquiredSurfaceTextureCopy,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresentedPixels {
+    pub selector: PresentedScreenshotSelector,
+    pub captured_frame: FrameIdentity,
+    pub source: slipway_core::EvidenceSource,
+    pub capture_path: PresentedCapturePath,
+    pub source_format: PresentedSurfaceFormat,
+    pub transfer: PresentedTransferFunction,
+    pub alpha: PresentedAlphaMode,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Arc<[u8]>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PresentedScreenshotRefusal {
+    pub selector: PresentedScreenshotSelector,
+    pub captured_frame: Option<FrameIdentity>,
+    pub backend_id: Option<String>,
+    pub code: String,
+    pub reason: String,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PresentedScreenshotProduct {
+    Captured(PresentedPixels),
+    Refusal(PresentedScreenshotRefusal),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DebugCommand {
     pub request_id: String,
@@ -304,6 +397,13 @@ impl DebugCommand {
         Self {
             request_id: request_id.into(),
             kind: DebugCommandKind::Render { packet },
+        }
+    }
+
+    pub fn screenshot(request_id: impl Into<String>, request: PresentedScreenshotRequest) -> Self {
+        Self {
+            request_id: request_id.into(),
+            kind: DebugCommandKind::Screenshot { request },
         }
     }
 
@@ -363,6 +463,14 @@ impl DebugCommand {
             | DebugCommandKind::PhysicalControl { frame, .. }
             | DebugCommandKind::Resize { frame } => frame,
             DebugCommandKind::Render { packet } => &packet.frame,
+            DebugCommandKind::Screenshot { request } => request.selector.correlation_frame(),
+        }
+    }
+
+    pub fn screenshot_admission(&self) -> Option<PresentedScreenshotAdmission> {
+        match &self.kind {
+            DebugCommandKind::Screenshot { request } => Some(request.selector.admission()),
+            _ => None,
         }
     }
 
@@ -421,6 +529,17 @@ pub enum DebugPhysicalControl {
         offset_x: f32,
         offset_y: f32,
     },
+    TextComposition {
+        selector: DebugPhysicalControlDeclarationSelector,
+        updates: Vec<DebugTextCompositionUpdate>,
+        commit: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DebugTextCompositionUpdate {
+    pub preedit_text: String,
+    pub cursor_range: Option<TextSelectionRange>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -441,6 +560,9 @@ pub enum DebugCommandKind {
     },
     Render {
         packet: RenderPacket,
+    },
+    Screenshot {
+        request: PresentedScreenshotRequest,
     },
     Control {
         frame: FrameIdentity,
@@ -685,6 +807,53 @@ impl DebugControlTrace {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositionPhaseProvenance {
+    Native,
+    Derived { from: TextCompositionPhase },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DebugCompositionIngressObservation {
+    IcedQueueSlice { sequence_index: usize },
+    EguiRawInputSpan { event_index: usize },
+    Derived { from_sequence_index: usize },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugCompositionPhaseTrace {
+    pub phase: TextCompositionPhase,
+    pub backend_event: String,
+    pub provenance: CompositionPhaseProvenance,
+    pub event: TextCompositionEvent,
+    pub ingress_observation: DebugCompositionIngressObservation,
+    pub dispatch_evidence: DeclaredEventDispatchEvidence,
+    pub app_handled: bool,
+    pub result_identity: Option<EventResultIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugCompositionCommitMutation {
+    pub trace: DebugControlTrace,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugCompositionTrace {
+    pub request_id: String,
+    pub frame: FrameIdentity,
+    pub backend_id: String,
+    pub target: WidgetId,
+    pub selected_region: PresentationRegionId,
+    pub focused_before: bool,
+    pub focused_after: bool,
+    pub phases: Vec<DebugCompositionPhaseTrace>,
+    pub commit_mutation: Option<DebugCompositionCommitMutation>,
+    pub completed: bool,
+    pub failure: Option<DebugFailure>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DebugStatus {
     pub admitted: bool,
@@ -719,8 +888,10 @@ pub enum DebugReplyProduct {
     Status(DebugStatus),
     Probes(Vec<ProbeProduct>),
     Render(RenderProduct),
+    Screenshot(PresentedScreenshotProduct),
     Diagnostics(Vec<Diagnostic>),
     ControlTrace(DebugControlTrace),
+    CompositionTrace(DebugCompositionTrace),
     Error(DebugFailure),
 }
 
@@ -729,7 +900,14 @@ impl DebugReplyProduct {
         match self {
             Self::Render(RenderProduct::Evidence(evidence)) => &evidence.frame != expected,
             Self::Render(RenderProduct::Refusal(refusal)) => &refusal.frame != expected,
+            Self::Screenshot(PresentedScreenshotProduct::Captured(pixels)) => {
+                pixels.selector.correlation_frame() != expected
+            }
+            Self::Screenshot(PresentedScreenshotProduct::Refusal(refusal)) => {
+                refusal.selector.correlation_frame() != expected
+            }
             Self::ControlTrace(trace) => &trace.frame != expected,
+            Self::CompositionTrace(trace) => &trace.frame != expected,
             Self::Probes(products) => products.iter().any(|product| {
                 probe_frame_identity(product).is_some_and(|frame| frame != expected)
             }),
@@ -742,6 +920,104 @@ impl DebugReplyProduct {
 pub enum RenderProduct {
     Evidence(RenderEvidence),
     Refusal(RenderRefusal),
+}
+
+pub fn validate_presented_screenshot_product(
+    reply_frame: &FrameIdentity,
+    admitted: PresentedScreenshotAdmission,
+    product: &PresentedScreenshotProduct,
+) -> Result<(), DebugFailure> {
+    let selector = match product {
+        PresentedScreenshotProduct::Captured(pixels) => &pixels.selector,
+        PresentedScreenshotProduct::Refusal(refusal) => &refusal.selector,
+    };
+    if selector.correlation_frame() != reply_frame {
+        return Err(screenshot_validation_failure(
+            "screenshot-requested-frame-mismatch",
+            "presented screenshot requested frame does not match the admitted command frame",
+        ));
+    }
+    if selector.admission() != admitted {
+        return Err(screenshot_validation_failure(
+            "screenshot-admission-mismatch",
+            "presented screenshot admission does not match the admitted command selector",
+        ));
+    }
+
+    let PresentedScreenshotProduct::Captured(pixels) = product else {
+        return Ok(());
+    };
+
+    if let PresentedScreenshotSelector::Exact { expected_frame } = selector {
+        let captured = &pixels.captured_frame;
+        let next_frame_index = expected_frame.frame_index.checked_add(1);
+        if captured.surface_id != expected_frame.surface_id
+            || captured.surface_instance_id != expected_frame.surface_instance_id
+            || captured.revision != expected_frame.revision
+            || captured.viewport != expected_frame.viewport
+            || Some(captured.frame_index) != next_frame_index
+        {
+            return Err(screenshot_validation_failure(
+                "screenshot-captured-frame-transition-invalid",
+                "presented screenshot must capture exactly the next presentation of the admitted surface identity",
+            ));
+        }
+    }
+
+    if pixels.source.label() != EVIDENCE_SOURCE_BACKEND_PRESENTED
+        || pixels
+            .source
+            .backend_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || pixels.source.pass_id.as_deref() != Some(PRESENTED_PIXELS_PASS_ID)
+        || pixels.source.provider_id.is_some()
+    {
+        return Err(screenshot_validation_failure(
+            "screenshot-presented-provenance-invalid",
+            "presented screenshot requires direct backend-presented provenance",
+        ));
+    }
+
+    let expected_transfer = match pixels.source_format {
+        PresentedSurfaceFormat::Rgba8Unorm | PresentedSurfaceFormat::Bgra8Unorm => {
+            PresentedTransferFunction::Linear
+        }
+        PresentedSurfaceFormat::Rgba8UnormSrgb | PresentedSurfaceFormat::Bgra8UnormSrgb => {
+            PresentedTransferFunction::Srgb
+        }
+    };
+    if pixels.transfer != expected_transfer {
+        return Err(screenshot_validation_failure(
+            "screenshot-transfer-function-mismatch",
+            "presented screenshot transfer function does not match its acquired surface format",
+        ));
+    }
+
+    let expected_len = usize::try_from(pixels.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(pixels.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4));
+    if pixels.width == 0 || pixels.height == 0 || expected_len != Some(pixels.bytes.len()) {
+        return Err(screenshot_validation_failure(
+            "screenshot-artifact-invalid-rgba",
+            "presented screenshot bytes must be tightly packed non-empty top-row-first RGBA8",
+        ));
+    }
+
+    Ok(())
+}
+
+fn screenshot_validation_failure(code: &str, message: &str) -> DebugFailure {
+    DebugFailure {
+        code: code.to_string(),
+        message: message.to_string(),
+        dispatch_evidence: None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -781,6 +1057,7 @@ pub struct DebugRequestHandle {
 pub struct DebugCommandLease {
     request_id: String,
     frame: FrameIdentity,
+    screenshot_admission: Option<PresentedScreenshotAdmission>,
     command: DebugCommand,
     reply_tx: Sender<DebugReply>,
 }
@@ -828,9 +1105,11 @@ impl DebugBridgeRuntime {
             }
         };
 
+        let screenshot_admission = envelope.command.screenshot_admission();
         Ok(Some(DebugCommandLease {
             request_id: envelope.command.request_id.clone(),
             frame: envelope.command.frame_identity().clone(),
+            screenshot_admission,
             command: envelope.command,
             reply_tx: envelope.reply_tx,
         }))
@@ -862,8 +1141,10 @@ impl DebugBridgeRuntime {
 
         let request_id = envelope.command.request_id.clone();
         let frame = envelope.command.frame_identity().clone();
+        let screenshot_admission = envelope.command.screenshot_admission();
         let product = checked_product(
             frame.clone(),
+            screenshot_admission,
             match intercept(&envelope.command) {
                 Some(product) => product,
                 None => handler.handle_debug_command(envelope.command),
@@ -910,7 +1191,7 @@ impl DebugCommandLease {
         let reply = DebugReply {
             request_id: self.request_id,
             frame: self.frame.clone(),
-            product: checked_product(self.frame, product),
+            product: checked_product(self.frame, self.screenshot_admission, product),
         };
 
         self.reply_tx
@@ -924,13 +1205,29 @@ impl DebugCommandLease {
     }
 }
 
-fn checked_product(frame: FrameIdentity, product: DebugReplyProduct) -> DebugReplyProduct {
+fn checked_product(
+    frame: FrameIdentity,
+    screenshot_admission: Option<PresentedScreenshotAdmission>,
+    product: DebugReplyProduct,
+) -> DebugReplyProduct {
     if product.frame_identity_mismatch(&frame) {
         DebugReplyProduct::Error(DebugFailure {
             code: "frame-identity-mismatch".to_string(),
             message: "handler returned evidence for a different frame identity".to_string(),
             dispatch_evidence: None,
         })
+    } else if let DebugReplyProduct::Screenshot(screenshot) = &product {
+        let Some(admitted) = screenshot_admission else {
+            return DebugReplyProduct::Error(DebugFailure {
+                code: "screenshot-admission-missing".to_string(),
+                message: "screenshot product returned for a non-screenshot command".to_string(),
+                dispatch_evidence: None,
+            });
+        };
+        match validate_presented_screenshot_product(&frame, admitted, screenshot) {
+            Ok(()) => product,
+            Err(failure) => DebugReplyProduct::Error(failure),
+        }
     } else {
         product
     }
@@ -976,6 +1273,7 @@ pub enum McpProbeMethod {
     Status,
     Probe,
     Render,
+    Screenshot,
     Control,
     Resize,
 }
@@ -1168,6 +1466,16 @@ mod tests {
                     Ok(evidence) => DebugReplyProduct::Render(RenderProduct::Evidence(evidence)),
                     Err(refusal) => DebugReplyProduct::Render(RenderProduct::Refusal(refusal)),
                 },
+                DebugCommandKind::Screenshot { request } => DebugReplyProduct::Screenshot(
+                    PresentedScreenshotProduct::Refusal(PresentedScreenshotRefusal {
+                        selector: request.selector,
+                        captured_frame: None,
+                        backend_id: None,
+                        code: "screenshot-no-visible-backend".to_string(),
+                        reason: "test handler has no visible backend".to_string(),
+                        diagnostics: Vec::new(),
+                    }),
+                ),
                 DebugCommandKind::Control {
                     frame,
                     event,
@@ -1583,5 +1891,238 @@ mod tests {
         assert!(output.contains("over_budget_total=2"));
         assert!(output.contains("root_frame_budget_status=PASS"));
         assert!(output.contains("root_frame_over_budget_total=0"));
+    }
+
+    fn presented_pixels(
+        selector: PresentedScreenshotSelector,
+        captured_frame: FrameIdentity,
+    ) -> PresentedPixels {
+        PresentedPixels {
+            selector,
+            captured_frame,
+            source: slipway_core::EvidenceSource::backend_presented(
+                "test-backend",
+                PRESENTED_PIXELS_PASS_ID,
+            ),
+            capture_path: PresentedCapturePath::DirectAcquiredSurfaceTextureCopy,
+            source_format: PresentedSurfaceFormat::Rgba8UnormSrgb,
+            transfer: PresentedTransferFunction::Srgb,
+            alpha: PresentedAlphaMode::Opaque,
+            width: 1,
+            height: 1,
+            bytes: Arc::from([1, 2, 3, 255]),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn screenshot_selectors_exhaustively_report_honest_correlation_fields() {
+        let exact_frame = frame(40);
+        let current_context = frame(3);
+        let exact = PresentedScreenshotSelector::Exact {
+            expected_frame: exact_frame.clone(),
+        };
+        let current = PresentedScreenshotSelector::Current {
+            request_context: current_context.clone(),
+        };
+
+        assert_eq!(exact.admission(), PresentedScreenshotAdmission::Exact);
+        assert_eq!(exact.correlation_frame(), &exact_frame);
+        assert_eq!(current.admission(), PresentedScreenshotAdmission::Current);
+        assert_eq!(current.correlation_frame(), &current_context);
+
+        let exact_command = DebugCommand::screenshot(
+            "exact",
+            PresentedScreenshotRequest {
+                selector: exact.clone(),
+            },
+        );
+        let current_command = DebugCommand::screenshot(
+            "current",
+            PresentedScreenshotRequest {
+                selector: current.clone(),
+            },
+        );
+        assert_eq!(exact_command.frame_identity(), &exact_frame);
+        assert_eq!(current_command.frame_identity(), &current_context);
+        assert_eq!(
+            exact_command.screenshot_admission(),
+            Some(PresentedScreenshotAdmission::Exact)
+        );
+        assert_eq!(
+            current_command.screenshot_admission(),
+            Some(PresentedScreenshotAdmission::Current)
+        );
+    }
+
+    #[test]
+    fn current_product_keeps_context_as_correlation_not_expected_identity() {
+        let request_context = frame(5);
+        let mut captured = frame(90);
+        captured.surface_id = "presented-surface".to_string();
+        captured.surface_instance_id = "presented-instance".to_string();
+        captured.revision = 77;
+        let product =
+            DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Captured(presented_pixels(
+                PresentedScreenshotSelector::Current {
+                    request_context: request_context.clone(),
+                },
+                captured,
+            )));
+
+        assert_eq!(
+            checked_product(
+                request_context,
+                Some(PresentedScreenshotAdmission::Current),
+                product.clone()
+            ),
+            product
+        );
+    }
+
+    #[test]
+    fn screenshot_validator_rejects_wrong_admission_for_capture_and_refusal() {
+        let correlation = frame(50);
+        let mut captured = correlation.clone();
+        captured.frame_index += 1;
+        let selector = PresentedScreenshotSelector::Exact {
+            expected_frame: correlation.clone(),
+        };
+        let products = [
+            PresentedScreenshotProduct::Captured(presented_pixels(selector.clone(), captured)),
+            PresentedScreenshotProduct::Refusal(PresentedScreenshotRefusal {
+                selector,
+                captured_frame: None,
+                backend_id: Some("test-backend".to_string()),
+                code: "test-refusal".to_string(),
+                reason: "test refusal".to_string(),
+                diagnostics: Vec::new(),
+            }),
+        ];
+
+        for product in products {
+            let failure = validate_presented_screenshot_product(
+                &correlation,
+                PresentedScreenshotAdmission::Current,
+                &product,
+            )
+            .expect_err("product admission must match the consumed request");
+            assert_eq!(failure.code, "screenshot-admission-mismatch");
+        }
+    }
+
+    #[test]
+    fn screenshot_validator_rejects_wrong_correlation_and_exact_captured_identity() {
+        let expected = frame(60);
+        let selector = PresentedScreenshotSelector::Exact {
+            expected_frame: expected.clone(),
+        };
+        let refusal = PresentedScreenshotProduct::Refusal(PresentedScreenshotRefusal {
+            selector: selector.clone(),
+            captured_frame: None,
+            backend_id: None,
+            code: "test-refusal".to_string(),
+            reason: "test refusal".to_string(),
+            diagnostics: Vec::new(),
+        });
+        let failure = validate_presented_screenshot_product(
+            &frame(61),
+            PresentedScreenshotAdmission::Exact,
+            &refusal,
+        )
+        .expect_err("refusal correlation must match the reply frame");
+        assert_eq!(failure.code, "screenshot-requested-frame-mismatch");
+
+        let mut wrong_captured = expected.clone();
+        wrong_captured.frame_index += 1;
+        wrong_captured.surface_instance_id = "wrong-instance".to_string();
+        let captured =
+            PresentedScreenshotProduct::Captured(presented_pixels(selector, wrong_captured));
+        let failure = validate_presented_screenshot_product(
+            &expected,
+            PresentedScreenshotAdmission::Exact,
+            &captured,
+        )
+        .expect_err("exact capture must preserve the complete admitted identity");
+        assert_eq!(failure.code, "screenshot-captured-frame-transition-invalid");
+    }
+
+    #[test]
+    fn screenshot_validator_keeps_rgba_checks_for_current() {
+        let request_context = frame(70);
+        let mut pixels = presented_pixels(
+            PresentedScreenshotSelector::Current {
+                request_context: request_context.clone(),
+            },
+            frame(200),
+        );
+        pixels.bytes = Arc::from([0, 0, 0]);
+
+        let failure = validate_presented_screenshot_product(
+            &request_context,
+            PresentedScreenshotAdmission::Current,
+            &PresentedScreenshotProduct::Captured(pixels),
+        )
+        .expect_err("current captures retain artifact validation");
+        assert_eq!(failure.code, "screenshot-artifact-invalid-rgba");
+    }
+
+    #[test]
+    fn bridge_retains_admission_after_handler_consumes_command() {
+        struct WrongAdmissionHandler;
+
+        impl SlipwayDebugCommandHandler for WrongAdmissionHandler {
+            fn handle_debug_command(&mut self, command: DebugCommand) -> DebugReplyProduct {
+                let correlation = command.frame_identity().clone();
+                let mut captured = correlation.clone();
+                captured.frame_index += 1;
+                DebugReplyProduct::Screenshot(PresentedScreenshotProduct::Captured(
+                    presented_pixels(
+                        PresentedScreenshotSelector::Exact {
+                            expected_frame: correlation,
+                        },
+                        captured,
+                    ),
+                ))
+            }
+        }
+
+        let context = frame(80);
+        let (client, runtime) = bounded_debug_bridge(1);
+        let handle = client
+            .submit(DebugCommand::screenshot(
+                "wrong-admission",
+                PresentedScreenshotRequest {
+                    selector: PresentedScreenshotSelector::Current {
+                        request_context: context,
+                    },
+                },
+            ))
+            .expect("command queued");
+        runtime
+            .drain_one(&mut WrongAdmissionHandler)
+            .expect("runtime drains")
+            .expect("reply generated");
+        let reply = handle
+            .try_recv()
+            .expect("reply channel readable")
+            .expect("reply available");
+
+        let DebugReplyProduct::Error(failure) = reply.product else {
+            panic!("wrong admission must become an error reply");
+        };
+        assert_eq!(failure.code, "screenshot-admission-mismatch");
+    }
+
+    #[test]
+    fn screenshot_contract_source_guards_prevent_compatibility_backdoors() {
+        let source = include_str!("lib.rs");
+        assert!(!source.contains(concat!("pub expected_", "frame: FrameIdentity")));
+        assert!(!source.contains(concat!("pub requested_", "frame: FrameIdentity")));
+        assert!(!source.contains(concat!("continu", "ation")));
+        assert!(!source.contains(concat!("Mut", "ex")));
+        assert!(!source.contains(concat!("Rw", "Lock")));
+        assert!(!source.contains(concat!("unsafe", " ")));
+        assert!(!source.contains(concat!("pixel_", "fallback")));
     }
 }

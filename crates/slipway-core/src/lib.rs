@@ -1730,6 +1730,7 @@ pub enum TextCompositionPhase {
     Start,
     Update,
     Commit,
+    End,
     Cancel,
 }
 
@@ -11659,10 +11660,22 @@ macro_rules! impl_widget_list_tuple {
             ) -> EventOutcome<Self::AppMessage> {
                 let target = event.target().clone();
                 let target_slot = event.target_slot().cloned();
+                let addressed_matches = ($(
+                    target_slot.as_ref().is_some_and(|target_slot| {
+                        target_slot_matches_direct_child(
+                            target_slot,
+                            parent_slot,
+                            &self.$index.id(),
+                            $index,
+                        )
+                    }),
+                )+);
+                let addressed_match_count = 0 $(+ usize::from(addressed_matches.$index))+;
                 $(
                     let child_slot = parent_slot.child(self.$index.id(), $index);
                     let event_matches_child = if let Some(target_slot) = &target_slot {
-                        target_slot == &child_slot
+                        let _ = target_slot;
+                        addressed_match_count == 1 && addressed_matches.$index
                     } else {
                         widget_contains_target(&self.$index, external, &target)
                     };
@@ -11934,7 +11947,12 @@ fn mount_child_view_definition(
         for region in &mut view.hit_regions {
             mount_optional_slot_address(&mut region.address, slot);
             mount_optional_slot_address(&mut region.route.address, slot);
-            region.route.path = mount_event_route_path(&region.route.path, slot);
+            region.route.path = region
+                .route
+                .address
+                .as_ref()
+                .map(|address| address.path.clone())
+                .unwrap_or_default();
         }
 
         for region in &mut view.focus_regions {
@@ -11947,18 +11965,6 @@ fn mount_child_view_definition(
     }
 
     view
-}
-
-fn mount_event_route_path(route_path: &[WidgetId], slot: &WidgetSlotAddress) -> Vec<WidgetId> {
-    if route_path.first() == Some(&slot.widget) {
-        let mut mounted = slot.path.clone();
-        mounted.extend(route_path.iter().skip(1).cloned());
-        mounted
-    } else {
-        let mut mounted = slot.path.clone();
-        mounted.extend(route_path.iter().cloned());
-        mounted
-    }
 }
 
 fn mount_child_view_definition_geometry(view: &mut ViewDefinition, placement: ParentLocalRect) {
@@ -11992,7 +11998,7 @@ fn mount_optional_slot_address(
     *address = Some(
         address
             .take()
-            .map(|slot| mount_existing_slot(slot, parent_slot))
+            .map(|slot| mount_widget_slot_address(slot, parent_slot))
             .unwrap_or_else(|| parent_slot.clone()),
     );
 }
@@ -12002,7 +12008,7 @@ fn mount_existing_optional_slot_address(
     parent_slot: &WidgetSlotAddress,
 ) {
     if let Some(slot) = address.take() {
-        *address = Some(mount_existing_slot(slot, parent_slot));
+        *address = Some(mount_widget_slot_address(slot, parent_slot));
     }
 }
 
@@ -12016,7 +12022,7 @@ fn mount_child_topology(mut node: TopologyNode, child_slot: WidgetSlotAddress) -
 
 fn mount_descendant_topology_slots(node: &mut TopologyNode, parent_slot: &WidgetSlotAddress) {
     if let Some(slot) = node.local_state_slot.clone() {
-        node.local_state_slot = Some(mount_existing_slot(slot, parent_slot));
+        node.local_state_slot = Some(mount_widget_slot_address(slot, parent_slot));
     }
     for child in &mut node.children {
         mount_descendant_topology_slots(child, parent_slot);
@@ -12032,7 +12038,7 @@ fn mount_state_observations(
         .map(|mut observation| {
             observation.slot = observation
                 .slot
-                .map(|slot| mount_existing_slot(slot, child_slot))
+                .map(|slot| mount_widget_slot_address(slot, child_slot))
                 .or_else(|| Some(child_slot.clone()));
             observation
         })
@@ -12061,7 +12067,7 @@ fn mount_change_evidence(
 ) -> ChangeEvidence {
     change.slot = change
         .slot
-        .map(|slot| mount_existing_slot(slot, child_slot))
+        .map(|slot| mount_widget_slot_address(slot, child_slot))
         .or_else(|| Some(child_slot.clone()));
     change
 }
@@ -12094,7 +12100,11 @@ fn mount_probe_slots(probe: &mut ProbeProduct, child_slot: &WidgetSlotAddress) {
     }
 }
 
-fn mount_existing_slot(
+/// Mounts a self-rooted child address below an already-mounted parent address.
+///
+/// Already-mounted inputs are returned unchanged, making the operation
+/// idempotent across nested presentation passes.
+pub fn mount_widget_slot_address(
     slot: WidgetSlotAddress,
     parent_slot: &WidgetSlotAddress,
 ) -> WidgetSlotAddress {
@@ -12106,17 +12116,56 @@ fn mount_existing_slot(
         return parent_slot.clone();
     }
 
-    let mut path = parent_slot.path.clone();
-    let mut suffix = slot.path;
-    if suffix.first() == Some(&parent_slot.widget) {
-        suffix.remove(0);
-    }
-    path.extend(suffix);
+    let WidgetSlotAddress {
+        widget,
+        path: child_path,
+        ordinal,
+    } = slot;
+    let skip_boundary = usize::from(child_path.first() == Some(&parent_slot.widget));
+    let mut path = Vec::with_capacity(parent_slot.path.len() + child_path.len() - skip_boundary);
+    path.extend(parent_slot.path.iter().cloned());
+    path.extend(child_path.into_iter().skip(skip_boundary));
 
     WidgetSlotAddress {
-        widget: slot.widget,
+        widget,
         path,
-        ordinal: slot.ordinal,
+        ordinal,
+    }
+}
+
+fn target_slot_matches_direct_child(
+    target_slot: &WidgetSlotAddress,
+    parent_slot: &WidgetSlotAddress,
+    child: &WidgetId,
+    child_ordinal: usize,
+) -> bool {
+    if target_slot.widget == *child
+        && target_slot.ordinal == child_ordinal
+        && target_slot.path.len() == parent_slot.path.len() + 1
+        && target_slot.path.starts_with(&parent_slot.path)
+        && target_slot.path.last() == Some(child)
+    {
+        return true;
+    }
+
+    let app = &parent_slot.widget;
+    let mut matched_child_index = None;
+    for (index, window) in target_slot.path.windows(2).enumerate() {
+        if &window[0] == app && &window[1] == child {
+            if matched_child_index.is_some() {
+                return false;
+            }
+            matched_child_index = Some(index + 1);
+        }
+    }
+
+    let Some(child_index) = matched_child_index else {
+        return false;
+    };
+    if child_index + 1 == target_slot.path.len() {
+        target_slot.widget == *child && target_slot.ordinal == child_ordinal
+    } else {
+        true
     }
 }
 
@@ -16001,6 +16050,48 @@ mod tests {
         widgets: (BubblingWidget,),
     }
 
+    #[derive(Clone, Debug, PartialEq)]
+    struct NestedRouteApp<W> {
+        id: WidgetId,
+        widgets: (W,),
+    }
+
+    impl<W> SlipwayApp for NestedRouteApp<W>
+    where
+        W: SlipwayWidget<ExternalState = AppExternal, AppMessage = AppMessage>
+            + SlipwayEventRoutingPolicy
+            + SlipwayEventDispositionPolicy
+            + SlipwayViewDefinition,
+    {
+        type ExternalState = AppExternal;
+        type LocalState = ();
+        type AppMessage = AppMessage;
+        type Widgets = (W,);
+
+        fn id(&self) -> WidgetId {
+            self.id.clone()
+        }
+
+        fn widgets(&self) -> &Self::Widgets {
+            &self.widgets
+        }
+
+        fn initial_local_state(&self) -> Self::LocalState {}
+    }
+
+    fn nested_route_app<W>(id: &str, child: W) -> SlipwayAppWidget<NestedRouteApp<W>>
+    where
+        W: SlipwayWidget<ExternalState = AppExternal, AppMessage = AppMessage>
+            + SlipwayEventRoutingPolicy
+            + SlipwayEventDispositionPolicy
+            + SlipwayViewDefinition,
+    {
+        SlipwayAppWidget::new(NestedRouteApp {
+            id: WidgetId::from(id),
+            widgets: (child,),
+        })
+    }
+
     macro_rules! impl_core_test_event_policy {
         ($($type:ty),+ $(,)?) => {
             $(
@@ -17796,6 +17887,208 @@ mod tests {
             outcome.changes[0].slot.as_ref().map(|slot| slot.ordinal),
             Some(1)
         );
+    }
+
+    #[test]
+    fn canonical_widget_slot_mounting_is_idempotent_through_three_levels() {
+        let root = WidgetSlotAddress::new(WidgetId::from("root"), 0);
+        let app_1 = root.child(WidgetId::from("app-1"), 0);
+        let app_2 = app_1.child(WidgetId::from("app-2"), 0);
+        let app_3 = app_2.child(WidgetId::from("app-3"), 0);
+        let leaf = app_3.child(WidgetId::from("leaf"), 7);
+
+        let rows = [
+            (
+                WidgetSlotAddress::new(WidgetId::from("app-1"), 0),
+                root.clone(),
+                app_1.clone(),
+            ),
+            (
+                WidgetSlotAddress::new(WidgetId::from("app-1"), 0)
+                    .child(WidgetId::from("app-2"), 0),
+                app_1.clone(),
+                app_2.clone(),
+            ),
+            (
+                WidgetSlotAddress::new(WidgetId::from("app-3"), 0).child(WidgetId::from("leaf"), 7),
+                app_3.clone(),
+                leaf.clone(),
+            ),
+            (leaf.clone(), app_3.clone(), leaf.clone()),
+        ];
+
+        for (child, parent, expected) in rows {
+            let mounted = mount_widget_slot_address(child, &parent);
+            assert_eq!(mounted, expected);
+            assert_eq!(
+                mount_widget_slot_address(mounted.clone(), &parent),
+                mounted,
+                "mounting an already-rooted address must not add a prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_app_routing_preserves_full_address_at_one_two_and_three_hops() {
+        let external = AppExternal;
+
+        let one = nested_route_app(
+            "root",
+            nested_route_app(
+                "app-1",
+                CounterWidget {
+                    id: WidgetId::from("leaf"),
+                    origin_x: 0.0,
+                },
+            ),
+        );
+        let one_slot = WidgetSlotAddress::new(WidgetId::from("root"), 0)
+            .child(WidgetId::from("app-1"), 0)
+            .child(WidgetId::from("leaf"), 0);
+        let mut one_local = one.initial_local_state();
+        let one_event = command_with_slot("leaf", one_slot.clone());
+        let one_declaration = declared_event_handling(&one, &external, &one_local, &one_event);
+        assert_eq!(
+            one_declaration.routing.route.address,
+            Some(one_slot.clone())
+        );
+        let one_outcome = one.handle_event(&external, &mut one_local, one_event);
+        assert!(one_outcome.handled);
+        assert_eq!(one_local.widgets.0.widgets.0.count, 1);
+        assert_eq!(one_outcome.changes[0].slot, Some(one_slot.clone()));
+        assert_eq!(one_outcome.observations[0].slot, Some(one_slot));
+
+        let two = nested_route_app(
+            "root",
+            nested_route_app(
+                "app-1",
+                nested_route_app(
+                    "app-2",
+                    CounterWidget {
+                        id: WidgetId::from("leaf"),
+                        origin_x: 0.0,
+                    },
+                ),
+            ),
+        );
+        let two_slot = WidgetSlotAddress::new(WidgetId::from("root"), 0)
+            .child(WidgetId::from("app-1"), 0)
+            .child(WidgetId::from("app-2"), 0)
+            .child(WidgetId::from("leaf"), 0);
+        let mut two_local = two.initial_local_state();
+        let two_outcome = two.handle_event(
+            &external,
+            &mut two_local,
+            command_with_slot("leaf", two_slot.clone()),
+        );
+        assert!(two_outcome.handled);
+        assert_eq!(two_local.widgets.0.widgets.0.widgets.0.count, 1);
+        assert_eq!(two_outcome.changes[0].slot, Some(two_slot));
+
+        let three = nested_route_app(
+            "root",
+            nested_route_app(
+                "app-1",
+                nested_route_app(
+                    "app-2",
+                    nested_route_app(
+                        "app-3",
+                        CounterWidget {
+                            id: WidgetId::from("leaf"),
+                            origin_x: 0.0,
+                        },
+                    ),
+                ),
+            ),
+        );
+        let three_slot = WidgetSlotAddress::new(WidgetId::from("root"), 0)
+            .child(WidgetId::from("app-1"), 0)
+            .child(WidgetId::from("app-2"), 0)
+            .child(WidgetId::from("app-3"), 0)
+            .child(WidgetId::from("leaf"), 0);
+        let mut three_local = three.initial_local_state();
+        let three_outcome = three.handle_event(
+            &external,
+            &mut three_local,
+            command_with_slot("leaf", three_slot.clone()),
+        );
+        assert!(three_outcome.handled);
+        assert_eq!(three_local.widgets.0.widgets.0.widgets.0.widgets.0.count, 1);
+        assert_eq!(three_outcome.changes[0].slot, Some(three_slot.clone()));
+
+        let mut wrong_local = three.initial_local_state();
+        let mut wrong_ordinal = three_slot;
+        wrong_ordinal.ordinal = 9;
+        let wrong_outcome = three.handle_event(
+            &external,
+            &mut wrong_local,
+            command_with_slot("leaf", wrong_ordinal),
+        );
+        assert!(!wrong_outcome.handled);
+        assert_eq!(wrong_local.widgets.0.widgets.0.widgets.0.widgets.0.count, 0);
+    }
+
+    #[test]
+    fn nested_sibling_collision_uses_ancestor_branch_not_leaf_ordinal() {
+        let leaf = || CounterWidget {
+            id: WidgetId::from("leaf"),
+            origin_x: 0.0,
+        };
+        let widgets = (
+            nested_route_app("left-app", leaf()),
+            nested_route_app("right-app", leaf()),
+        );
+        let external = AppExternal;
+        let mut local = widgets.initial_child_local_state();
+        let root = WidgetSlotAddress::new(WidgetId::from("root"), 0);
+        let right = root
+            .child(WidgetId::from("right-app"), 1)
+            .child(WidgetId::from("leaf"), 0);
+
+        let outcome = widgets.route_event(
+            &external,
+            &mut local,
+            &root,
+            command_with_slot("leaf", right.clone()),
+        );
+
+        assert!(outcome.handled);
+        assert_eq!(local.0.widgets.0.count, 0);
+        assert_eq!(local.1.widgets.0.count, 1);
+        assert_eq!(outcome.changes[0].slot, Some(right));
+
+        let mut refused_local = widgets.initial_child_local_state();
+        let wrong_branch = root
+            .child(WidgetId::from("missing-app"), 0)
+            .child(WidgetId::from("leaf"), 0);
+        let wrong_outcome = widgets.route_event(
+            &external,
+            &mut refused_local,
+            &root,
+            command_with_slot("leaf", wrong_branch),
+        );
+        assert!(!wrong_outcome.handled);
+
+        let ambiguous = WidgetSlotAddress {
+            widget: WidgetId::from("leaf"),
+            path: vec![
+                WidgetId::from("root"),
+                WidgetId::from("left-app"),
+                WidgetId::from("root"),
+                WidgetId::from("left-app"),
+                WidgetId::from("leaf"),
+            ],
+            ordinal: 0,
+        };
+        let ambiguous_outcome = widgets.route_event(
+            &external,
+            &mut refused_local,
+            &root,
+            command_with_slot("leaf", ambiguous),
+        );
+        assert!(!ambiguous_outcome.handled);
+        assert_eq!(refused_local.0.widgets.0.count, 0);
+        assert_eq!(refused_local.1.widgets.0.count, 0);
     }
 
     #[test]
