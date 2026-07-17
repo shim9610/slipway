@@ -1,19 +1,19 @@
 [package]
 name = "slipway-backend-egui"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license.workspace = true
 
 [dependencies]
-eframe = { version = "0.35.0", path = "../../third_party/eframe-0.35.0", default-features = false, features = ["default_fonts", "wgpu", "slipway_debug"] }
-egui-wgpu = { version = "0.35", path = "../../third_party/egui-wgpu-0.35.0", default-features = false }
-slipway-core = { version = "0.1.4", path = "../slipway-core" }
-slipway-debug-bridge = { version = "0.1.4", path = "../slipway-debug-bridge" }
-slipway-runtime = { version = "0.1.4", path = "../slipway-runtime" }
+eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "wgpu"] }
+egui-wgpu = { version = "0.35", default-features = false }
+slipway-core = { version = "0.1.5", path = "../slipway-core" }
+slipway-debug-bridge = { version = "0.1.5", path = "../slipway-debug-bridge" }
+slipway-runtime = { version = "0.1.5", path = "../slipway-runtime" }
 winit = { version = "0.30.13", default-features = false }
 
 [dev-dependencies]
-slipway-debug-bridge = { version = "0.1.4", path = "../slipway-debug-bridge" }
+slipway-debug-bridge = { version = "0.1.5", path = "../slipway-debug-bridge" }
 
 [lints]
 workspace = true

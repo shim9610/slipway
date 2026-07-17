@@ -588,6 +588,8 @@ dependencies = [
 [[package]]
 name = "eframe"
 version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8dc8234e2f681b2afd2b2e8c332fa614de2fddbdcb28d0acf5c420449682ea90"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -638,6 +640,8 @@ dependencies = [
 [[package]]
 name = "egui-wgpu"
 version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2e6cfac0725563555fa4f91e9f799b9d7c6c5dd831fca6abc8234afc64b7a34"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -656,6 +660,8 @@ dependencies = [
 [[package]]
 name = "egui-winit"
 version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ea6bf3608db949588b95b8b341ee358d0c3f95cf4dc3f53d8d76717edee87db"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -1371,6 +1377,8 @@ dependencies = [
 [[package]]
 name = "iced_wgpu"
 version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff144a999b0ca0f8a10257934500060240825c42e950ec0ebee9c8ae30561c13"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",
@@ -2863,7 +2871,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slipway"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "slipway-backend-egui",
  "slipway-backend-iced",
@@ -2876,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-backend-egui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "eframe",
  "egui-wgpu",
@@ -2888,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-backend-iced"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "iced",
  "iced_core",
@@ -2902,14 +2910,14 @@ dependencies = [
 
 [[package]]
 name = "slipway-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "trybuild",
 ]
 
 [[package]]
 name = "slipway-debug-bridge"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crossbeam-channel",
  "slipway-core",
@@ -2917,7 +2925,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-debug-mcp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crossbeam-channel",
  "serde",
@@ -2929,7 +2937,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-debug-renderer"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ab_glyph",
  "png",
@@ -2938,7 +2946,7 @@ dependencies = [
 
 [[package]]
 name = "slipway-example-admission"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "slipway-backend-egui",
  "slipway-backend-iced",
@@ -2948,14 +2956,14 @@ dependencies = [
 
 [[package]]
 name = "slipway-example-authored"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "slipway",
 ]
 
 [[package]]
 name = "slipway-runtime"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "crossbeam-channel",
  "serde_json",

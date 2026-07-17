@@ -1,13 +1,13 @@
 [package]
 name = "slipway-debug-bridge"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
 crossbeam-channel = "0.5.15"
-slipway-core = { version = "0.1.4", path = "../slipway-core" }
+slipway-core = { version = "0.1.5", path = "../slipway-core" }
 
 [lints]
 workspace = true

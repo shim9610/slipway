@@ -19,7 +19,7 @@ currently distributed from GitHub, not crates.io; do not use
 announced.
 
 ```powershell
-cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.4 --features iced
+cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.5 --features iced
 ```
 
 For a human overview:
