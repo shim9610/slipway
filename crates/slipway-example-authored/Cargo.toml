@@ -2,14 +2,14 @@
 # LE-H2/LE-H6): the copy source an authoring LLM starts from.
 #
 # Dependency rule (docs/public/llm-contract-checklist.md "First Rule"): an
-# authored app depends on the `slipway` facade crate only — never on
+# authored app depends on the `slipway` facade crate only ??never on
 # slipway-core, slipway-runtime, or a backend crate directly. Backend
 # support is selected with the facade's Cargo features; this example keeps
 # both backends on by default because it is the two-backend reference, an
 # ordinary app picks exactly one (docs/public/quickstart-authoring.md).
 [package]
 name = "slipway-example-authored"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license.workspace = true
 
@@ -19,7 +19,7 @@ iced = ["slipway/iced"]
 egui = ["slipway/egui"]
 
 [dependencies]
-slipway = { version = "0.1.1", path = "../slipway" }
+slipway = { version = "0.1.2", path = "../slipway" }
 
 [lints]
 workspace = true
