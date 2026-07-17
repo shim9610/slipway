@@ -8,10 +8,14 @@ do not guess the API from private notes, old crates, or repository history.
 
 ## 1. Add Slipway
 
+Slipway is currently distributed from GitHub, not crates.io. Do not use
+`slipway = { version = "..." }` unless a crates.io release is explicitly
+announced.
+
 Prefer `cargo add`:
 
 ```powershell
-cargo add slipway --git https://github.com/shim9610/slipway.git --features iced
+cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.4 --features iced
 ```
 
 Use `--features egui` for egui, or `--features all-backends` only when the

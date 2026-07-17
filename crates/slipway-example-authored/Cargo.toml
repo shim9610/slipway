@@ -9,7 +9,7 @@
 # ordinary app picks exactly one (docs/public/quickstart-authoring.md).
 [package]
 name = "slipway-example-authored"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 license.workspace = true
 
@@ -19,7 +19,7 @@ iced = ["slipway/iced"]
 egui = ["slipway/egui"]
 
 [dependencies]
-slipway = { version = "0.1.3", path = "../slipway" }
+slipway = { version = "0.1.4", path = "../slipway" }
 
 [lints]
 workspace = true

@@ -13,10 +13,13 @@ and the linked public pages do not explain the next authoring step, report a
 public documentation gap instead of investigating internal architecture or old
 evaluation history.
 
-Install the public facade crate with the backend feature you need:
+Install the public facade crate with the backend feature you need. Slipway is
+currently distributed from GitHub, not crates.io; do not use
+`slipway = { version = "..." }` unless a crates.io release is explicitly
+announced.
 
 ```powershell
-cargo add slipway --git https://github.com/shim9610/slipway.git --features iced
+cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.4 --features iced
 ```
 
 For a human overview:

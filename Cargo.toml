@@ -11,7 +11,11 @@ members = [
     "crates/slipway-debug-renderer",
     "crates/slipway-runtime",
 ]
-exclude = ["third_party/eframe-0.35.0"]
+exclude = [
+    "third_party/eframe-0.35.0",
+    "third_party/egui-wgpu-0.35.0",
+    "third_party/egui-winit-0.35.0",
+]
 resolver = "2"
 
 [workspace.package]

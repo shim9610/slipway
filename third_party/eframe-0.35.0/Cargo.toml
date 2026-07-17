@@ -227,6 +227,7 @@ features = [
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.egui-wgpu]
 version = "0.35.0"
+path = "../egui-wgpu-0.35.0"
 features = [
     "winit",
     "capture",
@@ -236,6 +237,7 @@ default-features = false
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.egui-winit]
 version = "0.35.0"
+path = "../egui-winit-0.35.0"
 features = [
     "clipboard",
     "links",
@@ -286,6 +288,7 @@ version = "1.25"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.egui-wgpu]
 version = "0.35.0"
+path = "../egui-wgpu-0.35.0"
 features = ["capture"]
 optional = true
 default-features = false
