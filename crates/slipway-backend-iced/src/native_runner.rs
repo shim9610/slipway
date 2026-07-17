@@ -19,14 +19,18 @@ use slipway_debug_bridge::{
     CompositionPhaseProvenance, DEBUG_COMPOSITION_PASS_ID, DebugCommandLease,
     DebugCompositionCommitMutation, DebugCompositionIngressObservation, DebugCompositionPhaseTrace,
     DebugCompositionTrace, DebugControlMode, DebugControlTrace, DebugFailure, DebugPhysicalControl,
-    DebugReplyProduct, PresentedAlphaMode, PresentedCapturePath, PresentedPixels,
-    PresentedScreenshotProduct, PresentedScreenshotRefusal, PresentedScreenshotSelector,
-    PresentedSurfaceFormat, PresentedTransferFunction, VISIBLE_FRAME_BUDGET_NS,
-    VisibleFrameTimingRecorder,
+    DebugReplyProduct, PresentedScreenshotProduct, PresentedScreenshotRefusal,
+    PresentedScreenshotSelector, VISIBLE_FRAME_BUDGET_NS, VisibleFrameTimingRecorder,
+};
+#[cfg(feature = "iced-direct-capture")]
+use slipway_debug_bridge::{
+    PresentedAlphaMode, PresentedCapturePath, PresentedPixels, PresentedSurfaceFormat,
+    PresentedTransferFunction,
 };
 use slipway_runtime::{SlipwayImePolicy, SlipwayRuntimePendingNativeMcpCall};
 use std::borrow::Cow;
 use std::sync::Arc;
+#[cfg(feature = "iced-direct-capture")]
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -43,9 +47,13 @@ use winit::window::{ImePurpose, Window, WindowId};
 #[derive(Clone, Copy, Debug)]
 enum NativeRunnerEvent {
     McpWake,
-    DirectCaptureWake { token: u64 },
+    #[cfg(feature = "iced-direct-capture")]
+    DirectCaptureWake {
+        token: u64,
+    },
 }
 
+#[cfg(feature = "iced-direct-capture")]
 fn spawn_iced_capture_deadline(
     proxy: EventLoopProxy<NativeRunnerEvent>,
     token: u64,
@@ -106,6 +114,7 @@ fn unicode_scalar_to_byte_index(text: &str, scalar_index: usize) -> usize {
         .map_or(text.len(), |(index, _)| index)
 }
 
+#[cfg(feature = "iced-direct-capture")]
 fn direct_capture_refusal(
     reason: iced_renderer::wgpu::window::compositor::DirectCaptureRefusal,
 ) -> (&'static str, &'static str) {
@@ -138,6 +147,7 @@ fn direct_capture_refusal(
     }
 }
 
+#[cfg(feature = "iced-direct-capture")]
 fn presented_surface_format(
     format: iced_renderer::wgpu::window::compositor::DirectCaptureFormat,
 ) -> PresentedSurfaceFormat {
@@ -150,6 +160,7 @@ fn presented_surface_format(
     }
 }
 
+#[cfg(feature = "iced-direct-capture")]
 fn presented_transfer(
     format: iced_renderer::wgpu::window::compositor::DirectCaptureFormat,
 ) -> PresentedTransferFunction {
@@ -164,6 +175,7 @@ fn presented_transfer(
     }
 }
 
+#[cfg(feature = "iced-direct-capture")]
 fn presented_alpha(
     alpha: iced_renderer::wgpu::window::compositor::DirectCaptureAlphaMode,
 ) -> PresentedAlphaMode {
@@ -266,10 +278,12 @@ enum PendingIcedPhysicalEvidence {
     },
 }
 
+#[cfg(feature = "iced-direct-capture")]
 struct DirectCaptureWakeProxy {
     proxy: EventLoopProxy<NativeRunnerEvent>,
 }
 
+#[cfg(feature = "iced-direct-capture")]
 impl iced_renderer::wgpu::window::compositor::DirectCaptureWake for DirectCaptureWakeProxy {
     fn wake(&self, token: u64) {
         let _ = self
@@ -278,6 +292,7 @@ impl iced_renderer::wgpu::window::compositor::DirectCaptureWake for DirectCaptur
     }
 }
 
+#[cfg(feature = "iced-direct-capture")]
 struct CaptureLease {
     token: u64,
     command: DebugCommand,
@@ -289,6 +304,14 @@ struct CaptureLease {
     deadline: Instant,
 }
 
+#[cfg(not(feature = "iced-direct-capture"))]
+struct CaptureLease {
+    command: DebugCommand,
+    lease: DebugCommandLease,
+    pending: SlipwayRuntimePendingNativeMcpCall,
+}
+
+#[cfg(feature = "iced-direct-capture")]
 #[allow(clippy::too_many_arguments)]
 fn build_iced_capture_lease<S>(
     token: u64,
@@ -350,6 +373,7 @@ fn complete_presented_capture_refusal(
     let _ = pending.try_finish_and_respond();
 }
 
+#[cfg(feature = "iced-direct-capture")]
 struct PresentedMeta {
     format: iced_renderer::wgpu::window::compositor::DirectCaptureFormat,
     alpha: iced_renderer::wgpu::window::compositor::DirectCaptureAlphaMode,
@@ -357,12 +381,14 @@ struct PresentedMeta {
     height: u32,
 }
 
+#[cfg(feature = "iced-direct-capture")]
 #[derive(Default)]
 struct IcedCaptureEvidence {
     presented: Option<PresentedMeta>,
     mapped: Option<Arc<[u8]>>,
 }
 
+#[cfg(feature = "iced-direct-capture")]
 fn iced_capture_deadline_refusal(
     committed_frame: Option<&FrameIdentity>,
 ) -> (Option<FrameIdentity>, &'static str, &'static str) {
@@ -373,6 +399,7 @@ fn iced_capture_deadline_refusal(
     )
 }
 
+#[cfg(feature = "iced-direct-capture")]
 fn iced_capture_teardown_refusal(
     committed_frame: Option<&FrameIdentity>,
 ) -> (Option<FrameIdentity>, &'static str, &'static str) {
@@ -383,6 +410,7 @@ fn iced_capture_teardown_refusal(
     )
 }
 
+#[cfg(feature = "iced-direct-capture")]
 enum IcedCaptureSignal {
     Presented {
         format: iced_renderer::wgpu::window::compositor::DirectCaptureFormat,
@@ -399,6 +427,7 @@ enum IcedCaptureSignal {
     },
 }
 
+#[cfg(feature = "iced-direct-capture")]
 enum IcedCaptureReduction {
     Continue,
     Refused {
@@ -407,6 +436,7 @@ enum IcedCaptureReduction {
     },
 }
 
+#[cfg(feature = "iced-direct-capture")]
 fn reduce_iced_capture_signal(
     _committed_frame: Option<&FrameIdentity>,
     evidence: &mut IcedCaptureEvidence,
@@ -452,6 +482,7 @@ fn reduce_iced_capture_signal(
     IcedCaptureReduction::Continue
 }
 
+#[cfg(feature = "iced-direct-capture")]
 fn reduce_iced_capture_event(
     expected_token: u64,
     committed_frame: Option<&FrameIdentity>,
@@ -494,6 +525,7 @@ fn reduce_iced_capture_event(
     reduce_iced_capture_signal(committed_frame, evidence, signal)
 }
 
+#[cfg(feature = "iced-direct-capture")]
 enum PendingPresentedCapture {
     Armed(CaptureLease),
     Waiting {
@@ -502,6 +534,9 @@ enum PendingPresentedCapture {
         evidence: IcedCaptureEvidence,
     },
 }
+
+#[cfg(not(feature = "iced-direct-capture"))]
+enum PendingPresentedCapture {}
 
 struct IcedPresentOutcome {
     result: IcedPresentationResult,
@@ -2350,6 +2385,18 @@ where
         lease: DebugCommandLease,
         pending: SlipwayRuntimePendingNativeMcpCall,
     ) {
+        #[cfg(not(feature = "iced-direct-capture"))]
+        {
+            complete_presented_capture_refusal(
+                command,
+                lease,
+                pending,
+                self.last_successfully_presented.clone(),
+                "screenshot-iced-direct-capture-feature-disabled",
+                "the iced backend was built without the fork-only direct presented capture feature",
+            );
+        }
+        #[cfg(feature = "iced-direct-capture")]
         self.arm_presented_capture_with_deadline_spawner(
             command,
             lease,
@@ -2358,6 +2405,7 @@ where
         );
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     fn arm_presented_capture_with_deadline_spawner<S>(
         &mut self,
         command: DebugCommand,
@@ -2437,6 +2485,7 @@ where
         }
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     fn refuse_pending_presented_capture_on_teardown(&mut self) {
         let Some(capture) = self.pending_presented_capture.take() else {
             return;
@@ -2462,6 +2511,10 @@ where
         );
     }
 
+    #[cfg(not(feature = "iced-direct-capture"))]
+    fn refuse_pending_presented_capture_on_teardown(&mut self) {}
+
+    #[cfg(feature = "iced-direct-capture")]
     fn handle_direct_capture_wake(&mut self, token: u64) {
         let Some(state) = self.pending_presented_capture.take() else {
             return;
@@ -3703,6 +3756,7 @@ where
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: NativeRunnerEvent) {
         match event {
             NativeRunnerEvent::McpWake => self.pump_mcp(),
+            #[cfg(feature = "iced-direct-capture")]
             NativeRunnerEvent::DirectCaptureWake { token } => {
                 self.handle_direct_capture_wake(token)
             }
@@ -4177,6 +4231,7 @@ enum PresentErrorRecovery {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IcedPresentIdentityOverflow;
 
+#[cfg(feature = "iced-direct-capture")]
 fn iced_capture_frame_is_exact_next(expected: &FrameIdentity, captured: &FrameIdentity) -> bool {
     expected.frame_index.checked_add(1) == Some(captured.frame_index)
         && expected.surface_id == captured.surface_id
@@ -4226,6 +4281,46 @@ fn finish_iced_present(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(feature = "iced-direct-capture"))]
+fn present_iced_window(
+    window: &mut NativeIcedWindow,
+    render_candidate: FrameIdentity,
+    backend_present_index: &mut u64,
+    last_successfully_presented: &mut Option<FrameIdentity>,
+    _pending_capture: Option<PendingPresentedCapture>,
+    background_color: iced::Color,
+    on_pre_present: impl FnOnce(),
+) -> IcedPresentOutcome {
+    let Ok(precomputed_present_index) = preflight_next_iced_present_index(*backend_present_index)
+    else {
+        return IcedPresentOutcome {
+            result: IcedPresentationResult::SkippedOverflow,
+            pending_capture: None,
+            capture_failure: None,
+        };
+    };
+    let result = window.compositor.present(
+        &mut window.renderer,
+        &mut window.surface,
+        &window.viewport,
+        background_color,
+        on_pre_present,
+    );
+    IcedPresentOutcome {
+        result: finish_iced_present(
+            result,
+            render_candidate,
+            precomputed_present_index,
+            backend_present_index,
+            last_successfully_presented,
+        ),
+        pending_capture: None,
+        capture_failure: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "iced-direct-capture")]
 fn present_iced_window(
     window: &mut NativeIcedWindow,
     render_candidate: FrameIdentity,
@@ -4612,6 +4707,7 @@ mod tests {
         }))
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn direct_capture_success_path_uses_only_the_primary_acquired_surface_hook() {
         let source = include_str!("native_runner.rs");
@@ -4643,6 +4739,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn direct_capture_refusal_codes_are_concrete_and_exhaustive() {
         use iced_renderer::wgpu::window::compositor::DirectCaptureRefusal::*;
@@ -4716,6 +4813,7 @@ mod tests {
         assert_eq!(backend_present_index, 2);
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn present_index_overflow_preflight_reverts_and_fails_without_identity_mutation() {
         let mut backend_present_index = u64::MAX;
@@ -4750,6 +4848,7 @@ mod tests {
         assert!(last_successfully_presented.is_none());
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn exact_next_requires_all_non_index_candidate_fields_unchanged() {
         let expected = step223_capture_frame(20);
@@ -4759,6 +4858,7 @@ mod tests {
         assert!(!iced_capture_frame_is_exact_next(&expected, &captured));
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     fn step223_presented_event(
         token: u64,
         width: u32,
@@ -4775,6 +4875,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     fn step223_mapped_event(
         token: u64,
         bytes: &[u8],
@@ -4785,10 +4886,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     fn assert_step223_capture_continues(reduction: IcedCaptureReduction) {
         assert!(matches!(reduction, IcedCaptureReduction::Continue));
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn step223_capture_state_accepts_either_event_order_and_retains_first_duplicates() {
         for mapped_first in [false, true] {
@@ -4836,6 +4939,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn step223_capture_state_ignores_wrong_and_late_tokens_without_mutation() {
         let requested = step223_capture_frame(3);
@@ -4881,6 +4985,7 @@ mod tests {
         assert!(next_request.mapped.is_none());
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn step223_capture_state_refuses_map_poll_and_renderer_failures_once() {
         let requested = step223_capture_frame(4);
@@ -4919,6 +5024,7 @@ mod tests {
         assert_eq!(evidence.mapped.as_deref(), Some(&[1, 2, 3, 4][..]));
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn step223_capture_state_deadline_and_teardown_preserve_only_presented_identity() {
         let (captured, deadline_code, _) = iced_capture_deadline_refusal(None);
@@ -4941,12 +5047,15 @@ mod tests {
         assert_eq!(iced_capture_teardown_refusal(Some(&committed)).0, expected);
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     struct Step223NoopCaptureWake;
 
+    #[cfg(feature = "iced-direct-capture")]
     impl iced_renderer::wgpu::window::compositor::DirectCaptureWake for Step223NoopCaptureWake {
         fn wake(&self, _token: u64) {}
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     fn step223_frame_json(frame: &FrameIdentity) -> String {
         format!(
             r#"{{"surface_id":"{}","surface_instance_id":"{}","revision":{},"frame_index":{},"viewport":{{"origin":{{"x":{},"y":{}}},"size":{{"width":{},"height":{}}}}}}}"#,
@@ -4961,6 +5070,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn step223_capture_state_deadline_spawn_failure_completes_real_lease_once() {
         let mut app = SlipwayIcedRuntimeApp::from_parts(crate::tests::TestWidget, (), |_, _| {});
@@ -5030,6 +5140,7 @@ mod tests {
         assert_eq!(completion_count, 1);
     }
 
+    #[cfg(feature = "iced-direct-capture")]
     #[test]
     fn direct_capture_revert_guard_requires_surface_configuration_restore() {
         let source = include_str!("../../../third_party/iced_wgpu-0.14.0/src/window/compositor.rs");
