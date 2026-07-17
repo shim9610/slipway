@@ -1,9 +1,11 @@
 use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
 use slipway_core::{
-    BaselineShift, ClipDeclaration, Color, Diagnostic, DiagnosticSeverity, EvidenceSource,
-    FontStyle, FontWeight, FrameIdentity, PaintOp, PathCommand, PathDeclaration, Rect,
-    RenderEvidence, RenderPacket, RenderRefusal, ShapeDeclaration, ShapeKind, Size,
-    SlipwayOffscreenRenderer, TextAlignX, TextAlignY, TextStyle, TextWrap, WidgetId,
+    BaselineShift, BoxSpacing, ClipDeclaration, Color, Diagnostic, DiagnosticSeverity,
+    EvidenceSource, FontStyle, FontWeight, FrameIdentity, PREPARED_GEOMETRY_REQUIRED, PaintOp,
+    PathCommand, PathDeclaration, PlacementBoxGeometry, PresentedBoxGeometry, Rect, RenderEvidence,
+    RenderPacket, RenderRefusal, ShapeDeclaration, ShapeKind, Size, SlipwayOffscreenRenderer,
+    TargetBoxGeometry, TextAlignX, TextAlignY, TextStyle, TextWrap, Translation, WidgetId,
+    WidgetSlotAddress,
 };
 use std::fs::{self, File};
 use std::io::BufWriter;
@@ -60,7 +62,24 @@ pub struct DebugRenderArtifact {
     pub height: u32,
     pub rgba: Vec<u8>,
     pub pixel_hash: String,
+    pub box_geometry: Vec<DebugBoxGeometryEvidence>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DebugBoxGeometryEvidence {
+    pub target: WidgetId,
+    pub address: WidgetSlotAddress,
+    pub spacing: BoxSpacing,
+    pub target_local: TargetBoxGeometry,
+    pub parent_local: PlacementBoxGeometry,
+    pub unscrolled_root: PresentedBoxGeometry,
+    pub scroll_translation: Translation,
+    pub overlay_translation: Translation,
+    pub final_presented: PresentedBoxGeometry,
+    pub authored_overflow: Option<slipway_core::TargetLocalRect>,
+    pub ancestor_clip_final: Option<Rect>,
+    pub effective_clip_final: Rect,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -131,6 +150,42 @@ impl CpuDebugRenderer {
     }
 
     fn render_packet(&self, packet: &RenderPacket) -> Result<RenderedPixels, RenderRefusal> {
+        let captured = packet
+            .prepared_geometry
+            .as_ref()
+            .and_then(|prepared| prepared.captured_records())
+            .ok_or_else(|| RenderRefusal {
+                target: Some(packet.target.clone()),
+                frame: packet.frame.clone(),
+                source: Some(EvidenceSource::canonical_offscreen(
+                    self.config.provider_id.clone(),
+                )),
+                provider_id: Some(self.config.provider_id.clone()),
+                reason: "debug renderer requires core-prepared captured geometry".to_string(),
+                diagnostics: vec![diagnostic(
+                    Some(packet.target.clone()),
+                    DiagnosticSeverity::Error,
+                    PREPARED_GEOMETRY_REQUIRED,
+                    "core-prepared captured geometry is required before canonical rasterization",
+                )],
+            })?;
+        let box_geometry = captured
+            .iter()
+            .map(|record| DebugBoxGeometryEvidence {
+                target: record.target.clone(),
+                address: record.address.clone(),
+                spacing: record.spacing,
+                target_local: record.target_local,
+                parent_local: record.parent_local,
+                unscrolled_root: record.unscrolled_root,
+                scroll_translation: record.scroll_translation,
+                overlay_translation: record.overlay_translation,
+                final_presented: record.final_presented,
+                authored_overflow: record.authored_overflow,
+                ancestor_clip_final: record.ancestor_clip_final,
+                effective_clip_final: record.effective_clip_final,
+            })
+            .collect();
         let width = viewport_axis_to_pixels(packet.frame.viewport.size.width);
         let height = viewport_axis_to_pixels(packet.frame.viewport.size.height);
         let total_pixels = width as u64 * height as u64;
@@ -188,6 +243,7 @@ impl CpuDebugRenderer {
             width,
             height,
             rgba: target.rgba,
+            box_geometry,
             diagnostics,
         })
     }
@@ -243,6 +299,7 @@ impl SlipwayOffscreenRenderer for CpuDebugRenderer {
             height: rendered.height,
             rgba: rendered.rgba,
             pixel_hash: pixel_hash.clone(),
+            box_geometry: rendered.box_geometry,
             diagnostics: diagnostics.clone(),
         };
 
@@ -275,6 +332,7 @@ struct RenderedPixels {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    box_geometry: Vec<DebugBoxGeometryEvidence>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -1621,8 +1679,12 @@ fn diagnostic(
 mod tests {
     use super::*;
     use slipway_core::{
-        BaselineShift, FontStyle, FontWeight, LayoutOutput, Point, RenderSurfaceDeclaration,
-        ShapeDeclaration, Size, TargetLocalRect, TextDecoration, TextStyle,
+        BaselineShift, BoxSpacing, ChildLayoutPlan, ChildLayoutResult, ChildLayoutSeed,
+        ContentLocalRect, EdgeInsets, FontStyle, FontWeight, GeometryCaptureIntent,
+        LayoutConstraints, LayoutInput, LayoutOutput, PaintOrderDeclaration, Point,
+        RenderSurfaceDeclaration, ShapeDeclaration, Size, TargetLocalRect, TextDecoration,
+        TextStyle, ViewDefinition, WidgetSlotAddress, prepare_leaf_layout, prepare_resolved_layout,
+        validate_and_index_view_with_capture,
     };
 
     fn frame(width: f32, height: f32, index: u64) -> FrameIdentity {
@@ -1639,19 +1701,51 @@ mod tests {
     }
 
     fn packet(frame: FrameIdentity, paint: Vec<PaintOp>) -> RenderPacket {
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(frame.viewport),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
+        let bounds = TargetLocalRect::new(frame.viewport);
+        let input = LayoutInput {
+            viewport: bounds,
+            content: bounds,
+            constraints: LayoutConstraints {
+                min: frame.viewport.size,
+                max: frame.viewport.size,
+            },
         };
-        RenderPacket {
+        let (frame, _, output) =
+            slipway_core::ViewDefinitionInput::new(frame, input).into_layout_parts();
+        let layout = prepare_leaf_layout(output, bounds);
+        let mut packet = RenderPacket {
             target: WidgetId::from("root"),
             frame,
             layout,
             paint,
             surfaces: Vec::new(),
             diagnostics: Vec::new(),
-        }
+            prepared_geometry: None,
+        };
+        prepare_packet(&mut packet);
+        packet
+    }
+
+    fn prepare_packet(packet: &mut RenderPacket) {
+        let view = ViewDefinition {
+            target: packet.target.clone(),
+            frame: packet.frame.clone(),
+            layout: packet.layout.clone(),
+            paint: packet.paint.clone(),
+            paint_order: PaintOrderDeclaration::source_order(packet.target.clone()),
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        packet.prepared_geometry = validate_and_index_view_with_capture(
+            &view,
+            GeometryCaptureIntent::RenderPacketEvidence,
+        )
+        .ok();
     }
 
     fn rect(id: &str, x: f32, y: f32, width: f32, height: f32) -> ShapeDeclaration {
@@ -2291,5 +2385,240 @@ mod tests {
                 actual: 4,
             })
         );
+    }
+
+    fn layout_with_placement(
+        frame: &FrameIdentity,
+        spacing: BoxSpacing,
+        border: Rect,
+        addressed: bool,
+    ) -> LayoutOutput {
+        let child = WidgetId::from("panel");
+        let slot = addressed.then(|| WidgetSlotAddress::new(child.clone(), 0));
+        let seed = ChildLayoutSeed {
+            child: child.clone(),
+            local_state_slot: slot,
+        };
+        let outer = Rect {
+            origin: Point {
+                x: border.origin.x - spacing.margin.left,
+                y: border.origin.y - spacing.margin.top,
+            },
+            size: Size {
+                width: border.size.width + spacing.margin.horizontal(),
+                height: border.size.height + spacing.margin.vertical(),
+            },
+        };
+        let plan = ChildLayoutPlan::requested_outer(
+            seed.clone(),
+            ContentLocalRect::new(outer),
+            LayoutConstraints {
+                min: outer.size,
+                max: outer.size,
+            },
+            spacing,
+        );
+        let child_bounds = TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: border.size,
+        });
+        let child_input = LayoutInput {
+            viewport: child_bounds,
+            content: child_bounds,
+            constraints: LayoutConstraints {
+                min: border.size,
+                max: border.size,
+            },
+        };
+        let (_, _, child_output) =
+            slipway_core::ViewDefinitionInput::new(frame.clone(), child_input).into_layout_parts();
+        let result = ChildLayoutResult {
+            seed,
+            layout: prepare_leaf_layout(child_output, child_bounds),
+            diagnostics: Vec::new(),
+        };
+        let root_bounds = TargetLocalRect::new(frame.viewport);
+        let root_input = LayoutInput {
+            viewport: root_bounds,
+            content: root_bounds,
+            constraints: LayoutConstraints {
+                min: frame.viewport.size,
+                max: frame.viewport.size,
+            },
+        };
+        let (_, _, root_output) =
+            slipway_core::ViewDefinitionInput::new(frame.clone(), root_input).into_layout_parts();
+        prepare_resolved_layout(root_output, root_bounds, [(plan, result)]).unwrap()
+    }
+
+    #[test]
+    fn artifact_records_asymmetric_box_geometry_without_margin_pixels() {
+        let spacing = BoxSpacing::new(
+            EdgeInsets::trbl(8.0, 24.0, 12.0, 4.0),
+            EdgeInsets::trbl(6.0, 28.0, 18.0, 10.0),
+        );
+        let mut packet = packet(frame(160.0, 100.0, 80), Vec::new());
+        packet.layout = layout_with_placement(
+            &packet.frame,
+            spacing,
+            Rect {
+                origin: Point { x: 20.0, y: 15.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 60.0,
+                },
+            },
+            true,
+        );
+        prepare_packet(&mut packet);
+        let mut renderer = CpuDebugRenderer::default();
+        let rendered = renderer.render_offscreen(packet).expect("valid geometry");
+        let artifact = renderer
+            .artifact(rendered.artifact_ref.as_deref().unwrap())
+            .unwrap();
+        let geometry = &artifact.box_geometry[0];
+
+        assert_eq!(
+            geometry.target_local.border.into_rect(),
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 60.0
+                },
+            }
+        );
+        assert_eq!(
+            geometry.target_local.content.into_rect(),
+            Rect {
+                origin: Point { x: 10.0, y: 6.0 },
+                size: Size {
+                    width: 62.0,
+                    height: 36.0
+                },
+            }
+        );
+        assert_eq!(
+            geometry.parent_local.outer.into_rect(),
+            Rect {
+                origin: Point { x: 16.0, y: 7.0 },
+                size: Size {
+                    width: 128.0,
+                    height: 80.0
+                },
+            }
+        );
+        assert_eq!(
+            geometry.final_presented.content,
+            Rect {
+                origin: Point { x: 30.0, y: 21.0 },
+                size: Size {
+                    width: 62.0,
+                    height: 36.0
+                },
+            }
+        );
+        assert_eq!(
+            geometry.effective_clip_final,
+            geometry.final_presented.border
+        );
+        assert_eq!(
+            non_clear_pixels(artifact),
+            0,
+            "margin is evidence, never paint"
+        );
+    }
+
+    #[test]
+    fn oversized_padding_is_valid_and_records_clamped_empty_content() {
+        let spacing = BoxSpacing::ZERO.with_padding(EdgeInsets::trbl(70.0, 80.0, 90.0, 120.0));
+        let mut packet = packet(frame(160.0, 100.0, 81), Vec::new());
+        packet.layout = layout_with_placement(
+            &packet.frame,
+            spacing,
+            Rect {
+                origin: Point { x: 20.0, y: 15.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 60.0,
+                },
+            },
+            true,
+        );
+        prepare_packet(&mut packet);
+        let mut renderer = CpuDebugRenderer::default();
+        let evidence = renderer
+            .render_offscreen(packet)
+            .expect("oversized padding is valid");
+        let geometry = &renderer
+            .artifact(evidence.artifact_ref.as_deref().unwrap())
+            .unwrap()
+            .box_geometry[0];
+        assert_eq!(
+            geometry.target_local.content.origin,
+            Point { x: 100.0, y: 60.0 }
+        );
+        assert_eq!(
+            geometry.target_local.content.size,
+            Size {
+                width: 0.0,
+                height: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn missing_address_refuses_before_artifact_creation() {
+        let mut renderer = CpuDebugRenderer::default();
+        let mut fallback = packet(frame(160.0, 100.0, 83), Vec::new());
+        fallback.layout = layout_with_placement(
+            &fallback.frame,
+            BoxSpacing::ZERO,
+            Rect {
+                origin: Point { x: 20.0, y: 15.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 60.0,
+                },
+            },
+            false,
+        );
+        prepare_packet(&mut fallback);
+        let refusal = renderer
+            .render_offscreen(fallback)
+            .expect_err("ID fallback is forbidden");
+        assert_eq!(
+            refusal.diagnostics.last().unwrap().code,
+            PREPARED_GEOMETRY_REQUIRED
+        );
+        assert!(renderer.artifacts().is_empty());
+    }
+
+    #[test]
+    fn zero_spacing_preserves_pixels_and_hash() {
+        let paint = vec![PaintOp::Fill {
+            shape: rect("same", 2.0, 3.0, 9.0, 7.0),
+            color: color(0.2, 0.7, 0.4, 1.0),
+        }];
+        let mut renderer = CpuDebugRenderer::default();
+        let baseline = renderer
+            .render_offscreen(packet(frame(24.0, 24.0, 84), paint.clone()))
+            .unwrap();
+        let mut with_geometry = packet(frame(24.0, 24.0, 85), paint);
+        with_geometry.layout = layout_with_placement(
+            &with_geometry.frame,
+            BoxSpacing::ZERO,
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 24.0,
+                    height: 24.0,
+                },
+            },
+            true,
+        );
+        prepare_packet(&mut with_geometry);
+        let spaced = renderer.render_offscreen(with_geometry).unwrap();
+        assert_eq!(baseline.pixel_hash, spaced.pixel_hash);
     }
 }

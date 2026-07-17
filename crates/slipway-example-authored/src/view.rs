@@ -144,18 +144,18 @@ fn header_op(bounds: Rect, content: String) -> PaintOp {
     )
 }
 
-fn card_layout(input: &LayoutInput, height: f32) -> LayoutOutput {
-    LayoutOutput {
-        bounds: TargetLocalRect::new(Rect {
-            origin: Point { x: 0.0, y: 0.0 },
-            size: Size {
-                width: input.viewport.size.width.max(1.0),
-                height,
-            },
-        }),
-        child_placements: Vec::new(),
-        diagnostics: Vec::new(),
-    }
+fn card_layout(
+    input: &LayoutInput,
+    height: f32,
+    output: slipway::LayoutOutputBuilder,
+) -> LayoutOutput {
+    output.finish(TargetLocalRect::new(Rect {
+        origin: Point { x: 0.0, y: 0.0 },
+        size: Size {
+            width: input.viewport.size.width.max(1.0),
+            height,
+        },
+    }))
 }
 
 fn self_slot(id: WidgetId) -> Option<WidgetSlotAddress> {
@@ -179,8 +179,9 @@ impl SlipwayView for NoteListWidget {
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
         input: LayoutInput,
+        output: slipway::LayoutOutputBuilder,
     ) -> LayoutOutput {
-        card_layout(&input, LIST_CARD_HEIGHT)
+        card_layout(&input, LIST_CARD_HEIGHT, output)
     }
 
     fn paint(
@@ -189,7 +190,7 @@ impl SlipwayView for NoteListWidget {
         local: &Self::LocalState,
         layout: &LayoutOutput,
     ) -> Vec<PaintOp> {
-        let bounds = layout.bounds.into_rect();
+        let bounds = layout.bounds().into_rect();
         let width = bounds.size.width;
         let offset_y = list_offset_y(local.scroll_rows);
         let selected = external.selected_note;
@@ -270,8 +271,8 @@ impl SlipwayViewDefinition for NoteListWidget {
         local: &Self::LocalState,
         input: ViewDefinitionInput,
     ) -> ViewDefinition {
-        let layout = self.layout(external, local, input.layout_input.clone());
-        let width = layout.bounds.size.width;
+        let (frame, layout) = slipway::layout_view_definition(self, external, local, input);
+        let width = layout.bounds().as_rect().size.width;
         let offset_y = list_offset_y(local.scroll_rows);
         let band = list_rows_band(width);
         let address = self_slot(self.id());
@@ -348,7 +349,9 @@ impl SlipwayViewDefinition for NoteListWidget {
         // overlay's hit region, must use the `_with_order` variant (see
         // OverlayWidget and NestedFeedWidget below) or admission refuses
         // overlaps with `view_contract.ambiguous_wheel_overlap`.
-        let scroll_regions = vec![scroll_region_from_scrollable_capability(
+        let mut scroll_regions = Vec::new();
+        let terminal_region_index = scroll_regions.len();
+        scroll_regions.push(scroll_region_from_scrollable_capability(
             self,
             external,
             local,
@@ -356,17 +359,18 @@ impl SlipwayViewDefinition for NoteListWidget {
             Some(list_scroll_region_id()),
             address,
             true,
-        )];
+        ));
 
         let paint = self.paint(external, local, &layout);
         assemble_view(
             self.id(),
-            input,
+            frame,
             layout,
             paint,
             hit_regions,
             focus_regions,
             scroll_regions,
+            Some(terminal_region_index),
         )
     }
 }
@@ -460,8 +464,9 @@ impl SlipwayView for DraftInputWidget {
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
         input: LayoutInput,
+        output: slipway::LayoutOutputBuilder,
     ) -> LayoutOutput {
-        card_layout(&input, INPUT_CARD_HEIGHT)
+        card_layout(&input, INPUT_CARD_HEIGHT, output)
     }
 
     fn paint(
@@ -470,7 +475,7 @@ impl SlipwayView for DraftInputWidget {
         local: &Self::LocalState,
         layout: &LayoutOutput,
     ) -> Vec<PaintOp> {
-        let bounds = layout.bounds.into_rect();
+        let bounds = layout.bounds().into_rect();
         let field = input_field_rect(bounds.size.width);
         let mut ops = card_chrome("input", bounds);
         ops.push(header_op(bounds, "Draft (click, then type)".to_string()));
@@ -545,8 +550,9 @@ impl SlipwayViewDefinition for DraftInputWidget {
         local: &Self::LocalState,
         input: ViewDefinitionInput,
     ) -> ViewDefinition {
-        let layout = self.layout(external, local, input.layout_input.clone());
-        let field = input_field_rect(layout.bounds.size.width);
+        let layout_input = input.layout_input.clone();
+        let (frame, layout) = slipway::layout_view_definition(self, external, local, input);
+        let field = input_field_rect(layout.bounds().as_rect().size.width);
         let address = self_slot(self.id());
 
         // PATTERN: text-input region via
@@ -569,19 +575,20 @@ impl SlipwayViewDefinition for DraftInputWidget {
             TargetLocalRect::new(field),
             SlipwayFocusTraversal::focus_member(self, external, local),
             true,
-            &input.layout_input,
+            &layout_input,
             None,
         )];
 
         let paint = self.paint(external, local, &layout);
         assemble_view(
             self.id(),
-            input,
+            frame,
             layout,
             paint,
             Vec::new(),
             focus_regions,
             Vec::new(),
+            None,
         )
     }
 }
@@ -872,8 +879,9 @@ impl SlipwayView for OverlayWidget {
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
         input: LayoutInput,
+        output: slipway::LayoutOutputBuilder,
     ) -> LayoutOutput {
-        card_layout(&input, OVERLAY_CARD_HEIGHT)
+        card_layout(&input, OVERLAY_CARD_HEIGHT, output)
     }
 
     fn paint(
@@ -882,7 +890,7 @@ impl SlipwayView for OverlayWidget {
         local: &Self::LocalState,
         layout: &LayoutOutput,
     ) -> Vec<PaintOp> {
-        let bounds = layout.bounds.into_rect();
+        let bounds = layout.bounds().into_rect();
         let width = bounds.size.width;
         let band = overlay_feed_band(width);
         let offset_y = overlay_feed_offset_y(local.feed_rows);
@@ -1107,10 +1115,10 @@ impl SlipwayViewDefinition for OverlayWidget {
         local: &Self::LocalState,
         input: ViewDefinitionInput,
     ) -> ViewDefinition {
-        let layout = self.layout(external, local, input.layout_input.clone());
+        let (frame, layout) = slipway::layout_view_definition(self, external, local, input);
         let address = self_slot(self.id());
 
-        let width = layout.bounds.size.width;
+        let width = layout.bounds().as_rect().size.width;
 
         // PATTERN: drag surface with PointerCaptureIntent::DuringDrag.
         // The hit region is re-declared each frame at the CURRENT panel
@@ -1186,7 +1194,9 @@ impl SlipwayViewDefinition for OverlayWidget {
         // UNDER the overlay's hit region, the documented rule-of-thumb
         // trigger for explicit ordering
         // (docs/public/api/routing-and-scroll.md "Nesting Order").
-        let scroll_regions = vec![scroll_region_from_scrollable_capability_with_order(
+        let mut scroll_regions = Vec::new();
+        let terminal_region_index = scroll_regions.len();
+        scroll_regions.push(scroll_region_from_scrollable_capability_with_order(
             self,
             external,
             local,
@@ -1199,17 +1209,18 @@ impl SlipwayViewDefinition for OverlayWidget {
                 paint_order: 0,
                 traversal_order: 1,
             },
-        )];
+        ));
 
         let paint = self.paint(external, local, &layout);
         let mut view = assemble_view(
             self.id(),
-            input,
+            frame,
             layout,
             paint,
             hit_regions,
             Vec::new(),
             scroll_regions,
+            Some(terminal_region_index),
         );
         // PATTERN: the overflow-bounds declaration that makes the roaming
         // panel legal (docs/public/api/routing-and-scroll.md "Overlay
@@ -1306,8 +1317,9 @@ impl SlipwayView for NestedFeedWidget {
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
         input: LayoutInput,
+        output: slipway::LayoutOutputBuilder,
     ) -> LayoutOutput {
-        card_layout(&input, NESTED_CARD_HEIGHT)
+        card_layout(&input, NESTED_CARD_HEIGHT, output)
     }
 
     fn paint(
@@ -1316,7 +1328,7 @@ impl SlipwayView for NestedFeedWidget {
         local: &Self::LocalState,
         layout: &LayoutOutput,
     ) -> Vec<PaintOp> {
-        let bounds = layout.bounds.into_rect();
+        let bounds = layout.bounds().into_rect();
         let width = bounds.size.width;
         let band = nested_outer_band(width);
         let outer_offset = nested_outer_offset_y(local.outer_rows);
@@ -1474,8 +1486,8 @@ impl SlipwayViewDefinition for NestedFeedWidget {
         local: &Self::LocalState,
         input: ViewDefinitionInput,
     ) -> ViewDefinition {
-        let layout = self.layout(external, local, input.layout_input.clone());
-        let width = layout.bounds.size.width;
+        let (frame, layout) = slipway::layout_view_definition(self, external, local, input);
+        let width = layout.bounds().as_rect().size.width;
         let outer_offset = nested_outer_offset_y(local.outer_rows);
         let address = self_slot(self.id());
 
@@ -1490,6 +1502,7 @@ impl SlipwayViewDefinition for NestedFeedWidget {
 
         // The outer region: geometry comes straight from the scroll
         // policy below (single-declaration surface, no patch needed).
+        let terminal_region_index = scroll_regions.len();
         scroll_regions.push(scroll_region_from_scrollable_capability_with_order(
             self,
             external,
@@ -1632,12 +1645,13 @@ impl SlipwayViewDefinition for NestedFeedWidget {
         let paint = self.paint(external, local, &layout);
         assemble_view(
             self.id(),
-            input,
+            frame,
             layout,
             paint,
             hit_regions,
             Vec::new(),
             scroll_regions,
+            Some(terminal_region_index),
         )
     }
 }
@@ -1751,25 +1765,29 @@ fn observations(id: WidgetId, external: String, local: String) -> Vec<StateObser
 /// layer, not via paint-order tricks), no semantic/probe extras.
 fn assemble_view(
     target: WidgetId,
-    input: ViewDefinitionInput,
+    frame: FrameIdentity,
     layout: LayoutOutput,
     paint: Vec<PaintOp>,
     hit_regions: Vec<HitRegionDeclaration>,
     focus_regions: Vec<FocusRegionDeclaration>,
     scroll_regions: Vec<ScrollRegionDeclaration>,
+    terminal_region_index: Option<usize>,
 ) -> ViewDefinition {
-    let diagnostics = layout.diagnostics.clone();
-    ViewDefinition {
+    let diagnostics = layout.diagnostics().to_vec();
+    let mut view = ViewDefinition {
         target: target.clone(),
-        frame: input.frame,
+        frame,
         layout,
         paint,
         paint_order: PaintOrderDeclaration::source_order(target),
         hit_regions,
         focus_regions,
         scroll_regions,
+        wheel_traversal_boundary: Default::default(),
         semantic_slots: Vec::new(),
         probe_metadata: Vec::new(),
         diagnostics,
-    }
+    };
+    view.wheel_traversal_boundary.terminal_region_index = terminal_region_index;
+    view
 }

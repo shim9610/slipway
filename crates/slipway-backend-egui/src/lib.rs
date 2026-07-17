@@ -28,7 +28,8 @@ use slipway_core::{
     UnsupportedCapabilityEvidence, ViewDefinition, ViewDefinitionInput, WidgetId, WidgetSlot,
     WidgetSlotAddress, expand_paint_unit_layers, mount_widget_slot_address, paint_unit_sort_key,
     scroll_region_from_scrollable_capability, scroll_region_from_scrollable_capability_with_order,
-    text_edit_focus_region_from_capability, view_definition_contract_diagnostics_for_capabilities,
+    text_edit_focus_region_from_capability, validate_and_index_view,
+    view_definition_contract_diagnostics_for_capabilities,
     view_definition_has_blocking_contract_diagnostic,
 };
 use slipway_debug_bridge::{
@@ -97,10 +98,7 @@ where
     let mut view = widget.visible_backend_view_definition(
         external,
         local,
-        ViewDefinitionInput {
-            frame,
-            layout_input,
-        },
+        ViewDefinitionInput::new(frame, layout_input),
     );
     let occlusions = slipway_core::dispatch_graph_occlusion_regions_for_composed_view(
         widget, external, local, &view,
@@ -480,12 +478,9 @@ pub trait SlipwayEguiNativeWidgetSpec: SlipwayWidgetTypes {
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
         input: LayoutInput,
+        output: slipway_core::LayoutOutputBuilder,
     ) -> LayoutOutput {
-        LayoutOutput {
-            bounds: input.viewport,
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        }
+        output.finish(input.viewport)
     }
 
     fn observe_state(
@@ -702,8 +697,9 @@ where
         external: &Self::ExternalState,
         local: &Self::LocalState,
         input: LayoutInput,
+        output: slipway_core::LayoutOutputBuilder,
     ) -> LayoutOutput {
-        self.native.layout(external, local, input)
+        self.native.layout(external, local, input, output)
     }
 
     fn paint(
@@ -734,16 +730,17 @@ where
         local: &Self::LocalState,
         input: ViewDefinitionInput,
     ) -> ViewDefinition {
-        let layout = self.layout(external, local, input.layout_input);
+        let (frame, layout) = slipway_core::layout_view_definition(self, external, local, input);
         ViewDefinition {
             target: self.id(),
-            frame: input.frame,
+            frame,
             layout,
             paint: Vec::new(),
             paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
             hit_regions: Vec::new(),
             focus_regions: Vec::new(),
             scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: self.unsupported(),
@@ -1347,6 +1344,7 @@ pub struct EguiInputContext<'a> {
     pub hit_regions: &'a [HitRegionDeclaration],
     pub focus_regions: &'a [FocusRegionDeclaration],
     pub scroll_regions: &'a [ScrollRegionDeclaration],
+    pub wheel_traversal_boundary: slipway_core::DeclaredWheelTraversalBoundary,
     pub response: &'a egui::Response,
     pub regions: &'a [EguiPresentedRegion],
     pub native_physical_operation: Option<&'a DebugPhysicalControl>,
@@ -1660,6 +1658,10 @@ pub trait EguiSlipwayBridge<W: SlipwayAuthoredWidget> {
         Vec::new()
     }
 
+    fn take_terminal_wheel_consumed(&mut self) -> bool {
+        false
+    }
+
     fn wants_observation(&mut self) -> bool {
         false
     }
@@ -1704,6 +1706,7 @@ pub struct DefaultEguiBridge {
     indicator_drag: Option<EguiIndicatorDragState>,
     refused_admissions: Vec<BackendParityAdmission>,
     dispatch_refusals: Vec<slipway_core::DeclaredEventDispatchEvidence>,
+    terminal_wheel_consumed: bool,
     debug_input_span: Option<eframe::egui_winit::SlipwayDebugInputSpan>,
     debug_composition: bool,
     composition_preflight: Option<EguiCompositionPreflight>,
@@ -1730,6 +1733,10 @@ impl DefaultEguiBridge {
 
     pub fn take_dispatch_refusals(&mut self) -> Vec<slipway_core::DeclaredEventDispatchEvidence> {
         std::mem::take(&mut self.dispatch_refusals)
+    }
+
+    pub fn take_terminal_wheel_consumed(&mut self) -> bool {
+        std::mem::take(&mut self.terminal_wheel_consumed)
     }
 }
 
@@ -1767,6 +1774,10 @@ where
                 origin: Point { x: 0.0, y: 0.0 },
                 size: Size { width, height },
             }),
+            content: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size { width, height },
+            }),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -1779,8 +1790,8 @@ where
 
     fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
         egui::vec2(
-            layout.bounds.size.width.max(0.0),
-            layout.bounds.size.height.max(0.0),
+            layout.bounds().into_rect().size.width.max(0.0),
+            layout.bounds().into_rect().size.height.max(0.0),
         )
     }
 
@@ -2423,13 +2434,17 @@ where
                         continue;
                     };
                     let refusal_start = self.dispatch_refusals.len();
-                    if let Some(event) = egui_backend_wheel_input_event(
+                    let resolution = egui_backend_wheel_input_resolution(
                         &context,
                         position,
                         delta.x,
                         delta.y,
                         &mut self.dispatch_refusals,
-                    ) {
+                    );
+                    if resolution.terminal_consumed {
+                        self.terminal_wheel_consumed = true;
+                    }
+                    if let Some(event) = resolution.event {
                         push_egui_backend_input_with_source(
                             &mut events,
                             event,
@@ -2548,6 +2563,10 @@ where
 
     fn drain_dispatch_refusals(&mut self) -> Vec<slipway_core::DeclaredEventDispatchEvidence> {
         self.take_dispatch_refusals()
+    }
+
+    fn take_terminal_wheel_consumed(&mut self) -> bool {
+        self.take_terminal_wheel_consumed()
     }
 
     fn wants_observation(&mut self) -> bool {
@@ -2752,10 +2771,7 @@ where
         let mut view = self.widget.visible_backend_view_definition(
             self.external,
             self.local,
-            ViewDefinitionInput {
-                frame,
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame, layout_input),
         );
         push_egui_frame_timing(
             &mut timing_samples,
@@ -2764,14 +2780,28 @@ where
             1,
         );
         let admission_geometry_start = Instant::now();
-        let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
-        normalize_egui_visible_scroll_regions(&mut view, &geometry_index);
         let capabilities = self.widget.capabilities();
+        let prepared_geometry = match validate_and_index_view(&view) {
+            Ok(prepared) => prepared,
+            Err(diagnostics) => {
+                view.diagnostics.extend(diagnostics);
+                let admission = egui_backend_admission()
+                    .admit_view_definition_with_capabilities(&capabilities, &view);
+                let desired_size = self.bridge.desired_size(&view.layout);
+                let allocated_size = self.allocated_size_override.unwrap_or(desired_size);
+                let (rect, response) = ui.allocate_exact_size(allocated_size, self.sense);
+                paint_visible_admission_refusal(ui, rect, &admission);
+                self.bridge.visible_admission_refused(admission);
+                return response;
+            }
+        };
+        let geometry_index = &prepared_geometry.index;
+        normalize_egui_visible_scroll_regions(&mut view, geometry_index);
         let admission =
             egui_backend_admission().admit_view_definition_with_capabilities(&capabilities, &view);
         let desired_size = self.bridge.desired_size(&view.layout);
         if let Some(presented_content_size) = self.presented_content_size {
-            *presented_content_size = Some(view.layout.bounds.size);
+            *presented_content_size = Some(view.layout.bounds().into_rect().size);
         }
         let allocated_size = self.allocated_size_override.unwrap_or(desired_size);
         let (rect, response) = ui.allocate_exact_size(allocated_size, self.sense);
@@ -2904,7 +2934,7 @@ where
             Some(&root_slot),
             rect.min,
             &view,
-            &geometry_index,
+            geometry_index,
             &child_slots,
             &mut child_assembly,
             self.native_physical_operation,
@@ -2931,7 +2961,7 @@ where
             self.local,
             &view,
             Some(&root_slot),
-            &geometry_index,
+            geometry_index,
             rect.min,
             &child_assembly.claimed_slots,
             None,
@@ -2960,10 +2990,11 @@ where
             frame: &view.frame,
             rect,
             layout: &view.layout,
-            geometry_index: &geometry_index,
+            geometry_index,
             hit_regions: &view.hit_regions,
             focus_regions: &view.focus_regions,
             scroll_regions: &view.scroll_regions,
+            wheel_traversal_boundary: view.wheel_traversal_boundary,
             response: &response,
             regions: &regions,
             native_physical_operation: self.native_physical_operation,
@@ -3113,14 +3144,24 @@ where
         let mut view = self.widget.visible_backend_view_definition(
             self.external,
             self.local,
-            ViewDefinitionInput {
-                frame,
-                layout_input: layout_input.clone(),
-            },
+            ViewDefinitionInput::new(frame, layout_input.clone()),
         );
-        let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
-        normalize_egui_visible_scroll_regions(&mut view, &geometry_index);
         let capabilities = self.widget.capabilities();
+        let prepared_geometry = match validate_and_index_view(&view) {
+            Ok(prepared) => prepared,
+            Err(diagnostics) => {
+                view.diagnostics.extend(diagnostics);
+                let admission = egui_backend_admission()
+                    .admit_view_definition_with_capabilities(&capabilities, &view);
+                let desired_size = self.bridge.desired_size(&view.layout);
+                let (rect, response) = ui.allocate_exact_size(desired_size, self.sense);
+                paint_visible_admission_refusal(ui, rect, &admission);
+                self.bridge.visible_admission_refused(admission);
+                return response;
+            }
+        };
+        let geometry_index = &prepared_geometry.index;
+        normalize_egui_visible_scroll_regions(&mut view, geometry_index);
         let admission =
             egui_backend_admission().admit_view_definition_with_capabilities(&capabilities, &view);
         let desired_size = self.bridge.desired_size(&view.layout);
@@ -3160,7 +3201,7 @@ where
             self.local,
             rect.min,
             &view,
-            &geometry_index,
+            geometry_index,
             &child_slots,
             &mut child_assembly,
             None,
@@ -3173,7 +3214,7 @@ where
             self.local,
             &view,
             Some(&root_slot),
-            &geometry_index,
+            geometry_index,
             rect.min,
             &child_assembly.claimed_slots,
             None,
@@ -3194,10 +3235,11 @@ where
             frame: &view.frame,
             rect,
             layout: &view.layout,
-            geometry_index: &geometry_index,
+            geometry_index,
             hit_regions: &view.hit_regions,
             focus_regions: &view.focus_regions,
             scroll_regions: &view.scroll_regions,
+            wheel_traversal_boundary: view.wheel_traversal_boundary,
             response: &response,
             regions: &regions,
             native_physical_operation: None,
@@ -4344,10 +4386,14 @@ where
         });
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(Rect {
-                origin: Point {
-                    x: self.root_scroll_offset.x.max(0.0),
-                    y: self.root_scroll_offset.y.max(0.0),
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: available_size.x.max(0.0),
+                    height: available_size.y.max(0.0),
                 },
+            }),
+            content: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
                 size: Size {
                     width: available_size.x.max(0.0),
                     height: available_size.y.max(0.0),
@@ -4450,6 +4496,7 @@ where
         let app_message_count = messages.len();
         let revision_after = revision_before + u64::from(app_message_count > 0);
         let handled_wheel = backend_traces_handled_wheel(&backend_traces);
+        let terminal_wheel_consumed = self.bridge.take_terminal_wheel_consumed();
         let backend_trace_count = backend_traces.len();
         let retain_validated_traces = self.pending_native_physical.is_some();
         let mut validated_pending_traces = Vec::new();
@@ -4512,7 +4559,7 @@ where
             self.runtime
                 .record_dispatch_refusal_for_backend(refusal, EGUI_BACKEND_ID);
         }
-        if root_wheel_delta != egui::Vec2::ZERO && !handled_wheel {
+        if root_wheel_delta != egui::Vec2::ZERO && !handled_wheel && !terminal_wheel_consumed {
             self.root_scroll_offset = clamp_egui_root_scroll_offset(
                 self.root_scroll_offset - root_wheel_delta,
                 root_content_size,
@@ -6002,7 +6049,7 @@ impl<ExternalState, AppMessage> SlipwayEguiWidgetListVisitor<ExternalState, AppM
         let Some(placement) = self
             .parent_view
             .layout
-            .child_placements
+            .child_placements()
             .iter()
             .find(|placement| child_placement_matches_slot(placement, &widget.id(), &slot))
         else {
@@ -6060,7 +6107,7 @@ impl<ExternalState, AppMessage> SlipwayEguiWidgetListVisitor<ExternalState, AppM
         let Some(placement) = self
             .parent_view
             .layout
-            .child_placements
+            .child_placements()
             .iter()
             .find(|placement| child_placement_matches_slot(placement, &widget.id(), &slot))
         else {
@@ -6430,27 +6477,34 @@ fn present_egui_child<W>(
 {
     let mut timing_samples = timing_samples;
     let view_definition_start = Instant::now();
-    let layout_input = child_layout_input(placement.bounds.into_rect());
+    let layout_input = child_layout_input_for_placement(&placement);
     let frame = egui_frame_identity(ui, &widget.id(), layout_input.viewport.into_rect());
     let view = widget.visible_backend_view_definition(
         external,
         local,
-        ViewDefinitionInput {
-            frame,
-            layout_input,
-        },
+        ViewDefinitionInput::new(frame, layout_input),
     );
-    let view = mount_presented_child_view_addresses(view, &slot);
-    let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
-    let mut view = view;
-    normalize_egui_visible_scroll_regions(&mut view, &geometry_index);
+    let mut view = mount_presented_child_view_addresses(view, &slot);
+    let child_rect = egui_rect(view_origin, placement.bounds.into_rect());
+    let prepared_geometry = match validate_and_index_view(&view) {
+        Ok(prepared) => prepared,
+        Err(diagnostics) => {
+            view.diagnostics.extend(diagnostics);
+            let admission = egui_backend_admission()
+                .admit_view_definition_with_capabilities(&widget.capabilities(), &view);
+            paint_visible_admission_refusal(ui, child_rect, &admission);
+            output.refused_admissions.push(admission);
+            return;
+        }
+    };
+    let geometry_index = &prepared_geometry.index;
+    normalize_egui_visible_scroll_regions(&mut view, geometry_index);
     push_egui_frame_timing(
         &mut timing_samples,
         "egui.child.view_definition",
         view_definition_start.elapsed(),
         1,
     );
-    let child_rect = egui_rect(view_origin, placement.bounds.into_rect());
     let response_start = Instant::now();
     let region_id =
         PresentationRegionId::from(format!("egui-child-response:{}", widget_slot_key(&slot)));
@@ -6559,7 +6613,7 @@ fn present_egui_child<W>(
         Some(&slot),
         child_rect.min,
         &view,
-        &geometry_index,
+        geometry_index,
         &child_slots,
         &mut nested_assembly,
         native_physical_operation,
@@ -6581,7 +6635,7 @@ fn present_egui_child<W>(
         local,
         &view,
         Some(&slot),
-        &geometry_index,
+        geometry_index,
         child_rect.min,
         &nested_assembly.claimed_slots,
         None,
@@ -6613,27 +6667,34 @@ fn present_egui_native_child<N>(
 {
     let mut timing_samples = timing_samples;
     let view_definition_start = Instant::now();
-    let layout_input = child_layout_input(placement.bounds.into_rect());
+    let layout_input = child_layout_input_for_placement(&placement);
     let frame = egui_frame_identity(ui, &widget.id(), layout_input.viewport.into_rect());
     let view = widget.visible_backend_view_definition(
         external,
         local,
-        ViewDefinitionInput {
-            frame: frame.clone(),
-            layout_input,
-        },
+        ViewDefinitionInput::new(frame.clone(), layout_input),
     );
-    let view = mount_presented_child_view_addresses(view, &slot);
-    let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
-    let mut view = view;
-    normalize_egui_visible_scroll_regions(&mut view, &geometry_index);
+    let mut view = mount_presented_child_view_addresses(view, &slot);
+    let child_rect = egui_rect(view_origin, placement.bounds.into_rect());
+    let prepared_geometry = match validate_and_index_view(&view) {
+        Ok(prepared) => prepared,
+        Err(diagnostics) => {
+            view.diagnostics.extend(diagnostics);
+            let admission = egui_backend_admission()
+                .admit_view_definition_with_capabilities(&widget.capabilities(), &view);
+            paint_visible_admission_refusal(ui, child_rect, &admission);
+            output.refused_admissions.push(admission);
+            return;
+        }
+    };
+    let geometry_index = &prepared_geometry.index;
+    normalize_egui_visible_scroll_regions(&mut view, geometry_index);
     push_egui_frame_timing(
         &mut timing_samples,
         "egui.child.view_definition",
         view_definition_start.elapsed(),
         1,
     );
-    let child_rect = egui_rect(view_origin, placement.bounds.into_rect());
 
     let admission_start = Instant::now();
     let capabilities = widget.capabilities();
@@ -7416,19 +7477,25 @@ fn declared_scroll_content_rect(
     )
 }
 
+fn child_layout_input_for_placement(placement: &ChildPlacement) -> LayoutInput {
+    slipway_core::child_layout_input_for_placement(placement)
+}
+
+#[cfg(test)]
 fn child_layout_input(bounds: Rect) -> LayoutInput {
-    let viewport = Rect {
+    let viewport = TargetLocalRect::new(Rect {
         origin: Point { x: 0.0, y: 0.0 },
         size: bounds.size,
-    };
+    });
     LayoutInput {
-        viewport: TargetLocalRect::new(viewport),
+        viewport,
+        content: viewport,
         constraints: LayoutConstraints {
             min: Size {
                 width: 0.0,
                 height: 0.0,
             },
-            max: viewport.size,
+            max: bounds.size,
         },
     }
 }
@@ -7668,6 +7735,8 @@ fn mount_presented_child_view_addresses(
     mut view: ViewDefinition,
     child_slot: &WidgetSlotAddress,
 ) -> ViewDefinition {
+    let scroll_region_count = view.scroll_regions.len();
+    let wheel_traversal_boundary = view.wheel_traversal_boundary;
     for region in &mut view.hit_regions {
         region.address = Some(
             region
@@ -7712,6 +7781,9 @@ fn mount_presented_child_view_addresses(
         );
     }
 
+    debug_assert_eq!(view.scroll_regions.len(), scroll_region_count);
+    debug_assert_eq!(view.wheel_traversal_boundary, wheel_traversal_boundary);
+
     view
 }
 
@@ -7745,7 +7817,7 @@ where
     let child_slot = parent_slot.child(child.clone(), source_order);
     let Some(placement) = parent_view
         .layout
-        .child_placements
+        .child_placements()
         .iter()
         .find(|placement| child_placement_matches_slot(placement, &child, &child_slot))
     else {
@@ -7754,10 +7826,10 @@ where
     let view = widget.visible_backend_view_definition(
         external,
         local,
-        ViewDefinitionInput {
-            frame: parent_view.frame.clone(),
-            layout_input: child_layout_input(placement.bounds.into_rect()),
-        },
+        ViewDefinitionInput::new(
+            parent_view.frame.clone(),
+            child_layout_input_for_placement(placement),
+        ),
     );
     expanded_paint_unit_sort_key(PaintUnit::from_view(view, source_order))
 }
@@ -8788,15 +8860,17 @@ fn egui_wheel_visible_viewport_position(
     egui_view_root_local_position(position, context.rect.min, context.frame)
 }
 
+#[cfg(test)]
 fn egui_wheel_select_consumer<'a>(
     context: &'a EguiInputContext<'_>,
     point: Point,
     delta_x: f32,
     delta_y: f32,
 ) -> Option<&'a ScrollRegionDeclaration> {
-    slipway_core::select_declared_wheel_consumer_at_root_local_point_with_geometry_index(
+    slipway_core::select_declared_wheel_consumer_at_root_local_point_with_geometry_index_and_boundary(
         context.geometry_index,
         context.scroll_regions,
+        context.wheel_traversal_boundary,
         point,
         delta_x,
         delta_y,
@@ -8837,50 +8911,132 @@ fn egui_wheel_owner_is_undisplaced_ancestor(
 /// viewport rect, the core resolve returns None, and the wheel goes silently
 /// dead ("freezes" mid-scroll) even though the visible cursor still sits inside
 /// the scrollable root -- the Step 190 E1 mapping regression that this repairs.
-fn egui_wheel_resolve_position(
-    context: &EguiInputContext<'_>,
+struct EguiResolvedWheel<'a> {
+    point: Point,
+    position_space: slipway_core::DispatchPositionSpace,
+    disposition: slipway_core::DeclaredWheelDisposition<'a>,
+}
+
+fn egui_wheel_resolve_position<'a>(
+    context: &'a EguiInputContext<'_>,
     position: egui::Pos2,
     delta_x: f32,
     delta_y: f32,
-) -> (Point, slipway_core::DispatchPositionSpace) {
+) -> EguiResolvedWheel<'a> {
+    let disposition_at = |point| {
+        slipway_core::declared_wheel_disposition_at_root_local_point_with_geometry_index(
+            context.geometry_index,
+            context.scroll_regions,
+            context.wheel_traversal_boundary,
+            point,
+            delta_x,
+            delta_y,
+        )
+    };
     let dispatch_point = egui_wheel_dispatch_position(context, position);
-    if egui_wheel_select_consumer(context, dispatch_point, delta_x, delta_y).is_some() {
-        return (dispatch_point, slipway_core::DispatchPositionSpace::Content);
+    let dispatch_disposition = disposition_at(dispatch_point);
+    if !matches!(
+        dispatch_disposition,
+        slipway_core::DeclaredWheelDisposition::Bubble
+    ) {
+        return EguiResolvedWheel {
+            point: dispatch_point,
+            position_space: slipway_core::DispatchPositionSpace::Content,
+            disposition: dispatch_disposition,
+        };
     }
     let visual_point = egui_wheel_visible_viewport_position(context, position);
-    if let Some(owner) = egui_wheel_select_consumer(context, visual_point, delta_x, delta_y)
+    let visual_disposition = disposition_at(visual_point);
+    let visual_owner = match visual_disposition {
+        slipway_core::DeclaredWheelDisposition::Moved(owner)
+        | slipway_core::DeclaredWheelDisposition::ConsumedNoOp(owner) => Some(owner),
+        slipway_core::DeclaredWheelDisposition::Bubble => None,
+    };
+    if let Some(owner) = visual_owner
         && egui_wheel_owner_is_undisplaced_ancestor(context, owner)
     {
-        return (visual_point, slipway_core::DispatchPositionSpace::Viewport);
+        return EguiResolvedWheel {
+            point: visual_point,
+            position_space: slipway_core::DispatchPositionSpace::Viewport,
+            disposition: visual_disposition,
+        };
     }
-    (dispatch_point, slipway_core::DispatchPositionSpace::Content)
+    EguiResolvedWheel {
+        point: dispatch_point,
+        position_space: slipway_core::DispatchPositionSpace::Content,
+        disposition: dispatch_disposition,
+    }
 }
 
-fn egui_backend_wheel_input_event(
+struct EguiWheelInputResolution {
+    event: Option<BackendInputEvent>,
+    terminal_consumed: bool,
+}
+
+fn egui_backend_wheel_input_resolution(
     context: &EguiInputContext<'_>,
     position: egui::Pos2,
     delta_x: f32,
     delta_y: f32,
     refusals: &mut Vec<slipway_core::DeclaredEventDispatchEvidence>,
-) -> Option<BackendInputEvent> {
-    let (view_root_local_position, position_space) =
-        egui_wheel_resolve_position(context, position, delta_x, delta_y);
+) -> EguiWheelInputResolution {
+    let resolved = egui_wheel_resolve_position(context, position, delta_x, delta_y);
+    if let slipway_core::DeclaredWheelDisposition::ConsumedNoOp(root) = resolved.disposition {
+        let root_key = egui_presented_scroll_region_by_id(context.regions, &root.id)
+            .map(|region| region.paint_sort_key)
+            .unwrap_or((
+                root.order.z_index,
+                root.order.paint_order,
+                root.order.traversal_order,
+            ));
+        let blocked = egui_wheel_occlusion_region_at_position(context.regions, position)
+            .is_some_and(|occlusion| {
+                slipway_core::hit_region_order_is_front_of(
+                    &egui_hit_region_order_from_key(occlusion.paint_sort_key),
+                    &egui_hit_region_order_from_key(root_key),
+                )
+            });
+        return EguiWheelInputResolution {
+            event: None,
+            terminal_consumed: !blocked,
+        };
+    }
+    let slipway_core::DeclaredWheelDisposition::Moved(owner) = resolved.disposition else {
+        let (_, mut evidence) =
+            slipway_core::resolve_bubbled_declared_wheel_dispatch_with_evidence_and_geometry_index(
+                EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
+                context.frame.clone(),
+                context.geometry_index,
+                context.scroll_regions,
+                resolved.point,
+            );
+        evidence.input_position_space = Some(resolved.position_space);
+        refusals.push(evidence);
+        return EguiWheelInputResolution {
+            event: None,
+            terminal_consumed: false,
+        };
+    };
     let (dispatch, mut evidence) =
-        slipway_core::resolve_declared_wheel_dispatch_with_evidence_and_geometry_index(
+        slipway_core::resolve_selected_declared_wheel_dispatch_with_evidence_and_geometry_index(
             EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
             context.frame.clone(),
             context.geometry_index,
             context.scroll_regions,
-            view_root_local_position,
+            resolved.point,
             delta_x,
             delta_y,
+            owner,
         );
-    evidence.input_position_space = Some(position_space);
+    evidence.input_position_space = Some(resolved.position_space);
     let Some(dispatch) = dispatch else {
         // No consumer (dead point / at-limit): retain the already-constructed
         // refusal evidence instead of dropping it (audit finding MF-H3).
         refusals.push(evidence);
-        return None;
+        return EguiWheelInputResolution {
+            event: None,
+            terminal_consumed: false,
+        };
     };
 
     if let Some(occlusion) = egui_wheel_occlusion_region_at_position(context.regions, position) {
@@ -8913,11 +9069,28 @@ fn egui_backend_wheel_input_event(
                 dispatch.selected_region.as_str()
             ));
             refusals.push(evidence);
-            return None;
+            return EguiWheelInputResolution {
+                event: None,
+                terminal_consumed: false,
+            };
         }
     }
 
-    Some(BackendInputEvent::declared(dispatch.input, evidence))
+    EguiWheelInputResolution {
+        event: Some(BackendInputEvent::declared(dispatch.input, evidence)),
+        terminal_consumed: false,
+    }
+}
+
+#[cfg(test)]
+fn egui_backend_wheel_input_event(
+    context: &EguiInputContext<'_>,
+    position: egui::Pos2,
+    delta_x: f32,
+    delta_y: f32,
+    refusals: &mut Vec<slipway_core::DeclaredEventDispatchEvidence>,
+) -> Option<BackendInputEvent> {
+    egui_backend_wheel_input_resolution(context, position, delta_x, delta_y, refusals).event
 }
 
 fn egui_presented_scroll_region_by_id<'a>(
@@ -10359,17 +10532,166 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use slipway_core::{
-        BaselineShift, CaretGeometryEvidence, CaretSet, CommandEvent, EventRoute, EventRoutePhase,
-        FontResolutionEvidence, FontStyle, FontWeight, FrameIdentity, HitRegionOrder,
-        ImeCompositionPolicyDeclaration, Point, Rect, ScrollAxes, ScrollConsumptionPolicy, Size,
-        SlipwayLogic, SlipwaySsot, SlipwayView, SlipwayWidgetListVisitor, SlipwayWidgetTypes,
-        TextBufferSnapshot, TextDecoration, TextSelectionPolicyDeclaration, TextStyle,
-        WheelRouting,
+        BaselineShift, BoxSpacing, CaretGeometryEvidence, CaretSet, CommandEvent, EventRoute,
+        EventRoutePhase, FontResolutionEvidence, FontStyle, FontWeight, FrameIdentity,
+        HitRegionOrder, ImeCompositionPolicyDeclaration, PaintOrderDeclaration, Point, Rect,
+        ScrollAxes, ScrollConsumptionPolicy, Size, SlipwayLogic, SlipwaySsot, SlipwayView,
+        SlipwayWidgetListVisitor, SlipwayWidgetTypes, TextBufferSnapshot, TextDecoration,
+        TextSelectionPolicyDeclaration, TextStyle, WheelRouting,
     };
     use slipway_debug_bridge::{
         DebugCommand, DebugPhysicalControl, DebugReplyProduct, MessageDisposition,
     };
     use slipway_runtime::SlipwayRuntime;
+
+    macro_rules! zero_spacing_layout_input {
+        (viewport: $viewport:expr, constraints: $constraints:expr $(,)?) => {{
+            let viewport = $viewport;
+            LayoutInput {
+                viewport,
+                content: viewport,
+                constraints: $constraints,
+            }
+        }};
+    }
+
+    fn test_parent_local(rect: Rect) -> slipway_core::ParentLocalRect {
+        let seed = slipway_core::ChildLayoutSeed {
+            child: WidgetId::from("test-child"),
+            local_state_slot: None,
+        };
+        let plan = slipway_core::ChildLayoutPlan::explicit_border(
+            seed.clone(),
+            slipway_core::ContentLocalRect::new(rect),
+            BoxSpacing::ZERO,
+        );
+        let child_bounds = TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: rect.size,
+        });
+        let child_input = LayoutInput {
+            viewport: child_bounds,
+            content: child_bounds,
+            constraints: LayoutConstraints {
+                min: rect.size,
+                max: rect.size,
+            },
+        };
+        let result = slipway_core::ChildLayoutResult {
+            seed,
+            layout: slipway_core::prepare_leaf_layout(
+                test_layout_builder(&child_input),
+                child_bounds,
+            ),
+            diagnostics: Vec::new(),
+        };
+        let root_bounds = TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: rect.size,
+        });
+        let root_input = LayoutInput {
+            viewport: root_bounds,
+            content: root_bounds,
+            constraints: LayoutConstraints {
+                min: rect.size,
+                max: rect.size,
+            },
+        };
+        slipway_core::prepare_resolved_layout(
+            test_layout_builder(&root_input),
+            root_bounds,
+            [(plan, result)],
+        )
+        .unwrap()
+        .child_placements()[0]
+            .bounds
+    }
+
+    fn test_layout_builder(input: &LayoutInput) -> slipway_core::LayoutOutputBuilder {
+        let frame = FrameIdentity {
+            surface_id: "test".to_string(),
+            surface_instance_id: "test".to_string(),
+            revision: 0,
+            frame_index: 0,
+            viewport: input.viewport.into_rect(),
+        };
+        let (_, _, output) = ViewDefinitionInput::new(frame, input.clone()).into_layout_parts();
+        output
+    }
+
+    fn test_leaf_layout(bounds: TargetLocalRect) -> LayoutOutput {
+        let input = LayoutInput {
+            viewport: bounds,
+            content: bounds,
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: bounds.into_rect().size,
+            },
+        };
+        slipway_core::prepare_leaf_layout(test_layout_builder(&input), bounds)
+    }
+
+    fn test_layout_with_placements(
+        bounds: TargetLocalRect,
+        placements: impl IntoIterator<Item = ChildPlacement>,
+    ) -> LayoutOutput {
+        let input = LayoutInput {
+            viewport: bounds,
+            content: bounds,
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: bounds.into_rect().size,
+            },
+        };
+        test_layout_with_placements_from(test_layout_builder(&input), bounds, placements)
+    }
+
+    fn test_layout_with_placements_from(
+        output: slipway_core::LayoutOutputBuilder,
+        bounds: TargetLocalRect,
+        placements: impl IntoIterator<Item = ChildPlacement>,
+    ) -> LayoutOutput {
+        let resolved = placements.into_iter().map(|placement| {
+            let seed = slipway_core::ChildLayoutSeed {
+                child: placement.child,
+                local_state_slot: placement.local_state_slot,
+            };
+            let border = placement.bounds.into_rect();
+            let plan = slipway_core::ChildLayoutPlan::explicit_border(
+                seed.clone(),
+                slipway_core::ContentLocalRect::new(border),
+                placement.spacing,
+            );
+            let child_bounds = TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: border.size,
+            });
+            let child_input = LayoutInput {
+                viewport: child_bounds,
+                content: child_bounds,
+                constraints: LayoutConstraints {
+                    min: border.size,
+                    max: border.size,
+                },
+            };
+            let result = slipway_core::ChildLayoutResult {
+                seed,
+                layout: slipway_core::prepare_leaf_layout(
+                    test_layout_builder(&child_input),
+                    child_bounds,
+                ),
+                diagnostics: Vec::new(),
+            };
+            (plan, result)
+        });
+        slipway_core::prepare_resolved_layout(output, bounds, resolved).unwrap()
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ProbeWidget {
@@ -10616,12 +10938,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -10729,7 +11048,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -10741,7 +11060,7 @@ mod tests {
                     local,
                     self.region_id(),
                     None,
-                    layout.bounds,
+                    *layout.bounds(),
                     slipway_core::PointerEventCoordinateSpace::TargetLocal,
                     HitRegionOrder {
                         z_index: 0,
@@ -10755,6 +11074,7 @@ mod tests {
                 )],
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -10832,10 +11152,10 @@ mod tests {
                         } else {
                             input.viewport.into_rect()
                         };
-                        slipway_core::ChildLayoutPlan::placed_for_seed(
+                        slipway_core::ChildLayoutPlan::explicit_border(
                             seed,
-                            child_layout_input(bounds),
-                            slipway_core::ParentLocalRect::new(bounds),
+                            slipway_core::ContentLocalRect::new(bounds),
+                            BoxSpacing::ZERO,
                         )
                     })
                     .collect(),
@@ -10933,7 +11253,7 @@ mod tests {
 
     impl EguiSlipwayBridge<ProbeWidget> for TwoCommandBridge {
         fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
-            LayoutInput {
+            zero_spacing_layout_input! {
                 viewport: TargetLocalRect::new(Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
@@ -10955,7 +11275,10 @@ mod tests {
         }
 
         fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
-            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+            egui::vec2(
+                layout.bounds().as_rect().size.width,
+                layout.bounds().as_rect().size.height,
+            )
         }
 
         fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
@@ -10982,7 +11305,7 @@ mod tests {
 
     impl EguiSlipwayBridge<ProbeWidget> for DirectCommandBridge {
         fn layout_input(&mut self, _context: EguiLayoutContext<'_>) -> LayoutInput {
-            LayoutInput {
+            zero_spacing_layout_input! {
                 viewport: TargetLocalRect::new(Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
@@ -11004,7 +11327,10 @@ mod tests {
         }
 
         fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
-            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+            egui::vec2(
+                layout.bounds().as_rect().size.width,
+                layout.bounds().as_rect().size.height,
+            )
         }
 
         fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
@@ -11040,7 +11366,10 @@ mod tests {
         }
 
         fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
-            egui::vec2(layout.bounds.size.width, layout.bounds.size.height)
+            egui::vec2(
+                layout.bounds().as_rect().size.width,
+                layout.bounds().as_rect().size.height,
+            )
         }
 
         fn input_events(&mut self, context: EguiInputContext<'_>) -> Vec<BackendInputEvent> {
@@ -11070,7 +11399,7 @@ mod tests {
         fn layout_input(&mut self, context: EguiLayoutContext<'_>) -> LayoutInput {
             let width = context.available_size.x.max(0.0);
             let height = context.available_size.y.max(0.0);
-            LayoutInput {
+            zero_spacing_layout_input! {
                 viewport: TargetLocalRect::new(Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size { width, height },
@@ -11087,8 +11416,8 @@ mod tests {
 
         fn desired_size(&mut self, layout: &LayoutOutput) -> egui::Vec2 {
             egui::vec2(
-                layout.bounds.size.width.max(0.0),
-                layout.bounds.size.height.max(0.0),
+                layout.bounds().as_rect().size.width.max(0.0),
+                layout.bounds().as_rect().size.height.max(0.0),
             )
         }
 
@@ -11703,8 +12032,8 @@ mod tests {
         ) -> slipway_core::LayoutEvidence {
             slipway_core::LayoutEvidence {
                 target: self.id.clone(),
-                bounds: output.bounds,
-                child_placements: output.child_placements.clone(),
+                bounds: *output.bounds(),
+                child_placements: output.child_placements().to_vec(),
                 invalidated: false,
                 diagnostics: Vec::new(),
             }
@@ -12211,7 +12540,7 @@ mod tests {
         frame: FrameIdentity,
         kind: PointerEventKind,
     ) -> BackendInputEvent {
-        let layout_input = LayoutInput {
+        let layout_input = zero_spacing_layout_input! {
             viewport: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
@@ -12224,10 +12553,7 @@ mod tests {
         let view = runtime.widget().visible_backend_view_definition(
             runtime.external(),
             runtime.local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame.clone(), layout_input),
         );
         let (dispatch, evidence) = slipway_core::resolve_declared_pointer_dispatch_with_evidence(
             EvidenceSource::backend_presented(EGUI_BACKEND_ID, "physical-input"),
@@ -12262,7 +12588,7 @@ mod tests {
             bounds,
             None,
             true,
-            &LayoutInput {
+            &zero_spacing_layout_input! {
                 viewport: bounds,
                 constraints: LayoutConstraints {
                     min: Size {
@@ -12278,11 +12604,7 @@ mod tests {
 
     fn test_scroll_region(target: WidgetId, viewport: impl Into<Rect>) -> ScrollRegionDeclaration {
         let viewport = viewport.into();
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(viewport),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(viewport));
         slipway_core::scroll_region_from_scrollable_capability(
             &ScrollProbeWidget { id: target.clone() },
             &(),
@@ -12389,16 +12711,16 @@ mod tests {
             let parent_view = widget.visible_backend_view_definition(
                 &(),
                 &local,
-                ViewDefinitionInput {
-                    frame: frame(222),
-                    layout_input: child_layout_input(Rect {
+                ViewDefinitionInput::new(
+                    frame(222),
+                    child_layout_input(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
                             width: 100.0,
                             height: 40.0,
                         },
                     }),
-                },
+                ),
             );
             let parent_view = mount_presented_child_view_addresses(parent_view, &mounted_parent);
             assert_eq!(parent_view.hit_regions[0].address, Some(expected.clone()));
@@ -12409,9 +12731,19 @@ mod tests {
             assert_eq!(parent_view.hit_regions[0].route.path, expected.path.clone());
             let local_child =
                 WidgetSlotAddress::new(WidgetId::from(app_id), 0).child(WidgetId::from("leaf"), 0);
-            assert!(parent_view.layout.child_placements.iter().any(|placement| {
-                child_placement_matches_slot(placement, &WidgetId::from("leaf"), &local_child)
-            }));
+            assert!(
+                parent_view
+                    .layout
+                    .child_placements()
+                    .iter()
+                    .any(|placement| {
+                        child_placement_matches_slot(
+                            placement,
+                            &WidgetId::from("leaf"),
+                            &local_child,
+                        )
+                    })
+            );
             let mut paint = MountedSlotTrace::default();
             visit_egui_authored_children_in_paint_order_mounted(
                 &widget,
@@ -12777,11 +13109,7 @@ mod tests {
                     },
                 },
             };
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(frame.viewport),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            };
+            let layout = test_leaf_layout(TargetLocalRect::new(frame.viewport));
             let geometry_index = PresentationGeometryIndex::from_layout(&layout);
             let response = ui.interact(
                 egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1.0, 1.0)),
@@ -12831,6 +13159,7 @@ mod tests {
                 hit_regions: &[],
                 focus_regions: &[],
                 scroll_regions: &[],
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -12858,11 +13187,7 @@ mod tests {
                     },
                 },
             };
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(frame.viewport),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            };
+            let layout = test_leaf_layout(TargetLocalRect::new(frame.viewport));
             let geometry_index = PresentationGeometryIndex::from_layout(&layout);
             let mut hit = test_hit_region(
                 "drag-hit",
@@ -12897,6 +13222,7 @@ mod tests {
                 hit_regions: &hit_regions,
                 focus_regions: &[],
                 scroll_regions: &[],
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -13418,11 +13744,7 @@ mod tests {
                     },
                 },
             };
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(frame.viewport),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            };
+            let layout = test_leaf_layout(TargetLocalRect::new(frame.viewport));
             let geometry_index = PresentationGeometryIndex::from_layout(&layout);
             let scroll_regions = vec![indicator_test_declaration()];
             let (region, _track, thumb) = indicator_test_region(ui);
@@ -13437,6 +13759,7 @@ mod tests {
                 hit_regions: &[],
                 focus_regions: &[],
                 scroll_regions: &scroll_regions,
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -13472,7 +13795,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_wheel_event_uses_declared_boundary_bubbling() {
+    fn mounted_live_root_bottom_wheel_is_consumed_no_op() {
         egui::__run_test_ui(|ui| {
             let target = WidgetId::from("scroll");
             let frame = FrameIdentity {
@@ -13483,25 +13806,22 @@ mod tests {
                 viewport: Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
-                        width: 100.0,
-                        height: 100.0,
+                        width: 800.0,
+                        height: 600.0,
                     },
                 },
             };
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(frame.viewport),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            };
+            let layout = test_leaf_layout(TargetLocalRect::new(frame.viewport));
             let geometry_index = PresentationGeometryIndex::from_layout(&layout);
             let mut outer_scroll = test_scroll_region(target.clone(), frame.viewport);
             outer_scroll.id = PresentationRegionId::from("outer-scroll");
-            outer_scroll.address = None;
+            let mounted_slot = WidgetSlotAddress::new(target.clone(), 0);
+            outer_scroll.address = Some(mounted_slot.clone());
             outer_scroll.content_bounds = TargetLocalRect::new(Rect {
                 origin: Point { x: 0.0, y: 0.0 },
                 size: Size {
-                    width: 100.0,
-                    height: 300.0,
+                    width: 800.0,
+                    height: 1484.0,
                 },
             });
             outer_scroll.offset = Point { x: 0.0, y: 0.0 };
@@ -13514,15 +13834,39 @@ mod tests {
             outer_scroll.consumption = ScrollConsumptionPolicy::exclusive_wheel();
             let mut inner_scroll = outer_scroll.clone();
             inner_scroll.id = PresentationRegionId::from("inner-scroll");
-            inner_scroll.offset.y = 200.0;
+            inner_scroll.offset.y = 884.0;
             inner_scroll.order = HitRegionOrder {
                 z_index: 1,
                 paint_order: 0,
                 traversal_order: 0,
             };
-            let scroll_regions = vec![outer_scroll.clone(), inner_scroll];
+            let mounted_view = mount_presented_child_view_addresses(
+                ViewDefinition {
+                    target: target.clone(),
+                    frame: frame.clone(),
+                    layout: layout.clone(),
+                    paint: Vec::new(),
+                    paint_order: PaintOrderDeclaration::source_order(target.clone()),
+                    hit_regions: Vec::new(),
+                    focus_regions: Vec::new(),
+                    scroll_regions: vec![outer_scroll.clone(), inner_scroll],
+                    wheel_traversal_boundary: slipway_core::DeclaredWheelTraversalBoundary {
+                        terminal_region_index: Some(0),
+                    },
+                    semantic_slots: Vec::new(),
+                    probe_metadata: Vec::new(),
+                    diagnostics: Vec::new(),
+                },
+                &mounted_slot,
+            );
+            assert!(mounted_view.scroll_regions[0].address.is_some());
+            assert_eq!(
+                mounted_view.wheel_traversal_boundary.terminal_region_index,
+                Some(0)
+            );
+            let scroll_regions = mounted_view.scroll_regions;
 
-            let rect = egui_test_rect(0.0, 0.0, 100.0, 100.0);
+            let rect = egui_test_rect(0.0, 0.0, 800.0, 600.0);
             let mut outer_region = test_presented_region(
                 ui,
                 "outer-scroll",
@@ -13552,6 +13896,9 @@ mod tests {
                 hit_regions: &[],
                 focus_regions: &[],
                 scroll_regions: &scroll_regions,
+                wheel_traversal_boundary: slipway_core::DeclaredWheelTraversalBoundary {
+                    terminal_region_index: Some(0),
+                },
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -13559,7 +13906,7 @@ mod tests {
 
             let event = egui_backend_wheel_input_event(
                 &context,
-                egui::pos2(20.0, 20.0),
+                egui::pos2(20.0, 580.0),
                 0.0,
                 -4.0,
                 &mut Vec::new(),
@@ -13587,44 +13934,56 @@ mod tests {
             );
             assert_eq!(wheel.target, target);
 
-            outer_scroll.offset.y = 200.0;
+            outer_scroll.offset.y = 884.0;
             let scroll_regions = vec![outer_scroll, scroll_regions[1].clone()];
             let context = EguiInputContext {
                 scroll_regions: &scroll_regions,
                 ..context
             };
             let mut refusals = Vec::new();
+            let resolution = egui_backend_wheel_input_resolution(
+                &context,
+                egui::pos2(20.0, 580.0),
+                0.0,
+                -4.0,
+                &mut refusals,
+            );
+            assert!(resolution.event.is_none());
+            assert!(resolution.terminal_consumed);
             assert!(
-                egui_backend_wheel_input_event(
-                    &context,
-                    egui::pos2(20.0, 20.0),
-                    0.0,
-                    -4.0,
-                    &mut refusals
-                )
-                .is_none(),
-                "no Slipway wheel is generated when every containing scroll owner is at boundary"
+                refusals.is_empty(),
+                "terminal root absorption is not a refusal"
             );
-            // MF-H3: the at-boundary wheel must leave its refusal evidence
-            // instead of vanishing without a trace.
-            assert_eq!(refusals.len(), 1);
-            let refusal = &refusals[0];
-            assert_eq!(refusal.selected_region, None);
-            assert_eq!(
-                refusal.refusal_reason.as_deref(),
-                Some("no enabled scroll region accepted the physical wheel position")
-            );
-            assert_eq!(
-                refusal.candidate_regions,
-                vec![
-                    PresentationRegionId::from("outer-scroll"),
-                    PresentationRegionId::from("inner-scroll"),
-                ],
-                "containing-but-at-limit regions stay listed as candidates"
-            );
-            assert!(refusal.input_position.is_some());
-            assert!(refusal.input_position_space.is_some());
         });
+    }
+
+    #[test]
+    fn egui_wheel_resolution_computes_disposition_once() {
+        let source = include_str!("lib.rs");
+        let resolver = source
+            .split("fn egui_wheel_resolve_position")
+            .nth(1)
+            .and_then(|tail| tail.split("struct EguiWheelInputResolution").next())
+            .expect("wheel resolver source");
+        assert_eq!(
+            resolver
+                .matches("declared_wheel_disposition_at_root_local_point_with_geometry_index")
+                .count(),
+            1,
+            "the resolver has one disposition authority reused for visual fallback"
+        );
+        let input_resolution = source
+            .split("fn egui_backend_wheel_input_resolution")
+            .nth(1)
+            .and_then(|tail| tail.split("fn egui_presented_scroll_region_by_id").next())
+            .expect("wheel input resolution source");
+        assert_eq!(
+            input_resolution
+                .matches("declared_wheel_disposition_at_root_local_point_with_geometry_index")
+                .count(),
+            0,
+            "the selected disposition is passed forward, never recomputed"
+        );
     }
 
     #[test]
@@ -13649,11 +14008,7 @@ mod tests {
                     },
                 },
             };
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(frame.viewport),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            };
+            let layout = test_leaf_layout(TargetLocalRect::new(frame.viewport));
             let geometry_index = PresentationGeometryIndex::from_layout(&layout);
             let mut outer_scroll = test_scroll_region(target.clone(), frame.viewport);
             outer_scroll.id = PresentationRegionId::from("outer-scroll");
@@ -13713,6 +14068,7 @@ mod tests {
                 hit_regions: &[],
                 focus_regions: &[],
                 scroll_regions: &scroll_regions,
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -13765,11 +14121,7 @@ mod tests {
                     },
                 },
             };
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(frame.viewport),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            };
+            let layout = test_leaf_layout(TargetLocalRect::new(frame.viewport));
             let geometry_index = PresentationGeometryIndex::from_layout(&layout);
             let mut scroll = test_scroll_region(target.clone(), frame.viewport);
             scroll.id = PresentationRegionId::from("root-scroll");
@@ -13832,6 +14184,7 @@ mod tests {
                 hit_regions: &[],
                 focus_regions: &[],
                 scroll_regions: &scroll_regions,
+                wheel_traversal_boundary: Default::default(),
                 response: &opaque_regions[0].response,
                 regions: &opaque_regions,
                 native_physical_operation: None,
@@ -13876,6 +14229,7 @@ mod tests {
                 hit_regions: &[],
                 focus_regions: &[],
                 scroll_regions: &scroll_regions,
+                wheel_traversal_boundary: Default::default(),
                 response: &through_regions[0].response,
                 regions: &through_regions,
                 native_physical_operation: None,
@@ -13922,11 +14276,11 @@ mod tests {
             // The list target sits at content-space y[200,300] (the geometry the
             // scrolled layout produced), while it is painted at view-local
             // y[0,100].
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(frame.viewport),
-                child_placements: vec![ChildPlacement {
+            let layout = test_layout_with_placements(
+                TargetLocalRect::new(frame.viewport),
+                [ChildPlacement {
                     child: WidgetId::from("list-scroll"),
-                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                    bounds: test_parent_local(Rect {
                         origin: Point { x: 0.0, y: 200.0 },
                         size: Size {
                             width: 100.0,
@@ -13934,9 +14288,9 @@ mod tests {
                         },
                     }),
                     local_state_slot: None,
+                    spacing: BoxSpacing::ZERO,
                 }],
-                diagnostics: Vec::new(),
-            };
+            );
             let geometry_index = PresentationGeometryIndex::from_layout(&layout);
 
             let mut root_scroll = test_scroll_region(WidgetId::from("root"), frame.viewport);
@@ -14012,6 +14366,7 @@ mod tests {
                 hit_regions: &[],
                 focus_regions: &[],
                 scroll_regions: &scroll_regions,
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -14123,17 +14478,17 @@ mod tests {
             // The nested panel target sits at content-space y[500,650] but is
             // painted (target_origin) at view-local y[300,450] -- the 200 gap is
             // the ancestor root scroll offset.
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(Rect {
+            let layout = test_layout_with_placements(
+                TargetLocalRect::new(Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
                         width: 100.0,
                         height: 1000.0,
                     },
                 }),
-                child_placements: vec![ChildPlacement {
+                [ChildPlacement {
                     child: WidgetId::from("panel"),
-                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                    bounds: test_parent_local(Rect {
                         origin: Point { x: 0.0, y: 500.0 },
                         size: Size {
                             width: 100.0,
@@ -14141,9 +14496,9 @@ mod tests {
                         },
                     }),
                     local_state_slot: None,
+                    spacing: BoxSpacing::ZERO,
                 }],
-                diagnostics: Vec::new(),
-            };
+            );
             let geometry_index = PresentationGeometryIndex::from_layout(&layout);
 
             let mut root_scroll = test_scroll_region(
@@ -14210,6 +14565,7 @@ mod tests {
                 hit_regions: &[],
                 focus_regions: &[],
                 scroll_regions: &scroll_regions,
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -14305,11 +14661,7 @@ mod tests {
                 },
             },
         };
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(frame.viewport),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(frame.viewport));
         let drag_bounds = Rect {
             origin: Point { x: 8.0, y: 8.0 },
             size: Size {
@@ -14352,6 +14704,7 @@ mod tests {
                 hit_regions: &hit_regions,
                 focus_regions: &[],
                 scroll_regions: &[],
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -14400,6 +14753,7 @@ mod tests {
                 hit_regions: &hit_regions,
                 focus_regions: &[],
                 scroll_regions: &[],
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -14663,11 +15017,7 @@ mod tests {
                 },
             },
         };
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(frame.viewport),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(frame.viewport));
         let covered_bounds = Rect {
             origin: Point { x: 0.0, y: 0.0 },
             size: Size {
@@ -14721,6 +15071,7 @@ mod tests {
                     hit_regions: &hit_regions,
                     focus_regions: &[],
                     scroll_regions: &[],
+                    wheel_traversal_boundary: Default::default(),
                     response: &regions[0].response,
                     regions: &regions,
                     native_physical_operation: None,
@@ -14835,12 +15186,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -14853,7 +15201,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some("probe-fill".to_string()),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -14887,7 +15235,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id.clone(),
                 frame: input.frame,
@@ -14896,11 +15244,12 @@ mod tests {
                 hit_regions: vec![test_hit_region(
                     "probe-hit",
                     self.id.clone(),
-                    layout.bounds,
+                    *layout.bounds(),
                     0,
                 )],
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -14968,18 +15317,15 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: TargetLocalRect::new(Rect {
-                    origin: Point { x: 0.0, y: 0.0 },
-                    size: Size {
-                        width: input.viewport.into_rect().size.width,
-                        height: self.height,
-                    },
-                }),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: input.viewport.into_rect().size.width,
+                    height: self.height,
+                },
+            }))
         }
 
         fn paint(
@@ -14992,7 +15338,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some("tall-root-fill".to_string()),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -15016,7 +15362,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -15025,6 +15371,7 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -15210,12 +15557,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -15281,7 +15625,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             let mut paint_order = match &self.paint_order_mode {
                 PaintOrderMode::SourceOrder => {
                     slipway_core::PaintOrderDeclaration::source_order(self.id())
@@ -15328,6 +15672,7 @@ mod tests {
                 hit_regions,
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -15481,13 +15826,15 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: vec![
+            test_layout_with_placements_from(
+                output,
+                input.viewport,
+                [
                     ChildPlacement {
                         child: self.children.0.id(),
-                        bounds: slipway_core::ParentLocalRect::new(Rect {
+                        bounds: test_parent_local(Rect {
                             origin: Point { x: 0.0, y: 0.0 },
                             size: Size {
                                 width: 50.0,
@@ -15495,10 +15842,11 @@ mod tests {
                             },
                         }),
                         local_state_slot: Some(self.child_slot(0)),
+                        spacing: BoxSpacing::ZERO,
                     },
                     ChildPlacement {
                         child: self.children.1.id(),
-                        bounds: slipway_core::ParentLocalRect::new(Rect {
+                        bounds: test_parent_local(Rect {
                             origin: Point { x: 10.0, y: 10.0 },
                             size: Size {
                                 width: 50.0,
@@ -15506,10 +15854,10 @@ mod tests {
                             },
                         }),
                         local_state_slot: Some(self.child_slot(1)),
+                        spacing: BoxSpacing::ZERO,
                     },
                 ],
-                diagnostics: Vec::new(),
-            }
+            )
         }
 
         fn paint(
@@ -15582,7 +15930,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -15591,6 +15939,7 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -15811,12 +16160,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -15829,7 +16175,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some("scroll-probe-fill".to_string()),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -15863,7 +16209,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id.clone(),
                 frame: input.frame,
@@ -15873,8 +16219,9 @@ mod tests {
                 focus_regions: Vec::new(),
                 scroll_regions: vec![test_scroll_region(
                     self.id.clone(),
-                    layout.bounds.into_rect(),
+                    layout.bounds().into_rect(),
                 )],
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -16065,12 +16412,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -16083,7 +16427,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some("focused-probe-fill".to_string()),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -16117,7 +16461,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id.clone(),
                 frame: input.frame,
@@ -16126,9 +16470,10 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: vec![test_text_edit_region(
                     self.id.clone(),
-                    layout.bounds.into_rect(),
+                    layout.bounds().into_rect(),
                 )],
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -16226,15 +16571,15 @@ mod tests {
                     height: 40.0,
                 },
             });
-            let layout = LayoutOutput {
-                bounds: viewport,
-                child_placements: vec![ChildPlacement {
+            let layout = test_layout_with_placements(
+                viewport,
+                [ChildPlacement {
                     child: self.child.id(),
-                    bounds: slipway_core::ParentLocalRect::new(self.child_bounds()),
+                    bounds: test_parent_local(self.child_bounds()),
                     local_state_slot: Some(self.child_slot()),
+                    spacing: BoxSpacing::ZERO,
                 }],
-                diagnostics: Vec::new(),
-            };
+            );
             scroll_region_from_scrollable_capability(
                 &ScrollProbeWidget {
                     id: self.id.clone(),
@@ -16374,16 +16719,18 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: vec![ChildPlacement {
+            test_layout_with_placements_from(
+                output,
+                input.viewport,
+                [ChildPlacement {
                     child: self.child.id(),
-                    bounds: slipway_core::ParentLocalRect::new(self.child_bounds()),
+                    bounds: test_parent_local(self.child_bounds()),
                     local_state_slot: Some(self.child_slot()),
+                    spacing: BoxSpacing::ZERO,
                 }],
-                diagnostics: Vec::new(),
-            }
+            )
         }
 
         fn paint(
@@ -16416,16 +16763,18 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: vec![ChildPlacement {
+            test_layout_with_placements_from(
+                output,
+                input.viewport,
+                [ChildPlacement {
                     child: self.child.id(),
-                    bounds: slipway_core::ParentLocalRect::new(self.child_bounds()),
+                    bounds: test_parent_local(self.child_bounds()),
                     local_state_slot: Some(self.child_slot()),
+                    spacing: BoxSpacing::ZERO,
                 }],
-                diagnostics: Vec::new(),
-            }
+            )
         }
 
         fn paint(
@@ -16458,16 +16807,22 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
                 layout: layout.clone(),
                 paint: Vec::new(),
                 paint_order: slipway_core::PaintOrderDeclaration::source_order(self.id()),
-                hit_regions: vec![test_hit_region("parent-root", self.id(), layout.bounds, 0)],
+                hit_regions: vec![test_hit_region(
+                    "parent-root",
+                    self.id(),
+                    *layout.bounds(),
+                    0,
+                )],
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -16482,7 +16837,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -16492,6 +16847,7 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
                 scroll_regions: vec![self.scroll_region()],
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -16583,12 +16939,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -16601,7 +16954,7 @@ mod tests {
                 id: Some("path-clip-group".to_string()),
                 clip: Some(slipway_core::ClipDeclaration {
                     id: Some("path-clip".to_string()),
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: Some(PathDeclaration {
                         commands: vec![
                             PathCommand::MoveTo(Point { x: 0.0, y: 0.0 }),
@@ -16631,7 +16984,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             let paint = self.paint(external, local, &layout);
 
             ViewDefinition {
@@ -16643,6 +16996,7 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -16767,17 +17121,13 @@ mod tests {
     fn declared_hit_regions_allocate_distinct_egui_responses() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 120.0,
-                    height: 80.0,
-                },
-            }),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        }));
         let view = ViewDefinition {
             target: widget.id(),
             frame: FrameIdentity {
@@ -16785,7 +17135,7 @@ mod tests {
                 surface_instance_id: "test".to_string(),
                 revision: 0,
                 frame_index: 0,
-                viewport: layout.bounds.into_rect(),
+                viewport: layout.bounds().into_rect(),
             },
             layout: layout.clone(),
             paint: Vec::new(),
@@ -16818,6 +17168,7 @@ mod tests {
             ],
             focus_regions: Vec::new(),
             scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -16862,23 +17213,19 @@ mod tests {
     fn declared_hit_region_allocation_preserves_route_event_target() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 120.0,
-                    height: 80.0,
-                },
-            }),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        }));
         let route_target = WidgetId::from("route-target");
         let route_slot = WidgetSlotAddress::new(route_target.clone(), 9);
         let mut hit = test_hit_region(
             "routed-hit",
             WidgetId::from("visual-target"),
-            layout.bounds.into_rect(),
+            layout.bounds().into_rect(),
             0,
         );
         hit.route.path = vec![WidgetId::from("root"), route_target.clone()];
@@ -16891,7 +17238,7 @@ mod tests {
                 surface_instance_id: "test".to_string(),
                 revision: 0,
                 frame_index: 0,
-                viewport: layout.bounds.into_rect(),
+                viewport: layout.bounds().into_rect(),
             },
             layout: layout.clone(),
             paint: Vec::new(),
@@ -16899,6 +17246,7 @@ mod tests {
             hit_regions: vec![hit],
             focus_regions: Vec::new(),
             scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -16969,17 +17317,13 @@ mod tests {
     fn empty_root_space_is_not_a_region_target() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 100.0,
-                    height: 80.0,
-                },
-            }),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 100.0,
+                height: 80.0,
+            },
+        }));
         let view = ViewDefinition {
             target: widget.id(),
             frame: FrameIdentity {
@@ -16987,7 +17331,7 @@ mod tests {
                 surface_instance_id: "test".to_string(),
                 revision: 0,
                 frame_index: 0,
-                viewport: layout.bounds.into_rect(),
+                viewport: layout.bounds().into_rect(),
             },
             layout: layout.clone(),
             paint: Vec::new(),
@@ -17006,6 +17350,7 @@ mod tests {
             )],
             focus_regions: Vec::new(),
             scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -17039,17 +17384,13 @@ mod tests {
     fn text_edit_allocates_input_region_and_self_painted_scroll_metadata() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 200.0,
-                    height: 120.0,
-                },
-            }),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 200.0,
+                height: 120.0,
+            },
+        }));
         let view = ViewDefinition {
             target: widget.id(),
             frame: FrameIdentity {
@@ -17057,7 +17398,7 @@ mod tests {
                 surface_instance_id: "test".to_string(),
                 revision: 0,
                 frame_index: 0,
-                viewport: layout.bounds.into_rect(),
+                viewport: layout.bounds().into_rect(),
             },
             layout: layout.clone(),
             paint: Vec::new(),
@@ -17083,6 +17424,7 @@ mod tests {
                     },
                 },
             )],
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -17128,17 +17470,13 @@ mod tests {
     fn focused_input_without_presented_region_returns_refusal_dispatch_evidence() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 120.0,
-                    height: 48.0,
-                },
-            }),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 48.0,
+            },
+        }));
         let view = ViewDefinition {
             target: widget.id(),
             frame: FrameIdentity {
@@ -17146,7 +17484,7 @@ mod tests {
                 surface_instance_id: "test".to_string(),
                 revision: 0,
                 frame_index: 7,
-                viewport: layout.bounds.into_rect(),
+                viewport: layout.bounds().into_rect(),
             },
             layout: layout.clone(),
             paint: Vec::new(),
@@ -17163,6 +17501,7 @@ mod tests {
                 },
             )],
             scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -17202,6 +17541,7 @@ mod tests {
                 hit_regions: &view.hit_regions,
                 focus_regions: &view.focus_regions,
                 scroll_regions: &view.scroll_regions,
+                wheel_traversal_boundary: Default::default(),
                 response: &root_response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -17228,8 +17568,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -17242,7 +17582,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -17261,7 +17601,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
 
         egui::__run_test_ui(|ui| {
@@ -17325,8 +17665,8 @@ mod tests {
         let mut view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -17339,7 +17679,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -17358,9 +17698,21 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
-        view.layout.child_placements.clear();
+        let bounds = *view.layout.bounds();
+        let input = LayoutInput {
+            viewport: bounds,
+            content: bounds,
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: bounds.into_rect().size,
+            },
+        };
+        view.layout = slipway_core::prepare_leaf_layout(test_layout_builder(&input), bounds);
 
         egui::__run_test_ui(|ui| {
             let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
@@ -17401,8 +17753,8 @@ mod tests {
         let view = root.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -17415,7 +17767,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -17434,7 +17786,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
         let native = SlipwayEguiNativeWidget::new(NativeEguiLabel);
         let slot = WidgetSlotAddress::new(root.id(), 0).child(native.id(), 0);
@@ -17479,8 +17831,8 @@ mod tests {
         let mut view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -17493,7 +17845,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -17512,7 +17864,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
         view.scroll_regions = vec![test_scroll_region(
             widget.id(),
@@ -17586,8 +17938,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -17600,7 +17952,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -17619,7 +17971,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
 
         egui::__run_test_ui(|ui| {
@@ -17673,8 +18025,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -17687,7 +18039,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -17706,7 +18058,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
         let child_fill_color = egui_color(slipway_core::Color {
             red: 0.1,
@@ -17802,8 +18154,8 @@ mod tests {
         let mut view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -17816,7 +18168,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -17835,13 +18187,13 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
         for region in &mut view.scroll_regions {
             *region = region.clone().with_scroll_indicator(indicator);
         }
         assert!(
-            view.layout.child_placements.is_empty(),
+            view.layout.child_placements().is_empty(),
             "fixture must stay canvas-painted (no child placements)"
         );
 
@@ -18007,11 +18359,7 @@ mod tests {
                 frame_index: 0,
                 viewport: card,
             },
-            layout: LayoutOutput {
-                bounds: TargetLocalRect::new(card),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            },
+            layout: test_leaf_layout(TargetLocalRect::new(card)),
             paint: Vec::new(),
             paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id.clone()),
             hit_regions: Vec::new(),
@@ -18023,6 +18371,7 @@ mod tests {
                 region("authored.nested:inner-1", inner_viewport(1), 112.0, 2)
                     .with_scroll_indicator(slipway_core::ScrollIndicatorMode::Hidden),
             ],
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -18188,16 +18537,13 @@ mod tests {
                 frame_index: 0,
                 viewport: card,
             },
-            layout: LayoutOutput {
-                bounds: TargetLocalRect::new(card),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            },
+            layout: test_leaf_layout(TargetLocalRect::new(card)),
             paint: Vec::new(),
             paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id.clone()),
             hit_regions: vec![row_region(row_z)],
             focus_regions: Vec::new(),
             scroll_regions: vec![scroll_region.clone()],
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -18299,8 +18645,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -18313,7 +18659,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -18332,27 +18678,23 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
         let earlier_view = widget.children.0.visible_backend_view_definition(
             &(),
             &local.0,
-            ViewDefinitionInput {
-                frame: view.frame.clone(),
-                layout_input: child_layout_input(
-                    view.layout.child_placements[0].bounds.into_rect(),
-                ),
-            },
+            ViewDefinitionInput::new(
+                view.frame.clone(),
+                child_layout_input(view.layout.child_placements()[0].bounds.into_rect()),
+            ),
         );
         let later_view = widget.children.1.visible_backend_view_definition(
             &(),
             &local.1,
-            ViewDefinitionInput {
-                frame: view.frame.clone(),
-                layout_input: child_layout_input(
-                    view.layout.child_placements[1].bounds.into_rect(),
-                ),
-            },
+            ViewDefinitionInput::new(
+                view.frame.clone(),
+                child_layout_input(view.layout.child_placements()[1].bounds.into_rect()),
+            ),
         );
         assert_eq!(
             earlier_view.paint_order.mode,
@@ -18422,8 +18764,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -18436,7 +18778,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -18455,7 +18797,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
 
         let ctx = egui::Context::default();
@@ -18517,8 +18859,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -18531,7 +18873,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -18550,7 +18892,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
 
         let ctx = egui::Context::default();
@@ -18626,8 +18968,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -18640,7 +18982,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -18659,7 +19001,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
 
         let ctx = egui::Context::default();
@@ -18734,8 +19076,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -18748,7 +19090,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -18767,7 +19109,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
 
         let ctx = egui::Context::default();
@@ -18829,7 +19171,7 @@ mod tests {
         let mut local = widget.initial_local_state();
         let mut bridge = DefaultEguiBridge::new();
         let mut messages = Vec::new();
-        let layout_input = LayoutInput {
+        let layout_input = zero_spacing_layout_input! {
             viewport: TargetLocalRect::new(Rect {
                 origin: Point { x: 0.0, y: 0.0 },
                 size: Size {
@@ -18901,7 +19243,7 @@ mod tests {
         let mut local = widget.initial_local_state();
         let mut bridge = DefaultEguiBridge::new();
         let mut messages = Vec::new();
-        let layout_input = LayoutInput {
+        let layout_input = zero_spacing_layout_input! {
             viewport: TargetLocalRect::new(Rect {
                 origin: Point { x: 0.0, y: 0.0 },
                 size: Size {
@@ -18974,8 +19316,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -18988,7 +19330,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -19007,7 +19349,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
 
         egui::__run_test_ui(|ui| {
@@ -19068,8 +19410,8 @@ mod tests {
         let mut view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -19082,7 +19424,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -19101,7 +19443,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
         let mut scroll = test_scroll_region(
             widget.id(),
@@ -19213,8 +19555,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -19227,7 +19569,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -19246,7 +19588,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
 
         let ctx = egui::Context::default();
@@ -19301,8 +19643,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -19315,7 +19657,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -19334,27 +19676,23 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
         let top_view = widget.children.0.visible_backend_view_definition(
             &(),
             &local.0,
-            ViewDefinitionInput {
-                frame: view.frame.clone(),
-                layout_input: child_layout_input(
-                    view.layout.child_placements[0].bounds.into_rect(),
-                ),
-            },
+            ViewDefinitionInput::new(
+                view.frame.clone(),
+                child_layout_input(view.layout.child_placements()[0].bounds.into_rect()),
+            ),
         );
         let normal_view = widget.children.1.visible_backend_view_definition(
             &(),
             &local.1,
-            ViewDefinitionInput {
-                frame: view.frame.clone(),
-                layout_input: child_layout_input(
-                    view.layout.child_placements[1].bounds.into_rect(),
-                ),
-            },
+            ViewDefinitionInput::new(
+                view.frame.clone(),
+                child_layout_input(view.layout.child_placements()[1].bounds.into_rect()),
+            ),
         );
         assert_eq!(
             top_view.paint_order.mode,
@@ -19411,8 +19749,8 @@ mod tests {
         let view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -19425,7 +19763,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -19444,7 +19782,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
 
         egui::__run_test_ui(|ui| {
@@ -19484,8 +19822,8 @@ mod tests {
         let mut view = widget.view_definition(
             &(),
             &local,
-            ViewDefinitionInput {
-                frame: FrameIdentity {
+            ViewDefinitionInput::new(
+                FrameIdentity {
                     surface_id: "test".to_string(),
                     surface_instance_id: "test".to_string(),
                     revision: 0,
@@ -19498,7 +19836,7 @@ mod tests {
                         },
                     },
                 },
-                layout_input: LayoutInput {
+                zero_spacing_layout_input! {
                     viewport: TargetLocalRect::new(Rect {
                         origin: Point { x: 0.0, y: 0.0 },
                         size: Size {
@@ -19517,7 +19855,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
         view.scroll_regions = vec![test_scroll_region(
             widget.id(),
@@ -19656,8 +19994,8 @@ mod tests {
     fn egui_backend_admission_accepts_supported_path_and_regions() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let input = ViewDefinitionInput {
-            frame: FrameIdentity {
+        let input = ViewDefinitionInput::new(
+            FrameIdentity {
                 surface_id: "egui-admission".to_string(),
                 surface_instance_id: "test-instance".to_string(),
                 revision: 1,
@@ -19670,7 +20008,7 @@ mod tests {
                     },
                 },
             },
-            layout_input: LayoutInput {
+            zero_spacing_layout_input! {
                 viewport: TargetLocalRect::new(Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
@@ -19689,13 +20027,13 @@ mod tests {
                     },
                 },
             },
-        };
+        );
         let mut view = widget.view_definition(&(), &local, input);
         view.paint = vec![PaintOp::Stroke {
             shape: ShapeDeclaration {
                 id: Some("supported-path".to_string()),
                 kind: ShapeKind::Path,
-                bounds: view.layout.bounds.into_rect(),
+                bounds: view.layout.bounds().into_rect(),
                 path: Some(PathDeclaration {
                     commands: vec![
                         PathCommand::MoveTo(Point { x: 0.0, y: 0.0 }),
@@ -19799,8 +20137,8 @@ mod tests {
     fn egui_backend_admission_refuses_blocking_view_contract_errors() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let input = ViewDefinitionInput {
-            frame: FrameIdentity {
+        let input = ViewDefinitionInput::new(
+            FrameIdentity {
                 surface_id: "egui-admission".to_string(),
                 surface_instance_id: "contract-test".to_string(),
                 revision: 1,
@@ -19813,7 +20151,7 @@ mod tests {
                     },
                 },
             },
-            layout_input: LayoutInput {
+            zero_spacing_layout_input! {
                 viewport: TargetLocalRect::new(Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
@@ -19832,7 +20170,7 @@ mod tests {
                     },
                 },
             },
-        };
+        );
         let mut view = widget.view_definition(&(), &local, input);
         view.hit_regions[0].route.path.clear();
 
@@ -19862,8 +20200,8 @@ mod tests {
     fn visible_admission_refusal_lines_include_blocking_diagnostics() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let input = ViewDefinitionInput {
-            frame: FrameIdentity {
+        let input = ViewDefinitionInput::new(
+            FrameIdentity {
                 surface_id: "egui-admission-lines".to_string(),
                 surface_instance_id: "contract-test".to_string(),
                 revision: 1,
@@ -19876,7 +20214,7 @@ mod tests {
                     },
                 },
             },
-            layout_input: LayoutInput {
+            zero_spacing_layout_input! {
                 viewport: TargetLocalRect::new(Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
@@ -19895,7 +20233,7 @@ mod tests {
                     },
                 },
             },
-        };
+        );
         let mut view = widget.view_definition(&(), &local, input);
         view.hit_regions[0].route.path.clear();
         let admission = egui_backend_admission().admit_view_definition(&view);
@@ -19918,11 +20256,7 @@ mod tests {
                 height: 100.0,
             },
         };
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(layout_bounds),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(layout_bounds));
         let mut cropped_scroll = test_scroll_region(
             target.clone(),
             Rect {
@@ -19970,6 +20304,7 @@ mod tests {
             hit_regions: Vec::new(),
             focus_regions: Vec::new(),
             scroll_regions: vec![cropped_scroll, disabled_scroll],
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -20023,8 +20358,8 @@ mod tests {
     fn egui_backend_admission_refuses_text_input_without_text_edit_focus_region() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let input = ViewDefinitionInput {
-            frame: FrameIdentity {
+        let input = ViewDefinitionInput::new(
+            FrameIdentity {
                 surface_id: "egui-admission".to_string(),
                 surface_instance_id: "text-contract-test".to_string(),
                 revision: 1,
@@ -20037,7 +20372,7 @@ mod tests {
                     },
                 },
             },
-            layout_input: LayoutInput {
+            zero_spacing_layout_input! {
                 viewport: TargetLocalRect::new(Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
@@ -20056,7 +20391,7 @@ mod tests {
                     },
                 },
             },
-        };
+        );
         let mut view = widget.view_definition(&(), &local, input);
         view.focus_regions.clear();
 
@@ -20077,17 +20412,13 @@ mod tests {
     #[test]
     fn egui_backend_admission_refuses_unsupported_path_clip() {
         let widget = ProbeWidget::new("root");
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 120.0,
-                    height: 80.0,
-                },
-            }),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 80.0,
+            },
+        }));
         let view = ViewDefinition {
             target: widget.id(),
             frame: FrameIdentity {
@@ -20095,14 +20426,14 @@ mod tests {
                 surface_instance_id: "test-instance".to_string(),
                 revision: 1,
                 frame_index: 2,
-                viewport: layout.bounds.into_rect(),
+                viewport: layout.bounds().into_rect(),
             },
             layout: layout.clone(),
             paint: vec![PaintOp::Group {
                 id: Some("unsupported-clip".to_string()),
                 clip: Some(slipway_core::ClipDeclaration {
                     id: Some("clip-path".to_string()),
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: Some(PathDeclaration {
                         commands: vec![
                             PathCommand::MoveTo(Point { x: 0.0, y: 0.0 }),
@@ -20115,9 +20446,10 @@ mod tests {
                 ops: Vec::new(),
             }],
             paint_order: slipway_core::PaintOrderDeclaration::source_order(widget.id()),
-            hit_regions: vec![test_hit_region("hit", widget.id(), layout.bounds, 0)],
+            hit_regions: vec![test_hit_region("hit", widget.id(), *layout.bounds(), 0)],
             focus_regions: Vec::new(),
             scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -20244,17 +20576,17 @@ mod tests {
             };
             let overlay = WidgetId::from("overlay");
             let overlay_slot = WidgetSlotAddress::new(overlay.clone(), 0);
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(Rect {
+            let layout = test_layout_with_placements(
+                TargetLocalRect::new(Rect {
                     origin: Point { x: 0.0, y: 0.0 },
                     size: Size {
                         width: 640.0,
                         height: 900.0,
                     },
                 }),
-                child_placements: vec![ChildPlacement {
+                [ChildPlacement {
                     child: overlay.clone(),
-                    bounds: slipway_core::ParentLocalRect::new(Rect {
+                    bounds: test_parent_local(Rect {
                         origin: Point { x: 220.0, y: 520.0 },
                         size: Size {
                             width: 200.0,
@@ -20262,9 +20594,9 @@ mod tests {
                         },
                     }),
                     local_state_slot: Some(overlay_slot.clone()),
+                    spacing: BoxSpacing::ZERO,
                 }],
-                diagnostics: Vec::new(),
-            };
+            );
             let geometry_index = PresentationGeometryIndex::from_layout(&layout);
             let mut hit = test_hit_region(
                 "overlay-hit",
@@ -20325,6 +20657,7 @@ mod tests {
                 hit_regions: &hit_regions,
                 focus_regions: &[],
                 scroll_regions: &[],
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -20658,17 +20991,13 @@ mod tests {
     fn cjk_paint_without_installable_font_reports_backend_evidence() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 120.0,
-                    height: 40.0,
-                },
-            }),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 120.0,
+                height: 40.0,
+            },
+        }));
         let view = ViewDefinition {
             target: widget.id(),
             frame: FrameIdentity {
@@ -20676,11 +21005,11 @@ mod tests {
                 surface_instance_id: "font-test".to_string(),
                 revision: 0,
                 frame_index: 0,
-                viewport: layout.bounds.into_rect(),
+                viewport: layout.bounds().into_rect(),
             },
             layout: layout.clone(),
             paint: vec![PaintOp::Text {
-                bounds: layout.bounds.into_rect(),
+                bounds: layout.bounds().into_rect(),
                 content: "\u{d55c}\u{ae00}".to_string(),
                 color: slipway_core::Color {
                     red: 0.0,
@@ -20694,6 +21023,7 @@ mod tests {
             hit_regions: Vec::new(),
             focus_regions: Vec::new(),
             scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -20725,17 +21055,13 @@ mod tests {
     fn cjk_text_edit_stays_native_and_reports_font_evidence() {
         let widget = ProbeWidget::new("root");
         let local = widget.initial_local_state();
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 160.0,
-                    height: 48.0,
-                },
-            }),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        };
+        let layout = test_leaf_layout(TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 160.0,
+                height: 48.0,
+            },
+        }));
         let mut focus = test_text_edit_region(
             WidgetId::from("text"),
             Rect {
@@ -20778,7 +21104,7 @@ mod tests {
                 surface_instance_id: "text-edit-font-test".to_string(),
                 revision: 0,
                 frame_index: 0,
-                viewport: layout.bounds.into_rect(),
+                viewport: layout.bounds().into_rect(),
             },
             layout: layout.clone(),
             paint: Vec::new(),
@@ -20786,6 +21112,7 @@ mod tests {
             hit_regions: Vec::new(),
             focus_regions: vec![focus],
             scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -21690,11 +22017,7 @@ mod tests {
                     },
                 },
             };
-            let layout = LayoutOutput {
-                bounds: TargetLocalRect::new(frame.viewport),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            };
+            let layout = test_leaf_layout(TargetLocalRect::new(frame.viewport));
             let mut selected_focus = test_text_edit_region(target.clone(), frame.viewport);
             selected_focus.id = PresentationRegionId::from("egui-selected-focus");
             selected_focus.address = None;
@@ -21719,6 +22042,7 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: focus_regions.clone(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -21742,6 +22066,7 @@ mod tests {
                 hit_regions: &[],
                 focus_regions: &focus_regions,
                 scroll_regions: &[],
+                wheel_traversal_boundary: Default::default(),
                 response: &regions[0].response,
                 regions: &regions,
                 native_physical_operation: None,
@@ -22145,18 +22470,15 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             _input: LayoutInput,
+            output: slipway_core::LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: TargetLocalRect::new(Rect {
-                    origin: Point { x: 0.0, y: 0.0 },
-                    size: Size {
-                        width: 10.0,
-                        height: 10.0,
-                    },
-                }),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 10.0,
+                    height: 10.0,
+                },
+            }))
         }
 
         fn paint(
@@ -22187,7 +22509,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = slipway_core::layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -22197,6 +22519,7 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),

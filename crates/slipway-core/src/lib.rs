@@ -46,7 +46,13 @@
 //! `grep RESERVED` over this file enumerates that surface;
 //! `docs/public/api/trait-surface.md` is the public index.
 
-use std::{cmp::Ordering, collections::HashMap, mem};
+use std::{cmp::Ordering, collections::HashMap, mem, sync::Arc};
+
+#[cfg(test)]
+thread_local! {
+    static PREPARATION_PLACEMENT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FROM_LAYOUT_PLACEMENT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WidgetId(String);
@@ -127,6 +133,10 @@ impl TargetLocalRect {
     pub fn into_rect(self) -> Rect {
         self.0
     }
+
+    pub const fn as_rect(&self) -> &Rect {
+        &self.0
+    }
 }
 
 impl std::ops::Deref for TargetLocalRect {
@@ -150,35 +160,69 @@ impl From<TargetLocalRect> for Rect {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ParentLocalRect(Rect);
+pub struct ContentLocalRect(Rect);
 
-impl ParentLocalRect {
-    pub fn new(rect: Rect) -> Self {
+impl ContentLocalRect {
+    pub const fn new(rect: Rect) -> Self {
         Self(rect)
     }
 
-    pub fn into_rect(self) -> Rect {
-        self.0
-    }
-}
-
-impl std::ops::Deref for ParentLocalRect {
-    type Target = Rect;
-
-    fn deref(&self) -> &Self::Target {
+    pub const fn as_rect(&self) -> &Rect {
         &self.0
     }
-}
 
-impl std::ops::DerefMut for ParentLocalRect {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+    pub const fn into_rect(self) -> Rect {
+        self.0
+    }
+
+    fn to_parent(self, translation: ContentToParentTranslation) -> ParentLocalRect {
+        ParentLocalRect::from_parent_local(Rect {
+            origin: Point {
+                x: self.0.origin.x + translation.origin.x,
+                y: self.0.origin.y + translation.origin.y,
+            },
+            size: self.0.size,
+        })
     }
 }
 
-impl From<ParentLocalRect> for Rect {
-    fn from(value: ParentLocalRect) -> Self {
-        value.0
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContentToParentTranslation {
+    origin: Point,
+}
+
+impl ContentToParentTranslation {
+    fn from_layout_input(input: &LayoutInput) -> Self {
+        Self {
+            origin: input.content.into_rect().origin,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParentLocalRect(Rect);
+
+impl ParentLocalRect {
+    fn from_parent_local(rect: Rect) -> Self {
+        Self(rect)
+    }
+
+    pub const fn as_rect(&self) -> &Rect {
+        &self.0
+    }
+
+    pub const fn into_rect(self) -> Rect {
+        self.0
+    }
+
+    pub fn translated_for_presentation(self, translation: Translation) -> Self {
+        Self::from_parent_local(Rect {
+            origin: Point {
+                x: self.0.origin.x + translation.x,
+                y: self.0.origin.y + translation.y,
+            },
+            size: self.0.size,
+        })
     }
 }
 
@@ -190,6 +234,59 @@ pub struct EdgeInsets {
     pub left: f32,
 }
 
+impl EdgeInsets {
+    pub const ZERO: Self = Self::all(0.0);
+
+    pub const fn all(value: f32) -> Self {
+        Self::trbl(value, value, value, value)
+    }
+
+    pub const fn symmetric(vertical: f32, horizontal: f32) -> Self {
+        Self::trbl(vertical, horizontal, vertical, horizontal)
+    }
+
+    pub const fn trbl(top: f32, right: f32, bottom: f32, left: f32) -> Self {
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+
+    pub const fn horizontal(self) -> f32 {
+        self.left + self.right
+    }
+    pub const fn vertical(self) -> f32 {
+        self.top + self.bottom
+    }
+}
+
+impl Default for EdgeInsets {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BoxSpacing {
+    pub margin: EdgeInsets,
+    pub padding: EdgeInsets,
+}
+
+impl BoxSpacing {
+    pub const ZERO: Self = Self::new(EdgeInsets::ZERO, EdgeInsets::ZERO);
+    pub const fn new(margin: EdgeInsets, padding: EdgeInsets) -> Self {
+        Self { margin, padding }
+    }
+    pub const fn with_margin(self, margin: EdgeInsets) -> Self {
+        Self { margin, ..self }
+    }
+    pub const fn with_padding(self, padding: EdgeInsets) -> Self {
+        Self { padding, ..self }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutConstraints {
     pub min: Size,
@@ -199,6 +296,7 @@ pub struct LayoutConstraints {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutInput {
     pub viewport: TargetLocalRect,
+    pub content: TargetLocalRect,
     pub constraints: LayoutConstraints,
 }
 
@@ -207,6 +305,7 @@ pub struct ChildPlacement {
     pub child: WidgetId,
     pub bounds: ParentLocalRect,
     pub local_state_slot: Option<WidgetSlotAddress>,
+    pub spacing: BoxSpacing,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -219,78 +318,72 @@ pub struct ChildLayoutSeed {
 pub struct ChildLayoutRequest {
     pub child: WidgetId,
     pub local_state_slot: Option<WidgetSlotAddress>,
-    pub input: LayoutInput,
+    pub geometry: ChildLayoutGeometry,
+    pub outer_constraints: LayoutConstraints,
+    pub spacing: BoxSpacing,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChildLayoutGeometry {
+    RequestedOuter(ContentLocalRect),
+    ExplicitBorder(ContentLocalRect),
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChildLayoutPlan {
     pub request: ChildLayoutRequest,
-    pub placement: Option<ParentLocalRect>,
 }
 
 impl ChildLayoutPlan {
-    pub fn requested(child: impl Into<WidgetId>, input: LayoutInput) -> Self {
-        Self {
-            request: ChildLayoutRequest {
-                child: child.into(),
-                local_state_slot: None,
-                input,
-            },
-            placement: None,
-        }
-    }
-
-    pub fn requested_for_seed(seed: ChildLayoutSeed, input: LayoutInput) -> Self {
-        Self {
-            request: ChildLayoutRequest {
-                child: seed.child,
-                local_state_slot: seed.local_state_slot,
-                input,
-            },
-            placement: None,
-        }
-    }
-
-    pub fn for_seed(seed: ChildLayoutSeed, input: LayoutInput) -> Self {
-        Self::requested_for_seed(seed, input)
-    }
-
-    pub fn placed(
-        child: impl Into<WidgetId>,
-        input: LayoutInput,
-        placement: ParentLocalRect,
-    ) -> Self {
-        Self {
-            request: ChildLayoutRequest {
-                child: child.into(),
-                local_state_slot: None,
-                input,
-            },
-            placement: Some(placement),
-        }
-    }
-
-    pub fn placed_for_seed(
+    pub fn requested_outer(
         seed: ChildLayoutSeed,
-        input: LayoutInput,
-        placement: ParentLocalRect,
+        outer: ContentLocalRect,
+        outer_constraints: LayoutConstraints,
+        spacing: BoxSpacing,
     ) -> Self {
         Self {
             request: ChildLayoutRequest {
                 child: seed.child,
                 local_state_slot: seed.local_state_slot,
-                input,
+                geometry: ChildLayoutGeometry::RequestedOuter(outer),
+                outer_constraints,
+                spacing,
             },
-            placement: Some(placement),
+        }
+    }
+
+    pub fn explicit_border(
+        seed: ChildLayoutSeed,
+        border: ContentLocalRect,
+        spacing: BoxSpacing,
+    ) -> Self {
+        let size = border.as_rect().size;
+        Self {
+            request: ChildLayoutRequest {
+                child: seed.child,
+                local_state_slot: seed.local_state_slot,
+                geometry: ChildLayoutGeometry::ExplicitBorder(border),
+                outer_constraints: LayoutConstraints {
+                    min: Size {
+                        width: size.width + spacing.margin.horizontal(),
+                        height: size.height + spacing.margin.vertical(),
+                    },
+                    max: Size {
+                        width: size.width + spacing.margin.horizontal(),
+                        height: size.height + spacing.margin.vertical(),
+                    },
+                },
+                spacing,
+            },
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChildLayoutResult {
-    pub request: ChildLayoutRequest,
+    pub seed: ChildLayoutSeed,
     pub layout: LayoutOutput,
-    pub local_state_slot: Option<WidgetSlotAddress>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -302,9 +395,363 @@ pub struct AppLayoutPlan {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutOutput {
-    pub bounds: TargetLocalRect,
-    pub child_placements: Vec<ChildPlacement>,
-    pub diagnostics: Vec<Diagnostic>,
+    bounds: TargetLocalRect,
+    child_placements: Vec<ChildPlacement>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl LayoutOutput {
+    pub const fn bounds(&self) -> &TargetLocalRect {
+        &self.bounds
+    }
+
+    pub fn child_placements(&self) -> &[ChildPlacement] {
+        &self.child_placements
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn reset_to_leaf(&mut self, bounds: TargetLocalRect) {
+        self.bounds = bounds;
+        self.child_placements.clear();
+        self.diagnostics.clear();
+    }
+
+    fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+        std::mem::take(&mut self.diagnostics)
+    }
+}
+
+pub struct LayoutOutputBuilder {
+    translation: ContentToParentTranslation,
+    child_placements: Vec<ChildPlacement>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl LayoutOutputBuilder {
+    fn for_input(input: &LayoutInput) -> Self {
+        Self {
+            translation: ContentToParentTranslation::from_layout_input(input),
+            child_placements: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.child_placements.reserve(additional);
+    }
+
+    fn extend_diagnostics(&mut self, diagnostics: impl IntoIterator<Item = Diagnostic>) {
+        self.diagnostics.extend(diagnostics);
+    }
+
+    pub fn push_resolved(
+        &mut self,
+        plan: ChildLayoutPlan,
+        mut result: ChildLayoutResult,
+    ) -> Result<(), BoxGeometryDiagnostic> {
+        if result.seed.child != plan.request.child
+            || result.seed.local_state_slot != plan.request.local_state_slot
+        {
+            return Err(BoxGeometryDiagnostic {
+                component: "child.identity",
+                value: f32::NAN,
+            });
+        }
+        validate_spacing(plan.request.spacing)?;
+        let final_size = result.layout.bounds().into_rect().size;
+        validate_size(final_size)?;
+        if let ChildLayoutGeometry::ExplicitBorder(border) = &plan.request.geometry {
+            let authored_size = border.as_rect().size;
+            if final_size != authored_size {
+                return Err(BoxGeometryDiagnostic {
+                    component: "explicit_border.size",
+                    value: final_size.width,
+                });
+            }
+        }
+
+        self.diagnostics.append(&mut result.diagnostics);
+        let spacing = plan.request.spacing;
+        let final_border = match plan.request.geometry {
+            ChildLayoutGeometry::RequestedOuter(authored_outer) => {
+                let parent_outer = authored_outer.to_parent(self.translation);
+                ParentLocalRect::from_parent_local(Rect {
+                    origin: Point {
+                        x: parent_outer.as_rect().origin.x + spacing.margin.left,
+                        y: parent_outer.as_rect().origin.y + spacing.margin.top,
+                    },
+                    size: final_size,
+                })
+            }
+            ChildLayoutGeometry::ExplicitBorder(authored_border) => {
+                let parent_border = authored_border.to_parent(self.translation);
+                parent_border
+            }
+        };
+        self.child_placements.push(ChildPlacement {
+            child: plan.request.child,
+            bounds: final_border,
+            local_state_slot: plan.request.local_state_slot,
+            spacing,
+        });
+        Ok(())
+    }
+
+    pub fn finish(self, bounds: TargetLocalRect) -> LayoutOutput {
+        LayoutOutput {
+            bounds,
+            child_placements: self.child_placements,
+            diagnostics: self.diagnostics,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Translation {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TargetBoxGeometry {
+    pub border: TargetLocalRect,
+    pub content: TargetLocalRect,
+    pub content_paint_bounds: TargetLocalRect,
+    pub default_clip: TargetLocalRect,
+    pub default_hit_bounds: TargetLocalRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlacementBoxGeometry {
+    pub outer: ParentLocalRect,
+    pub border: ParentLocalRect,
+    pub content: ParentLocalRect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PresentedBoxGeometry {
+    pub outer: Rect,
+    pub border: Rect,
+    pub content: Rect,
+    pub default_clip: Rect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxSpacingError {
+    pub component: &'static str,
+    pub value: f32,
+}
+
+pub type BoxGeometryDiagnostic = BoxSpacingError;
+
+fn validate_spacing(spacing: BoxSpacing) -> Result<(), BoxSpacingError> {
+    for (component, value) in [
+        ("margin.top", spacing.margin.top),
+        ("margin.right", spacing.margin.right),
+        ("margin.bottom", spacing.margin.bottom),
+        ("margin.left", spacing.margin.left),
+        ("padding.top", spacing.padding.top),
+        ("padding.right", spacing.padding.right),
+        ("padding.bottom", spacing.padding.bottom),
+        ("padding.left", spacing.padding.left),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(BoxSpacingError { component, value });
+        }
+    }
+    Ok(())
+}
+
+fn validate_size(size: Size) -> Result<(), BoxSpacingError> {
+    if !size.width.is_finite() || size.width < 0.0 {
+        return Err(BoxSpacingError {
+            component: "border.width",
+            value: size.width,
+        });
+    }
+    if !size.height.is_finite() || size.height < 0.0 {
+        return Err(BoxSpacingError {
+            component: "border.height",
+            value: size.height,
+        });
+    }
+    Ok(())
+}
+
+pub fn derive_target_box(
+    size: Size,
+    spacing: BoxSpacing,
+) -> Result<TargetBoxGeometry, BoxSpacingError> {
+    validate_spacing(spacing)?;
+    validate_size(size)?;
+    let border = TargetLocalRect::new(Rect {
+        origin: Point { x: 0.0, y: 0.0 },
+        size,
+    });
+    let content = TargetLocalRect::new(Rect {
+        origin: Point {
+            x: spacing.padding.left.min(size.width),
+            y: spacing.padding.top.min(size.height),
+        },
+        size: Size {
+            width: (size.width - spacing.padding.horizontal()).max(0.0),
+            height: (size.height - spacing.padding.vertical()).max(0.0),
+        },
+    });
+    Ok(TargetBoxGeometry {
+        border,
+        content,
+        content_paint_bounds: content,
+        default_clip: border,
+        default_hit_bounds: border,
+    })
+}
+
+/// Reconstructs a child's target-local layout input from its already-final
+/// parent-local border. Margin is parent-side geometry and is intentionally
+/// not applied again here.
+pub fn child_layout_input_for_placement(placement: &ChildPlacement) -> LayoutInput {
+    let size = placement.bounds.as_rect().size;
+    let target = derive_target_box(size, placement.spacing)
+        .expect("validated child placement must have valid box geometry");
+    LayoutInput {
+        viewport: target.border,
+        content: target.content,
+        constraints: LayoutConstraints {
+            min: Size {
+                width: 0.0,
+                height: 0.0,
+            },
+            max: size,
+        },
+    }
+}
+
+pub fn derive_placement_box(
+    border: ParentLocalRect,
+    spacing: BoxSpacing,
+) -> Result<PlacementBoxGeometry, BoxSpacingError> {
+    let border_rect = border.as_rect();
+    let target = derive_target_box(border_rect.size, spacing)?;
+    if !border_rect.origin.x.is_finite() {
+        return Err(BoxSpacingError {
+            component: "border.x",
+            value: border_rect.origin.x,
+        });
+    }
+    if !border_rect.origin.y.is_finite() {
+        return Err(BoxSpacingError {
+            component: "border.y",
+            value: border_rect.origin.y,
+        });
+    }
+    let m = spacing.margin;
+    Ok(PlacementBoxGeometry {
+        outer: ParentLocalRect::from_parent_local(Rect {
+            origin: Point {
+                x: border_rect.origin.x - m.left,
+                y: border_rect.origin.y - m.top,
+            },
+            size: Size {
+                width: border_rect.size.width + m.horizontal(),
+                height: border_rect.size.height + m.vertical(),
+            },
+        }),
+        border,
+        content: ParentLocalRect::from_parent_local(translate_rect(
+            target.content,
+            border_rect.origin,
+        )),
+    })
+}
+
+pub fn effective_clip(
+    default_clip: TargetLocalRect,
+    authored_overflow: Option<TargetLocalRect>,
+    ancestor_clip: Option<Rect>,
+    target_to_presented: Translation,
+) -> Rect {
+    let translated = translate_rect(
+        authored_overflow.unwrap_or(default_clip),
+        Point {
+            x: target_to_presented.x,
+            y: target_to_presented.y,
+        },
+    );
+    ancestor_clip
+        .and_then(|ancestor| rect_intersection(translated, ancestor))
+        .unwrap_or_else(|| {
+            if ancestor_clip.is_some() {
+                Rect {
+                    origin: translated.origin,
+                    size: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                }
+            } else {
+                translated
+            }
+        })
+}
+
+pub fn full_border_hit_bounds(input: &LayoutInput) -> TargetLocalRect {
+    input.viewport
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedChildLayout {
+    pub input: LayoutInput,
+}
+
+pub fn prepare_child_layout(
+    plan: &ChildLayoutPlan,
+) -> Result<PreparedChildLayout, BoxGeometryDiagnostic> {
+    let request = &plan.request;
+    validate_spacing(request.spacing)?;
+    let m = request.spacing.margin;
+    let authored = match &request.geometry {
+        ChildLayoutGeometry::RequestedOuter(outer) => outer.as_rect(),
+        ChildLayoutGeometry::ExplicitBorder(border) => border.as_rect(),
+    };
+    let outer_size = match request.geometry {
+        ChildLayoutGeometry::RequestedOuter(_) => authored.size,
+        ChildLayoutGeometry::ExplicitBorder(_) => Size {
+            width: authored.size.width + m.horizontal(),
+            height: authored.size.height + m.vertical(),
+        },
+    };
+    let available = Size {
+        width: (outer_size.width - m.horizontal()).max(0.0),
+        height: (outer_size.height - m.vertical()).max(0.0),
+    };
+    let max = Size {
+        width: (request.outer_constraints.max.width - m.horizontal())
+            .max(0.0)
+            .min(available.width),
+        height: (request.outer_constraints.max.height - m.vertical())
+            .max(0.0)
+            .min(available.height),
+    };
+    let min = Size {
+        width: (request.outer_constraints.min.width - m.horizontal())
+            .max(0.0)
+            .min(max.width),
+        height: (request.outer_constraints.min.height - m.vertical())
+            .max(0.0)
+            .min(max.height),
+    };
+    let target = derive_target_box(available, request.spacing)?;
+    Ok(PreparedChildLayout {
+        input: LayoutInput {
+            viewport: target.border,
+            content: target.content,
+            constraints: LayoutConstraints { min, max },
+        },
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -312,6 +759,9 @@ pub struct PresentationGeometryIndex {
     root_target_rect: Rect,
     target_rects_by_address: HashMap<WidgetSlotAddress, Rect>,
     first_target_rects_by_id: HashMap<WidgetId, Rect>,
+    boxes_by_address: HashMap<WidgetSlotAddress, PresentedBoxGeometry>,
+    first_border_by_id: HashMap<WidgetId, Rect>,
+    root: PresentedBoxGeometry,
 }
 
 impl PresentationGeometryIndex {
@@ -322,8 +772,20 @@ impl PresentationGeometryIndex {
         };
         let mut target_rects_by_address = HashMap::new();
         let mut first_target_rects_by_id = HashMap::new();
+        let mut boxes_by_address = HashMap::new();
+        let mut first_border_by_id = HashMap::new();
+        let root_target =
+            derive_target_box(layout.bounds.size, BoxSpacing::ZERO).expect("zero spacing is valid");
+        let root = PresentedBoxGeometry {
+            outer: root_target.border.into_rect(),
+            border: root_target.border.into_rect(),
+            content: root_target.content.into_rect(),
+            default_clip: root_target.default_clip.into_rect(),
+        };
 
         for placement in &layout.child_placements {
+            #[cfg(test)]
+            FROM_LAYOUT_PLACEMENT_VISITS.with(|visits| visits.set(visits.get() + 1));
             let rect = placement.bounds.into_rect();
             if let Some(address) = placement.local_state_slot.as_ref() {
                 target_rects_by_address.insert(address.clone(), rect);
@@ -331,12 +793,29 @@ impl PresentationGeometryIndex {
             first_target_rects_by_id
                 .entry(placement.child.clone())
                 .or_insert(rect);
+            if let Ok(placement_box) = derive_placement_box(placement.bounds, placement.spacing) {
+                let presented = PresentedBoxGeometry {
+                    outer: placement_box.outer.into_rect(),
+                    border: rect,
+                    content: placement_box.content.into_rect(),
+                    default_clip: rect,
+                };
+                if let Some(address) = placement.local_state_slot.as_ref() {
+                    boxes_by_address.insert(address.clone(), presented);
+                }
+                first_border_by_id
+                    .entry(placement.child.clone())
+                    .or_insert(rect);
+            }
         }
 
         Self {
             root_target_rect,
             target_rects_by_address,
             first_target_rects_by_id,
+            boxes_by_address,
+            first_border_by_id,
+            root,
         }
     }
 
@@ -397,7 +876,62 @@ impl PresentationGeometryIndex {
             self.target_local_point_for_region_address(target, address, root_local_position);
         rect_contains_point(target_local_rect, target_local_position)
     }
+
+    pub fn box_for_address(&self, address: &WidgetSlotAddress) -> Option<&PresentedBoxGeometry> {
+        self.boxes_by_address.get(address)
+    }
+    pub fn first_border_for_id(&self, id: &WidgetId) -> Option<Rect> {
+        self.first_border_by_id.get(id).copied()
+    }
+    pub fn root_box(&self) -> PresentedBoxGeometry {
+        self.root
+    }
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedPresentationGeometry {
+    pub index: PresentationGeometryIndex,
+    capture: Option<PreparedGeometryCapture>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeometryCaptureIntent {
+    None,
+    RenderPacketEvidence,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedGeometryCapture {
+    records: Box<[PreparedGeometryRecord]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedGeometryRecord {
+    pub target: WidgetId,
+    pub address: WidgetSlotAddress,
+    pub spacing: BoxSpacing,
+    pub target_local: TargetBoxGeometry,
+    pub parent_local: PlacementBoxGeometry,
+    pub unscrolled_root: PresentedBoxGeometry,
+    pub scroll_translation: Translation,
+    pub overlay_translation: Translation,
+    pub final_presented: PresentedBoxGeometry,
+    pub authored_overflow: Option<TargetLocalRect>,
+    pub ancestor_clip_final: Option<Rect>,
+    pub effective_clip_final: Rect,
+}
+
+impl PreparedPresentationGeometry {
+    pub fn captured_records(&self) -> Option<&[PreparedGeometryRecord]> {
+        self.capture
+            .as_ref()
+            .map(|capture| capture.records.as_ref())
+    }
+}
+
+pub const PREPARED_GEOMETRY_REQUIRED: &str =
+    concat!("view_contract.", "prepared_geometry_required");
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SizePolicy {
@@ -2984,10 +3518,25 @@ pub struct BackendParityAdmission {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
 pub struct ViewDefinitionInput {
     pub frame: FrameIdentity,
     pub layout_input: LayoutInput,
+    output: LayoutOutputBuilder,
+}
+
+impl ViewDefinitionInput {
+    pub fn new(frame: FrameIdentity, layout_input: LayoutInput) -> Self {
+        let output = LayoutOutputBuilder::for_input(&layout_input);
+        Self {
+            frame,
+            layout_input,
+            output,
+        }
+    }
+
+    pub fn into_layout_parts(self) -> (FrameIdentity, LayoutInput, LayoutOutputBuilder) {
+        (self.frame, self.layout_input, self.output)
+    }
 }
 
 /// The one total order every declared-region selector uses to pick the
@@ -3485,7 +4034,7 @@ pub enum PaintOrderMode {
     ExplicitLayered,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PaintOrderDeclaration {
     pub target: WidgetId,
     pub mode: PaintOrderMode,
@@ -3510,7 +4059,39 @@ pub struct PaintOrderDeclaration {
     pub allow_ambiguous_hits: bool,
     pub allow_overflow_paint: bool,
     pub overflow_bounds: Option<TargetLocalRect>,
+    pub overlay_anchor: Option<AddressedOverlayAnchor>,
+    pub mounted_geometry: Vec<MountedGeometryDeclaration>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+impl PartialEq for PaintOrderDeclaration {
+    fn eq(&self, other: &Self) -> bool {
+        self.target == other.target
+            && self.mode == other.mode
+            && self.z_index == other.z_index
+            && self.order == other.order
+            && self.allow_overlap == other.allow_overlap
+            && self.allow_ambiguous_hits == other.allow_ambiguous_hits
+            && self.allow_overflow_paint == other.allow_overflow_paint
+            && self.overflow_bounds == other.overflow_bounds
+            && self.overlay_anchor == other.overlay_anchor
+            && self.diagnostics == other.diagnostics
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AddressedOverlayAnchor {
+    pub address: WidgetSlotAddress,
+    pub point: Point,
+    pub delta: Translation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MountedGeometryDeclaration {
+    pub address: WidgetSlotAddress,
+    pub parent_address: Option<WidgetSlotAddress>,
+    pub authored_overflow: Option<TargetLocalRect>,
+    pub overlay_anchor: Option<AddressedOverlayAnchor>,
 }
 
 impl PaintOrderDeclaration {
@@ -3524,6 +4105,8 @@ impl PaintOrderDeclaration {
             allow_ambiguous_hits: false,
             allow_overflow_paint: false,
             overflow_bounds: None,
+            overlay_anchor: None,
+            mounted_geometry: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -3538,6 +4121,8 @@ impl PaintOrderDeclaration {
             allow_ambiguous_hits: false,
             allow_overflow_paint: false,
             overflow_bounds: None,
+            overlay_anchor: None,
+            mounted_geometry: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -3552,6 +4137,8 @@ impl PaintOrderDeclaration {
             allow_ambiguous_hits: false,
             allow_overflow_paint: false,
             overflow_bounds: None,
+            overlay_anchor: None,
+            mounted_geometry: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -3559,6 +4146,20 @@ impl PaintOrderDeclaration {
     pub fn with_overflow_bounds(mut self, bounds: TargetLocalRect) -> Self {
         self.allow_overflow_paint = true;
         self.overflow_bounds = Some(bounds);
+        self
+    }
+
+    pub fn with_overlay_anchor(
+        mut self,
+        address: WidgetSlotAddress,
+        point: Point,
+        delta: Translation,
+    ) -> Self {
+        self.overlay_anchor = Some(AddressedOverlayAnchor {
+            address,
+            point,
+            delta,
+        });
         self
     }
 }
@@ -3573,9 +4174,15 @@ pub struct ViewDefinition {
     pub hit_regions: Vec<HitRegionDeclaration>,
     pub focus_regions: Vec<FocusRegionDeclaration>,
     pub scroll_regions: Vec<ScrollRegionDeclaration>,
+    pub wheel_traversal_boundary: DeclaredWheelTraversalBoundary,
     pub semantic_slots: Vec<SemanticSlotDeclaration>,
     pub probe_metadata: Vec<ProbeMetadataDeclaration>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DeclaredWheelTraversalBoundary {
+    pub terminal_region_index: Option<usize>,
 }
 
 /// Capability-independent admission validation: checks paint order,
@@ -3592,7 +4199,33 @@ pub struct ViewDefinition {
 /// — read the diagnostic message first; it embeds the offending region
 /// id, rects, and the fixing API.
 pub fn view_definition_contract_diagnostics(view: &ViewDefinition) -> Vec<Diagnostic> {
+    let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+    view_definition_contract_diagnostics_with_index(view, &geometry_index)
+}
+
+fn view_definition_contract_diagnostics_with_index(
+    view: &ViewDefinition,
+    geometry_index: &PresentationGeometryIndex,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+
+    if let Some(index) = view.wheel_traversal_boundary.terminal_region_index {
+        let valid = view.scroll_regions.get(index).is_some_and(|region| {
+            region.enabled
+                && region.consumption.wheel
+                && (region.axes.horizontal || region.axes.vertical)
+        });
+        if !valid {
+            diagnostics.push(Diagnostic::error(
+                Some(view.target.clone()),
+                "view_contract.wheel_traversal_boundary_invalid",
+                format!(
+                    "wheel traversal terminal index {index} must name an enabled wheel-consuming scroll declaration with an enabled axis (declaration count {})",
+                    view.scroll_regions.len()
+                ),
+            ));
+        }
+    }
 
     if view.paint_order.target != view.target {
         diagnostics.push(Diagnostic::error(
@@ -3650,15 +4283,321 @@ pub fn view_definition_contract_diagnostics(view: &ViewDefinition) -> Vec<Diagno
         ));
     }
 
-    let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
-    validate_hit_regions(view, &geometry_index, &mut diagnostics);
-    validate_focus_regions(view, &geometry_index, &mut diagnostics);
-    validate_scroll_regions(view, &geometry_index, &mut diagnostics);
+    validate_hit_regions(view, geometry_index, &mut diagnostics);
+    validate_focus_regions(view, geometry_index, &mut diagnostics);
+    validate_scroll_regions(view, geometry_index, &mut diagnostics);
     validate_paint_bounds(view, &mut diagnostics);
     validate_content_overflow_scroll_coverage(view, &mut diagnostics);
     validate_view_contract_diagnostics(view, &mut diagnostics);
 
     diagnostics
+}
+
+fn mounted_address_is_ancestor(
+    ancestor: &WidgetSlotAddress,
+    descendant: &WidgetSlotAddress,
+    declarations: &[MountedGeometryDeclaration],
+) -> bool {
+    let mut current = descendant;
+    while let Some(declaration) = declarations
+        .iter()
+        .find(|declaration| declaration.address == *current)
+    {
+        let Some(parent) = declaration.parent_address.as_ref() else {
+            return false;
+        };
+        if parent == ancestor {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+fn addressed_scroll_translation(view: &ViewDefinition, address: &WidgetSlotAddress) -> Translation {
+    view.scroll_regions
+        .iter()
+        .filter(|region| {
+            region.enabled
+                && region.address.as_ref().is_some_and(|owner| {
+                    mounted_address_is_ancestor(owner, address, &view.paint_order.mounted_geometry)
+                })
+        })
+        .fold(Translation { x: 0.0, y: 0.0 }, |mut total, region| {
+            total.x -= region.offset.x;
+            total.y -= region.offset.y;
+            total
+        })
+}
+
+pub fn validate_and_index_view(
+    view: &ViewDefinition,
+) -> Result<Arc<PreparedPresentationGeometry>, Vec<Diagnostic>> {
+    validate_and_index_view_with_capture(view, GeometryCaptureIntent::None)
+}
+
+pub fn validate_and_index_view_with_capture(
+    view: &ViewDefinition,
+    capture: GeometryCaptureIntent,
+) -> Result<Arc<PreparedPresentationGeometry>, Vec<Diagnostic>> {
+    let mut geometry_diagnostics = Vec::new();
+    let root_target_rect = view.layout.bounds.into_rect();
+    let root_target =
+        derive_target_box(view.layout.bounds.size, BoxSpacing::ZERO).unwrap_or_else(|_| {
+            derive_target_box(
+                Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                BoxSpacing::ZERO,
+            )
+            .expect("zero-sized zero-spacing root is valid")
+        });
+    let root = PresentedBoxGeometry {
+        outer: root_target.border.into_rect(),
+        border: root_target.border.into_rect(),
+        content: root_target.content.into_rect(),
+        default_clip: root_target.default_clip.into_rect(),
+    };
+    let mut target_rects_by_address = HashMap::new();
+    let mut first_target_rects_by_id = HashMap::new();
+    let mut boxes_by_address = HashMap::new();
+    let mut first_border_by_id = HashMap::new();
+    let mut captured = match capture {
+        GeometryCaptureIntent::None => None,
+        GeometryCaptureIntent::RenderPacketEvidence => {
+            Some(Vec::with_capacity(view.layout.child_placements.len()))
+        }
+    };
+    for placement in &view.layout.child_placements {
+        #[cfg(test)]
+        PREPARATION_PLACEMENT_VISITS.with(|visits| visits.set(visits.get() + 1));
+        let address = placement.local_state_slot.as_ref();
+        let rect = placement.bounds.into_rect();
+        let invalid_border = [
+            ("border.x", rect.origin.x),
+            ("border.y", rect.origin.y),
+            ("border.width", rect.size.width),
+            ("border.height", rect.size.height),
+        ]
+        .into_iter()
+        .find(|(component, value)| {
+            !value.is_finite()
+                || ((*component == "border.width" || *component == "border.height") && *value < 0.0)
+        });
+        if let Some((component, value)) = invalid_border {
+            geometry_diagnostics.push(Diagnostic::error(
+                Some(placement.child.clone()),
+                "view_contract.box_border_invalid",
+                format!(
+                    "widget {} at {:?}: {} is invalid ({value})",
+                    placement.child.as_str(),
+                    address,
+                    component
+                ),
+            ));
+            continue;
+        }
+        if let Err(error) = validate_spacing(placement.spacing) {
+            let code = if error.value.is_finite() {
+                "view_contract.box_spacing_negative"
+            } else {
+                "view_contract.box_spacing_non_finite"
+            };
+            geometry_diagnostics.push(Diagnostic::error(
+                Some(placement.child.clone()),
+                code,
+                format!(
+                    "widget {} at {:?}: {} is invalid ({})",
+                    placement.child.as_str(),
+                    address,
+                    error.component,
+                    error.value
+                ),
+            ));
+            continue;
+        }
+        if address.is_none() {
+            geometry_diagnostics.push(Diagnostic::error(
+                Some(placement.child.clone()),
+                "view_contract.box_geometry_mismatch",
+                format!(
+                    "widget {} has no mounted WidgetSlotAddress",
+                    placement.child.as_str()
+                ),
+            ));
+            continue;
+        }
+
+        let address = address.expect("missing addresses continue above");
+        let declaration = view
+            .paint_order
+            .mounted_geometry
+            .iter()
+            .find(|declaration| declaration.address == *address);
+        let parent_origin = declaration
+            .and_then(|declaration| declaration.parent_address.as_ref())
+            .and_then(|parent| boxes_by_address.get(parent))
+            .map_or(root.border.origin, |geometry: &PresentedBoxGeometry| {
+                geometry.border.origin
+            });
+        let parent_border = ParentLocalRect::from_parent_local(translate_rect(
+            placement.bounds.into_rect(),
+            Point {
+                x: -parent_origin.x,
+                y: -parent_origin.y,
+            },
+        ));
+        let parent_local = derive_placement_box(parent_border, placement.spacing)
+            .expect("border and spacing were validated above");
+        let target_local = derive_target_box(placement.bounds.as_rect().size, placement.spacing)
+            .expect("border and spacing were validated above");
+        let unscrolled_root = PresentedBoxGeometry {
+            outer: translate_rect(parent_local.outer.into_rect(), parent_origin),
+            border: translate_rect(parent_local.border.into_rect(), parent_origin),
+            content: translate_rect(parent_local.content.into_rect(), parent_origin),
+            default_clip: translate_rect(parent_local.border.into_rect(), parent_origin),
+        };
+        let applicable_scrolls = view.scroll_regions.iter().filter(|region| {
+            region.enabled
+                && region.address.as_ref().is_some_and(|scroll_address| {
+                    mounted_address_is_ancestor(
+                        scroll_address,
+                        address,
+                        &view.paint_order.mounted_geometry,
+                    )
+                })
+        });
+        let mut scroll_translation = Translation { x: 0.0, y: 0.0 };
+        let mut ancestor_clip_final: Option<Rect> = None;
+        for region in applicable_scrolls {
+            let owner_origin = region
+                .address
+                .as_ref()
+                .and_then(|owner| boxes_by_address.get(owner))
+                .map(|geometry: &PresentedBoxGeometry| geometry.border.origin)
+                .unwrap_or(root.border.origin);
+            let viewport_final = translate_rect(
+                region.viewport,
+                Point {
+                    x: owner_origin.x + scroll_translation.x,
+                    y: owner_origin.y + scroll_translation.y,
+                },
+            );
+            ancestor_clip_final = Some(match ancestor_clip_final {
+                Some(clip) => rect_intersection(clip, viewport_final).unwrap_or(Rect {
+                    origin: viewport_final.origin,
+                    size: Size {
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                }),
+                None => viewport_final,
+            });
+            scroll_translation.x -= region.offset.x;
+            scroll_translation.y -= region.offset.y;
+        }
+        let overlay_translation = declaration
+            .and_then(|declaration| declaration.overlay_anchor.as_ref())
+            .and_then(|overlay| {
+                boxes_by_address.get(&overlay.address).map(|anchor| {
+                    let anchor_scroll = addressed_scroll_translation(view, &overlay.address);
+                    Translation {
+                        x: anchor.border.origin.x
+                            + anchor_scroll.x
+                            + overlay.point.x
+                            + overlay.delta.x,
+                        y: anchor.border.origin.y
+                            + anchor_scroll.y
+                            + overlay.point.y
+                            + overlay.delta.y,
+                    }
+                })
+            })
+            .unwrap_or(Translation { x: 0.0, y: 0.0 });
+        let target_translation = if declaration.is_some_and(|d| d.overlay_anchor.is_some()) {
+            Point {
+                x: overlay_translation.x,
+                y: overlay_translation.y,
+            }
+        } else {
+            Point {
+                x: unscrolled_root.border.origin.x + scroll_translation.x,
+                y: unscrolled_root.border.origin.y + scroll_translation.y,
+            }
+        };
+        let final_presented = PresentedBoxGeometry {
+            outer: translate_rect(
+                unscrolled_root.outer,
+                Point {
+                    x: target_translation.x - unscrolled_root.border.origin.x,
+                    y: target_translation.y - unscrolled_root.border.origin.y,
+                },
+            ),
+            border: translate_rect(target_local.border, target_translation),
+            content: translate_rect(target_local.content, target_translation),
+            default_clip: translate_rect(target_local.default_clip, target_translation),
+        };
+        let authored_overflow = declaration.and_then(|declaration| declaration.authored_overflow);
+        let effective_clip_final = effective_clip(
+            target_local.default_clip,
+            authored_overflow,
+            ancestor_clip_final,
+            Translation {
+                x: target_translation.x,
+                y: target_translation.y,
+            },
+        );
+
+        let rect = placement.bounds.into_rect();
+        target_rects_by_address.insert(address.clone(), rect);
+        first_target_rects_by_id
+            .entry(placement.child.clone())
+            .or_insert(rect);
+        boxes_by_address.insert(address.clone(), unscrolled_root);
+        first_border_by_id
+            .entry(placement.child.clone())
+            .or_insert(rect);
+        if let Some(records) = captured.as_mut() {
+            records.push(PreparedGeometryRecord {
+                target: placement.child.clone(),
+                address: address.clone(),
+                spacing: placement.spacing,
+                target_local,
+                parent_local,
+                unscrolled_root,
+                scroll_translation,
+                overlay_translation,
+                final_presented,
+                authored_overflow,
+                ancestor_clip_final,
+                effective_clip_final,
+            });
+        }
+    }
+    let index = PresentationGeometryIndex {
+        root_target_rect,
+        target_rects_by_address,
+        first_target_rects_by_id,
+        boxes_by_address,
+        first_border_by_id,
+        root,
+    };
+    let mut diagnostics = geometry_diagnostics;
+    diagnostics.extend(view_definition_contract_diagnostics_with_index(
+        view, &index,
+    ));
+    if view_definition_has_blocking_contract_diagnostic(&diagnostics) {
+        Err(diagnostics)
+    } else {
+        Ok(Arc::new(PreparedPresentationGeometry {
+            index,
+            capture: captured.map(|records| PreparedGeometryCapture {
+                records: records.into_boxed_slice(),
+            }),
+            diagnostics,
+        }))
+    }
 }
 
 /// The full admission pre-flight: everything
@@ -4187,11 +5126,12 @@ fn validate_wheel_dispatch_evidence(
         ));
         return;
     };
-    let (dispatch, _) = resolve_declared_wheel_dispatch_with_evidence_and_geometry_index(
+    let (dispatch, _) = resolve_declared_wheel_dispatch_with_evidence_geometry_index_and_boundary(
         evidence.source.clone(),
         evidence.frame.clone(),
         geometry_index,
         &view.scroll_regions,
+        view.wheel_traversal_boundary,
         position,
         wheel.delta_x,
         wheel.delta_y,
@@ -5443,10 +6383,29 @@ pub fn resolve_declared_wheel_dispatch(
     delta_x: f32,
     delta_y: f32,
 ) -> Option<DeclaredWheelDispatch> {
+    resolve_declared_wheel_dispatch_with_boundary(
+        layout,
+        scroll_regions,
+        DeclaredWheelTraversalBoundary::default(),
+        root_local_position,
+        delta_x,
+        delta_y,
+    )
+}
+
+pub fn resolve_declared_wheel_dispatch_with_boundary(
+    layout: &LayoutOutput,
+    scroll_regions: &[ScrollRegionDeclaration],
+    boundary: DeclaredWheelTraversalBoundary,
+    root_local_position: Point,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<DeclaredWheelDispatch> {
     let geometry_index = PresentationGeometryIndex::from_layout(layout);
-    resolve_declared_wheel_dispatch_with_geometry_index(
+    resolve_declared_wheel_dispatch_with_geometry_index_and_boundary(
         &geometry_index,
         scroll_regions,
+        boundary,
         root_local_position,
         delta_x,
         delta_y,
@@ -5460,6 +6419,51 @@ pub fn resolve_declared_wheel_dispatch_with_geometry_index(
     delta_x: f32,
     delta_y: f32,
 ) -> Option<DeclaredWheelDispatch> {
+    resolve_declared_wheel_dispatch_with_geometry_index_and_boundary(
+        geometry_index,
+        scroll_regions,
+        DeclaredWheelTraversalBoundary::default(),
+        root_local_position,
+        delta_x,
+        delta_y,
+    )
+}
+
+pub fn resolve_declared_wheel_dispatch_with_geometry_index_and_boundary(
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &[ScrollRegionDeclaration],
+    boundary: DeclaredWheelTraversalBoundary,
+    root_local_position: Point,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<DeclaredWheelDispatch> {
+    let region =
+        select_declared_wheel_consumer_at_root_local_point_with_geometry_index_and_boundary(
+            geometry_index,
+            scroll_regions,
+            boundary,
+            root_local_position,
+            delta_x,
+            delta_y,
+        )?;
+    Some(declared_wheel_dispatch_for_selected_region(
+        geometry_index,
+        scroll_regions,
+        root_local_position,
+        delta_x,
+        delta_y,
+        region,
+    ))
+}
+
+fn declared_wheel_dispatch_for_selected_region(
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &[ScrollRegionDeclaration],
+    root_local_position: Point,
+    delta_x: f32,
+    delta_y: f32,
+    region: &ScrollRegionDeclaration,
+) -> DeclaredWheelDispatch {
     let candidate_regions = scroll_regions
         .iter()
         .filter(|region| region.enabled)
@@ -5474,14 +6478,7 @@ pub fn resolve_declared_wheel_dispatch_with_geometry_index(
         })
         .map(|region| region.id.clone())
         .collect::<Vec<_>>();
-    let region = select_declared_wheel_consumer_at_root_local_point_with_geometry_index(
-        geometry_index,
-        scroll_regions,
-        root_local_position,
-        delta_x,
-        delta_y,
-    )?;
-    Some(DeclaredWheelDispatch {
+    DeclaredWheelDispatch {
         selected_region: region.id.clone(),
         candidate_regions,
         input: InputEvent::Wheel(WheelEvent {
@@ -5493,7 +6490,7 @@ pub fn resolve_declared_wheel_dispatch_with_geometry_index(
         }),
         route: region_event_route(&region.id, &region.target, &region.address),
         capture_event: region.consumption.wheel,
-    })
+    }
 }
 
 /// Selects the scroll region that consumes a wheel at `root_local_position`
@@ -5541,20 +6538,89 @@ pub fn select_declared_wheel_consumer_at_root_local_point_with_geometry_index<'a
     delta_x: f32,
     delta_y: f32,
 ) -> Option<&'a ScrollRegionDeclaration> {
-    let eligible = scroll_regions
-        .iter()
-        .filter(|region| {
-            scroll_region_can_consume_wheel_delta(region, delta_x, delta_y) == Some(true)
-                && declared_region_contains_root_local_point_with_geometry_index(
-                    geometry_index,
-                    &region.target,
-                    region.address.as_ref(),
-                    region.viewport.into_rect(),
-                    root_local_position,
-                )
-        })
-        .collect::<Vec<_>>();
-    route_declared_wheel_winner_with_geometry_index(geometry_index, &eligible)
+    select_declared_wheel_consumer_at_root_local_point_with_geometry_index_and_boundary(
+        geometry_index,
+        scroll_regions,
+        DeclaredWheelTraversalBoundary::default(),
+        root_local_position,
+        delta_x,
+        delta_y,
+    )
+}
+
+pub fn select_declared_wheel_consumer_at_root_local_point_with_geometry_index_and_boundary<'a>(
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &'a [ScrollRegionDeclaration],
+    boundary: DeclaredWheelTraversalBoundary,
+    root_local_position: Point,
+    delta_x: f32,
+    delta_y: f32,
+) -> Option<&'a ScrollRegionDeclaration> {
+    match declared_wheel_disposition_at_root_local_point_with_geometry_index(
+        geometry_index,
+        scroll_regions,
+        boundary,
+        root_local_position,
+        delta_x,
+        delta_y,
+    ) {
+        DeclaredWheelDisposition::Moved(owner) => Some(owner),
+        DeclaredWheelDisposition::ConsumedNoOp(_) | DeclaredWheelDisposition::Bubble => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DeclaredWheelDisposition<'a> {
+    Moved(&'a ScrollRegionDeclaration),
+    ConsumedNoOp(&'a ScrollRegionDeclaration),
+    Bubble,
+}
+
+/// Resolves movement normally, while allowing only an address-less declared
+/// root to absorb an outward wheel at its limit. The terminal check reuses the
+/// same declaration slice and creates no candidate collection.
+pub fn declared_wheel_disposition_at_root_local_point_with_geometry_index<'a>(
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &'a [ScrollRegionDeclaration],
+    boundary: DeclaredWheelTraversalBoundary,
+    root_local_position: Point,
+    delta_x: f32,
+    delta_y: f32,
+) -> DeclaredWheelDisposition<'a> {
+    let mut eligible = Vec::new();
+    let mut terminal_root = None;
+    for (index, region) in scroll_regions.iter().enumerate() {
+        let contains = declared_region_contains_root_local_point_with_geometry_index(
+            geometry_index,
+            &region.target,
+            region.address.as_ref(),
+            region.viewport.into_rect(),
+            root_local_position,
+        );
+        if !contains {
+            continue;
+        }
+        if scroll_region_can_consume_wheel_delta(region, delta_x, delta_y) == Some(true) {
+            eligible.push(region);
+        } else if boundary.terminal_region_index == Some(index)
+            && region.enabled
+            && region.consumption.wheel
+            && ((region.axes.horizontal && delta_x.abs() > f32::EPSILON)
+                || (region.axes.vertical && delta_y.abs() > f32::EPSILON))
+            && terminal_root.is_none_or(|current: &ScrollRegionDeclaration| {
+                compare_hit_region_order(&region.order, &current.order).is_gt()
+            })
+        {
+            terminal_root = Some(region);
+        }
+    }
+    if let Some(owner) = route_declared_wheel_winner_with_geometry_index(geometry_index, &eligible)
+    {
+        return DeclaredWheelDisposition::Moved(owner);
+    }
+    terminal_root.map_or(DeclaredWheelDisposition::Bubble, |root| {
+        DeclaredWheelDisposition::ConsumedNoOp(root)
+    })
 }
 
 /// Applies the declared wheel-routing precedence over an already-filtered
@@ -5629,12 +6695,35 @@ pub fn resolve_declared_wheel_dispatch_with_evidence(
     delta_x: f32,
     delta_y: f32,
 ) -> (Option<DeclaredWheelDispatch>, DeclaredEventDispatchEvidence) {
+    resolve_declared_wheel_dispatch_with_evidence_and_boundary(
+        source,
+        frame,
+        layout,
+        scroll_regions,
+        DeclaredWheelTraversalBoundary::default(),
+        root_local_position,
+        delta_x,
+        delta_y,
+    )
+}
+
+pub fn resolve_declared_wheel_dispatch_with_evidence_and_boundary(
+    source: EvidenceSource,
+    frame: FrameIdentity,
+    layout: &LayoutOutput,
+    scroll_regions: &[ScrollRegionDeclaration],
+    boundary: DeclaredWheelTraversalBoundary,
+    root_local_position: Point,
+    delta_x: f32,
+    delta_y: f32,
+) -> (Option<DeclaredWheelDispatch>, DeclaredEventDispatchEvidence) {
     let geometry_index = PresentationGeometryIndex::from_layout(layout);
-    resolve_declared_wheel_dispatch_with_evidence_and_geometry_index(
+    resolve_declared_wheel_dispatch_with_evidence_geometry_index_and_boundary(
         source,
         frame,
         &geometry_index,
         scroll_regions,
+        boundary,
         root_local_position,
         delta_x,
         delta_y,
@@ -5650,13 +6739,99 @@ pub fn resolve_declared_wheel_dispatch_with_evidence_and_geometry_index(
     delta_x: f32,
     delta_y: f32,
 ) -> (Option<DeclaredWheelDispatch>, DeclaredEventDispatchEvidence) {
-    let dispatch = resolve_declared_wheel_dispatch_with_geometry_index(
+    resolve_declared_wheel_dispatch_with_evidence_geometry_index_and_boundary(
+        source,
+        frame,
+        geometry_index,
+        scroll_regions,
+        DeclaredWheelTraversalBoundary::default(),
+        root_local_position,
+        delta_x,
+        delta_y,
+    )
+}
+
+pub fn resolve_declared_wheel_dispatch_with_evidence_geometry_index_and_boundary(
+    source: EvidenceSource,
+    frame: FrameIdentity,
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &[ScrollRegionDeclaration],
+    boundary: DeclaredWheelTraversalBoundary,
+    root_local_position: Point,
+    delta_x: f32,
+    delta_y: f32,
+) -> (Option<DeclaredWheelDispatch>, DeclaredEventDispatchEvidence) {
+    let dispatch = resolve_declared_wheel_dispatch_with_geometry_index_and_boundary(
+        geometry_index,
+        scroll_regions,
+        boundary,
+        root_local_position,
+        delta_x,
+        delta_y,
+    );
+    declared_wheel_dispatch_evidence(
+        source,
+        frame,
+        geometry_index,
+        scroll_regions,
+        root_local_position,
+        dispatch,
+    )
+}
+
+pub fn resolve_selected_declared_wheel_dispatch_with_evidence_and_geometry_index(
+    source: EvidenceSource,
+    frame: FrameIdentity,
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &[ScrollRegionDeclaration],
+    root_local_position: Point,
+    delta_x: f32,
+    delta_y: f32,
+    selected: &ScrollRegionDeclaration,
+) -> (Option<DeclaredWheelDispatch>, DeclaredEventDispatchEvidence) {
+    let dispatch = Some(declared_wheel_dispatch_for_selected_region(
         geometry_index,
         scroll_regions,
         root_local_position,
         delta_x,
         delta_y,
-    );
+        selected,
+    ));
+    declared_wheel_dispatch_evidence(
+        source,
+        frame,
+        geometry_index,
+        scroll_regions,
+        root_local_position,
+        dispatch,
+    )
+}
+
+pub fn resolve_bubbled_declared_wheel_dispatch_with_evidence_and_geometry_index(
+    source: EvidenceSource,
+    frame: FrameIdentity,
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &[ScrollRegionDeclaration],
+    root_local_position: Point,
+) -> (Option<DeclaredWheelDispatch>, DeclaredEventDispatchEvidence) {
+    declared_wheel_dispatch_evidence(
+        source,
+        frame,
+        geometry_index,
+        scroll_regions,
+        root_local_position,
+        None,
+    )
+}
+
+fn declared_wheel_dispatch_evidence(
+    source: EvidenceSource,
+    frame: FrameIdentity,
+    geometry_index: &PresentationGeometryIndex,
+    scroll_regions: &[ScrollRegionDeclaration],
+    root_local_position: Point,
+    dispatch: Option<DeclaredWheelDispatch>,
+) -> (Option<DeclaredWheelDispatch>, DeclaredEventDispatchEvidence) {
     let candidate_regions = dispatch.as_ref().map_or_else(
         || {
             scroll_regions
@@ -5957,6 +7132,7 @@ impl<ExternalState, AppMessage> SlipwayWidgetListVisitor<ExternalState, AppMessa
         };
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(child_bounds),
+            content: TargetLocalRect::new(child_bounds),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -5970,10 +7146,7 @@ impl<ExternalState, AppMessage> SlipwayWidgetListVisitor<ExternalState, AppMessa
         let child_view = widget.visible_backend_view_definition(
             external,
             local,
-            ViewDefinitionInput {
-                frame,
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame, layout_input),
         );
         let units = expand_paint_unit_layers(PaintUnit::from_view_ref(&child_view, slot.ordinal));
         for unit in &units {
@@ -7486,6 +8659,7 @@ pub struct RenderPacket {
     pub paint: Vec<PaintOp>,
     pub surfaces: Vec<RenderSurfaceDeclaration>,
     pub diagnostics: Vec<Diagnostic>,
+    pub prepared_geometry: Option<Arc<PreparedPresentationGeometry>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -9356,6 +10530,7 @@ pub trait SlipwayView: SlipwayWidgetTypes {
         external: &Self::ExternalState,
         local: &Self::LocalState,
         input: LayoutInput,
+        output: LayoutOutputBuilder,
     ) -> LayoutOutput;
 
     fn paint(
@@ -9370,6 +10545,46 @@ pub trait SlipwayView: SlipwayWidgetTypes {
         external: &Self::ExternalState,
         local: &Self::LocalState,
     ) -> Vec<StateObservation>;
+}
+
+pub fn layout_view<W: SlipwayView>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    input: LayoutInput,
+) -> LayoutOutput {
+    let output = LayoutOutputBuilder::for_input(&input);
+    widget.layout(external, local, input, output)
+}
+
+pub fn layout_view_definition<W: SlipwayView>(
+    widget: &W,
+    external: &W::ExternalState,
+    local: &W::LocalState,
+    input: ViewDefinitionInput,
+) -> (FrameIdentity, LayoutOutput) {
+    let (frame, layout_input, output) = input.into_layout_parts();
+    let layout = widget.layout(external, local, layout_input, output);
+    (frame, layout)
+}
+
+pub fn prepare_leaf_layout(output: LayoutOutputBuilder, bounds: TargetLocalRect) -> LayoutOutput {
+    output.finish(bounds)
+}
+
+pub fn prepare_resolved_layout(
+    mut output: LayoutOutputBuilder,
+    bounds: TargetLocalRect,
+    resolved: impl IntoIterator<Item = (ChildLayoutPlan, ChildLayoutResult)>,
+) -> Result<LayoutOutput, BoxGeometryDiagnostic> {
+    for (plan, result) in resolved {
+        output.push_resolved(plan, result)?;
+    }
+    Ok(output.finish(bounds))
+}
+
+fn prepare_child_paint_layout(input: &LayoutInput, bounds: TargetLocalRect) -> LayoutOutput {
+    prepare_leaf_layout(LayoutOutputBuilder::for_input(input), bounds)
 }
 
 /// The composite every authored widget must satisfy: shorthand for
@@ -9856,6 +11071,7 @@ where
     let viewport = layout.bounds;
     let policy_input = LayoutInput {
         viewport,
+        content: viewport,
         constraints: LayoutConstraints {
             min: Size {
                 width: 0.0,
@@ -10324,8 +11540,8 @@ macro_rules! reserved_policy_defaults {
             ) -> $crate::LayoutEvidence {
                 $crate::LayoutEvidence {
                     target: <Self as $crate::SlipwaySsot>::id(self),
-                    bounds: output.bounds,
-                    child_placements: output.child_placements.clone(),
+                    bounds: *output.bounds(),
+                    child_placements: output.child_placements().to_vec(),
                     invalidated: false,
                     diagnostics: ::std::vec::Vec::new(),
                 }
@@ -10735,7 +11951,7 @@ pub trait SlipwayWidgetList {
         external: &Self::ExternalState,
         local: &Self::LocalState,
         parent_slot: &WidgetSlotAddress,
-        requests: &[ChildLayoutRequest],
+        plans: &[ChildLayoutPlan],
     ) -> Vec<ChildLayoutResult>;
 
     fn route_event(
@@ -10909,7 +12125,8 @@ pub trait SlipwayApp {
         &self,
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
-        _input: &ViewDefinitionInput,
+        _frame: &FrameIdentity,
+        _input: &LayoutInput,
         _layout: &LayoutOutput,
     ) -> Vec<ScrollRegionDeclaration> {
         Vec::new()
@@ -10980,7 +12197,14 @@ pub trait SlipwayApp {
             bounds: input.viewport,
             children: children
                 .into_iter()
-                .map(|seed| ChildLayoutPlan::requested_for_seed(seed, input.clone()))
+                .map(|seed| {
+                    ChildLayoutPlan::requested_outer(
+                        seed,
+                        ContentLocalRect::new(input.viewport.into_rect()),
+                        input.constraints,
+                        BoxSpacing::ZERO,
+                    )
+                })
                 .collect(),
             diagnostics: Vec::new(),
         }
@@ -10991,13 +12215,9 @@ pub trait SlipwayApp {
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
         input: LayoutInput,
-        children: Vec<ChildPlacement>,
+        output: LayoutOutputBuilder,
     ) -> LayoutOutput {
-        LayoutOutput {
-            bounds: input.viewport,
-            child_placements: children,
-            diagnostics: Vec::new(),
-        }
+        output.finish(input.viewport)
     }
 
     fn paint(
@@ -11239,60 +12459,46 @@ impl<A: SlipwayApp> SlipwayView for SlipwayAppWidget<A> {
         external: &Self::ExternalState,
         local: &Self::LocalState,
         input: LayoutInput,
+        mut output: LayoutOutputBuilder,
     ) -> LayoutOutput {
         let root_slot = WidgetSlotAddress::new(self.app.id(), 0);
         let seeds = self.app.widgets().child_layout_seeds(&root_slot);
         let plan = self
             .app
             .layout_plan(external, &local.app, input.clone(), seeds);
-        let requests: Vec<ChildLayoutRequest> = plan
-            .children
-            .iter()
-            .map(|child| child.request.clone())
-            .collect();
-        let child_results =
-            self.app
-                .widgets()
-                .layout_children(external, &local.widgets, &root_slot, &requests);
-        let mut diagnostics = plan.diagnostics.clone();
-        let mut placements = Vec::new();
+        let planned_bounds = plan.bounds;
+        let mut child_results = self.app.widgets().layout_children(
+            external,
+            &local.widgets,
+            &root_slot,
+            &plan.children,
+        );
+        output.extend_diagnostics(plan.diagnostics);
+        output.reserve(plan.children.len());
 
-        for child_plan in &plan.children {
-            if !rect_origin_is_zero(child_plan.request.input.viewport) {
-                diagnostics.push(Diagnostic::error(
-                    Some(child_plan.request.child.clone()),
-                    "view_contract.child_input_viewport_not_target_local",
-                    "Child layout input viewport origin must be 0,0; place children with ChildPlacement bounds and keep child layout target-local",
-                ));
-            }
-
-            if let Some(result) = child_results
+        for child_plan in plan.children {
+            if let Some(result_index) = child_results
                 .iter()
-                .find(|result| child_layout_result_matches_plan(result, child_plan))
+                .position(|result| child_layout_result_matches_plan(result, &child_plan))
             {
-                diagnostics.extend(result.layout.diagnostics.clone());
-                placements.push(ChildPlacement {
-                    child: child_plan.request.child.clone(),
-                    bounds: child_plan
-                        .placement
-                        .unwrap_or_else(|| ParentLocalRect::new(result.layout.bounds.into_rect())),
-                    local_state_slot: result.local_state_slot.clone(),
-                });
+                let result = child_results.remove(result_index);
+                output
+                    .push_resolved(child_plan, result)
+                    .expect("validated child geometry resolves after execution");
             } else {
-                diagnostics.push(Diagnostic {
+                output.extend_diagnostics([Diagnostic {
                     target: Some(child_plan.request.child.clone()),
                     severity: DiagnosticSeverity::Warning,
                     code: "missing-child-layout".to_string(),
                     message: "app layout plan requested a child that is not in the widget list"
                         .to_string(),
-                });
+                }]);
             }
         }
 
-        let mut output = self.app.layout(external, &local.app, input, placements);
-        output.diagnostics.splice(0..0, diagnostics);
-        output.bounds = plan.bounds;
-        output
+        let mut finish_input = input;
+        finish_input.viewport = planned_bounds;
+        self.app.layout(external, &local.app, finish_input, output)
     }
 
     fn paint(
@@ -11351,14 +12557,15 @@ impl<A: SlipwayApp> SlipwayViewDefinition for SlipwayAppWidget<A> {
         local: &Self::LocalState,
         input: ViewDefinitionInput,
     ) -> ViewDefinition {
-        let mut layout = self.layout(external, local, input.layout_input.clone());
+        let (frame, layout_input, output) = input.into_layout_parts();
+        let mut layout = self.layout(external, local, layout_input.clone(), output);
         let root_paint = self.app.paint(external, &local.app, &layout);
         let root_slot = WidgetSlotAddress::new(self.app.id(), 0);
         let child_views = self.app.widgets().child_view_definitions(
             external,
             &local.widgets,
             &root_slot,
-            &input.frame,
+            &frame,
             &layout,
         );
 
@@ -11369,6 +12576,7 @@ impl<A: SlipwayApp> SlipwayViewDefinition for SlipwayAppWidget<A> {
         let mut probe_metadata = Vec::new();
         let mut diagnostics = layout.diagnostics.clone();
         let mut child_overflow_bounds: Option<Rect> = None;
+        let mut paint_order_mounts = Vec::new();
 
         for child in child_views {
             // A child that declared overflow bounds (the roaming-overlay
@@ -11396,6 +12604,7 @@ impl<A: SlipwayApp> SlipwayViewDefinition for SlipwayAppWidget<A> {
                     });
                 }
             }
+            paint_order_mounts.extend(child.paint_order.mounted_geometry.iter().cloned());
             hit_regions.extend(child.hit_regions);
             focus_regions.extend(child.focus_regions);
             scroll_regions.extend(child.scroll_regions);
@@ -11409,6 +12618,7 @@ impl<A: SlipwayApp> SlipwayViewDefinition for SlipwayAppWidget<A> {
         }
 
         let mut paint_order = PaintOrderDeclaration::source_order(self.id());
+        paint_order.mounted_geometry = paint_order_mounts;
         if let Some(overflow) = child_overflow_bounds {
             // The composed allowance must still contain the root's own
             // layout (paint validation checks EVERY op against the overflow
@@ -11422,20 +12632,24 @@ impl<A: SlipwayApp> SlipwayViewDefinition for SlipwayAppWidget<A> {
         // AFTER the child regions so the app can see the final composed
         // layout; the empty default keeps the composed view byte-identical
         // for apps that do not override the hook.
-        scroll_regions.extend(
+        let app_scroll_regions =
             self.app
-                .app_scroll_regions(external, &local.app, &input, &layout),
-        );
+                .app_scroll_regions(external, &local.app, &frame, &layout_input, &layout);
+        let wheel_traversal_boundary = DeclaredWheelTraversalBoundary {
+            terminal_region_index: (!app_scroll_regions.is_empty()).then_some(scroll_regions.len()),
+        };
+        scroll_regions.extend(app_scroll_regions);
 
         ViewDefinition {
             target: self.id(),
-            frame: input.frame,
+            frame,
             layout,
             paint: root_paint,
             paint_order,
             hit_regions,
             focus_regions,
             scroll_regions,
+            wheel_traversal_boundary,
             semantic_slots,
             probe_metadata,
             diagnostics,
@@ -11491,7 +12705,7 @@ impl SlipwayWidgetList for () {
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
         _parent_slot: &WidgetSlotAddress,
-        _requests: &[ChildLayoutRequest],
+        _plans: &[ChildLayoutPlan],
     ) -> Vec<ChildLayoutResult> {
         Vec::new()
     }
@@ -11626,23 +12840,40 @@ macro_rules! impl_widget_list_tuple {
                 external: &Self::ExternalState,
                 local: &Self::LocalState,
                 parent_slot: &WidgetSlotAddress,
-                requests: &[ChildLayoutRequest],
+                plans: &[ChildLayoutPlan],
             ) -> Vec<ChildLayoutResult> {
                 let mut results = Vec::new();
-                for request in requests {
+                for plan in plans {
+                    let request = &plan.request;
                     $(
                         let child = self.$index.id();
                         let child_slot = parent_slot.child(child.clone(), $index);
                         if child_layout_request_matches_slot(request, &child, &child_slot) {
-                            let child_layout = self.$index.layout(
-                                external,
-                                &local.$index,
-                                request.input.clone(),
-                            );
+                            let prepared = prepare_child_layout(plan);
+                            let mut child_layout = prepared.as_ref().map(|prepared| {
+                                let output = LayoutOutputBuilder::for_input(&prepared.input);
+                                self.$index.layout(
+                                    external,
+                                    &local.$index,
+                                    prepared.input.clone(),
+                                    output,
+                                )
+                            }).unwrap_or_else(|_| {
+                                let input = LayoutInput {
+                                    viewport: TargetLocalRect::new(Rect { origin: Point { x: 0.0, y: 0.0 }, size: Size { width: 0.0, height: 0.0 } }),
+                                    content: TargetLocalRect::new(Rect { origin: Point { x: 0.0, y: 0.0 }, size: Size { width: 0.0, height: 0.0 } }),
+                                    constraints: LayoutConstraints { min: Size { width: 0.0, height: 0.0 }, max: Size { width: 0.0, height: 0.0 } },
+                                };
+                                LayoutOutputBuilder::for_input(&input).finish(input.viewport)
+                            });
+                            let diagnostics = child_layout.take_diagnostics();
                             results.push(ChildLayoutResult {
-                                request: request.clone(),
+                                seed: ChildLayoutSeed {
+                                    child: child.clone(),
+                                    local_state_slot: Some(child_slot),
+                                },
                                 layout: child_layout,
-                                local_state_slot: Some(child_slot),
+                                diagnostics,
                             });
                             continue;
                         }
@@ -11718,17 +12949,14 @@ macro_rules! impl_widget_list_tuple {
                     if let Some(placement) = layout.child_placements.iter().find(|placement| {
                         child_placement_matches_slot(placement, &child, &child_slot)
                     }) {
-                        let child_layout = LayoutOutput {
-                            bounds: TargetLocalRect::new(Rect {
+                        let child_input = child_view_definition_input(placement.bounds);
+                        let child_layout = prepare_child_paint_layout(&child_input, TargetLocalRect::new(Rect {
                                 origin: Point { x: 0.0, y: 0.0 },
-                                size: placement.bounds.size,
-                            }),
-                            child_placements: Vec::new(),
-                            diagnostics: Vec::new(),
-                        };
+                                size: placement.bounds.as_rect().size,
+                            }));
                         ops.extend(mount_child_paint_ops(
                             self.$index.paint(external, &local.$index, &child_layout),
-                            placement.bounds,
+                            placement.bounds.into_rect(),
                         ));
                     }
                 )+
@@ -11750,27 +12978,21 @@ macro_rules! impl_widget_list_tuple {
                     if let Some(placement) = layout.child_placements.iter().find(|placement| {
                         child_placement_matches_slot(placement, &child, &child_slot)
                     }) {
-                        let child_layout = LayoutOutput {
-                            bounds: TargetLocalRect::new(Rect {
+                        let child_input = child_view_definition_input(placement.bounds);
+                        let child_layout = prepare_child_paint_layout(&child_input, TargetLocalRect::new(Rect {
                                 origin: Point { x: 0.0, y: 0.0 },
-                                size: placement.bounds.size,
-                            }),
-                            child_placements: Vec::new(),
-                            diagnostics: Vec::new(),
-                        };
+                                size: placement.bounds.as_rect().size,
+                            }));
                         let view = self.$index.view_definition(
                             external,
                             &local.$index,
-                            ViewDefinitionInput {
-                                frame: frame.clone(),
-                                layout_input: child_view_definition_input(placement.bounds),
-                            },
+                            ViewDefinitionInput::new(frame.clone(), child_view_definition_input(placement.bounds)),
                         );
                         let mut unit = PaintUnit::from_view(view, $index + 1);
                         unit.address = placement.local_state_slot.clone().or(Some(child_slot));
                         unit.paint = mount_child_paint_ops(
                             self.$index.paint(external, &local.$index, &child_layout),
-                            placement.bounds,
+                            placement.bounds.into_rect(),
                         );
                         units.push(unit);
                     }
@@ -11821,13 +13043,11 @@ macro_rules! impl_widget_list_tuple {
                         let view = self.$index.view_definition(
                             external,
                             &local.$index,
-                            ViewDefinitionInput {
-                                frame: frame.clone(),
-                                layout_input: child_view_definition_input(placement.bounds),
-                            },
+                            ViewDefinitionInput::new(frame.clone(), child_view_definition_input(placement.bounds)),
                         );
                         views.push(mount_child_view_definition(
                             view,
+                            parent_slot,
                             placement.local_state_slot.as_ref(),
                             placement.bounds,
                         ));
@@ -11882,9 +13102,9 @@ fn child_layout_request_matches_slot(
 
 fn child_layout_result_matches_plan(result: &ChildLayoutResult, plan: &ChildLayoutPlan) -> bool {
     if let Some(plan_slot) = &plan.request.local_state_slot {
-        result.request.local_state_slot.as_ref() == Some(plan_slot)
+        result.seed.local_state_slot.as_ref() == Some(plan_slot)
     } else {
-        result.request.child == plan.request.child
+        result.seed.child == plan.request.child
     }
 }
 
@@ -11901,17 +13121,22 @@ fn child_placement_matches_slot(
 }
 
 fn child_view_definition_input(bounds: ParentLocalRect) -> LayoutInput {
+    let size = bounds.as_rect().size;
     LayoutInput {
         viewport: TargetLocalRect::new(Rect {
             origin: Point { x: 0.0, y: 0.0 },
-            size: bounds.size,
+            size,
+        }),
+        content: TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size,
         }),
         constraints: LayoutConstraints {
             min: Size {
                 width: 0.0,
                 height: 0.0,
             },
-            max: bounds.size,
+            max: size,
         },
     }
 }
@@ -11934,9 +13159,35 @@ fn bounding_union_rect(a: Rect, b: Rect) -> Rect {
 
 fn mount_child_view_definition(
     mut view: ViewDefinition,
+    parent_slot: &WidgetSlotAddress,
     slot: Option<&WidgetSlotAddress>,
     placement: ParentLocalRect,
 ) -> ViewDefinition {
+    if let Some(slot) = slot {
+        for declaration in &mut view.paint_order.mounted_geometry {
+            declaration.address = mount_widget_slot_address(declaration.address.clone(), slot);
+            if let Some(parent) = declaration.parent_address.take() {
+                declaration.parent_address = Some(mount_widget_slot_address(parent, slot));
+            }
+            if let Some(anchor) = &mut declaration.overlay_anchor {
+                anchor.address = mount_widget_slot_address(anchor.address.clone(), slot);
+            }
+        }
+        if let Some(anchor) = &mut view.paint_order.overlay_anchor {
+            anchor.address = mount_widget_slot_address(anchor.address.clone(), parent_slot);
+        }
+        view.paint_order.mounted_geometry.insert(
+            0,
+            MountedGeometryDeclaration {
+                address: slot.clone(),
+                parent_address: Some(parent_slot.clone()),
+                authored_overflow: (view.paint_order.allow_overflow_paint)
+                    .then_some(view.paint_order.overflow_bounds)
+                    .flatten(),
+                overlay_anchor: view.paint_order.overlay_anchor.clone(),
+            },
+        );
+    }
     mount_child_view_definition_geometry(&mut view, placement);
 
     if let Some(slot) = slot {
@@ -11968,7 +13219,7 @@ fn mount_child_view_definition(
 }
 
 fn mount_child_view_definition_geometry(view: &mut ViewDefinition, placement: ParentLocalRect) {
-    let offset = placement.origin;
+    let offset = placement.as_rect().origin;
 
     view.layout = translate_layout_output(view.layout.clone(), offset);
     view.paint = view
@@ -11981,7 +13232,10 @@ fn mount_child_view_definition_geometry(view: &mut ViewDefinition, placement: Pa
 fn translate_layout_output(mut layout: LayoutOutput, offset: Point) -> LayoutOutput {
     layout.bounds = TargetLocalRect::new(translate_rect(layout.bounds, offset));
     for placement in &mut layout.child_placements {
-        placement.bounds = ParentLocalRect::new(translate_rect(placement.bounds, offset));
+        placement.bounds = ParentLocalRect::from_parent_local(translate_rect(
+            placement.bounds.into_rect(),
+            offset,
+        ));
     }
     layout
 }
@@ -12632,12 +13886,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -12670,7 +13921,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             let address = Some(WidgetSlotAddress::new(self.id.clone(), 0));
             let scroll_content = Rect {
                 origin: Point { x: 0.0, y: 0.0 },
@@ -12752,6 +14003,7 @@ mod tests {
                     enabled: true,
                     diagnostics: Vec::new(),
                 }],
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: vec![SemanticSlotDeclaration {
                     target: self.id.clone(),
                     node: SemanticNode {
@@ -12855,7 +14107,7 @@ mod tests {
             }),
             child_placements: vec![ChildPlacement {
                 child: child.clone(),
-                bounds: ParentLocalRect::new(Rect {
+                bounds: ParentLocalRect::from_parent_local(Rect {
                     origin: Point { x: 20.0, y: 10.0 },
                     size: Size {
                         width: 50.0,
@@ -12863,6 +14115,7 @@ mod tests {
                     },
                 }),
                 local_state_slot: Some(child_slot.clone()),
+                spacing: BoxSpacing::ZERO,
             }],
             diagnostics: Vec::new(),
         };
@@ -12950,7 +14203,7 @@ mod tests {
             child_placements: vec![
                 ChildPlacement {
                     child: child.clone(),
-                    bounds: ParentLocalRect::new(Rect {
+                    bounds: ParentLocalRect::from_parent_local(Rect {
                         origin: Point { x: 10.0, y: 5.0 },
                         size: Size {
                             width: 40.0,
@@ -12958,10 +14211,11 @@ mod tests {
                         },
                     }),
                     local_state_slot: Some(first_slot),
+                    spacing: BoxSpacing::ZERO,
                 },
                 ChildPlacement {
                     child: child.clone(),
-                    bounds: ParentLocalRect::new(Rect {
+                    bounds: ParentLocalRect::from_parent_local(Rect {
                         origin: Point { x: 80.0, y: 45.0 },
                         size: Size {
                             width: 70.0,
@@ -12969,6 +14223,7 @@ mod tests {
                         },
                     }),
                     local_state_slot: Some(second_slot.clone()),
+                    spacing: BoxSpacing::ZERO,
                 },
             ],
             diagnostics: Vec::new(),
@@ -13038,7 +14293,7 @@ mod tests {
             child_placements: vec![
                 ChildPlacement {
                     child: child.clone(),
-                    bounds: ParentLocalRect::new(Rect {
+                    bounds: ParentLocalRect::from_parent_local(Rect {
                         origin: Point { x: 12.0, y: 6.0 },
                         size: Size {
                             width: 40.0,
@@ -13046,10 +14301,11 @@ mod tests {
                         },
                     }),
                     local_state_slot: Some(first_slot),
+                    spacing: BoxSpacing::ZERO,
                 },
                 ChildPlacement {
                     child: child.clone(),
-                    bounds: ParentLocalRect::new(Rect {
+                    bounds: ParentLocalRect::from_parent_local(Rect {
                         origin: Point { x: 120.0, y: 70.0 },
                         size: Size {
                             width: 80.0,
@@ -13057,6 +14313,7 @@ mod tests {
                         },
                     }),
                     local_state_slot: Some(second_slot.clone()),
+                    spacing: BoxSpacing::ZERO,
                 },
             ],
             diagnostics: Vec::new(),
@@ -13098,7 +14355,7 @@ mod tests {
             }),
             child_placements: vec![ChildPlacement {
                 child: child.clone(),
-                bounds: ParentLocalRect::new(Rect {
+                bounds: ParentLocalRect::from_parent_local(Rect {
                     origin: Point { x: 60.0, y: 40.0 },
                     size: Size {
                         width: 90.0,
@@ -13106,6 +14363,7 @@ mod tests {
                     },
                 }),
                 local_state_slot: Some(slot.clone()),
+                spacing: BoxSpacing::ZERO,
             }],
             diagnostics: Vec::new(),
         };
@@ -13452,6 +14710,235 @@ mod tests {
     }
 
     #[test]
+    fn mounted_terminal_boundary_uses_index_not_address() {
+        let layout = routed_wheel_test_layout();
+        let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+        let mut outer = routed_wheel_test_scroll_region(
+            "outer",
+            routed_wheel_outer_viewport(),
+            400.0,
+            200.0,
+            -1,
+            WheelRouting::NearestScrollable,
+        );
+        let mut inner = routed_wheel_test_scroll_region(
+            "inner",
+            routed_wheel_inner_viewport(),
+            300.0,
+            200.0,
+            1,
+            WheelRouting::NearestScrollable,
+        );
+        inner.address = Some(WidgetSlotAddress::new(inner.target.clone(), 0));
+        let point = Point { x: 50.0, y: 50.0 };
+        outer.address = Some(WidgetSlotAddress::new(outer.target.clone(), 0));
+
+        outer.offset.y = 0.0;
+        let regions = [outer.clone(), inner.clone()];
+        assert!(matches!(
+            declared_wheel_disposition_at_root_local_point_with_geometry_index(
+                &geometry_index,
+                &regions,
+                DeclaredWheelTraversalBoundary { terminal_region_index: Some(0) },
+                point,
+                0.0,
+                -48.0,
+            ),
+            DeclaredWheelDisposition::Moved(region) if region.id == outer.id
+        ));
+
+        outer.offset.y = 200.0;
+        let regions = [outer.clone(), inner];
+        assert!(matches!(
+            declared_wheel_disposition_at_root_local_point_with_geometry_index(
+                &geometry_index,
+                &regions,
+                DeclaredWheelTraversalBoundary { terminal_region_index: Some(0) },
+                point,
+                0.0,
+                -48.0,
+            ),
+            DeclaredWheelDisposition::ConsumedNoOp(region) if region.id == outer.id
+        ));
+        assert_eq!(
+            declared_wheel_disposition_at_root_local_point_with_geometry_index(
+                &geometry_index,
+                &regions,
+                DeclaredWheelTraversalBoundary {
+                    terminal_region_index: Some(0)
+                },
+                Point { x: 500.0, y: 500.0 },
+                0.0,
+                -48.0,
+            ),
+            DeclaredWheelDisposition::Bubble
+        );
+
+        let nested_only = regions[1].clone();
+        assert_eq!(
+            declared_wheel_disposition_at_root_local_point_with_geometry_index(
+                &geometry_index,
+                &[nested_only],
+                DeclaredWheelTraversalBoundary::default(),
+                point,
+                0.0,
+                -48.0,
+            ),
+            DeclaredWheelDisposition::Bubble,
+            "an address-bearing nested declaration is never a terminal root"
+        );
+    }
+
+    #[test]
+    fn terminal_boundary_diagonal_preserves_movable_axis() {
+        let layout = routed_wheel_test_layout();
+        let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+        let mut root = routed_wheel_test_scroll_region(
+            "root",
+            routed_wheel_outer_viewport(),
+            300.0,
+            0.0,
+            0,
+            WheelRouting::NearestScrollable,
+        );
+        root.axes.horizontal = true;
+        root.content_bounds = TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 300.0,
+                height: 300.0,
+            },
+        });
+        root.offset.x = 100.0;
+        let boundary = DeclaredWheelTraversalBoundary {
+            terminal_region_index: Some(0),
+        };
+        assert!(matches!(
+            declared_wheel_disposition_at_root_local_point_with_geometry_index(
+                &geometry_index,
+                &[root.clone()],
+                boundary,
+                Point { x: 50.0, y: 50.0 },
+                -48.0,
+                -48.0,
+            ),
+            DeclaredWheelDisposition::Moved(_)
+        ));
+        root.offset.y = 100.0;
+        assert!(matches!(
+            declared_wheel_disposition_at_root_local_point_with_geometry_index(
+                &geometry_index,
+                &[root.clone()],
+                boundary,
+                Point { x: 50.0, y: 50.0 },
+                -48.0,
+                -48.0,
+            ),
+            DeclaredWheelDisposition::ConsumedNoOp(_)
+        ));
+        assert!(matches!(
+            declared_wheel_disposition_at_root_local_point_with_geometry_index(
+                &geometry_index,
+                &[root],
+                boundary,
+                Point { x: 50.0, y: 50.0 },
+                0.0,
+                48.0,
+            ),
+            DeclaredWheelDisposition::Moved(_)
+        ));
+    }
+
+    #[test]
+    fn terminal_boundary_rejects_stale_index() {
+        let mut view = dashboard_card_column_view();
+        view.wheel_traversal_boundary.terminal_region_index = Some(view.scroll_regions.len());
+        assert!(
+            view_definition_contract_diagnostics(&view)
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == "view_contract.wheel_traversal_boundary_invalid"
+                        && diagnostic.severity == DiagnosticSeverity::Error
+                })
+        );
+
+        let mut disabled = routed_wheel_test_scroll_region(
+            "disabled",
+            routed_wheel_outer_viewport(),
+            400.0,
+            0.0,
+            0,
+            WheelRouting::NearestScrollable,
+        );
+        disabled.enabled = false;
+        view.scroll_regions = vec![disabled];
+        view.wheel_traversal_boundary.terminal_region_index = Some(0);
+        assert!(
+            view_definition_contract_diagnostics(&view)
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == "view_contract.wheel_traversal_boundary_invalid"
+                        && diagnostic.severity == DiagnosticSeverity::Error
+                })
+        );
+    }
+
+    #[test]
+    fn terminal_root_disposition_scales_through_sixty_four_declarations() {
+        let layout = routed_wheel_test_layout();
+        let geometry_index = PresentationGeometryIndex::from_layout(&layout);
+        let mut regions = Vec::with_capacity(64);
+        for index in 0..63 {
+            let mut nested = routed_wheel_test_scroll_region(
+                &format!("nested-{index}"),
+                routed_wheel_inner_viewport(),
+                300.0,
+                200.0,
+                index,
+                WheelRouting::NearestScrollable,
+            );
+            nested.address = Some(WidgetSlotAddress::new(
+                nested.target.clone(),
+                index as usize,
+            ));
+            regions.push(nested);
+        }
+        let root = routed_wheel_test_scroll_region(
+            "root",
+            routed_wheel_outer_viewport(),
+            400.0,
+            200.0,
+            -1,
+            WheelRouting::NearestScrollable,
+        );
+        regions.push(root.clone());
+
+        assert!(matches!(
+            declared_wheel_disposition_at_root_local_point_with_geometry_index(
+                &geometry_index,
+                &regions,
+                DeclaredWheelTraversalBoundary { terminal_region_index: Some(63) },
+                Point { x: 50.0, y: 50.0 },
+                0.0,
+                -48.0,
+            ),
+            DeclaredWheelDisposition::ConsumedNoOp(owner) if owner.id == root.id
+        ));
+        regions.pop();
+        assert_eq!(
+            declared_wheel_disposition_at_root_local_point_with_geometry_index(
+                &geometry_index,
+                &regions,
+                DeclaredWheelTraversalBoundary::default(),
+                Point { x: 50.0, y: 50.0 },
+                0.0,
+                -48.0,
+            ),
+            DeclaredWheelDisposition::Bubble
+        );
+    }
+
+    #[test]
     fn wheel_routing_nearest_scrollable_only_matches_pre_routing_selection() {
         let layout = routed_wheel_test_layout();
         let geometry_index = PresentationGeometryIndex::from_layout(&layout);
@@ -13795,6 +15282,7 @@ mod tests {
             hit_regions: Vec::new(),
             focus_regions: Vec::new(),
             scroll_regions: vec![scroll, inner],
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -13833,7 +15321,7 @@ mod tests {
             }),
             child_placements: vec![ChildPlacement {
                 child: child.clone(),
-                bounds: ParentLocalRect::new(Rect {
+                bounds: ParentLocalRect::from_parent_local(Rect {
                     origin: Point { x: 60.0, y: 30.0 },
                     size: Size {
                         width: 80.0,
@@ -13841,6 +15329,7 @@ mod tests {
                     },
                 }),
                 local_state_slot: Some(child_slot.clone()),
+                spacing: BoxSpacing::ZERO,
             }],
             diagnostics: Vec::new(),
         };
@@ -14245,10 +15734,11 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame.clone(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame.viewport),
+                    content: TargetLocalRect::new(frame.viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -14257,7 +15747,7 @@ mod tests {
                         max: frame.viewport.size,
                     },
                 },
-            },
+            ),
         );
         let (dispatch, evidence) = resolve_declared_pointer_dispatch_with_evidence(
             EvidenceSource::backend_presented("test-backend", "physical-input"),
@@ -14296,10 +15786,11 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame.clone(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame.viewport),
+                    content: TargetLocalRect::new(frame.viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -14308,7 +15799,7 @@ mod tests {
                         max: frame.viewport.size,
                     },
                 },
-            },
+            ),
         );
         let mut lower = view.hit_regions[0].clone();
         lower.id = PresentationRegionId::from("lower-hit");
@@ -14387,10 +15878,11 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame.clone(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame.viewport),
+                    content: TargetLocalRect::new(frame.viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -14399,7 +15891,7 @@ mod tests {
                         max: frame.viewport.size,
                     },
                 },
-            },
+            ),
         );
         let (dispatch, mut evidence) = resolve_declared_pointer_dispatch_with_evidence(
             EvidenceSource::backend_presented("test-backend", "physical-input"),
@@ -14441,10 +15933,11 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame.clone(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame.viewport),
+                    content: TargetLocalRect::new(frame.viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -14453,7 +15946,7 @@ mod tests {
                         max: frame.viewport.size,
                     },
                 },
-            },
+            ),
         );
         let (_, mcp_evidence) = resolve_declared_pointer_dispatch_with_evidence(
             EvidenceSource::debug_mcp("physical-control"),
@@ -15312,7 +16805,9 @@ mod tests {
                 parent: self.id.clone(),
                 child: external.child.clone(),
                 input: input.clone(),
-                placement: Some(ParentLocalRect::new(input.viewport.into_rect())),
+                placement: Some(ParentLocalRect::from_parent_local(
+                    input.viewport.into_rect(),
+                )),
                 diagnostics: Vec::new(),
             }]
         }
@@ -16209,12 +17704,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -16247,13 +17739,14 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -16388,12 +17881,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -16436,7 +17926,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             let paint = self.paint(external, local, &layout);
 
             let paint_order = match self.id.as_str() {
@@ -16483,6 +17973,7 @@ mod tests {
                 }],
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -16544,14 +18035,11 @@ mod tests {
             _external: &Self::ExternalState,
             local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
             let mut bounds = input.viewport;
             bounds.origin.x += local.layout_offset_x;
-            LayoutOutput {
-                bounds,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(bounds)
         }
 
         fn paint(
@@ -16589,7 +18077,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             let paint = self.paint(external, local, &layout);
 
             ViewDefinition {
@@ -16619,6 +18107,7 @@ mod tests {
                 }],
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -16670,10 +18159,10 @@ mod tests {
                                 height: 16.0,
                             },
                         };
-                        ChildLayoutPlan::placed_for_seed(
+                        ChildLayoutPlan::explicit_border(
                             seed,
-                            child_layout_input_for_size(bounds.size),
-                            ParentLocalRect::new(bounds),
+                            ContentLocalRect::new(bounds),
+                            BoxSpacing::ZERO,
                         )
                     })
                     .collect(),
@@ -16686,13 +18175,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
-            children: Vec<ChildPlacement>,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: children,
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
     }
 
@@ -16736,10 +18221,10 @@ mod tests {
                                 height,
                             },
                         };
-                        ChildLayoutPlan::placed_for_seed(
+                        ChildLayoutPlan::explicit_border(
                             seed,
-                            child_layout_input_for_size(viewport.size),
-                            ParentLocalRect::new(viewport),
+                            ContentLocalRect::new(viewport),
+                            BoxSpacing::ZERO,
                         )
                     })
                     .collect(),
@@ -16837,10 +18322,10 @@ mod tests {
                                 height: 20.0,
                             },
                         };
-                        ChildLayoutPlan::placed_for_seed(
+                        ChildLayoutPlan::explicit_border(
                             seed,
-                            child_layout_input_for_size(viewport.size),
-                            ParentLocalRect::new(viewport),
+                            ContentLocalRect::new(viewport),
+                            BoxSpacing::ZERO,
                         )
                     })
                     .collect(),
@@ -16903,18 +18388,17 @@ mod tests {
                                 height: 16.0,
                             },
                         };
-                        ChildLayoutPlan::requested_for_seed(
+                        ChildLayoutPlan::requested_outer(
                             seed,
-                            LayoutInput {
-                                viewport: TargetLocalRect::new(viewport),
-                                constraints: LayoutConstraints {
-                                    min: Size {
-                                        width: 0.0,
-                                        height: 0.0,
-                                    },
-                                    max: viewport.size,
+                            ContentLocalRect::new(viewport),
+                            LayoutConstraints {
+                                min: Size {
+                                    width: 0.0,
+                                    height: 0.0,
                                 },
+                                max: viewport.size,
                             },
+                            BoxSpacing::ZERO,
                         )
                     })
                     .collect(),
@@ -16971,10 +18455,10 @@ mod tests {
                 children: children
                     .into_iter()
                     .map(|seed| {
-                        ChildLayoutPlan::placed_for_seed(
+                        ChildLayoutPlan::explicit_border(
                             seed,
-                            child_layout_input_for_size(input.viewport.size),
-                            ParentLocalRect::new(input.viewport.into_rect()),
+                            ContentLocalRect::new(input.viewport.into_rect()),
+                            BoxSpacing::ZERO,
                         )
                     })
                     .collect(),
@@ -17088,14 +18572,16 @@ mod tests {
     }
 
     fn app_layout_input() -> LayoutInput {
+        let viewport = TargetLocalRect::new(Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Size {
+                width: 96.0,
+                height: 32.0,
+            },
+        });
         LayoutInput {
-            viewport: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size: Size {
-                    width: 96.0,
-                    height: 32.0,
-                },
-            }),
+            viewport,
+            content: viewport,
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -17105,22 +18591,6 @@ mod tests {
                     width: 96.0,
                     height: 32.0,
                 },
-            },
-        }
-    }
-
-    fn child_layout_input_for_size(size: Size) -> LayoutInput {
-        LayoutInput {
-            viewport: TargetLocalRect::new(Rect {
-                origin: Point { x: 0.0, y: 0.0 },
-                size,
-            }),
-            constraints: LayoutConstraints {
-                min: Size {
-                    width: 0.0,
-                    height: 0.0,
-                },
-                max: size,
             },
         }
     }
@@ -17162,10 +18632,11 @@ mod tests {
             let view = widget.view_definition(
                 external,
                 local,
-                ViewDefinitionInput {
-                    frame: frame_identity(),
-                    layout_input: LayoutInput {
+                ViewDefinitionInput::new(
+                    frame_identity(),
+                    LayoutInput {
                         viewport: layout.bounds,
+                        content: layout.bounds,
                         constraints: LayoutConstraints {
                             min: Size {
                                 width: 0.0,
@@ -17174,7 +18645,7 @@ mod tests {
                             max: layout.bounds.size,
                         },
                     },
-                },
+                ),
             );
             let state_label = widget
                 .paint(external, local, &layout)
@@ -17317,10 +18788,7 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
 
         assert_eq!(view.target, WidgetId::from("duplicate-slot-app"));
@@ -17361,10 +18829,7 @@ mod tests {
         let view = widget.visible_backend_view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
 
         assert_eq!(view.target, WidgetId::from("duplicate-slot-app"));
@@ -18148,13 +19613,13 @@ mod tests {
         let widget = two_counter_app_widget();
         let external = AppExternal;
         let local = widget.initial_local_state();
-        let layout = widget.layout(&external, &local, app_layout_input());
+        let layout = layout_view(&widget, &external, &local, app_layout_input());
 
         assert_eq!(layout.child_placements.len(), 2);
         assert_eq!(layout.child_placements[0].child, WidgetId::from("one"));
         assert_eq!(layout.child_placements[1].child, WidgetId::from("two"));
-        assert_eq!(layout.child_placements[0].bounds.origin.x, 0.0);
-        assert_eq!(layout.child_placements[1].bounds.origin.x, 32.0);
+        assert_eq!(layout.child_placements[0].bounds.as_rect().origin.x, 0.0);
+        assert_eq!(layout.child_placements[1].bounds.as_rect().origin.x, 32.0);
         assert!(layout.child_placements[0].local_state_slot.is_some());
         assert!(layout.child_placements[1].local_state_slot.is_some());
     }
@@ -18164,15 +19629,21 @@ mod tests {
         let widget = vertical_echo_app_widget();
         let external = AppExternal;
         let local = widget.initial_local_state();
-        let layout = widget.layout(&external, &local, app_layout_input());
+        let layout = layout_view(&widget, &external, &local, app_layout_input());
 
         assert_eq!(layout.child_placements.len(), 2);
         assert_eq!(layout.child_placements[0].child, WidgetId::from("top"));
         assert_eq!(layout.child_placements[1].child, WidgetId::from("bottom"));
-        assert_eq!(layout.child_placements[0].bounds.origin.y, 0.0);
-        assert_eq!(layout.child_placements[0].bounds.size.height, 12.0);
-        assert_eq!(layout.child_placements[1].bounds.origin.y, 12.0);
-        assert_eq!(layout.child_placements[1].bounds.size.height, 20.0);
+        assert_eq!(layout.child_placements[0].bounds.as_rect().origin.y, 0.0);
+        assert_eq!(
+            layout.child_placements[0].bounds.as_rect().size.height,
+            12.0
+        );
+        assert_eq!(layout.child_placements[1].bounds.as_rect().origin.y, 12.0);
+        assert_eq!(
+            layout.child_placements[1].bounds.as_rect().size.height,
+            20.0
+        );
         assert_ne!(
             layout.child_placements[0].bounds,
             layout.child_placements[1].bounds
@@ -18185,7 +19656,7 @@ mod tests {
         let external = AppExternal;
         let local = widget.initial_local_state();
         let root_input = app_layout_input();
-        let layout = widget.layout(&external, &local, root_input.clone());
+        let layout = layout_view(&widget, &external, &local, root_input.clone());
 
         assert_eq!(layout.bounds, root_input.viewport);
         assert_ne!(
@@ -18196,8 +19667,8 @@ mod tests {
             layout.child_placements[1].bounds.into_rect(),
             root_input.viewport.into_rect()
         );
-        assert_eq!(layout.child_placements[0].bounds.size.width, 96.0);
-        assert_eq!(layout.child_placements[1].bounds.size.width, 96.0);
+        assert_eq!(layout.child_placements[0].bounds.as_rect().size.width, 96.0);
+        assert_eq!(layout.child_placements[1].bounds.as_rect().size.width, 96.0);
     }
 
     #[test]
@@ -18235,11 +19706,11 @@ mod tests {
                 .handled
         );
 
-        let layout = widget.layout(&external, &local, app_layout_input());
+        let layout = layout_view(&widget, &external, &local, app_layout_input());
         let origins: Vec<f32> = layout
             .child_placements
             .iter()
-            .map(|placement| placement.bounds.origin.y)
+            .map(|placement| placement.bounds.as_rect().origin.y)
             .collect();
 
         assert_eq!(origins, vec![-15.0, 5.0, 25.0]);
@@ -18251,7 +19722,7 @@ mod tests {
         let widget = scroll_echo_app_widget();
         let external = AppExternal;
         let local = widget.initial_local_state();
-        let layout = widget.layout(&external, &local, app_layout_input());
+        let layout = layout_view(&widget, &external, &local, app_layout_input());
 
         let slots: Vec<Vec<WidgetId>> = layout
             .child_placements
@@ -18281,7 +19752,7 @@ mod tests {
         let widget = duplicate_slot_app_widget();
         let external = AppExternal;
         let local = widget.initial_local_state();
-        let layout = widget.layout(&external, &local, app_layout_input());
+        let layout = layout_view(&widget, &external, &local, app_layout_input());
 
         assert_eq!(layout.child_placements.len(), 2);
         assert_eq!(
@@ -18292,10 +19763,10 @@ mod tests {
             layout.child_placements[1].child,
             WidgetId::from("duplicate")
         );
-        assert_eq!(layout.child_placements[0].bounds.origin.x, 1.0);
-        assert_eq!(layout.child_placements[0].bounds.origin.y, 0.0);
-        assert_eq!(layout.child_placements[1].bounds.origin.x, 102.0);
-        assert_eq!(layout.child_placements[1].bounds.origin.y, 20.0);
+        assert_eq!(layout.child_placements[0].bounds.as_rect().origin.x, 0.0);
+        assert_eq!(layout.child_placements[0].bounds.as_rect().origin.y, 0.0);
+        assert_eq!(layout.child_placements[1].bounds.as_rect().origin.x, 100.0);
+        assert_eq!(layout.child_placements[1].bounds.as_rect().origin.y, 20.0);
 
         let slots: Vec<WidgetSlotAddress> = layout
             .child_placements
@@ -18349,7 +19820,7 @@ mod tests {
         let widget = two_counter_app_widget();
         let external = AppExternal;
         let local = widget.initial_local_state();
-        let layout = widget.layout(&external, &local, app_layout_input());
+        let layout = layout_view(&widget, &external, &local, app_layout_input());
         let paint = widget.paint(&external, &local, &layout);
 
         let text_bounds: Vec<Rect> = paint
@@ -18375,14 +19846,11 @@ mod tests {
         let widget = two_counter_app_widget();
         let external = AppExternal;
         let local = widget.initial_local_state();
-        let layout = widget.layout(&external, &local, app_layout_input());
+        let layout = layout_view(&widget, &external, &local, app_layout_input());
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
 
         assert_eq!(view.hit_regions.len(), 2);
@@ -18390,14 +19858,14 @@ mod tests {
             view.hit_regions[0].bounds.into_rect(),
             Rect {
                 origin: Point { x: 0.0, y: 0.0 },
-                size: layout.child_placements[0].bounds.size,
+                size: layout.child_placements[0].bounds.as_rect().size,
             }
         );
         assert_eq!(
             view.hit_regions[1].bounds.into_rect(),
             Rect {
                 origin: Point { x: 0.0, y: 0.0 },
-                size: layout.child_placements[1].bounds.size,
+                size: layout.child_placements[1].bounds.as_rect().size,
             }
         );
         assert!(
@@ -18420,10 +19888,7 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
 
         assert_eq!(
@@ -18461,10 +19926,7 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
 
         assert!(view.paint_order.allow_overflow_paint);
@@ -18547,12 +20009,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -18601,7 +20060,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             let paint = self.paint(external, local, &layout);
             let bounds = layout.bounds;
             let mut paint_order = PaintOrderDeclaration::layer(self.id(), 100);
@@ -18635,6 +20094,7 @@ mod tests {
                 }],
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -18698,10 +20158,10 @@ mod tests {
                         } else {
                             viewport
                         };
-                        ChildLayoutPlan::placed_for_seed(
+                        ChildLayoutPlan::explicit_border(
                             seed,
-                            child_layout_input_for_size(bounds.size),
-                            ParentLocalRect::new(bounds),
+                            ContentLocalRect::new(bounds),
+                            BoxSpacing::ZERO,
                         )
                     })
                     .collect(),
@@ -18714,13 +20174,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
-            children: Vec<ChildPlacement>,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: children,
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
     }
 
@@ -18753,20 +20209,14 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
 
         // Per-widget pre-flight is structurally blind here: one region.
         let modal_view = widget.app.widgets.1.view_definition(
             &external,
             &CounterLocal { count: 0 },
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
         assert_eq!(modal_view.hit_regions.len(), 1);
         assert!(modal_view.paint_order.allow_overlap);
@@ -18803,10 +20253,7 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
 
         let diagnostics = view_definition_contract_diagnostics(&view);
@@ -18816,9 +20263,10 @@ mod tests {
                 .any(|diagnostic| diagnostic.code == "view_contract.ambiguous_hit_overlap"),
             "{diagnostics:?}"
         );
-        assert!(!view_definition_has_blocking_contract_diagnostic(
-            &diagnostics
-        ));
+        assert!(
+            !diagnostics.iter().any(|diagnostic| diagnostic.code
+                == "view_contract.child_input_viewport_not_target_local")
+        );
     }
 
     // Step-212 wrapper-less page scroll: an app that overrides
@@ -18853,10 +20301,11 @@ mod tests {
             &self,
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
-            input: &ViewDefinitionInput,
+            _frame: &FrameIdentity,
+            input: &LayoutInput,
             layout: &LayoutOutput,
         ) -> Vec<ScrollRegionDeclaration> {
-            let viewport = input.frame.viewport;
+            let viewport = input.viewport.into_rect();
             vec![ScrollRegionDeclaration::explicit(
                 PresentationRegionId::from("page-app:page-scroll"),
                 self.id(),
@@ -18908,10 +20357,7 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
         let page = view
             .scroll_regions
@@ -18931,10 +20377,7 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
         assert!(
             view.scroll_regions
@@ -18955,10 +20398,17 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame_identity(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(Rect {
+                        origin: Point { x: 8.0, y: 4.0 },
+                        size: Size {
+                            width: 24.0,
+                            height: 16.0,
+                        },
+                    }),
+                    content: TargetLocalRect::new(Rect {
                         origin: Point { x: 8.0, y: 4.0 },
                         size: Size {
                             width: 24.0,
@@ -18976,7 +20426,7 @@ mod tests {
                         },
                     },
                 },
-            },
+            ),
         );
         let diagnostics = view_definition_contract_diagnostics(&view);
 
@@ -18989,26 +20439,25 @@ mod tests {
     }
 
     #[test]
-    fn app_view_definition_blocks_non_target_local_child_input() {
+    fn requested_child_input_is_prepared_target_local() {
         let widget = duplicate_slot_app_widget();
         let external = AppExternal;
         let local = widget.initial_local_state();
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: app_layout_input(),
-            },
+            ViewDefinitionInput::new(frame_identity(), app_layout_input()),
         );
         let diagnostics = view_definition_contract_diagnostics(&view);
 
-        assert!(view.diagnostics.iter().any(|diagnostic| diagnostic.code
-            == "view_contract.child_input_viewport_not_target_local"
-            && diagnostic.severity == DiagnosticSeverity::Error));
-        assert!(view_definition_has_blocking_contract_diagnostic(
-            &diagnostics
-        ));
+        assert!(
+            !view.diagnostics.iter().any(|diagnostic| diagnostic.code
+                == "view_contract.child_input_viewport_not_target_local")
+        );
+        assert!(
+            !diagnostics.iter().any(|diagnostic| diagnostic.code
+                == "view_contract.child_input_viewport_not_target_local")
+        );
     }
 
     #[test]
@@ -19021,7 +20470,7 @@ mod tests {
                 .handle_event(&external, &mut local, command("two"))
                 .handled
         );
-        let layout = widget.layout(&external, &local, app_layout_input());
+        let layout = layout_view(&widget, &external, &local, app_layout_input());
         let paint = widget.paint(&external, &local, &layout);
 
         let labels: Vec<&str> = paint
@@ -20031,6 +21480,7 @@ mod tests {
                     traversal_order: 0,
                 },
             )],
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -20172,7 +21622,7 @@ mod tests {
         });
         let external = AppExternal;
         let local = widget.initial_local_state();
-        let layout = widget.layout(&external, &local, app_layout_input());
+        let layout = layout_view(&widget, &external, &local, app_layout_input());
         let paint = widget.paint(&external, &local, &layout);
         let labels: Vec<&str> = paint
             .iter()
@@ -20485,6 +21935,13 @@ mod tests {
                     height: 240.0,
                 },
             }),
+            content: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 320.0,
+                    height: 240.0,
+                },
+            }),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 120.0,
@@ -20696,6 +22153,7 @@ mod tests {
         let local = widget.initial_local_state();
         let input = LayoutInput {
             viewport: TargetLocalRect::new(frame_identity().viewport),
+            content: TargetLocalRect::new(frame_identity().viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -20755,10 +22213,7 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: input,
-            },
+            ViewDefinitionInput::new(frame_identity(), input),
         );
         view.focus_regions = vec![focus];
         view.scroll_regions = vec![scroll];
@@ -20779,6 +22234,7 @@ mod tests {
         let local = widget.initial_local_state();
         let input = LayoutInput {
             viewport: TargetLocalRect::new(frame_identity().viewport),
+            content: TargetLocalRect::new(frame_identity().viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -20824,10 +22280,7 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: input,
-            },
+            ViewDefinitionInput::new(frame_identity(), input),
         );
         view.scroll_regions = vec![back, front];
         let diagnostics = view_definition_contract_diagnostics(&view);
@@ -20852,6 +22305,7 @@ mod tests {
         let local = widget.initial_local_state();
         let input = LayoutInput {
             viewport: TargetLocalRect::new(frame_identity().viewport),
+            content: TargetLocalRect::new(frame_identity().viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -20897,10 +22351,7 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: input,
-            },
+            ViewDefinitionInput::new(frame_identity(), input),
         );
         view.scroll_regions = vec![back, front];
         let diagnostics = view_definition_contract_diagnostics(&view);
@@ -20922,6 +22373,7 @@ mod tests {
         let local = widget.initial_local_state();
         let input = LayoutInput {
             viewport: TargetLocalRect::new(frame_identity().viewport),
+            content: TargetLocalRect::new(frame_identity().viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -21103,6 +22555,7 @@ mod tests {
         let local = widget.initial_local_state();
         let input = LayoutInput {
             viewport: TargetLocalRect::new(frame_identity().viewport),
+            content: TargetLocalRect::new(frame_identity().viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -21114,10 +22567,7 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: input,
-            },
+            ViewDefinitionInput::new(frame_identity(), input),
         );
 
         let text_edit = view.focus_regions[0]
@@ -21167,6 +22617,7 @@ mod tests {
         let local = widget.initial_local_state();
         let input = LayoutInput {
             viewport: TargetLocalRect::new(frame_identity().viewport),
+            content: TargetLocalRect::new(frame_identity().viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -21178,10 +22629,7 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: input,
-            },
+            ViewDefinitionInput::new(frame_identity(), input),
         );
         view.focus_regions.clear();
 
@@ -21213,6 +22661,7 @@ mod tests {
         let local = widget.initial_local_state();
         let input = LayoutInput {
             viewport: TargetLocalRect::new(frame_identity().viewport),
+            content: TargetLocalRect::new(frame_identity().viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -21224,10 +22673,7 @@ mod tests {
         let base_view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: input,
-            },
+            ViewDefinitionInput::new(frame_identity(), input),
         );
 
         let mut pointer_view = base_view.clone();
@@ -21289,10 +22735,11 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame_identity(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame_identity().viewport),
+                    content: TargetLocalRect::new(frame_identity().viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -21301,7 +22748,7 @@ mod tests {
                         max: frame_identity().viewport.size,
                     },
                 },
-            },
+            ),
         );
 
         let region = focus_region_from_focus_capability(
@@ -21369,10 +22816,11 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame_identity(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame_identity().viewport),
+                    content: TargetLocalRect::new(frame_identity().viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -21381,7 +22829,7 @@ mod tests {
                         max: frame_identity().viewport.size,
                     },
                 },
-            },
+            ),
         );
         view.focus_regions = vec![focus_region_from_focus_capability(
             &widget,
@@ -21449,10 +22897,11 @@ mod tests {
         let base_view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame_identity(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame_identity().viewport),
+                    content: TargetLocalRect::new(frame_identity().viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -21461,7 +22910,7 @@ mod tests {
                         max: frame_identity().viewport.size,
                     },
                 },
-            },
+            ),
         );
         let advisory_code = "view_contract.keyboard_capability_plain_focus_delivery_limited";
 
@@ -21659,6 +23108,7 @@ mod tests {
                     diagnostics: Vec::new(),
                 },
             ],
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -21743,6 +23193,7 @@ mod tests {
         let frame = frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -21757,10 +23208,7 @@ mod tests {
         let view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame.clone(), layout_input),
         );
         assert_eq!(view.target, WidgetId::from("root"));
         assert_eq!(view.frame, frame);
@@ -21800,6 +23248,7 @@ mod tests {
             paint: Vec::new(),
             surfaces: Vec::new(),
             diagnostics: Vec::new(),
+            prepared_geometry: None,
         };
         let mut renderer = FakeRenderer::default();
 
@@ -21917,10 +23366,11 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame_identity(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame_identity().viewport),
+                    content: TargetLocalRect::new(frame_identity().viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -21929,7 +23379,7 @@ mod tests {
                         max: frame_identity().viewport.size,
                     },
                 },
-            },
+            ),
         );
         view.hit_regions[0].route.path.clear();
 
@@ -21957,10 +23407,11 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame_identity(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame_identity().viewport),
+                    content: TargetLocalRect::new(frame_identity().viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -21969,7 +23420,7 @@ mod tests {
                         max: frame_identity().viewport.size,
                     },
                 },
-            },
+            ),
         );
         let mut duplicate = view.hit_regions[0].clone();
         duplicate.id = PresentationRegionId::from("duplicate");
@@ -22025,10 +23476,11 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame_identity(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame_identity().viewport),
+                    content: TargetLocalRect::new(frame_identity().viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -22037,7 +23489,7 @@ mod tests {
                         max: frame_identity().viewport.size,
                     },
                 },
-            },
+            ),
         );
         let mut duplicate = view.hit_regions[0].clone();
         duplicate.id = PresentationRegionId::from("duplicate");
@@ -22077,10 +23529,11 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame_identity(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame_identity().viewport),
+                    content: TargetLocalRect::new(frame_identity().viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -22089,7 +23542,7 @@ mod tests {
                         max: frame_identity().viewport.size,
                     },
                 },
-            },
+            ),
         );
         let mut duplicate = view.hit_regions[0].clone();
         duplicate.id = PresentationRegionId::from("duplicate");
@@ -22118,10 +23571,11 @@ mod tests {
         let mut view = widget.view_definition(
             &external,
             &local,
-            ViewDefinitionInput {
-                frame: frame_identity(),
-                layout_input: LayoutInput {
+            ViewDefinitionInput::new(
+                frame_identity(),
+                LayoutInput {
                     viewport: TargetLocalRect::new(frame_identity().viewport),
+                    content: TargetLocalRect::new(frame_identity().viewport),
                     constraints: LayoutConstraints {
                         min: Size {
                             width: 0.0,
@@ -22130,7 +23584,7 @@ mod tests {
                         max: frame_identity().viewport.size,
                     },
                 },
-            },
+            ),
         );
         view.paint.push(PaintOp::Fill {
             shape: ShapeDeclaration {
@@ -22227,6 +23681,7 @@ mod tests {
             hit_regions: Vec::new(),
             focus_regions: Vec::new(),
             scroll_regions: Vec::new(),
+            wheel_traversal_boundary: Default::default(),
             semantic_slots: Vec::new(),
             probe_metadata: Vec::new(),
             diagnostics: Vec::new(),
@@ -22390,6 +23845,395 @@ mod tests {
                 diagnostic.code == "view_contract.content_overflow_without_scroll_region"
             }),
             "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_geometry_capture_is_gated_and_uses_mount_order() {
+        let view = dashboard_card_column_view();
+        let ordinary = validate_and_index_view(&view).expect("ordinary geometry preparation");
+        assert!(ordinary.captured_records().is_none());
+
+        let captured = validate_and_index_view_with_capture(
+            &view,
+            GeometryCaptureIntent::RenderPacketEvidence,
+        )
+        .expect("captured geometry preparation");
+        let records = captured.captured_records().expect("capture requested");
+        assert_eq!(records.len(), view.layout.child_placements.len());
+        for (record, placement) in records.iter().zip(&view.layout.child_placements) {
+            assert_eq!(record.target, placement.child);
+            assert_eq!(Some(&record.address), placement.local_state_slot.as_ref());
+        }
+    }
+
+    #[test]
+    fn prepared_geometry_applies_mount_once_and_records_all_boxes() {
+        let mut view = dashboard_card_column_view();
+        let child = WidgetId::from("prepared-panel");
+        let spacing = BoxSpacing::new(
+            EdgeInsets::trbl(8.0, 24.0, 12.0, 4.0),
+            EdgeInsets::trbl(6.0, 28.0, 18.0, 10.0),
+        );
+        let seed = ChildLayoutSeed {
+            child: child.clone(),
+            local_state_slot: Some(WidgetSlotAddress::new(child, 0)),
+        };
+        let plan = ChildLayoutPlan::explicit_border(
+            seed.clone(),
+            ContentLocalRect::new(Rect {
+                origin: Point { x: 20.0, y: 15.0 },
+                size: Size {
+                    width: 100.0,
+                    height: 60.0,
+                },
+            }),
+            spacing,
+        );
+        let input = LayoutInput {
+            viewport: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 120.0,
+                },
+            }),
+            content: TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 200.0,
+                    height: 120.0,
+                },
+            }),
+            constraints: LayoutConstraints {
+                min: Size {
+                    width: 0.0,
+                    height: 0.0,
+                },
+                max: Size {
+                    width: 200.0,
+                    height: 120.0,
+                },
+            },
+        };
+        let result = ChildLayoutResult {
+            seed,
+            layout: prepare_leaf_layout(
+                LayoutOutputBuilder::for_input(&input),
+                TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 100.0,
+                        height: 60.0,
+                    },
+                }),
+            ),
+            diagnostics: Vec::new(),
+        };
+        view.layout = prepare_resolved_layout(
+            LayoutOutputBuilder::for_input(&input),
+            view.layout.bounds,
+            [(plan, result)],
+        )
+        .expect("valid prepared placement");
+        let prepared = validate_and_index_view_with_capture(
+            &view,
+            GeometryCaptureIntent::RenderPacketEvidence,
+        )
+        .expect("valid asymmetric geometry");
+        let record = &prepared.captured_records().unwrap()[0];
+        assert_eq!(
+            record.parent_local.outer.as_rect().origin,
+            Point { x: 16.0, y: 7.0 }
+        );
+        assert_eq!(
+            record.target_local.content.origin,
+            Point { x: 10.0, y: 6.0 }
+        );
+        assert_eq!(
+            record.unscrolled_root.content.origin,
+            Point { x: 30.0, y: 21.0 }
+        );
+        assert_eq!(record.final_presented, record.unscrolled_root);
+        assert_eq!(record.effective_clip_final, record.final_presented.border);
+    }
+
+    #[test]
+    fn final_child_border_layout_input_applies_padding_only() {
+        let placement = ChildPlacement {
+            child: WidgetId::from("text"),
+            bounds: ParentLocalRect::from_parent_local(Rect {
+                origin: Point { x: 16.0, y: 192.0 },
+                size: Size {
+                    width: 608.0,
+                    height: 76.0,
+                },
+            }),
+            local_state_slot: None,
+            spacing: BoxSpacing::new(
+                EdgeInsets::trbl(4.0, 20.0, 12.0, 6.0),
+                EdgeInsets::trbl(9.0, 17.0, 25.0, 11.0),
+            ),
+        };
+        let input = child_layout_input_for_placement(&placement);
+        assert_eq!(
+            input.viewport.into_rect(),
+            Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 608.0,
+                    height: 76.0
+                },
+            }
+        );
+        assert_eq!(
+            input.content.into_rect(),
+            Rect {
+                origin: Point { x: 11.0, y: 9.0 },
+                size: Size {
+                    width: 580.0,
+                    height: 42.0
+                },
+            }
+        );
+        assert_ne!(
+            input.viewport.into_rect(),
+            Rect {
+                origin: Point { x: 6.0, y: 4.0 },
+                size: Size {
+                    width: 582.0,
+                    height: 60.0
+                },
+            }
+        );
+        assert_ne!(
+            input.content.into_rect(),
+            Rect {
+                origin: Point { x: 17.0, y: 13.0 },
+                size: Size {
+                    width: 554.0,
+                    height: 26.0
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn preparation_uses_one_placement_traversal_and_no_index_rebuild() {
+        let view = dashboard_card_column_view();
+        PREPARATION_PLACEMENT_VISITS.with(|visits| visits.set(0));
+        FROM_LAYOUT_PLACEMENT_VISITS.with(|visits| visits.set(0));
+
+        validate_and_index_view_with_capture(&view, GeometryCaptureIntent::None)
+            .expect("valid view");
+
+        PREPARATION_PLACEMENT_VISITS
+            .with(|visits| assert_eq!(visits.get(), view.layout.child_placements.len()));
+        FROM_LAYOUT_PLACEMENT_VISITS.with(|visits| assert_eq!(visits.get(), 0));
+    }
+
+    #[test]
+    fn every_contract_error_blocks_the_mandatory_gate() {
+        let mut target_mismatch = dashboard_card_column_view();
+        target_mismatch.paint_order.target = WidgetId::from("wrong-target");
+        let diagnostics = validate_and_index_view(&target_mismatch).unwrap_err();
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "view_contract.paint_order_target_mismatch"
+            })
+        );
+
+        let mut missing_overflow = dashboard_card_column_view();
+        missing_overflow.paint_order.allow_overflow_paint = true;
+        missing_overflow.paint_order.overflow_bounds = None;
+        let diagnostics = validate_and_index_view(&missing_overflow).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "view_contract.overflow_bounds_missing")
+        );
+    }
+
+    #[test]
+    fn nested_scroll_overlay_and_ancestor_clip_are_applied_once() {
+        let root = WidgetSlotAddress::new(WidgetId::from("root"), 0);
+        let parent = root.child(WidgetId::from("parent"), 0);
+        let child = parent.child(WidgetId::from("child"), 0);
+        let grand = child.child(WidgetId::from("grand"), 0);
+        let overlay = child.child(WidgetId::from("overlay"), 1);
+        let placement =
+            |id: &str, address: WidgetSlotAddress, x, y, width, height| ChildPlacement {
+                child: WidgetId::from(id),
+                bounds: ParentLocalRect::from_parent_local(Rect {
+                    origin: Point { x, y },
+                    size: Size { width, height },
+                }),
+                local_state_slot: Some(address),
+                spacing: BoxSpacing::ZERO,
+            };
+        let mut paint_order = PaintOrderDeclaration::source_order(WidgetId::from("root"));
+        paint_order.mounted_geometry = vec![
+            MountedGeometryDeclaration {
+                address: parent.clone(),
+                parent_address: Some(root.clone()),
+                authored_overflow: None,
+                overlay_anchor: None,
+            },
+            MountedGeometryDeclaration {
+                address: child.clone(),
+                parent_address: Some(parent.clone()),
+                authored_overflow: None,
+                overlay_anchor: None,
+            },
+            MountedGeometryDeclaration {
+                address: grand.clone(),
+                parent_address: Some(child.clone()),
+                authored_overflow: Some(TargetLocalRect::new(Rect {
+                    origin: Point { x: -4.0, y: -4.0 },
+                    size: Size {
+                        width: 30.0,
+                        height: 30.0,
+                    },
+                })),
+                overlay_anchor: None,
+            },
+            MountedGeometryDeclaration {
+                address: overlay.clone(),
+                parent_address: Some(child.clone()),
+                authored_overflow: None,
+                overlay_anchor: Some(AddressedOverlayAnchor {
+                    address: child.clone(),
+                    point: Point { x: 10.0, y: 5.0 },
+                    delta: Translation { x: 3.0, y: 4.0 },
+                }),
+            },
+        ];
+        let scroll = |id: &str, target: &str, address: WidgetSlotAddress, w, h, x, y| {
+            ScrollRegionDeclaration::explicit(
+                PresentationRegionId::from(id),
+                WidgetId::from(target),
+                Some(address),
+                TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: w,
+                        height: h,
+                    },
+                }),
+                TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: w + 50.0,
+                        height: h + 50.0,
+                    },
+                }),
+                Point { x, y },
+                ScrollAxes {
+                    horizontal: true,
+                    vertical: true,
+                },
+                WheelRouting::NearestScrollable,
+                HitRegionOrder::default(),
+                ScrollConsumptionPolicy::exclusive_wheel(),
+                true,
+            )
+        };
+        let mut view = ViewDefinition {
+            target: WidgetId::from("root"),
+            frame: FrameIdentity {
+                surface_id: "test".to_string(),
+                surface_instance_id: "test".to_string(),
+                revision: 0,
+                frame_index: 0,
+                viewport: Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 300.0,
+                        height: 200.0,
+                    },
+                },
+            },
+            layout: LayoutOutput {
+                bounds: TargetLocalRect::new(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 300.0,
+                        height: 200.0,
+                    },
+                }),
+                child_placements: vec![
+                    placement("parent", parent.clone(), 50.0, 40.0, 100.0, 100.0),
+                    placement("child", child.clone(), 67.0, 53.0, 50.0, 50.0),
+                    placement("grand", grand.clone(), 74.0, 61.0, 20.0, 20.0),
+                    placement("overlay", overlay.clone(), 80.0, 70.0, 12.0, 10.0),
+                ],
+                diagnostics: Vec::new(),
+            },
+            paint: Vec::new(),
+            paint_order,
+            hit_regions: Vec::new(),
+            focus_regions: Vec::new(),
+            scroll_regions: vec![
+                scroll("parent-scroll", "parent", parent, 100.0, 100.0, 5.0, 7.0),
+                scroll("child-scroll", "child", child, 50.0, 50.0, 2.0, 3.0),
+            ],
+            wheel_traversal_boundary: Default::default(),
+            semantic_slots: Vec::new(),
+            probe_metadata: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        view.scroll_regions[1].order.traversal_order = 1;
+        let prepared = validate_and_index_view_with_capture(
+            &view,
+            GeometryCaptureIntent::RenderPacketEvidence,
+        )
+        .expect("numeric composition fixture is valid");
+        let records = prepared.captured_records().unwrap();
+        let grand = records
+            .iter()
+            .find(|record| record.target.as_str() == "grand")
+            .unwrap();
+        assert_eq!(
+            grand.parent_local.border.as_rect().origin,
+            Point { x: 7.0, y: 8.0 }
+        );
+        assert_eq!(grand.scroll_translation, Translation { x: -7.0, y: -10.0 });
+        assert_eq!(
+            grand.final_presented.border.origin,
+            Point { x: 67.0, y: 51.0 }
+        );
+        assert_eq!(
+            grand.ancestor_clip_final.unwrap(),
+            Rect {
+                origin: Point { x: 62.0, y: 46.0 },
+                size: Size {
+                    width: 50.0,
+                    height: 50.0
+                }
+            }
+        );
+        assert_eq!(
+            grand.effective_clip_final,
+            Rect {
+                origin: Point { x: 63.0, y: 47.0 },
+                size: Size {
+                    width: 30.0,
+                    height: 30.0
+                }
+            }
+        );
+
+        let overlay = records
+            .iter()
+            .find(|record| record.target.as_str() == "overlay")
+            .unwrap();
+        assert_eq!(
+            overlay.overlay_translation,
+            Translation { x: 75.0, y: 55.0 }
+        );
+        assert_eq!(
+            overlay.final_presented.border.origin,
+            Point { x: 75.0, y: 55.0 }
         );
     }
 }

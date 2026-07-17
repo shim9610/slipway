@@ -95,6 +95,25 @@ LLM workers must not turn semantic direct control into a physical-control
 claim. A semantic state mutation can be useful debugging evidence, but it does
 not prove that the visible iced/egui path accepts the same user operation.
 
+## Command Events And Standard Shortcuts
+
+Keyboard shortcuts may arrive as a raw `keyboard` operation, as native text
+editing, or as a `command` operation such as `copy`, `cut`, `paste`,
+`select_all`, `undo`, or `redo`, depending on the backend and focused region.
+MCP reports the command event, dispatch evidence, emitted messages, and result
+identity; it does not currently enforce a global semantic rule that, for
+example, `copy` must leave author state unchanged.
+
+Authoring rule: standard command behavior belongs in the widget's declared text
+or command policy and in tests. If a command mutates state, make that mutation
+intentional and visible in the result evidence. Do not use a standard command
+name for a custom probe/demo mutation; use a custom command name instead.
+
+Current diagnostic limit: MCP can show that a standard command produced a state
+change, but it does not yet classify that as a framework-level policy warning.
+Treat unexpected state changes after `copy`/`select_all` as an authoring bug
+unless the app has an explicit command contract saying otherwise.
+
 ## Frame Identity
 
 Most debug calls bind to a frame:

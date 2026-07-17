@@ -101,6 +101,14 @@ example's `internal_logic.rs` models the table form.
 Authoring rule: a visual region that should react must have the matching
 declaration. Painting something clickable is not enough.
 
+Text-edit rule: a native text edit should be owned by its
+`text_edit_focus_region_from_capability` region. Do not put a separate pointer
+hit region over the same editor just to make it clickable; that competing
+region can steal focus/text routing from the backend-native editor. Put pointer
+regions on surrounding controls, labels, buttons, or explicit decorations, and
+let the text-edit focus region own insertion, deletion, selection, IME, and
+standard edit commands.
+
 LLM rule: if a click, wheel, focus, text input, or command works only because
 you directly changed state, the app has not satisfied the interaction contract.
 

@@ -1307,9 +1307,9 @@ pub trait SlipwayMcpProbeTransport {
 mod tests {
     use super::*;
     use slipway_core::{
-        Color, CommandEvent, DiagnosticSeverity, EvidenceSource, LayoutOutput, PaintOp, Point,
-        Rect, RenderSurfaceDeclaration, ShapeDeclaration, ShapeKind, Size,
-        SlipwayOffscreenRenderer, TargetLocalRect, WidgetId,
+        Color, CommandEvent, DiagnosticSeverity, EvidenceSource, PaintOp, Point, Rect,
+        RenderSurfaceDeclaration, ShapeDeclaration, ShapeKind, Size, SlipwayOffscreenRenderer,
+        TargetLocalRect, WidgetId,
     };
 
     fn frame(index: u64) -> FrameIdentity {
@@ -1329,11 +1329,18 @@ mod tests {
     }
 
     fn packet(frame: FrameIdentity) -> RenderPacket {
-        let layout = LayoutOutput {
-            bounds: TargetLocalRect::new(frame.viewport),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
+        let bounds = TargetLocalRect::new(frame.viewport);
+        let input = slipway_core::LayoutInput {
+            viewport: bounds,
+            content: bounds,
+            constraints: slipway_core::LayoutConstraints {
+                min: frame.viewport.size,
+                max: frame.viewport.size,
+            },
         };
+        let (frame, _, output) =
+            slipway_core::ViewDefinitionInput::new(frame, input).into_layout_parts();
+        let layout = slipway_core::prepare_leaf_layout(output, bounds);
         RenderPacket {
             target: WidgetId::from("widget"),
             frame,
@@ -1374,6 +1381,7 @@ mod tests {
                 capabilities: vec!["test".to_string()],
             }],
             diagnostics: Vec::new(),
+            prepared_geometry: None,
         }
     }
 

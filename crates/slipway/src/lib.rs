@@ -118,12 +118,9 @@ pub mod prelude {
     //!         _external: &Self::ExternalState,
     //!         _local: &Self::LocalState,
     //!         input: LayoutInput,
+    //!         output: LayoutOutputBuilder,
     //!     ) -> LayoutOutput {
-    //!         LayoutOutput {
-    //!             bounds: input.viewport,
-    //!             child_placements: Vec::new(),
-    //!             diagnostics: Vec::new(),
-    //!         }
+    //!         output.finish(input.viewport)
     //!     }
     //!     fn paint(
     //!         &self,
@@ -132,7 +129,7 @@ pub mod prelude {
     //!         layout: &LayoutOutput,
     //!     ) -> Vec<PaintOp> {
     //!         let text = PaintOp::styled_text(
-    //!             layout.bounds.into_rect(),
+    //!             layout.bounds().into_rect(),
     //!             "panel",
     //!             Color { red: 0.1, green: 0.1, blue: 0.1, alpha: 1.0 },
     //!             // Declared text alignment (NC-14): anchored within the
@@ -249,17 +246,22 @@ pub mod prelude {
     //!     origin: Point { x: 0.0, y: 0.0 },
     //!     size: Size { width: 240.0, height: 120.0 },
     //! };
-    //! let layout = panel.layout(
+    //! let content = TargetLocalRect::new(viewport);
+    //! let layout = layout_view(
+    //!     &panel,
     //!     &external,
     //!     &local,
     //!     LayoutInput {
-    //!         viewport: TargetLocalRect::new(viewport),
+    //!         // With zero spacing, content occupies the entire viewport.
+    //!         viewport: content,
+    //!         content,
     //!         constraints: LayoutConstraints {
     //!             min: Size { width: 0.0, height: 0.0 },
     //!             max: viewport.size,
     //!         },
     //!     },
     //! );
+    //! assert_eq!(layout.bounds(), &content);
     //!
     //! let hit = hit_region_from_pointer_capability(
     //!     &panel,
@@ -267,7 +269,7 @@ pub mod prelude {
     //!     &local,
     //!     PresentationRegionId::new("panel:hit"),
     //!     None,
-    //!     layout.bounds,
+    //!     *layout.bounds(),
     //!     PointerEventCoordinateSpace::TargetLocal,
     //!     HitRegionOrder::default(),
     //!     None,
@@ -281,7 +283,7 @@ pub mod prelude {
     //!     &local,
     //!     PresentationRegionId::new("panel:focus"),
     //!     None,
-    //!     layout.bounds,
+    //!     *layout.bounds(),
     //!     true,
     //! );
     //! let scroll = scroll_region_from_scrollable_capability_with_order(
@@ -316,6 +318,7 @@ pub mod prelude {
     //!     hit_regions: vec![hit],
     //!     focus_regions: vec![focus],
     //!     scroll_regions: vec![scroll],
+    //!     wheel_traversal_boundary: Default::default(),
     //!     semantic_slots: Vec::new(),
     //!     probe_metadata: Vec::new(),
     //!     diagnostics: Vec::new(),
@@ -335,11 +338,12 @@ pub mod prelude {
         FrameIdentity, InputEvent, SlipwayApp, SlipwayAppWidget, SlipwayLogic, SlipwaySsot,
         SlipwayView, SlipwayViewDefinition, SlipwayWidget, SlipwayWidgetTypes, StateObservation,
         TopologyNode, ViewDefinition, ViewDefinitionInput, WidgetId, WidgetSlotAddress,
+        layout_view, layout_view_definition,
     };
     // Geometry and layout.
     pub use slipway_core::{
-        LayoutConstraints, LayoutInput, LayoutOutput, ParentLocalRect, Point, Rect, Size,
-        TargetLocalRect,
+        BoxSpacing, ContentLocalRect, LayoutConstraints, LayoutInput, LayoutOutput,
+        LayoutOutputBuilder, ParentLocalRect, Point, Rect, Size, TargetLocalRect,
     };
     // Interaction declarations (llm-contract-checklist.md "What Must Be
     // Declared") and their field types.

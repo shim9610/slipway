@@ -131,6 +131,11 @@ Physical-equivalent success requires all of these to line up:
 for debug/tests, never proof that a visible click, wheel, focus, text, or
 command works.
 
+Standard command names are not custom demo hooks. If `copy`, `cut`, `paste`,
+`select_all`, `undo`, or `redo` appears in a physical/debug trace, verify that
+the resulting state change matches the widget's text/edit command contract. Use
+a custom command name for probe-only mutations.
+
 ## Backend Choice
 
 Backend switching is typed repair, not magic translation.

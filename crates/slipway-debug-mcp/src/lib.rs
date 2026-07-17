@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use slipway_core::{
     CommandEvent, DeclaredEventDispatchEvidence, DeclaredEventDispatchKind, Diagnostic,
     EvidenceSource, FocusEvent, FrameIdentity, InputEvent, KeyEventKind, KeyLocation,
-    KeyboardDetails, KeyboardEvent, LayoutOutput, Modifiers, Point, PointerButton, PointerButtons,
+    KeyboardDetails, KeyboardEvent, Modifiers, Point, PointerButton, PointerButtons,
     PointerDetails, PointerDeviceKind, PointerEvent, PointerEventKind, PresentationRegionId,
     ProbeKind, ProbeProduct, ProbeRequest, Rect, RenderPacket, Size, TargetLocalRect,
     TextCompositionPhase, TextEditKind, TextInputEvent, TextSelectionRange, WheelEvent, WidgetId,
@@ -2401,17 +2401,25 @@ fn parse_render_packet(arguments: &Value) -> Result<RenderPacket, RpcError> {
     let target = optional_string_field(packet, "target")?
         .map(parse_widget_id)
         .unwrap_or_else(|| parse_widget_id(&frame.surface_instance_id));
+    let bounds = TargetLocalRect::new(frame.viewport);
+    let input = slipway_core::LayoutInput {
+        viewport: bounds,
+        content: bounds,
+        constraints: slipway_core::LayoutConstraints {
+            min: frame.viewport.size,
+            max: frame.viewport.size,
+        },
+    };
+    let (frame, _, output) =
+        slipway_core::ViewDefinitionInput::new(frame, input).into_layout_parts();
     Ok(RenderPacket {
         target,
-        frame: frame.clone(),
-        layout: LayoutOutput {
-            bounds: TargetLocalRect::new(frame.viewport),
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        },
+        frame,
+        layout: slipway_core::prepare_leaf_layout(output, bounds),
         paint: Vec::new(),
         surfaces: Vec::new(),
         diagnostics: Vec::new(),
+        prepared_geometry: None,
     })
 }
 

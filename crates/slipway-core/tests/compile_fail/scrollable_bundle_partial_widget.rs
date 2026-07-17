@@ -57,12 +57,9 @@ impl SlipwayView for PartialListWidget {
         _external: &Self::ExternalState,
         _local: &Self::LocalState,
         input: LayoutInput,
+        output: LayoutOutputBuilder,
     ) -> LayoutOutput {
-        LayoutOutput {
-            bounds: input.viewport,
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
-        }
+        output.finish(input.viewport)
     }
 
     fn paint(

@@ -3265,6 +3265,7 @@ where
         let frame = self.app.runtime().last_frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: slipway_core::Size {
                     width: 0.0,

@@ -40,6 +40,10 @@ Severity is `error` (blocking) for every row except the four marked `warn`.
 | `view_contract.layout_bounds_not_target_local` | layout bounds origin is not `0,0` | keep layout target-local; parent placement belongs in `ChildPlacement` |
 | `view_contract.layout_outside_frame_viewport` (warn) | layout bounds extend outside the frame viewport | size the layout from the `LayoutInput` viewport |
 | `view_contract.child_input_viewport_not_target_local` | app layout plan gave a child a non-zero-origin input viewport | place children with `ChildPlacement` bounds; child `LayoutInput` stays origin `0,0` |
+| `view_contract.box_border_invalid` (error) | a mounted child's border origin is non-finite, or its border width/height is non-finite or negative; evidence names the widget id, optional `WidgetSlotAddress`, exact `border.x`/`border.y`/`border.width`/`border.height` component, and value | provide a finite parent-local border with non-negative width and height |
+| `view_contract.box_spacing_non_finite` (error) | the first invalid margin or padding edge is non-finite; evidence names the widget id, optional `WidgetSlotAddress`, exact edge component, and value | replace the edge with a finite, non-negative value |
+| `view_contract.box_spacing_negative` (error) | the first invalid margin or padding edge is finite and negative; evidence names the widget id, optional `WidgetSlotAddress`, exact edge component, and value | replace the edge with a finite, non-negative value |
+| `view_contract.box_geometry_mismatch` (error) | a child placement has no mounted `WidgetSlotAddress`; evidence names the widget id and states that the mounted address is missing | set `ChildPlacement::local_state_slot` to the child's mounted `WidgetSlotAddress` |
 | `view_contract.hit_bounds_invalid` | hit bounds non-finite or negative | fix the `bounds` passed to `hit_region_from_pointer_capability` |
 | `view_contract.hit_bounds_outside_layout` | enabled hit region leaves layout bounds without overflow paint | keep bounds target-local inside layout, or declare overflow bounds |
 | `view_contract.hit_bounds_outside_overflow_bounds` | hit region leaves the declared overflow bounds | grow `overflow_bounds` or shrink the region |
@@ -71,6 +75,7 @@ Severity is `error` (blocking) for every row except the four marked `warn`.
 | `view_contract.text_edit_missing_delete_command` | editable region without a delete command | declare `DeleteBackward`/`DeleteForward` commands |
 | `view_contract.text_edit_missing_replace_buffer_command` | editable region without an enabled `ReplaceBuffer` command | declare it (native backend text widgets replace the buffer) |
 | `view_contract.scroll_capability_missing_scroll_region` | `WheelInput`/`ScrollRegionPresentation` declared, no enabled scroll region | declare one via `scroll_region_from_scrollable_capability` or remove the capability |
+| `view_contract.wheel_traversal_boundary_invalid` | `ViewDefinition.wheel_traversal_boundary.terminal_region_index` is out of bounds, or names a disabled declaration, one that does not consume wheel input, or one with no enabled axis | set `terminal_region_index` to `None` when no terminal wheel owner exists; otherwise capture `scroll_regions.len()` when pushing the enabled, wheel-consuming declaration with at least one enabled axis, and store that declaration index |
 | `view_contract.scroll_geometry_invalid` | scroll viewport/content bounds non-finite or negative | fix the geometry in `SlipwayScrollBehaviorPolicy` |
 | `view_contract.scroll_viewport_outside_layout` | enabled scroll viewport leaves layout bounds without overflow paint | derive the viewport from the final `LayoutOutput` (see [Routing and scroll](routing-and-scroll.md)) |
 | `view_contract.scroll_viewport_outside_overflow_bounds` | scroll viewport leaves the declared overflow bounds | grow `overflow_bounds` or shrink the viewport |
@@ -87,6 +92,12 @@ Severity is `error` (blocking) for every row except the four marked `warn`.
 
 The geometry rows share one hint: bounds are target-local (origin `0,0`);
 window/parent placement belongs in `ChildPlacement`.
+
+Box validation is deterministic per child placement: it checks border fields
+first, then stops at the first invalid spacing edge in margin TRBL followed by
+padding TRBL order, then checks for a mounted address. Negative and non-finite
+spacing are runtime-refused blocking errors. Oversized finite padding is valid:
+content size clamps to zero rather than producing a spacing diagnostic.
 
 ## backend_input: Dispatch-Evidence Refusals
 

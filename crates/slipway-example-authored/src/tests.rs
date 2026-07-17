@@ -57,8 +57,10 @@ fn app_runtime_with_viewport(width: f32, height: f32) -> AppRuntime {
 
 fn composed_view(runtime: &AppRuntime) -> ViewDefinition {
     let frame = runtime.last_frame_identity();
+    let viewport = TargetLocalRect::new(frame.viewport);
     let layout_input = LayoutInput {
-        viewport: TargetLocalRect::new(frame.viewport),
+        viewport,
+        content: viewport,
         constraints: LayoutConstraints {
             min: Size {
                 width: 0.0,
@@ -70,19 +72,18 @@ fn composed_view(runtime: &AppRuntime) -> ViewDefinition {
     runtime.widget().view_definition(
         runtime.external(),
         runtime.local_state(),
-        ViewDefinitionInput {
-            frame,
-            layout_input,
-        },
+        ViewDefinitionInput::new(frame, layout_input),
     )
 }
 
 fn widget_input(width: f32, height: f32) -> LayoutInput {
+    let viewport = TargetLocalRect::new(Rect {
+        origin: Point { x: 0.0, y: 0.0 },
+        size: Size { width, height },
+    });
     LayoutInput {
-        viewport: TargetLocalRect::new(Rect {
-            origin: Point { x: 0.0, y: 0.0 },
-            size: Size { width, height },
-        }),
+        viewport,
+        content: viewport,
         constraints: LayoutConstraints {
             min: Size {
                 width: 0.0,
@@ -113,8 +114,8 @@ where
     widget.view_definition(
         external,
         local,
-        ViewDefinitionInput {
-            frame: FrameIdentity {
+        ViewDefinitionInput::new(
+            FrameIdentity {
                 surface_id: "test-surface".to_string(),
                 surface_instance_id: "test-instance".to_string(),
                 revision: 0,
@@ -122,7 +123,7 @@ where
                 viewport: layout_input.viewport.into_rect(),
             },
             layout_input,
-        },
+        ),
     )
 }
 
@@ -362,6 +363,51 @@ fn every_widget_view_passes_pre_flight_admission() {
 }
 
 #[test]
+fn scroll_producers_declare_their_outermost_terminal_owner() {
+    let list = widget_view(
+        &NoteListWidget,
+        &NoteListWidget.initial_local_state(),
+        ssot::LIST_CARD_HEIGHT,
+    );
+    assert_eq!(list.wheel_traversal_boundary.terminal_region_index, Some(0));
+    assert_eq!(list.scroll_regions[0].id, ssot::list_scroll_region_id());
+
+    let overlay = widget_view(
+        &OverlayWidget,
+        &OverlayWidget.initial_local_state(),
+        ssot::OVERLAY_CARD_HEIGHT,
+    );
+    assert_eq!(
+        overlay.wheel_traversal_boundary.terminal_region_index,
+        Some(0)
+    );
+    assert_eq!(overlay.scroll_regions[0].id, ssot::overlay_feed_region_id());
+
+    let nested = widget_view(
+        &NestedFeedWidget,
+        &NestedFeedWidget.initial_local_state(),
+        ssot::NESTED_CARD_HEIGHT,
+    );
+    assert_eq!(
+        nested.wheel_traversal_boundary.terminal_region_index,
+        Some(0)
+    );
+    assert_eq!(nested.scroll_regions[0].id, ssot::nested_outer_region_id());
+    assert!(
+        nested.scroll_regions[1..]
+            .iter()
+            .all(|region| region.id != ssot::nested_outer_region_id())
+    );
+
+    let input = widget_view(
+        &DraftInputWidget,
+        &DraftInputWidget.initial_local_state(),
+        ssot::INPUT_CARD_HEIGHT,
+    );
+    assert_eq!(input.wheel_traversal_boundary.terminal_region_index, None);
+}
+
+#[test]
 fn composed_app_view_passes_pre_flight_admission() {
     let runtime = app_runtime();
     let view = composed_view(&runtime);
@@ -402,7 +448,7 @@ fn page_region_appears_exactly_when_the_column_exceeds_the_window() {
     // root bounds stretch to the window (the min-height pattern).
     let runtime = app_runtime();
     let view = composed_view(&runtime);
-    assert_eq!(view.layout.bounds.size.height, FRAME_HEIGHT);
+    assert_eq!(view.layout.bounds().as_rect().size.height, FRAME_HEIGHT);
     assert!(
         !view
             .scroll_regions
@@ -498,7 +544,7 @@ fn responsive_width_tracks_a_changed_viewport_width() {
         let runtime = app_runtime_with_viewport(frame_width, FRAME_HEIGHT);
         let view = composed_view(&runtime);
         let card_width = frame_width - 2.0 * ssot::CARD_MARGIN_X;
-        for placement in &view.layout.child_placements {
+        for placement in view.layout.child_placements() {
             assert_eq!(
                 placement.bounds.into_rect().size.width,
                 card_width,
@@ -1058,7 +1104,7 @@ fn roaming_clamp_equals_declared_allowance_at_two_window_sizes() {
             "record_presented_viewport must project the live window into ShowcaseState"
         );
         let view = composed_view(&runtime);
-        let root_bounds = view.layout.bounds.into_rect();
+        let root_bounds = view.layout.bounds().into_rect();
 
         // The allowance, mapped from overlay-card-local space to root
         // space, covers the whole window (and the whole column when the
@@ -1102,10 +1148,10 @@ fn roaming_clamp_equals_declared_allowance_at_two_window_sizes() {
         let overlay_view = overlay.view_definition(
             &external,
             &overlay_local,
-            ViewDefinitionInput {
-                frame: runtime.last_frame_identity(),
-                layout_input: widget_input(card_width, ssot::OVERLAY_CARD_HEIGHT),
-            },
+            ViewDefinitionInput::new(
+                runtime.last_frame_identity(),
+                widget_input(card_width, ssot::OVERLAY_CARD_HEIGHT),
+            ),
         );
         assert_eq!(
             overlay_view
@@ -1118,7 +1164,7 @@ fn roaming_clamp_equals_declared_allowance_at_two_window_sizes() {
 
         // Every card placement is inside the allowance: the panel may
         // roam over each of them.
-        for placement in &view.layout.child_placements {
+        for placement in view.layout.child_placements() {
             let bounds = placement.bounds.into_rect();
             assert!(
                 ssot::intersect_rect(bounds, allowance_in_root)

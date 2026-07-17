@@ -1,7 +1,7 @@
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -15,15 +15,15 @@ help: the trait `SlipwayContainerLayoutPolicy` is not implemented for `PartialLi
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`
 
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -37,15 +37,15 @@ help: the trait `SlipwayChildConstraintPolicy` is not implemented for `PartialLi
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`
 
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -59,15 +59,15 @@ help: the trait `SlipwayLayoutInvalidationPolicy` is not implemented for `Partia
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`
 
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -81,15 +81,15 @@ help: the trait `SlipwayLayoutEvidencePolicy` is not implemented for `PartialLis
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`
 
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -103,15 +103,15 @@ help: the trait `SlipwayViewportObservationPolicy` is not implemented for `Parti
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`
 
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -125,15 +125,15 @@ help: the trait `SlipwayVirtualCollectionPolicy` is not implemented for `Partial
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`
 
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -147,15 +147,15 @@ help: the trait `SlipwayHitTesting` is not implemented for `PartialListWidget`
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`
 
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -169,15 +169,15 @@ help: the trait `SlipwayEventRoutingPolicy` is not implemented for `PartialListW
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`
 
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -191,15 +191,15 @@ help: the trait `SlipwayEventDispositionPolicy` is not implemented for `PartialL
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`
 
 error[E0277]: `PartialListWidget` does not satisfy the `SlipwayScrollableContainerCapability` bundle (scrollable containers)
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:145:32
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:32
     |
-145 |     requires_scrollable_bundle(&PartialListWidget);
+142 |     requires_scrollable_bundle(&PartialListWidget);
     |     -------------------------- ^^^^^^^^^^^^^^^^^^ missing one or more supertraits of the scrollable-container capability bundle
     |     |
     |     required by a bound introduced by this call
@@ -213,7 +213,7 @@ help: the trait `SlipwaySemantics` is not implemented for `PartialListWidget`
     = note: the remaining bounds are RESERVED (no runtime consumer; real logic in them is a silent no-op): SlipwayContainerLayoutPolicy, SlipwayChildConstraintPolicy, SlipwayLayoutInvalidationPolicy, SlipwayLayoutEvidencePolicy, SlipwayViewportObservationPolicy, SlipwayVirtualCollectionPolicy, SlipwayHitTesting, SlipwaySemantics — satisfy every RESERVED bound at once with `slipway_core::reserved_policy_defaults!(YourWidget);`
     = note: required for `PartialListWidget` to implement `slipway_core::SlipwayScrollableContainerCapability`
 note: required by a bound in `requires_scrollable_bundle`
-   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:142:34
+   --> tests/compile_fail/scrollable_bundle_partial_widget.rs:139:34
     |
-142 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
+139 | fn requires_scrollable_bundle<T: SlipwayScrollableContainerCapability>(_widget: &T) {}
     |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `requires_scrollable_bundle`

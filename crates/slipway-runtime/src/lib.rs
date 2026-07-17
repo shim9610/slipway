@@ -6,11 +6,11 @@ use slipway_core::{
     BackendInputEvent, BackendInputTrace, BackendParityAdmission, ChangeEvidence,
     ChangeShapeIdentity, ClipDeclaration, DeclaredEventDispatchEvidence, DeclaredEventDispatchKind,
     Diagnostic, DiagnosticIdentity, DiagnosticSeverity, EmittedMessage, EmittedMessageEvidence,
-    EventOutcome, EventResultIdentity, FrameIdentity, InputEvent, LayoutConstraints, LayoutInput,
-    PaintOp, PathCommand, PathDeclaration, Point, PresentationGeometryIndex, ProbeKind,
-    ProbeProduct, ProbeRequest, Rect, RenderEvidence, RenderPacket, RenderRefusal,
-    ScrollRegionDeclaration, ShapeDeclaration, Size, SlipwayApp, SlipwayAppLocalState,
-    SlipwayAppWidget, SlipwayAuthoredWidget, SlipwayEventDispositionPolicy,
+    EventOutcome, EventResultIdentity, FrameIdentity, GeometryCaptureIntent, InputEvent,
+    LayoutConstraints, LayoutInput, PaintOp, PathCommand, PathDeclaration, Point,
+    PreparedPresentationGeometry, ProbeKind, ProbeProduct, ProbeRequest, Rect, RenderEvidence,
+    RenderPacket, RenderRefusal, ScrollRegionDeclaration, ShapeDeclaration, Size, SlipwayApp,
+    SlipwayAppLocalState, SlipwayAppWidget, SlipwayAuthoredWidget, SlipwayEventDispositionPolicy,
     SlipwayEventRoutingPolicy, SlipwayOffscreenRenderer, SlipwayViewDefinition, SlipwayWidgetTypes,
     TargetLocalRect, TextCompositionPhase, TextEditEvent, TextEditKind, TextSelectionRange,
     ViewDefinition, ViewDefinitionInput, WidgetId, WidgetSlot,
@@ -35,6 +35,7 @@ use slipway_debug_renderer::CpuDebugRenderer;
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 const DEFAULT_BRIDGE_CAPACITY: usize = 32;
@@ -118,7 +119,7 @@ pub struct SlipwayBackendInputApplyReport {
 struct CurrentBackendViewSnapshot {
     frame: FrameIdentity,
     view: ViewDefinition,
-    geometry_index: PresentationGeometryIndex,
+    prepared_geometry: Result<Arc<PreparedPresentationGeometry>, Vec<Diagnostic>>,
 }
 
 fn emitted_message_evidence<M>(messages: &[EmittedMessage<M>]) -> Vec<EmittedMessageEvidence> {
@@ -834,12 +835,14 @@ fn render_packet_from_runtime_state<W>(
     external: &W::ExternalState,
     local: &W::LocalState,
     frame: FrameIdentity,
-) -> RenderPacket
+    capture: GeometryCaptureIntent,
+) -> Result<RenderPacket, RenderRefusal>
 where
     W: SlipwayAuthoredWidget + SlipwayViewDefinition,
 {
     let input = LayoutInput {
         viewport: TargetLocalRect::new(frame.viewport),
+        content: TargetLocalRect::new(frame.viewport),
         constraints: LayoutConstraints {
             min: Size {
                 width: 0.0,
@@ -851,25 +854,32 @@ where
     let view = widget.visible_backend_view_definition(
         external,
         local,
-        ViewDefinitionInput {
-            frame: frame.clone(),
-            layout_input: input,
-        },
+        ViewDefinitionInput::new(frame.clone(), input),
     );
+    let prepared_geometry = slipway_core::validate_and_index_view_with_capture(&view, capture)
+        .map_err(|diagnostics| RenderRefusal {
+            target: Some(widget.id()),
+            frame: frame.clone(),
+            source: None,
+            provider_id: None,
+            reason: "view failed the mandatory presentation-geometry gate".to_string(),
+            diagnostics,
+        })?;
     let paint = widget.paint(external, local, &view.layout);
     let paint =
         canonical_visible_viewport_paint(widget.id(), frame.viewport, &view.scroll_regions, paint);
-    let mut diagnostics = view.layout.diagnostics.clone();
+    let mut diagnostics = view.layout.diagnostics().to_vec();
     diagnostics.extend(view.diagnostics.clone());
 
-    RenderPacket {
+    Ok(RenderPacket {
         target: widget.id(),
         frame,
         paint,
         surfaces: Vec::new(),
         diagnostics,
         layout: view.layout,
-    }
+        prepared_geometry: Some(prepared_geometry),
+    })
 }
 
 fn canonical_visible_viewport_paint(
@@ -1359,6 +1369,7 @@ where
         self.last_viewport = viewport;
         LayoutInput {
             viewport: TargetLocalRect::new(viewport),
+            content: TargetLocalRect::new(viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -1369,7 +1380,10 @@ where
         }
     }
 
-    pub fn render_packet_for_frame(&self, frame: FrameIdentity) -> RenderPacket
+    pub fn render_packet_for_frame(
+        &self,
+        frame: FrameIdentity,
+    ) -> Result<RenderPacket, RenderRefusal>
     where
         W: SlipwayViewDefinition,
     {
@@ -1378,6 +1392,7 @@ where
             &self.external,
             &self.slot.local_state,
             frame,
+            GeometryCaptureIntent::RenderPacketEvidence,
         )
     }
 
@@ -1631,6 +1646,7 @@ where
         let frame = self.last_frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -1642,16 +1658,13 @@ where
         let view = self.slot.widget.visible_backend_view_definition(
             &self.external,
             &self.slot.local_state,
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame.clone(), layout_input),
         );
-        let geometry_index = PresentationGeometryIndex::from_layout(&view.layout);
+        let prepared_geometry = slipway_core::validate_and_index_view(&view);
         CurrentBackendViewSnapshot {
             frame,
             view,
-            geometry_index,
+            prepared_geometry,
         }
     }
 
@@ -1692,6 +1705,9 @@ where
         }
 
         let snapshot = self.current_backend_view_snapshot_cached(view_snapshot);
+        let Ok(prepared_geometry) = &snapshot.prepared_geometry else {
+            return event;
+        };
         let frame = &snapshot.frame;
         let view = &snapshot.view;
 
@@ -1706,7 +1722,7 @@ where
                     slipway_core::resolve_declared_wheel_dispatch_with_evidence_and_geometry_index(
                         evidence.source.clone(),
                         frame.clone(),
-                        &snapshot.geometry_index,
+                        &prepared_geometry.index,
                         &view.scroll_regions,
                         input_position,
                         wheel.delta_x,
@@ -1765,7 +1781,7 @@ where
                         refreshed_event.clone(),
                         Some(
                             slipway_core::declared_region_root_local_rect_with_geometry_index(
-                                &snapshot.geometry_index,
+                                &prepared_geometry.index,
                                 &region.target,
                                 region.address.as_ref(),
                                 region.viewport.into_rect(),
@@ -1794,9 +1810,12 @@ where
             ];
         };
         let snapshot = self.current_backend_view_snapshot_cached(view_snapshot);
+        let Ok(prepared_geometry) = &snapshot.prepared_geometry else {
+            return snapshot.prepared_geometry.as_ref().unwrap_err().clone();
+        };
         slipway_core::backend_input_dispatch_evidence_contract_diagnostics_with_geometry_index(
             &snapshot.view,
-            &snapshot.geometry_index,
+            &prepared_geometry.index,
             event,
             Some(slipway_core::EVIDENCE_SOURCE_BACKEND_PRESENTED),
             expected_backend_id,
@@ -3530,18 +3549,24 @@ where
         + SlipwayEventRoutingPolicy
         + SlipwayEventDispositionPolicy,
 {
-    fn render_packet(&self, frame: FrameIdentity) -> RenderPacket {
+    fn render_packet(
+        &self,
+        frame: FrameIdentity,
+        capture: GeometryCaptureIntent,
+    ) -> Result<RenderPacket, RenderRefusal> {
         render_packet_from_runtime_state(
             &self.slot.widget,
             self.external,
             &self.slot.local_state,
             frame,
+            capture,
         )
     }
 
     fn layout_input_for_frame(frame: &FrameIdentity) -> LayoutInput {
         LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -3556,10 +3581,7 @@ where
         self.slot.widget.visible_backend_view_definition(
             self.external,
             &self.slot.local_state,
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input: Self::layout_input_for_frame(frame),
-            },
+            ViewDefinitionInput::new(frame.clone(), Self::layout_input_for_frame(frame)),
         )
     }
 
@@ -3613,20 +3635,39 @@ where
                     }));
                 }
                 ProbeKind::Paint => {
-                    let packet = self.render_packet(frame.clone());
-                    products.push(ProbeProduct::Paint(slipway_core::PaintProbe {
-                        target: packet.target,
-                        ops: packet.paint,
-                    }));
+                    match self.render_packet(frame.clone(), GeometryCaptureIntent::None) {
+                        Ok(packet) => {
+                            products.push(ProbeProduct::Paint(slipway_core::PaintProbe {
+                                target: packet.target,
+                                ops: packet.paint,
+                            }))
+                        }
+                        Err(refusal) => products.extend(
+                            refusal
+                                .diagnostics
+                                .into_iter()
+                                .map(ProbeProduct::Diagnostic),
+                        ),
+                    }
                 }
                 ProbeKind::RenderPacket => {
-                    products.push(ProbeProduct::RenderPacket(
-                        self.render_packet(frame.clone()),
-                    ));
+                    match self
+                        .render_packet(frame.clone(), GeometryCaptureIntent::RenderPacketEvidence)
+                    {
+                        Ok(packet) => products.push(ProbeProduct::RenderPacket(packet)),
+                        Err(refusal) => products.extend(
+                            refusal
+                                .diagnostics
+                                .into_iter()
+                                .map(ProbeProduct::Diagnostic),
+                        ),
+                    }
                 }
                 ProbeKind::RenderEvidence => {
-                    let packet = self.render_packet(frame.clone());
-                    match self.render(packet) {
+                    let result = self
+                        .render_packet(frame.clone(), GeometryCaptureIntent::RenderPacketEvidence)
+                        .and_then(|packet| self.render(packet));
+                    match result {
                         Ok(evidence) => products.push(ProbeProduct::RenderEvidence(evidence)),
                         Err(refusal) => {
                             products.push(ProbeProduct::Diagnostic(Diagnostic::warning(
@@ -3828,11 +3869,13 @@ where
         frame: &FrameIdentity,
         target: &WidgetId,
     ) -> Option<TargetLocalRect> {
-        let layout = self.slot.widget.layout(
+        let layout = slipway_core::layout_view(
+            &self.slot.widget,
             self.external,
             &self.slot.local_state,
             LayoutInput {
                 viewport: TargetLocalRect::new(frame.viewport),
+                content: TargetLocalRect::new(frame.viewport),
                 constraints: LayoutConstraints {
                     min: Size {
                         width: 0.0,
@@ -3843,13 +3886,13 @@ where
             },
         );
         let size = if *target == self.slot.widget.id() {
-            layout.bounds.size
+            layout.bounds().into_rect().size
         } else {
             layout
-                .child_placements
+                .child_placements()
                 .iter()
                 .find(|placement| placement.child == *target)
-                .map(|placement| placement.bounds.size)?
+                .map(|placement| placement.bounds.as_rect().size)?
         };
         Some(TargetLocalRect::new(Rect {
             origin: Point { x: 0.0, y: 0.0 },
@@ -4094,8 +4137,11 @@ where
             }
             DebugCommandKind::Render { packet } => {
                 let frame = packet.frame;
-                let runtime_packet = self.render_packet(frame);
-                match self.render(runtime_packet) {
+                let runtime_packet = self.render_packet(
+                    frame,
+                    GeometryCaptureIntent::RenderPacketEvidence,
+                );
+                match runtime_packet.and_then(|packet| self.render(packet)) {
                     Ok(evidence) => DebugReplyProduct::Render(RenderProduct::Evidence(evidence)),
                     Err(refusal) => DebugReplyProduct::Render(RenderProduct::Refusal(refusal)),
                 }
@@ -4255,16 +4301,17 @@ fn dispatch_refusal_diagnostic(
 mod tests {
     use super::*;
     use slipway_core::{
-        Capability, CaretGeometryEvidence, CaretSet, ChildPlacement, Color, CommandEvent,
-        CursorCapability, DeclaredEventDispatchKind, Diagnostic, EventOutcome, EventRoute,
-        EventRoutePhase, FocusRegionDeclaration, HitRegionOrder, ImeCompositionPolicyDeclaration,
-        InputEvent, LayoutOutput, PaintOp, PaintOrderDeclaration, Point, PointerCaptureIntent,
-        PointerEventKind, PresentationRegionId, Rect, ScrollAxes, ScrollConsumptionEvidence,
-        ScrollConsumptionPolicy, ScrollDeltaConsumption, ScrollInputKind, ShapeDeclaration,
-        ShapeKind, Size, SlipwayLogic, SlipwaySsot, SlipwayView, SlipwayViewDefinition,
-        SlipwayWidgetTypes, StateObservation, TextBufferSnapshot, TextEditCommandDeclaration,
-        TextEditEvent, TextEditKind, TextLineMode, TextSelectionPolicyDeclaration, TextStyle,
-        TopologyNode, ViewDefinition, ViewDefinitionInput, WheelRouting, WidgetId,
+        Capability, CaretGeometryEvidence, CaretSet, Color, CommandEvent, CursorCapability,
+        DeclaredEventDispatchKind, Diagnostic, EventOutcome, EventRoute, EventRoutePhase,
+        FocusRegionDeclaration, HitRegionOrder, ImeCompositionPolicyDeclaration, InputEvent,
+        LayoutOutput, LayoutOutputBuilder, PaintOp, PaintOrderDeclaration, Point,
+        PointerCaptureIntent, PointerEventKind, PresentationRegionId, Rect, ScrollAxes,
+        ScrollConsumptionEvidence, ScrollConsumptionPolicy, ScrollDeltaConsumption,
+        ScrollInputKind, ShapeDeclaration, ShapeKind, Size, SlipwayLogic, SlipwaySsot, SlipwayView,
+        SlipwayViewDefinition, SlipwayWidgetTypes, StateObservation, TextBufferSnapshot,
+        TextEditCommandDeclaration, TextEditEvent, TextEditKind, TextLineMode,
+        TextSelectionPolicyDeclaration, TextStyle, TopologyNode, ViewDefinition,
+        ViewDefinitionInput, WheelRouting, WidgetId, layout_view,
     };
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
@@ -4524,12 +4571,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -4678,6 +4722,11 @@ mod tests {
                 TextEditCommandDeclaration {
                     command_id: "delete-backward".to_string(),
                     kind: TextEditKind::DeleteBackward,
+                    enabled: true,
+                },
+                TextEditCommandDeclaration {
+                    command_id: "replace-buffer".to_string(),
+                    kind: TextEditKind::ReplaceBuffer,
                     enabled: true,
                 },
             ]
@@ -4936,8 +4985,8 @@ mod tests {
         ) -> slipway_core::LayoutEvidence {
             slipway_core::LayoutEvidence {
                 target: self.id.clone(),
-                bounds: output.bounds,
-                child_placements: output.child_placements.clone(),
+                bounds: *output.bounds(),
+                child_placements: output.child_placements().to_vec(),
                 invalidated: false,
                 diagnostics: Vec::new(),
             }
@@ -5180,12 +5229,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -5198,7 +5244,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some(format!("count-{}", local.count)),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -5232,7 +5278,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -5241,6 +5287,7 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -5303,12 +5350,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -5321,7 +5365,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some("physical-probe-body".to_string()),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -5355,7 +5399,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -5367,7 +5411,7 @@ mod tests {
                     local,
                     PresentationRegionId::from("probe-hit"),
                     None,
-                    layout.bounds,
+                    *layout.bounds(),
                     slipway_core::PointerEventCoordinateSpace::TargetLocal,
                     HitRegionOrder {
                         z_index: 0,
@@ -5381,6 +5425,7 @@ mod tests {
                 )],
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -5443,12 +5488,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -5461,7 +5503,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some("clone-counting-physical-probe-body".to_string()),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -5495,7 +5537,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -5507,7 +5549,7 @@ mod tests {
                     local,
                     PresentationRegionId::from("clone-counting-probe-hit"),
                     None,
-                    layout.bounds,
+                    *layout.bounds(),
                     slipway_core::PointerEventCoordinateSpace::TargetLocal,
                     HitRegionOrder {
                         z_index: 0,
@@ -5521,6 +5563,7 @@ mod tests {
                 )],
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -5640,12 +5683,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -5658,7 +5698,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some("physical-mismatch-body".to_string()),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -5692,14 +5732,14 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             let mut hit_region = slipway_core::hit_region_from_pointer_capability(
                 self,
                 external,
                 local,
                 PresentationRegionId::from("mismatch-hit"),
                 None,
-                layout.bounds,
+                *layout.bounds(),
                 slipway_core::PointerEventCoordinateSpace::TargetLocal,
                 HitRegionOrder {
                     z_index: 0,
@@ -5723,6 +5763,7 @@ mod tests {
                 hit_regions: vec![hit_region],
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -5881,12 +5922,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -5899,7 +5937,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some("text-probe-body".to_string()),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -5965,6 +6003,7 @@ mod tests {
     fn layout_input_for_bounds(bounds: TargetLocalRect) -> LayoutInput {
         LayoutInput {
             viewport: bounds,
+            content: bounds,
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -6007,11 +6046,15 @@ mod tests {
     ) -> slipway_core::ScrollRegionDeclaration {
         let widget = RuntimeInteractionDeclarationWidget { id: target };
         let local = text_physical_local(String::new(), scroll_y);
-        let layout = LayoutOutput {
-            bounds,
-            child_placements: Vec::new(),
-            diagnostics: Vec::new(),
+        let input = LayoutInput {
+            viewport: bounds,
+            content: bounds,
+            constraints: LayoutConstraints {
+                min: bounds.into_rect().size,
+                max: bounds.into_rect().size,
+            },
         };
+        let layout = layout_view(&widget, &(), &local, input);
         let mut region = slipway_core::scroll_region_from_scrollable_capability(
             &widget,
             &(),
@@ -6022,6 +6065,9 @@ mod tests {
             true,
         );
         region.evidence = evidence;
+        if region_id == "text-scroll" {
+            region.order.traversal_order = 1;
+        }
         region
     }
 
@@ -6032,7 +6078,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -6043,13 +6089,13 @@ mod tests {
                     text_physical_focus_region(
                         WidgetId::from("decoy-text-probe"),
                         "decoy-focus",
-                        layout.bounds,
+                        *layout.bounds(),
                         String::new(),
                     ),
                     text_physical_focus_region(
                         self.id(),
                         "text-focus",
-                        layout.bounds,
+                        *layout.bounds(),
                         local.text.clone(),
                     ),
                 ],
@@ -6057,7 +6103,7 @@ mod tests {
                     text_physical_scroll_region(
                         WidgetId::from("decoy-scroll-probe"),
                         "decoy-scroll",
-                        layout.bounds,
+                        *layout.bounds(),
                         0.0,
                         vec![ScrollConsumptionEvidence {
                             target: WidgetId::from("decoy-scroll-probe"),
@@ -6074,7 +6120,7 @@ mod tests {
                     text_physical_scroll_region(
                         self.id(),
                         "text-scroll",
-                        layout.bounds,
+                        *layout.bounds(),
                         local.scroll_y,
                         vec![ScrollConsumptionEvidence {
                             target: self.id(),
@@ -6095,6 +6141,7 @@ mod tests {
                         }],
                     ),
                 ],
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -6158,12 +6205,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -6176,7 +6220,7 @@ mod tests {
                 shape: ShapeDeclaration {
                     id: Some("view-build-counting-wheel-probe-body".to_string()),
                     kind: ShapeKind::Rectangle,
-                    bounds: layout.bounds.into_rect(),
+                    bounds: layout.bounds().into_rect(),
                     path: None,
                     clip: None,
                 },
@@ -6211,7 +6255,7 @@ mod tests {
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
             VIEW_BUILD_COUNTING_WHEEL_PROBE_VIEW_BUILDS.fetch_add(1, Ordering::SeqCst);
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             ViewDefinition {
                 target: self.id(),
                 frame: input.frame,
@@ -6222,10 +6266,11 @@ mod tests {
                 scroll_regions: vec![text_physical_scroll_region(
                     self.id(),
                     "view-build-counting-scroll",
-                    layout.bounds,
+                    *layout.bounds(),
                     local.scroll_y,
                     Vec::new(),
                 )],
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -6291,18 +6336,15 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             _input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: TargetLocalRect::new(Rect {
-                    origin: Point { x: 0.0, y: 0.0 },
-                    size: Size {
-                        width: 24.0,
-                        height: 16.0,
-                    },
-                }),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(TargetLocalRect::new(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 24.0,
+                    height: 16.0,
+                },
+            }))
         }
 
         fn paint(
@@ -6312,7 +6354,7 @@ mod tests {
             layout: &LayoutOutput,
         ) -> Vec<PaintOp> {
             vec![PaintOp::Text {
-                bounds: layout.bounds.into_rect(),
+                bounds: layout.bounds().into_rect(),
                 content: format!("alpha:{}", local.count),
                 color: Color {
                     red: 0.1,
@@ -6345,7 +6387,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             let paint = self.paint(external, local, &layout);
 
             ViewDefinition {
@@ -6357,6 +6399,7 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -6421,18 +6464,15 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             _input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: TargetLocalRect::new(Rect {
-                    origin: Point { x: 28.0, y: 0.0 },
-                    size: Size {
-                        width: 24.0,
-                        height: 16.0,
-                    },
-                }),
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(TargetLocalRect::new(Rect {
+                origin: Point { x: 28.0, y: 0.0 },
+                size: Size {
+                    width: 24.0,
+                    height: 16.0,
+                },
+            }))
         }
 
         fn paint(
@@ -6442,7 +6482,7 @@ mod tests {
             layout: &LayoutOutput,
         ) -> Vec<PaintOp> {
             vec![PaintOp::Text {
-                bounds: layout.bounds.into_rect(),
+                bounds: layout.bounds().into_rect(),
                 content: format!("beta:{}", local.count),
                 color: Color {
                     red: 0.4,
@@ -6475,7 +6515,7 @@ mod tests {
             local: &Self::LocalState,
             input: ViewDefinitionInput,
         ) -> ViewDefinition {
-            let layout = self.layout(external, local, input.layout_input);
+            let layout = layout_view(self, external, local, input.layout_input);
             let paint = self.paint(external, local, &layout);
 
             ViewDefinition {
@@ -6487,6 +6527,7 @@ mod tests {
                 hit_regions: Vec::new(),
                 focus_regions: Vec::new(),
                 scroll_regions: Vec::new(),
+                wheel_traversal_boundary: Default::default(),
                 semantic_slots: Vec::new(),
                 probe_metadata: Vec::new(),
                 diagnostics: Vec::new(),
@@ -6517,13 +6558,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
-            children: Vec<ChildPlacement>,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: children,
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -6533,7 +6570,7 @@ mod tests {
             layout: &LayoutOutput,
         ) -> Vec<PaintOp> {
             vec![PaintOp::Text {
-                bounds: layout.bounds.into_rect(),
+                bounds: layout.bounds().into_rect(),
                 content: format!("app-initialized:{}", local.initialized),
                 color: Color {
                     red: 0.0,
@@ -6914,6 +6951,7 @@ mod tests {
     ) -> BackendInputEvent {
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -6925,10 +6963,7 @@ mod tests {
         let view = runtime.widget().visible_backend_view_definition(
             runtime.external(),
             runtime.local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame.clone(), layout_input),
         );
         let (dispatch, evidence) = slipway_core::resolve_declared_pointer_dispatch_with_evidence(
             slipway_core::EvidenceSource::backend_presented("test-backend", "physical-input"),
@@ -6953,6 +6988,7 @@ mod tests {
         let frame = runtime.last_frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -6964,10 +7000,7 @@ mod tests {
         let view = runtime.widget().visible_backend_view_definition(
             runtime.external(),
             runtime.local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame.clone(), layout_input),
         );
         let (dispatch, evidence) = slipway_core::resolve_declared_pointer_dispatch_with_evidence(
             slipway_core::EvidenceSource::backend_presented("test-backend", "physical-input"),
@@ -6995,6 +7028,7 @@ mod tests {
         let frame = runtime.last_frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -7006,10 +7040,7 @@ mod tests {
         let view = runtime.widget().visible_backend_view_definition(
             runtime.external(),
             runtime.local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame.clone(), layout_input),
         );
         let (dispatch, evidence) = slipway_core::resolve_declared_pointer_dispatch_with_evidence(
             slipway_core::EvidenceSource::backend_presented("test-backend", "physical-input"),
@@ -7162,12 +7193,9 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
             input: LayoutInput,
+            output: LayoutOutputBuilder,
         ) -> LayoutOutput {
-            LayoutOutput {
-                bounds: input.viewport,
-                child_placements: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            output.finish(input.viewport)
         }
 
         fn paint(
@@ -7517,6 +7545,7 @@ mod tests {
         let frame = runtime.last_frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -7528,10 +7557,7 @@ mod tests {
         let view = runtime.widget().visible_backend_view_definition(
             runtime.external(),
             runtime.local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame.clone(), layout_input),
         );
         let region = view
             .focus_regions
@@ -7580,7 +7606,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_presented_physical_control_ignores_view_contract_gate() {
+    fn backend_presented_physical_control_refuses_blocking_view_contract() {
         let mut runtime = SlipwayRuntime::new(
             PhysicalMismatchWidget::hit_bounds_outside_layout("mismatch-view-contract"),
             (),
@@ -7609,15 +7635,20 @@ mod tests {
             &mut |_, _messages: Vec<Message>| {},
         );
 
-        assert_eq!(runtime.local_state().presses, 1);
-        let DebugReplyProduct::ControlTrace(control_trace) = product else {
-            panic!("backend-presented visible input must not be blocked by runtime evidence gates");
+        assert_eq!(runtime.local_state().presses, 0);
+        let DebugReplyProduct::Error(_) = product else {
+            panic!("blocking view diagnostics must refuse backend-presented input");
         };
-        assert!(control_trace.handled);
         let trace = runtime
             .last_backend_input_trace()
-            .expect("delivered visible input is traced");
-        assert!(trace.handled);
+            .expect("refused visible input is traced");
+        assert!(!trace.handled);
+        assert!(
+            trace
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "view_contract.hit_bounds_outside_layout" })
+        );
     }
 
     #[test]
@@ -7671,9 +7702,12 @@ mod tests {
             .last_backend_input_trace()
             .expect("delivered route input is traced");
         assert!(!trace.handled);
-        assert!(trace.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_ROUTE_MISMATCH
-        }));
+        assert!(
+            trace
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "view_contract.hit_route_target_missing" })
+        );
     }
 
     #[test]
@@ -7818,6 +7852,7 @@ mod tests {
         let frame = runtime.last_frame_identity();
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -7829,10 +7864,7 @@ mod tests {
         let view = runtime.widget().visible_backend_view_definition(
             runtime.external(),
             runtime.local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame.clone(), layout_input),
         );
         let (dispatch, evidence) = slipway_core::resolve_declared_wheel_dispatch_with_evidence(
             slipway_core::EvidenceSource::backend_presented("test-backend", "physical-input"),
@@ -8011,9 +8043,12 @@ mod tests {
         assert!(!outcome.handled);
         assert_eq!(runtime.local_state().presses, 0);
         let trace = runtime.last_backend_input_trace().expect("trace recorded");
-        assert!(trace.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == slipway_core::BACKEND_INPUT_DISPATCH_EVIDENCE_ROUTE_MISMATCH
-        }));
+        assert!(
+            trace
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "view_contract.hit_route_target_missing" })
+        );
     }
 
     #[test]
@@ -9816,6 +9851,7 @@ mod tests {
         // same visible backend view the runtime validates dispatch against.
         let layout_input = LayoutInput {
             viewport: TargetLocalRect::new(frame.viewport),
+            content: TargetLocalRect::new(frame.viewport),
             constraints: LayoutConstraints {
                 min: Size {
                     width: 0.0,
@@ -9827,10 +9863,7 @@ mod tests {
         let view = runtime.widget().visible_backend_view_definition(
             runtime.external(),
             runtime.local_state(),
-            ViewDefinitionInput {
-                frame: frame.clone(),
-                layout_input,
-            },
+            ViewDefinitionInput::new(frame.clone(), layout_input),
         );
         let expected = slipway_core::derive_dispatch_graph_for_composed_view(
             runtime.widget(),
@@ -10059,7 +10092,9 @@ mod tests {
         let mut runtime = SlipwayRuntime::from_app(test_app(), TestExternal);
         let _ = runtime.apply_input_event(increment_child("beta-child"));
 
-        let packet = runtime.render_packet_for_frame(frame(5));
+        let packet = runtime
+            .render_packet_for_frame(frame(5))
+            .expect("valid runtime view prepares a render packet");
         let painted_text: Vec<_> = packet
             .paint
             .iter()
@@ -10070,9 +10105,40 @@ mod tests {
             .collect();
 
         assert_eq!(packet.target, WidgetId::from("test-app"));
-        assert_eq!(packet.layout.child_placements.len(), 2);
+        assert_eq!(packet.layout.child_placements().len(), 2);
         assert!(painted_text.contains(&"app-initialized:true"));
         assert!(painted_text.contains(&"alpha:3"));
         assert!(painted_text.contains(&"beta:30"));
+        let prepared = packet
+            .prepared_geometry
+            .as_ref()
+            .expect("production packet carries prepared geometry");
+        assert!(prepared.captured_records().is_some());
+        let cloned = packet.clone();
+        assert!(Arc::ptr_eq(
+            prepared,
+            cloned.prepared_geometry.as_ref().unwrap()
+        ));
+        assert!(std::ptr::eq(
+            prepared.captured_records().unwrap().as_ptr(),
+            cloned
+                .prepared_geometry
+                .as_ref()
+                .unwrap()
+                .captured_records()
+                .unwrap()
+                .as_ptr()
+        ));
+    }
+
+    #[test]
+    fn production_geometry_has_no_arc_unwrap_or_rewrap_churn() {
+        let runtime_source = include_str!("lib.rs");
+        let core_source = include_str!("../../slipway-core/src/lib.rs");
+        assert!(
+            !runtime_source
+                .contains("Arc::new(\n            slipway_core::validate_and_index_view")
+        );
+        assert!(!core_source.contains("Arc::try_unwrap"));
     }
 }

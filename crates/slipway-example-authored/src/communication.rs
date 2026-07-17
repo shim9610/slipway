@@ -263,22 +263,10 @@ impl SlipwayApp for ShowcaseApp {
                     height,
                 },
             };
-            plans.push(ChildLayoutPlan::placed_for_seed(
+            plans.push(ChildLayoutPlan::explicit_border(
                 seed,
-                LayoutInput {
-                    viewport: TargetLocalRect::new(Rect {
-                        origin: Point { x: 0.0, y: 0.0 },
-                        size: bounds.size,
-                    }),
-                    constraints: LayoutConstraints {
-                        min: Size {
-                            width: 0.0,
-                            height: 0.0,
-                        },
-                        max: bounds.size,
-                    },
-                },
-                ParentLocalRect::new(bounds),
+                slipway::ContentLocalRect::new(bounds),
+                slipway::BoxSpacing::ZERO,
             ));
             y += height + CARD_GAP;
         }
@@ -324,11 +312,12 @@ impl SlipwayApp for ShowcaseApp {
         &self,
         _external: &Self::ExternalState,
         local: &Self::LocalState,
-        input: &ViewDefinitionInput,
+        frame: &FrameIdentity,
+        _input: &LayoutInput,
         layout: &LayoutOutput,
     ) -> Vec<ScrollRegionDeclaration> {
-        let viewport = input.frame.viewport;
-        let content = layout.bounds.into_rect();
+        let viewport = frame.viewport;
+        let content = layout.bounds().into_rect();
         if content.size.height <= viewport.size.height + 0.5 {
             // No overflow -> no region (declaring zero travel refuses with
             // `view_contract.scroll_geometry_invalid`), and no indicator.
@@ -395,7 +384,7 @@ impl SlipwayApp for ShowcaseApp {
             shape: ShapeDeclaration {
                 id: Some("authored-app-background".to_string()),
                 kind: ShapeKind::Rectangle,
-                bounds: layout.bounds.into_rect(),
+                bounds: layout.bounds().into_rect(),
                 path: None,
                 clip: None,
             },

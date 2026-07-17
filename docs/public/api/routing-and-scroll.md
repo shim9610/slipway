@@ -29,6 +29,13 @@ clamped to `content - viewport` per enabled axis; enabled regions declare at
 least one axis. The wheel is consumed only when the declared
 `ScrollConsumptionPolicy.wheel` is true.
 
+Clamp the source state before you declare the region. The visible backends may
+defensively crop invalid scroll geometry so a live window can show a refusal
+panel instead of impossible rectangles, but that is not an authoring API. A
+state value below zero, above `content - viewport`, or derived from stale
+pre-layout size is a widget/app declaration bug; fix the reducer or projection
+that produced the offset.
+
 If admission sent you here with the
 `view_contract.content_overflow_without_scroll_region` advisory, your view
 paints content beyond its layout/frame viewport that no enabled scroll
