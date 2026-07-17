@@ -49,8 +49,9 @@
 //!      external state, so window-derived geometry agrees across paint,
 //!      declarations, and handlers.
 //!
-//! Run it with `cargo run -p slipway-example-authored -- --iced` or
-//! `-- --egui`; the same authored modules drive both backends.
+//! Run it with `cargo run -p slipway-example-authored`; the compiled
+//! default backend is selected. Pass `--iced` or `--egui` explicitly when
+//! both backends are enabled. The same authored modules drive both backends.
 
 mod app_runner;
 mod communication;

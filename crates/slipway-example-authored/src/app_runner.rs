@@ -25,13 +25,29 @@ use crate::ssot::ShowcaseState;
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("--iced") => run_iced(),
-        Some("--egui") | None => run_egui(),
+        Some("--egui") => run_egui(),
+        None => run_default_backend(),
         Some(other) => {
             eprintln!("unknown argument: {other}");
             eprintln!("usage: slipway-example-authored [--egui|--iced]");
             Ok(())
         }
     }
+}
+
+#[cfg(feature = "iced")]
+fn run_default_backend() -> Result<(), Box<dyn std::error::Error>> {
+    run_iced()
+}
+
+#[cfg(all(not(feature = "iced"), feature = "egui"))]
+fn run_default_backend() -> Result<(), Box<dyn std::error::Error>> {
+    run_egui()
+}
+
+#[cfg(not(any(feature = "iced", feature = "egui")))]
+fn run_default_backend() -> Result<(), Box<dyn std::error::Error>> {
+    Err("this binary was built without a backend feature".into())
 }
 
 /// Iced launch (docs/public/quickstart-authoring.md §4): the app is
