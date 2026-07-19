@@ -41,7 +41,7 @@ use slipway_debug_bridge::{
 };
 use slipway_runtime::{
     DebugEguiCompositionIngressCustody, SlipwayRuntime, SlipwayRuntimeDrainBudget,
-    SlipwayRuntimeMcpTransport, SlipwayRuntimePendingNativeMcpCall,
+    SlipwayRuntimeMcpTransport, SlipwayRuntimePendingNativeMcpCall, SlipwayServiceMcpTransport,
 };
 use std::fs;
 use std::net::SocketAddr;
@@ -3479,6 +3479,7 @@ where
     on_messages: F,
     sense: egui::Sense,
     debug_mcp_transport: Option<SlipwayRuntimeMcpTransport>,
+    service_mcp_transport: Option<SlipwayServiceMcpTransport>,
     egui_mcp_wake_rx: Option<mpsc::Receiver<()>>,
     native_mcp_wake_pending: bool,
     pending_native_physical: Option<PendingEguiNativePhysicalControl>,
@@ -3558,6 +3559,7 @@ where
             on_messages,
             sense: egui::Sense::hover(),
             debug_mcp_transport: None,
+            service_mcp_transport: None,
             egui_mcp_wake_rx: None,
             native_mcp_wake_pending: false,
             pending_native_physical: None,
@@ -3587,10 +3589,21 @@ where
         self
     }
 
+    pub fn with_service_mcp_transport(mut self, transport: SlipwayServiceMcpTransport) -> Self {
+        self.service_mcp_transport = Some(transport);
+        self
+    }
+
     pub fn debug_mcp_transport_addr(&self) -> Option<SocketAddr> {
         self.debug_mcp_transport
             .as_ref()
             .map(SlipwayRuntimeMcpTransport::local_addr)
+    }
+
+    pub fn service_mcp_transport_addr(&self) -> Option<SocketAddr> {
+        self.service_mcp_transport
+            .as_ref()
+            .map(SlipwayServiceMcpTransport::local_addr)
     }
 
     fn mark_native_create_started(&mut self) {
@@ -3628,7 +3641,9 @@ where
             &mut self.on_messages,
         ) {
             Ok(report) => (
-                report.debug_replies_drained + report.runtime_mcp_replies_drained,
+                report.debug_replies_drained
+                    + report.runtime_mcp_replies_drained
+                    + report.service_mcp_replies_drained,
                 None,
             ),
             Err(error) => (0, Some(format!("{error:?}"))),
@@ -4511,23 +4526,43 @@ where
             return;
         }
 
-        let Some(transport) = &self.debug_mcp_transport else {
+        if self.debug_mcp_transport.is_none() && self.service_mcp_transport.is_none() {
             return;
-        };
+        }
 
-        let wake_rx = transport.wake_receiver();
         let ctx = ctx.clone();
         let (wake_tx, wake_rx_for_app) = mpsc::sync_channel(1);
-        let spawn_result = thread::Builder::new()
-            .name("slipway-egui-mcp-wake".to_string())
-            .spawn(move || {
-                while wake_rx.recv() {
-                    let _ = wake_tx.try_send(());
-                    ctx.request_repaint();
-                }
-            });
+        let mut spawned = false;
+        if let Some(transport) = &self.debug_mcp_transport {
+            let wake_rx = transport.wake_receiver();
+            let wake_tx = wake_tx.clone();
+            let ctx = ctx.clone();
+            spawned |= thread::Builder::new()
+                .name("slipway-egui-debug-mcp-wake".to_string())
+                .spawn(move || {
+                    while wake_rx.recv() {
+                        let _ = wake_tx.try_send(());
+                        ctx.request_repaint();
+                    }
+                })
+                .is_ok();
+        }
+        if let Some(transport) = &self.service_mcp_transport {
+            let wake_rx = transport.wake_receiver();
+            let wake_tx = wake_tx.clone();
+            let ctx = ctx.clone();
+            spawned |= thread::Builder::new()
+                .name("slipway-egui-service-mcp-wake".to_string())
+                .spawn(move || {
+                    while wake_rx.recv() {
+                        let _ = wake_tx.try_send(());
+                        ctx.request_repaint();
+                    }
+                })
+                .is_ok();
+        }
 
-        if spawn_result.is_ok() {
+        if spawned {
             self.egui_mcp_wake_rx = Some(wake_rx_for_app);
         }
     }

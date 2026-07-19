@@ -19,7 +19,7 @@ currently distributed from GitHub, not crates.io; do not use
 announced.
 
 ```powershell
-cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.5 --features iced
+cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.6 --features iced
 ```
 
 For a human overview:
@@ -31,6 +31,7 @@ For a human overview:
 5. [Backend API map](api/backends.md)
 6. [IME and Korean text input](api/ime.md)
 7. [Debug MCP](api/debug-mcp.md)
+8. [Service MCP](api/service-mcp.md)
 
 For an LLM worker that must author or mirror a UI:
 
@@ -44,6 +45,7 @@ For an LLM worker that must author or mirror a UI:
 8. [IME and Korean text input](api/ime.md)
 9. [Web UI mirroring task guide](tasks/mirror-web-ui.md)
 10. [Debug MCP](api/debug-mcp.md)
+11. [Service MCP](api/service-mcp.md)
 
 Reference pages for specific situations: the
 [Diagnostics catalog](api/diagnostics.md) when admission refuses a view, and

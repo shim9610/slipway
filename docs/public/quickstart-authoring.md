@@ -15,7 +15,7 @@ announced.
 Prefer `cargo add`:
 
 ```powershell
-cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.5 --features iced
+cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.6 --features iced
 ```
 
 Use `--features egui` for egui, or `--features all-backends` only when the
@@ -46,7 +46,7 @@ src/
 ```
 
 This is exactly the module map of the reference example
-`crates/slipway-example-authored` — the designated copy source; start
+`crates/slipway-example-authored` ??the designated copy source; start
 from it (every pattern site there carries a `PATTERN:` comment). Each
 file has one job, shown concretely in the example:
 
@@ -70,12 +70,12 @@ unless there is a clear reason not to.
 
 `SlipwayAppWidget::new(app)` alone is the supported root. The adapter
 already carries every root policy the backends require (its font bound is
-satisfied by `SlipwayApp::resolve_app_font`, below) — a hand-written
+satisfied by `SlipwayApp::resolve_app_font`, below) ??a hand-written
 delegation wrapper around it is never needed. The reference example runs
 exactly this bare root on both backends
 (`crates/slipway-example-authored/src/app_runner.rs`); the ~160-line
 `AdmissionRuntimeAppWidget` wrapper in the internal admission fixture is
-the pre-Step-209 historical idiom, kept only as back-compat proof — do not
+the pre-Step-209 historical idiom, kept only as back-compat proof ??do not
 copy it.
 
 For iced:
@@ -144,7 +144,7 @@ matching contract, using the prelude helper that constructs it:
   `text_edit_focus_region_from_capability` for text input);
 - wheel or overflow region: `ScrollRegionDeclaration`
   (`scroll_region_from_scrollable_capability`, or the `_with_order` variant
-  when regions can overlap — see
+  when regions can overlap ??see
   [Routing and scroll](api/routing-and-scroll.md));
 - text editing support: text-edit declarations and command support;
 - overlay or modal ordering: `PaintOrderDeclaration`;
@@ -155,7 +155,7 @@ Then ask the scrolling question explicitly, for every widget and for the
 composed app: does any content exceed its container or the window? A card
 column taller than the window counts. If yes, declare a covering scroll
 region (`scroll_region_from_scrollable_capability`, `_with_order` when
-regions can overlap — [Routing and scroll](api/routing-and-scroll.md));
+regions can overlap ??[Routing and scroll](api/routing-and-scroll.md));
 for a page taller than the window, use the app-level page-scroll pattern
 (`SlipwayApp::app_scroll_regions`, modeled at the `PATTERN:` site in
 `crates/slipway-example-authored/src/communication.rs`). Painted content
@@ -166,7 +166,7 @@ is intentional.
 
 The helpers require capability-bundle trait bounds. Implement the
 LOAD-BEARING traits by hand and cover every RESERVED bound with one macro
-call, `reserved_policy_defaults!(MyWidget);` — do not write real logic in
+call, `reserved_policy_defaults!(MyWidget);` ??do not write real logic in
 RESERVED traits, it is a silent no-op (see
 [Trait surface](api/trait-surface.md)).
 

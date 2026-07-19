@@ -39,7 +39,11 @@ pub use slipway_debug_renderer as debug_renderer;
 pub use slipway_runtime as runtime;
 
 pub use slipway_core::*;
-pub use slipway_runtime::{SlipwayImePolicy, SlipwayRuntime, SlipwayRuntimeConfig};
+pub use slipway_runtime::{
+    SlipwayAppRuntime, SlipwayAssembledApp, SlipwayImePolicy, SlipwayRuntime, SlipwayRuntimeConfig,
+    SlipwayServiceMcpHandler, SlipwayServiceMcpToolCall, SlipwayServiceMcpToolDefinition,
+    SlipwayServiceMcpToolResult, SlipwayServiceMcpTransport,
+};
 
 #[cfg(feature = "iced")]
 pub use slipway_backend_iced as backend_iced;
@@ -449,7 +453,11 @@ pub mod prelude {
     // Satisfies every RESERVED capability-bundle bound with the documented
     // empty defaults; see the macro doc for the trait list.
     pub use slipway_core::reserved_policy_defaults;
-    pub use slipway_runtime::{SlipwayImePolicy, SlipwayRuntime, SlipwayRuntimeConfig};
+    pub use slipway_runtime::{
+        SlipwayAppRuntime, SlipwayAssembledApp, SlipwayImePolicy, SlipwayRuntime,
+        SlipwayRuntimeConfig, SlipwayServiceMcpHandler, SlipwayServiceMcpToolCall,
+        SlipwayServiceMcpToolDefinition, SlipwayServiceMcpToolResult, SlipwayServiceMcpTransport,
+    };
 
     #[cfg(feature = "iced")]
     pub use slipway_backend_iced::{

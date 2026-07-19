@@ -1,4 +1,4 @@
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use serde_json::{Value, json};
 #[cfg(test)]
 use slipway_core::WidgetSlotAddress;
@@ -46,6 +46,7 @@ const RENDER_REFUSAL_DIAGNOSTIC_CAPACITY: usize = 8;
 const ADMISSION_DIAGNOSTIC_CAPACITY: usize = 16;
 const DEFAULT_UI_TURN_DEBUG_BRIDGE_DRAIN_BUDGET: usize = 8;
 const DEFAULT_UI_TURN_RUNTIME_MCP_DRAIN_BUDGET: usize = 8;
+const DEFAULT_UI_TURN_SERVICE_MCP_DRAIN_BUDGET: usize = 8;
 const DEFAULT_MCP_PENDING_DEBUG_BRIDGE_DRAIN_BUDGET: usize = 8;
 
 #[doc(hidden)]
@@ -78,6 +79,7 @@ impl DebugEguiCompositionIngressCustody {
 pub struct SlipwayRuntimeDrainBudget {
     pub debug_bridge: usize,
     pub runtime_mcp: usize,
+    pub service_mcp: usize,
     pub mcp_pending_debug_bridge: usize,
 }
 
@@ -86,6 +88,7 @@ impl Default for SlipwayRuntimeDrainBudget {
         Self {
             debug_bridge: DEFAULT_UI_TURN_DEBUG_BRIDGE_DRAIN_BUDGET,
             runtime_mcp: DEFAULT_UI_TURN_RUNTIME_MCP_DRAIN_BUDGET,
+            service_mcp: DEFAULT_UI_TURN_SERVICE_MCP_DRAIN_BUDGET,
             mcp_pending_debug_bridge: DEFAULT_MCP_PENDING_DEBUG_BRIDGE_DRAIN_BUDGET,
         }
     }
@@ -95,6 +98,82 @@ impl Default for SlipwayRuntimeDrainBudget {
 pub struct SlipwayRuntimeDrainReport {
     pub debug_replies_drained: usize,
     pub runtime_mcp_replies_drained: usize,
+    pub service_mcp_replies_drained: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlipwayServiceMcpToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl SlipwayServiceMcpToolDefinition {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlipwayServiceMcpToolCall {
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlipwayServiceMcpToolResult<M> {
+    pub content: Value,
+    pub messages: Vec<M>,
+    pub is_error: bool,
+}
+
+impl<M> SlipwayServiceMcpToolResult<M> {
+    pub fn ok(content: Value) -> Self {
+        Self {
+            content,
+            messages: Vec::new(),
+            is_error: false,
+        }
+    }
+
+    pub fn ok_with_messages(content: Value, messages: Vec<M>) -> Self {
+        Self {
+            content,
+            messages,
+            is_error: false,
+        }
+    }
+
+    pub fn error(content: Value) -> Self {
+        Self {
+            content,
+            messages: Vec::new(),
+            is_error: true,
+        }
+    }
+}
+
+/// Author-owned MCP service surface for release-intended app APIs.
+///
+/// This is intentionally not the debug/control MCP. The runtime only exposes
+/// the tools this handler declares, calls them on the UI-runtime owner, and
+/// forwards returned typed app messages through the existing app reducer.
+pub trait SlipwayServiceMcpHandler<ExternalState, AppMessage> {
+    fn tools(&self, external: &ExternalState) -> Vec<SlipwayServiceMcpToolDefinition>;
+
+    fn call(
+        &mut self,
+        external: &mut ExternalState,
+        call: SlipwayServiceMcpToolCall,
+    ) -> SlipwayServiceMcpToolResult<AppMessage>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -466,6 +545,10 @@ where
     bridge_runtime: DebugBridgeRuntime,
     mcp_client: DebugMcpRuntimeClient,
     mcp_endpoint: DebugMcpRuntimeEndpoint,
+    service_mcp_client: SlipwayServiceMcpRuntimeClient,
+    service_mcp_endpoint: SlipwayServiceMcpRuntimeEndpoint,
+    service_mcp_handler:
+        Option<Box<dyn SlipwayServiceMcpHandler<W::ExternalState, W::AppMessage> + Send>>,
     config: SlipwayRuntimeConfig,
     revision: u64,
     frame_index: u64,
@@ -501,6 +584,7 @@ impl From<DebugBridgeError> for SlipwayRuntimeMcpError {
 pub enum SlipwayRuntimeMcpPumpError {
     Runtime(SlipwayRuntimeMcpError),
     Transport(DebugMcpRuntimeTransportError),
+    ServiceTransport(SlipwayServiceMcpRuntimeTransportError),
 }
 
 impl From<SlipwayRuntimeMcpError> for SlipwayRuntimeMcpPumpError {
@@ -521,7 +605,46 @@ impl From<DebugMcpRuntimeTransportError> for SlipwayRuntimeMcpPumpError {
     }
 }
 
+impl From<SlipwayServiceMcpRuntimeTransportError> for SlipwayRuntimeMcpPumpError {
+    fn from(error: SlipwayServiceMcpRuntimeTransportError) -> Self {
+        Self::ServiceTransport(error)
+    }
+}
+
 pub struct SlipwayRuntimeMcpTransport {
+    local_addr: SocketAddr,
+    wake_rx: SlipwayRuntimeMcpWakeReceiver,
+    stop_tx: Sender<()>,
+    listener_thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+pub struct SlipwayServiceMcpRuntimeClient {
+    tx: Sender<SlipwayServiceMcpRuntimeRequest>,
+}
+
+pub struct SlipwayServiceMcpRuntimeEndpoint {
+    rx: Receiver<SlipwayServiceMcpRuntimeRequest>,
+}
+
+pub struct SlipwayServiceMcpRuntimeRequest {
+    request: String,
+    response_tx: Sender<Option<Value>>,
+}
+
+pub struct SlipwayServiceMcpRuntimeResponseHandle {
+    rx: Receiver<Option<Value>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SlipwayServiceMcpRuntimeTransportError {
+    RequestQueueFull,
+    RequestQueueClosed,
+    ResponseQueueFull,
+    ResponseQueueClosed,
+}
+
+pub struct SlipwayServiceMcpTransport {
     local_addr: SocketAddr,
     wake_rx: SlipwayRuntimeMcpWakeReceiver,
     stop_tx: Sender<()>,
@@ -578,6 +701,148 @@ impl SlipwayRuntimeMcpTransport {
 }
 
 impl Drop for SlipwayRuntimeMcpTransport {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.try_send(());
+        let _ = TcpStream::connect(self.local_addr);
+        if let Some(listener_thread) = self.listener_thread.take() {
+            let _ = listener_thread.join();
+        }
+    }
+}
+
+impl SlipwayServiceMcpRuntimeClient {
+    pub fn submit(
+        &self,
+        request: impl Into<String>,
+    ) -> Result<SlipwayServiceMcpRuntimeResponseHandle, SlipwayServiceMcpRuntimeTransportError>
+    {
+        let (response_tx, response_rx) = bounded(1);
+        self.tx
+            .try_send(SlipwayServiceMcpRuntimeRequest {
+                request: request.into(),
+                response_tx,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => SlipwayServiceMcpRuntimeTransportError::RequestQueueFull,
+                TrySendError::Disconnected(_) => {
+                    SlipwayServiceMcpRuntimeTransportError::RequestQueueClosed
+                }
+            })?;
+        Ok(SlipwayServiceMcpRuntimeResponseHandle { rx: response_rx })
+    }
+}
+
+impl SlipwayServiceMcpRuntimeEndpoint {
+    pub fn try_recv(
+        &self,
+    ) -> Result<Option<SlipwayServiceMcpRuntimeRequest>, SlipwayServiceMcpRuntimeTransportError>
+    {
+        match self.rx.try_recv() {
+            Ok(request) => Ok(Some(request)),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Err(SlipwayServiceMcpRuntimeTransportError::RequestQueueClosed)
+            }
+        }
+    }
+}
+
+impl SlipwayServiceMcpRuntimeRequest {
+    pub fn request(&self) -> &str {
+        &self.request
+    }
+
+    pub fn respond(
+        self,
+        response: Option<Value>,
+    ) -> Result<(), SlipwayServiceMcpRuntimeTransportError> {
+        self.response_tx
+            .try_send(response)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => SlipwayServiceMcpRuntimeTransportError::ResponseQueueFull,
+                TrySendError::Disconnected(_) => {
+                    SlipwayServiceMcpRuntimeTransportError::ResponseQueueClosed
+                }
+            })
+    }
+}
+
+impl SlipwayServiceMcpRuntimeResponseHandle {
+    pub fn recv(self) -> Result<Option<Value>, SlipwayServiceMcpRuntimeTransportError> {
+        self.rx
+            .recv()
+            .map_err(|_| SlipwayServiceMcpRuntimeTransportError::ResponseQueueClosed)
+    }
+
+    pub fn try_recv(
+        &self,
+    ) -> Result<Option<Option<Value>>, SlipwayServiceMcpRuntimeTransportError> {
+        match self.rx.try_recv() {
+            Ok(response) => Ok(Some(response)),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Err(SlipwayServiceMcpRuntimeTransportError::ResponseQueueClosed)
+            }
+        }
+    }
+}
+
+fn bounded_service_mcp(
+    capacity: usize,
+) -> (
+    SlipwayServiceMcpRuntimeClient,
+    SlipwayServiceMcpRuntimeEndpoint,
+) {
+    let (tx, rx) = bounded(capacity.max(1));
+    (
+        SlipwayServiceMcpRuntimeClient { tx },
+        SlipwayServiceMcpRuntimeEndpoint { rx },
+    )
+}
+
+impl SlipwayServiceMcpTransport {
+    pub fn bind_loopback(
+        client: SlipwayServiceMcpRuntimeClient,
+        wake_capacity: usize,
+    ) -> io::Result<Self> {
+        Self::bind((Ipv4Addr::LOCALHOST, 0), client, wake_capacity)
+    }
+
+    pub fn bind(
+        addr: (Ipv4Addr, u16),
+        client: SlipwayServiceMcpRuntimeClient,
+        wake_capacity: usize,
+    ) -> io::Result<Self> {
+        let listener = TcpListener::bind(addr)?;
+        let local_addr = listener.local_addr()?;
+        let (wake_tx, wake_rx) = bounded(wake_capacity.max(1));
+        let (stop_tx, stop_rx) = bounded(1);
+        let listener_thread = thread::Builder::new()
+            .name("slipway-service-mcp-listener".to_string())
+            .spawn(move || service_mcp_listener_loop(listener, client, wake_tx, stop_rx))?;
+
+        Ok(Self {
+            local_addr,
+            wake_rx: SlipwayRuntimeMcpWakeReceiver { rx: wake_rx },
+            stop_tx,
+            listener_thread: Some(listener_thread),
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn wake_receiver(&self) -> SlipwayRuntimeMcpWakeReceiver {
+        self.wake_rx.clone()
+    }
+
+    pub fn drain_wakes(&self) -> usize {
+        self.wake_rx.drain_pending()
+    }
+}
+
+impl Drop for SlipwayServiceMcpTransport {
     fn drop(&mut self) {
         let _ = self.stop_tx.try_send(());
         let _ = TcpStream::connect(self.local_addr);
@@ -731,6 +996,110 @@ fn runtime_mcp_json_rpc_error(id: Option<Value>, code: i64, message: impl Into<S
     })
 }
 
+fn service_mcp_tool_name_is_allowed(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with("slipway.debug.")
+        && !name.starts_with("slipway.internal.")
+}
+
+fn service_mcp_tool_definition_value(tool: SlipwayServiceMcpToolDefinition) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": tool.input_schema,
+    })
+}
+
+fn service_mcp_listener_loop(
+    listener: TcpListener,
+    client: SlipwayServiceMcpRuntimeClient,
+    wake_tx: Sender<()>,
+    stop_rx: Receiver<()>,
+) {
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+
+        let stream = match listener.accept() {
+            Ok((stream, _addr)) => stream,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+
+        let client = client.clone();
+        let wake_tx = wake_tx.clone();
+        let _ = thread::Builder::new()
+            .name("slipway-service-mcp-connection".to_string())
+            .spawn(move || {
+                let _ = service_mcp_connection_loop(stream, client, wake_tx);
+            });
+    }
+}
+
+fn service_mcp_connection_loop(
+    mut stream: TcpStream,
+    client: SlipwayServiceMcpRuntimeClient,
+    wake_tx: Sender<()>,
+) -> io::Result<()> {
+    let reader_stream = stream.try_clone()?;
+    let reader = BufReader::new(reader_stream);
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(response) = service_mcp_handle_line(line, &client, &wake_tx) {
+            serde_json::to_writer(&mut stream, &response)?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
+        }
+    }
+
+    Ok(())
+}
+
+fn service_mcp_handle_line(
+    line: String,
+    client: &SlipwayServiceMcpRuntimeClient,
+    wake_tx: &Sender<()>,
+) -> Option<Value> {
+    let id = runtime_mcp_request_id(&line);
+    let response = match client.submit(line) {
+        Ok(response) => response,
+        Err(error) => {
+            return Some(runtime_mcp_json_rpc_error(
+                id,
+                -32000,
+                format!("service MCP request submit failed: {error:?}"),
+            ));
+        }
+    };
+
+    if wake_tx.send(()).is_err() {
+        return Some(runtime_mcp_json_rpc_error(
+            id,
+            -32000,
+            "service MCP wake receiver disconnected",
+        ));
+    }
+
+    match response.recv() {
+        Ok(response) => response,
+        Err(error) => Some(runtime_mcp_json_rpc_error(
+            id,
+            -32000,
+            format!("service MCP response failed: {error:?}"),
+        )),
+    }
+}
+
 #[derive(Clone)]
 pub struct SlipwayDebugMcpAttachment {
     server: DebugMcpServer,
@@ -804,6 +1173,14 @@ where
 
     pub fn into_parts(self) -> (SlipwayRuntime<W>, SlipwayDebugMcpAttachment) {
         (self.runtime, self.debug_mcp)
+    }
+
+    pub fn with_service_mcp_handler<H>(mut self, handler: H) -> Self
+    where
+        H: SlipwayServiceMcpHandler<W::ExternalState, W::AppMessage> + Send + 'static,
+    {
+        self.runtime.set_service_mcp_handler(handler);
+        self
     }
 }
 
@@ -1058,6 +1435,7 @@ where
         let capacity = config.debug_bridge_capacity.max(1);
         let (bridge_client, bridge_runtime) = bounded_debug_bridge(capacity);
         let (mcp_client, mcp_endpoint) = bounded_runtime_mcp(capacity);
+        let (service_mcp_client, service_mcp_endpoint) = bounded_service_mcp(capacity);
         Self {
             external,
             slot: WidgetSlot::new(widget),
@@ -1066,6 +1444,9 @@ where
             bridge_runtime,
             mcp_client,
             mcp_endpoint,
+            service_mcp_client,
+            service_mcp_endpoint,
+            service_mcp_handler: None,
             config,
             revision: 1,
             frame_index: 0,
@@ -1119,9 +1500,35 @@ where
         self.mcp_client.clone()
     }
 
+    pub fn service_mcp_client_clone(&self) -> SlipwayServiceMcpRuntimeClient {
+        self.service_mcp_client.clone()
+    }
+
+    pub fn with_service_mcp_handler<H>(mut self, handler: H) -> Self
+    where
+        H: SlipwayServiceMcpHandler<W::ExternalState, W::AppMessage> + Send + 'static,
+    {
+        self.service_mcp_handler = Some(Box::new(handler));
+        self
+    }
+
+    pub fn set_service_mcp_handler<H>(&mut self, handler: H)
+    where
+        H: SlipwayServiceMcpHandler<W::ExternalState, W::AppMessage> + Send + 'static,
+    {
+        self.service_mcp_handler = Some(Box::new(handler));
+    }
+
     pub fn start_debug_mcp_transport(&self) -> io::Result<SlipwayRuntimeMcpTransport> {
         SlipwayRuntimeMcpTransport::bind_loopback(
             self.runtime_mcp_client_clone(),
+            self.config.debug_bridge_capacity,
+        )
+    }
+
+    pub fn start_service_mcp_transport(&self) -> io::Result<SlipwayServiceMcpTransport> {
+        SlipwayServiceMcpTransport::bind_loopback(
+            self.service_mcp_client_clone(),
             self.config.debug_bridge_capacity,
         )
     }
@@ -2338,6 +2745,193 @@ where
         Ok(responses)
     }
 
+    pub fn handle_service_mcp_request_with_app_reducer<F>(
+        &mut self,
+        request: &str,
+        apply: &mut F,
+    ) -> Option<Value>
+    where
+        F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+    {
+        let id = runtime_mcp_request_id(request);
+        let message = match serde_json::from_str::<Value>(request) {
+            Ok(message) => message,
+            Err(error) => {
+                return Some(runtime_mcp_json_rpc_error(
+                    id,
+                    -32700,
+                    format!("service MCP request is not valid JSON: {error}"),
+                ));
+            }
+        };
+        let method = match message.get("method").and_then(Value::as_str) {
+            Some(method) => method,
+            None => {
+                return Some(runtime_mcp_json_rpc_error(
+                    id,
+                    -32600,
+                    "service MCP request.method must be a string",
+                ));
+            }
+        };
+
+        match method {
+            "initialize" => Some(json!({
+                "jsonrpc": "2.0",
+                "id": id.unwrap_or(Value::Null),
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "slipway.service",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            })),
+            "notifications/initialized" => None,
+            "tools/list" => {
+                let tools = self
+                    .service_mcp_handler
+                    .as_ref()
+                    .map(|handler| handler.tools(&self.external))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|tool| service_mcp_tool_name_is_allowed(&tool.name))
+                    .map(service_mcp_tool_definition_value)
+                    .collect::<Vec<_>>();
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id.unwrap_or(Value::Null),
+                    "result": { "tools": tools }
+                }))
+            }
+            "tools/call" => self.handle_service_mcp_tools_call(id, message.get("params"), apply),
+            _ => Some(runtime_mcp_json_rpc_error(
+                id,
+                -32601,
+                format!("unknown service MCP method `{method}`"),
+            )),
+        }
+    }
+
+    fn handle_service_mcp_tools_call<F>(
+        &mut self,
+        id: Option<Value>,
+        params: Option<&Value>,
+        apply: &mut F,
+    ) -> Option<Value>
+    where
+        F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+    {
+        let Some(params) = params.and_then(Value::as_object) else {
+            return Some(runtime_mcp_json_rpc_error(
+                id,
+                -32602,
+                "tools/call params must be an object",
+            ));
+        };
+        let Some(name) = params.get("name").and_then(Value::as_str) else {
+            return Some(runtime_mcp_json_rpc_error(
+                id,
+                -32602,
+                "tools/call params.name must be a string",
+            ));
+        };
+        if !service_mcp_tool_name_is_allowed(name) {
+            return Some(runtime_mcp_json_rpc_error(
+                id,
+                -32602,
+                format!("service MCP tool `{name}` uses a reserved Slipway debug namespace"),
+            ));
+        }
+        let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+        let Some(handler) = self.service_mcp_handler.as_deref_mut() else {
+            return Some(runtime_mcp_json_rpc_error(
+                id,
+                -32050,
+                "service MCP has no attached SlipwayServiceMcpHandler",
+            ));
+        };
+        let known = handler
+            .tools(&self.external)
+            .iter()
+            .any(|tool| tool.name == name && service_mcp_tool_name_is_allowed(&tool.name));
+        if !known {
+            return Some(runtime_mcp_json_rpc_error(
+                id,
+                -32602,
+                format!("unknown service MCP tool `{name}`"),
+            ));
+        }
+
+        let result = handler.call(
+            &mut self.external,
+            SlipwayServiceMcpToolCall {
+                name: name.to_string(),
+                arguments,
+            },
+        );
+        let emitted = result.messages.len();
+        self.apply_app_messages(result.messages, apply);
+        Some(json!({
+            "jsonrpc": "2.0",
+            "id": id.unwrap_or(Value::Null),
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": result.content.to_string()
+                }],
+                "isError": result.is_error,
+                "_slipway_service": {
+                    "tool": name,
+                    "emitted_messages": emitted,
+                    "revision": self.revision
+                }
+            }
+        }))
+    }
+
+    pub fn drain_service_mcp_once_with_app_reducer<F>(
+        &mut self,
+        apply: &mut F,
+    ) -> Result<Option<Option<Value>>, SlipwayRuntimeMcpPumpError>
+    where
+        F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+    {
+        let Some(request) = self
+            .service_mcp_endpoint
+            .try_recv()
+            .map_err(SlipwayRuntimeMcpPumpError::ServiceTransport)?
+        else {
+            return Ok(None);
+        };
+        let response = self.handle_service_mcp_request_with_app_reducer(request.request(), apply);
+        request
+            .respond(response.clone())
+            .map_err(SlipwayRuntimeMcpPumpError::ServiceTransport)?;
+        Ok(Some(response))
+    }
+
+    pub fn drain_service_mcp_pending_budgeted_with_app_reducer<F>(
+        &mut self,
+        max_requests: usize,
+        apply: &mut F,
+    ) -> Result<Vec<Value>, SlipwayRuntimeMcpPumpError>
+    where
+        F: FnMut(&mut W::ExternalState, Vec<W::AppMessage>),
+    {
+        let mut responses = Vec::new();
+        for _ in 0..max_requests {
+            let Some(response) = self.drain_service_mcp_once_with_app_reducer(apply)? else {
+                break;
+            };
+            if let Some(response) = response {
+                responses.push(response);
+            }
+        }
+        Ok(responses)
+    }
+
     pub fn drain_live_debug_turn_with_app_reducer<F>(
         &mut self,
         budget: SlipwayRuntimeDrainBudget,
@@ -2360,10 +2954,14 @@ where
                 apply,
             )?
             .len();
+        let service_mcp_replies = self
+            .drain_service_mcp_pending_budgeted_with_app_reducer(budget.service_mcp, apply)?
+            .len();
 
         Ok(SlipwayRuntimeDrainReport {
             debug_replies_drained: debug_replies,
             runtime_mcp_replies_drained: runtime_mcp_replies,
+            service_mcp_replies_drained: service_mcp_replies,
         })
     }
 
@@ -2396,10 +2994,14 @@ where
                 intercept,
             )?
             .len();
+        let service_mcp_replies = self
+            .drain_service_mcp_pending_budgeted_with_app_reducer(budget.service_mcp, apply)?
+            .len();
 
         Ok(SlipwayRuntimeDrainReport {
             debug_replies_drained: debug_replies,
             runtime_mcp_replies_drained: runtime_mcp_replies,
+            service_mcp_replies_drained: service_mcp_replies,
         })
     }
 
@@ -4408,6 +5010,38 @@ mod tests {
 
     #[derive(Clone, Debug, PartialEq)]
     struct TestExternal;
+
+    struct ServiceHandler {
+        calls: usize,
+    }
+
+    impl SlipwayServiceMcpHandler<(), Message> for ServiceHandler {
+        fn tools(&self, _external: &()) -> Vec<SlipwayServiceMcpToolDefinition> {
+            vec![SlipwayServiceMcpToolDefinition::new(
+                "app.counter.increment",
+                "Increment the app counter through the service MCP surface.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "amount": { "type": "integer" }
+                    }
+                }),
+            )]
+        }
+
+        fn call(
+            &mut self,
+            _external: &mut (),
+            call: SlipwayServiceMcpToolCall,
+        ) -> SlipwayServiceMcpToolResult<Message> {
+            assert_eq!(call.name, "app.counter.increment");
+            self.calls += 1;
+            SlipwayServiceMcpToolResult::ok_with_messages(
+                json!({ "accepted": true, "calls": self.calls }),
+                vec![Message::Counted],
+            )
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct TestAppLocal {
@@ -9376,6 +10010,135 @@ mod tests {
     }
 
     #[test]
+    fn service_mcp_lists_only_user_declared_tools_and_reduces_messages() {
+        let mut runtime = SlipwayRuntime::new(ProbeWidget, ())
+            .with_service_mcp_handler(ServiceHandler { calls: 0 });
+        let list = runtime
+            .handle_service_mcp_request_with_app_reducer(
+                r#"{"jsonrpc":"2.0","id":"list","method":"tools/list","params":{}}"#,
+                &mut |_external, _messages| {},
+            )
+            .expect("tools/list response");
+        let tools = list["result"]["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "app.counter.increment");
+
+        let mut reduced_messages = 0usize;
+        let call = runtime
+            .handle_service_mcp_request_with_app_reducer(
+                r#"{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"app.counter.increment","arguments":{"amount":1}}}"#,
+                &mut |_external, messages: Vec<Message>| {
+                    reduced_messages += messages.len();
+                },
+            )
+            .expect("tools/call response");
+
+        assert_eq!(reduced_messages, 1);
+        assert_eq!(call["result"]["isError"], false);
+        assert_eq!(
+            call["result"]["_slipway_service"]["tool"],
+            "app.counter.increment"
+        );
+        assert_eq!(call["result"]["_slipway_service"]["emitted_messages"], 1);
+        assert_eq!(call["result"]["_slipway_service"]["revision"], 2);
+        let content: Value = serde_json::from_str(
+            call["result"]["content"][0]["text"]
+                .as_str()
+                .expect("service content text"),
+        )
+        .expect("service content is JSON text");
+        assert_eq!(content["accepted"], true);
+        assert_eq!(content["calls"], 1);
+    }
+
+    #[test]
+    fn service_mcp_tcp_transport_wakes_ui_owner_and_returns_tool_result() {
+        let mut runtime = SlipwayRuntime::new(ProbeWidget, ())
+            .with_service_mcp_handler(ServiceHandler { calls: 0 });
+        let transport = runtime
+            .start_service_mcp_transport()
+            .expect("service MCP transport starts");
+
+        let mut stream =
+            TcpStream::connect(transport.local_addr()).expect("connect to service MCP transport");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        writeln!(
+            stream,
+            r#"{{"jsonrpc":"2.0","id":"service-call","method":"tools/call","params":{{"name":"app.counter.increment","arguments":{{}}}}}}"#
+        )
+        .expect("write service JSON-RPC line");
+        stream.flush().expect("flush service JSON-RPC line");
+
+        assert!(transport.wake_receiver().recv());
+        let mut reduced_messages = 0usize;
+        let responses = runtime
+            .drain_service_mcp_pending_budgeted_with_app_reducer(1, &mut |_external,
+                                                                          messages: Vec<
+                Message,
+            >| {
+                reduced_messages += messages.len();
+            })
+            .expect("service MCP drain succeeds");
+        assert_eq!(reduced_messages, 1);
+        assert_eq!(responses.len(), 1);
+
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        reader
+            .read_line(&mut response_line)
+            .expect("read service JSON-RPC response line");
+        let response: Value =
+            serde_json::from_str(response_line.trim()).expect("service response is JSON");
+        assert_eq!(response, responses[0]);
+        assert_eq!(
+            response["result"]["_slipway_service"]["tool"],
+            "app.counter.increment"
+        );
+    }
+
+    #[test]
+    fn service_mcp_refuses_debug_namespace_tools() {
+        struct ReservedHandler;
+
+        impl SlipwayServiceMcpHandler<(), Message> for ReservedHandler {
+            fn tools(&self, _external: &()) -> Vec<SlipwayServiceMcpToolDefinition> {
+                vec![SlipwayServiceMcpToolDefinition::new(
+                    "slipway.debug.status",
+                    "Reserved and must not be listed through service MCP.",
+                    json!({ "type": "object" }),
+                )]
+            }
+
+            fn call(
+                &mut self,
+                _external: &mut (),
+                _call: SlipwayServiceMcpToolCall,
+            ) -> SlipwayServiceMcpToolResult<Message> {
+                SlipwayServiceMcpToolResult::ok(json!({ "unreachable": true }))
+            }
+        }
+
+        let mut runtime =
+            SlipwayRuntime::new(ProbeWidget, ()).with_service_mcp_handler(ReservedHandler);
+        let list = runtime
+            .handle_service_mcp_request_with_app_reducer(
+                r#"{"jsonrpc":"2.0","id":"list","method":"tools/list","params":{}}"#,
+                &mut |_external, _messages| {},
+            )
+            .expect("tools/list response");
+        assert_eq!(list["result"]["tools"].as_array().expect("tools").len(), 0);
+        let call = runtime
+            .handle_service_mcp_request_with_app_reducer(
+                r#"{"jsonrpc":"2.0","id":"call","method":"tools/call","params":{"name":"slipway.debug.status","arguments":{}}}"#,
+                &mut |_external, _messages| {},
+            )
+            .expect("reserved call response");
+        assert_eq!(call["error"]["code"], -32602);
+    }
+
+    #[test]
     fn debug_bridge_budgeted_drain_stops_after_limit() {
         let mut runtime = SlipwayRuntime::new(ProbeWidget, ());
         let first = runtime
@@ -9441,6 +10204,7 @@ mod tests {
             SlipwayRuntimeDrainReport {
                 debug_replies_drained: 0,
                 runtime_mcp_replies_drained: 1,
+                service_mcp_replies_drained: 0,
             }
         );
         assert_eq!(runtime.local_state().count, 1);

@@ -50,19 +50,19 @@ Use the facade crate and choose the backend with features:
 
 ```toml
 [dependencies]
-slipway = { git = "https://github.com/shim9610/slipway.git", tag = "v0.1.5", features = ["iced"] }
+slipway = { git = "https://github.com/shim9610/slipway.git", tag = "v0.1.6", features = ["iced"] }
 ```
 
 For egui:
 
 ```toml
-slipway = { git = "https://github.com/shim9610/slipway.git", tag = "v0.1.5", features = ["egui"] }
+slipway = { git = "https://github.com/shim9610/slipway.git", tag = "v0.1.6", features = ["egui"] }
 ```
 
 For both backend adapters:
 
 ```toml
-slipway = { git = "https://github.com/shim9610/slipway.git", tag = "v0.1.5", features = ["all-backends"] }
+slipway = { git = "https://github.com/shim9610/slipway.git", tag = "v0.1.6", features = ["all-backends"] }
 ```
 
 ## Start Here

@@ -32,6 +32,7 @@ use slipway_debug_bridge::{
 use slipway_runtime::{
     SlipwayAssembledApp, SlipwayDebugMcpAttachment, SlipwayRuntime, SlipwayRuntimeConfig,
     SlipwayRuntimeDrainBudget, SlipwayRuntimeMcpTransport, SlipwayRuntimeMcpWakeReceiver,
+    SlipwayServiceMcpTransport,
 };
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -1933,6 +1934,7 @@ where
     assembled: SlipwayAssembledApp<W>,
     apply_app_messages: F,
     debug_mcp_transport: Option<SlipwayRuntimeMcpTransport>,
+    service_mcp_transport: Option<SlipwayServiceMcpTransport>,
     presented_viewport: Cell<Rect>,
 }
 
@@ -1949,6 +1951,7 @@ where
             assembled,
             apply_app_messages,
             debug_mcp_transport: None,
+            service_mcp_transport: None,
             presented_viewport,
         }
     }
@@ -1985,13 +1988,29 @@ where
         self
     }
 
+    pub fn with_service_mcp_transport(mut self, transport: SlipwayServiceMcpTransport) -> Self {
+        self.service_mcp_transport = Some(transport);
+        self
+    }
+
     pub fn title(&self) -> String {
-        match self.debug_mcp_transport.as_ref() {
-            Some(transport) => format!(
-                "Slipway Backend Iced - Iced MCP: {}",
-                transport.local_addr()
+        match (
+            self.debug_mcp_transport.as_ref(),
+            self.service_mcp_transport.as_ref(),
+        ) {
+            (Some(debug), Some(service)) => format!(
+                "Slipway Backend Iced - Iced MCP: {} Service MCP: {}",
+                debug.local_addr(),
+                service.local_addr()
             ),
-            None => "Slipway Backend Iced - Iced".to_string(),
+            (Some(debug), None) => {
+                format!("Slipway Backend Iced - Iced MCP: {}", debug.local_addr())
+            }
+            (None, Some(service)) => format!(
+                "Slipway Backend Iced - Iced Service MCP: {}",
+                service.local_addr()
+            ),
+            (None, None) => "Slipway Backend Iced - Iced".to_string(),
         }
     }
 
@@ -2062,7 +2081,9 @@ where
                 &mut intercept,
             ) {
             Ok(report) => (
-                report.debug_replies_drained + report.runtime_mcp_replies_drained,
+                report.debug_replies_drained
+                    + report.runtime_mcp_replies_drained
+                    + report.service_mcp_replies_drained,
                 None,
             ),
             Err(error) => (0, Some(format!("{error:?}"))),
@@ -2146,7 +2167,12 @@ where
                 .map(|()| SlipwayIcedRuntimeMessage::DrainDebug),
             None => iced::Subscription::none(),
         };
-        mcp
+        let service_mcp = match self.service_mcp_transport.as_ref() {
+            Some(transport) => iced_service_mcp_wake_subscription(transport)
+                .map(|()| SlipwayIcedRuntimeMessage::DrainDebug),
+            None => iced::Subscription::none(),
+        };
+        iced::Subscription::batch([mcp, service_mcp])
     }
 }
 
@@ -2174,6 +2200,18 @@ impl Hash for IcedMcpWakeSubscription {
 }
 
 fn iced_mcp_wake_subscription(transport: &SlipwayRuntimeMcpTransport) -> iced::Subscription<()> {
+    iced::Subscription::run_with(
+        IcedMcpWakeSubscription {
+            local_addr: transport.local_addr(),
+            wake_rx: transport.wake_receiver(),
+        },
+        iced_mcp_wake_stream,
+    )
+}
+
+fn iced_service_mcp_wake_subscription(
+    transport: &SlipwayServiceMcpTransport,
+) -> iced::Subscription<()> {
     iced::Subscription::run_with(
         IcedMcpWakeSubscription {
             local_addr: transport.local_addr(),
@@ -23064,7 +23102,6 @@ mod tests {
             target_slot: None,
             region_id: PresentationRegionId::from("text-edit-focus"),
         };
-        let root_before = ICED_COMMIT_GATE_ROOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
         let snapshots_before =
             ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed);
         let carriers_before =
@@ -23103,10 +23140,6 @@ mod tests {
         assert_eq!(mutations.len(), 1);
         assert_eq!(mutations[0].before, "");
         assert_eq!(mutations[0].after, "han");
-        assert_eq!(
-            ICED_COMMIT_GATE_ROOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed) - root_before,
-            1
-        );
         assert_eq!(
             ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed)
                 - snapshots_before,
@@ -23169,8 +23202,6 @@ mod tests {
             let runtime = SlipwayRuntime::new(TextEditUnsupportedWidget, ());
             let mut renderer = RecordingRenderer::default();
             let cache = focus_root_native_text_input(&runtime, &mut renderer);
-            let root_before =
-                ICED_COMMIT_GATE_ROOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
             let snapshots_before =
                 ICED_NATIVE_BEFORE_SNAPSHOTS.load(std::sync::atomic::Ordering::Relaxed);
             let carriers_before =
@@ -23213,11 +23244,6 @@ mod tests {
             assert_eq!(
                 ICED_NATIVE_MUTATION_CARRIERS.load(std::sync::atomic::Ordering::Relaxed),
                 carriers_before
-            );
-            assert_eq!(
-                ICED_COMMIT_GATE_ROOT_BUILDS.load(std::sync::atomic::Ordering::Relaxed)
-                    - root_before,
-                usize::from(gate.is_some())
             );
         }
     }

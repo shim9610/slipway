@@ -36,6 +36,8 @@ backend-native wrapping, provider insertion, or a public API gap.
   checklist.
 - [Debug MCP](debug-mcp.md) - request-scoped debug tools, physical-control
   meaning, and frame identity.
+- [Service MCP](service-mcp.md) - release-intended app-owned MCP tools,
+  custom function definitions, and reducer-backed service calls.
 - [Provider surfaces](provider-surfaces.md) - canvas, plot, media, GPU, and
   already-owned renderer insertion.
 
@@ -54,6 +56,8 @@ backend-native wrapping, provider insertion, or a public API gap.
 - Enabling Korean/Hangul text input: read [IME and Korean text input](ime.md).
 - Testing with debug/control/screenshot/probe evidence: read
   [Debug MCP](debug-mcp.md).
+- Exposing intentional app/domain operations to MCP clients: read
+  [Service MCP](service-mcp.md).
 - Inserting an existing chart, canvas, or GPU renderer: read
   [Provider surfaces](provider-surfaces.md).
 
