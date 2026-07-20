@@ -4364,7 +4364,7 @@ where
         .expect("text input widget requires text edit region");
     let target = region.target.clone();
     let target_slot = region.address.clone();
-    let selection_before = text_edit.selection.selection.clone();
+    let selection_before = text_edit.selection.selection().cloned();
     let frame = presentation.frame.clone();
     let prepared_geometry = Arc::clone(&presentation.prepared_geometry);
     let focus_regions = presentation.focus_regions.clone();
@@ -4386,7 +4386,7 @@ where
         move |_theme: &Theme, _status| iced_text_input_style_from_decl(&visual_style),
     )));
 
-    if text_edit.selection.editable {
+    if text_edit.selection.editable() {
         input.on_input(move |value| {
             let event = InputEvent::TextEdit(slipway_core::TextEditEvent {
                 target: target.clone(),
@@ -4425,7 +4425,7 @@ fn iced_native_text_mutation_message(
         selection_before: region
             .text_edit
             .as_ref()
-            .and_then(|text_edit| text_edit.selection.selection.clone()),
+            .and_then(|text_edit| text_edit.selection.selection().cloned()),
         selection_after: None,
     });
     let input = backend_focus_input_event(
@@ -4480,13 +4480,13 @@ where
         move |_theme: &Theme, _status| iced_text_input_style_from_decl(&visual_style),
     )));
 
-    if !text_edit.selection.editable {
+    if !text_edit.selection.editable() {
         return input;
     }
     if !gate.matches(presentation, region) {
         let target = region.target.clone();
         let target_slot = region.address.clone();
-        let selection_before = text_edit.selection.selection.clone();
+        let selection_before = text_edit.selection.selection().cloned();
         let frame = presentation.frame.clone();
         let prepared_geometry = Arc::clone(&presentation.prepared_geometry);
         let focus_regions = presentation.focus_regions.clone();
@@ -6507,7 +6507,7 @@ where
             .region
             .text_edit
             .as_ref()
-            .and_then(|text_edit| text_edit.selection.selection.clone());
+            .and_then(|text_edit| text_edit.selection.selection().cloned());
         {
             let mut editor = iced_text_editor_widget_for_region::<AppMessage, Theme, Renderer, _>(
                 self.region,
@@ -11222,7 +11222,7 @@ fn route_iced_event(
             let selection_before = focus
                 .text_edit
                 .as_ref()
-                .and_then(|text_edit| text_edit.selection.selection.clone());
+                .and_then(|text_edit| text_edit.selection.selection().cloned());
             let event = InputEvent::TextEdit(slipway_core::TextEditEvent {
                 target: focus_target(focus),
                 target_slot: focus.address.clone(),
@@ -13895,7 +13895,9 @@ impl slipway_core::SlipwayTextMetricProvider for IcedTextMetricProvider {
                 },
                 baseline: None,
                 line_count: Some(line_count),
-                caret_bounds: Vec::new(),
+                caret_bounds: slipway_core::TextCaretGeometry::unavailable(
+                    "text flow policy does not claim caret bounds",
+                ),
             },
             request,
         })
@@ -15827,16 +15829,11 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
         ) -> TextSelectionPolicyDeclaration {
-            TextSelectionPolicyDeclaration {
-                target: self.id.clone(),
-                selection: None,
-                carets: CaretSet {
-                    carets: vec![0],
-                    primary: Some(0),
-                },
-                editable: true,
-                diagnostics: Vec::new(),
-            }
+            TextSelectionPolicyDeclaration::editable_text(
+                self.id.clone(),
+                None,
+                CaretSet::single(0),
+            )
         }
     }
 
@@ -15863,13 +15860,17 @@ mod tests {
             _local: &Self::LocalState,
             _measurement: Option<&slipway_core::TextMeasurementEvidence>,
         ) -> CaretGeometryEvidence {
-            CaretGeometryEvidence {
-                target: self.id.clone(),
-                caret_bounds: Vec::new(),
-                selection_bounds: Vec::new(),
-                measurement_request_ids: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            CaretGeometryEvidence::measured(
+                self.id.clone(),
+                slipway_core::NonEmptyTextRects::one(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 1.0,
+                        height: 16.0,
+                    },
+                }),
+                slipway_core::TextSelectionGeometry::no_selection(),
+            )
         }
     }
 
@@ -15964,7 +15965,9 @@ mod tests {
                 line_clamp: None,
                 allow_ellipsis: false,
                 baseline: None,
-                caret_bounds: Vec::new(),
+                caret_bounds: slipway_core::TextCaretGeometry::unavailable(
+                    "text flow policy does not claim caret bounds",
+                ),
                 viewport: None,
             }
         }

@@ -621,16 +621,7 @@ impl SlipwayTextSelectionPolicy for DraftInputWidget {
         // Caret pinned to the end of the buffer; a real editor would keep
         // the caret in local state and declare it here.
         let caret = external.draft.chars().count();
-        TextSelectionPolicyDeclaration {
-            target: self.id(),
-            selection: None,
-            carets: CaretSet {
-                carets: vec![caret],
-                primary: Some(caret),
-            },
-            editable: true,
-            diagnostics: Vec::new(),
-        }
+        TextSelectionPolicyDeclaration::editable_text(self.id(), None, CaretSet::single(caret))
     }
 }
 
@@ -659,16 +650,17 @@ impl SlipwayCaretGeometryPolicy for DraftInputWidget {
         _local: &Self::LocalState,
         _measurement: Option<&TextMeasurementEvidence>,
     ) -> CaretGeometryEvidence {
-        // No measured caret rectangles are claimed: heuristic pixel math
-        // is INVALID measurement evidence (api-authoring-model). Empty
-        // evidence lets the backend own caret presentation.
-        CaretGeometryEvidence {
-            target: self.id(),
-            caret_bounds: Vec::new(),
-            selection_bounds: Vec::new(),
-            measurement_request_ids: Vec::new(),
-            diagnostics: Vec::new(),
-        }
+        CaretGeometryEvidence::measured(
+            self.id(),
+            NonEmptyTextRects::one(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 1.0,
+                    height: 18.0,
+                },
+            }),
+            TextSelectionGeometry::no_selection(),
+        )
     }
 }
 
@@ -771,7 +763,9 @@ impl SlipwayTextFlowPolicy for DraftInputWidget {
             line_clamp: Some(1),
             allow_ellipsis: true,
             baseline: None,
-            caret_bounds: Vec::new(),
+            caret_bounds: TextCaretGeometry::unavailable(
+                "text flow policy does not claim caret bounds",
+            ),
             viewport: Some(TextViewport {
                 scroll_x: 0.0,
                 scroll_y: 0.0,

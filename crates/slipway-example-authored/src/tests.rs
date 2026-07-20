@@ -939,7 +939,9 @@ fn window_badge_is_sized_by_the_projected_measurement() {
                         },
                         baseline: None,
                         line_count: Some(1),
-                        caret_bounds: Vec::new(),
+                        caret_bounds: TextCaretGeometry::unavailable(
+                            "text flow policy does not claim caret bounds",
+                        ),
                     },
                     request,
                 })

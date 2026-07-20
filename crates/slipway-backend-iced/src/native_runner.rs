@@ -2739,7 +2739,7 @@ where
                 pending,
             ));
         };
-        if !text_edit.selection.editable
+        if !text_edit.selection.editable()
             || !text_edit.edit_commands.iter().any(|command| {
                 command.enabled && command.kind == slipway_core::TextEditKind::ReplaceBuffer
             })

@@ -1,0 +1,15 @@
+error[E0560]: struct `CaretGeometryEvidence` has no field named `caret_bounds`
+  --> tests/compile_fail/text_geometry_raw_vec_bypass.rs:21:9
+   |
+21 |         caret_bounds: vec![Rect {
+   |         ^^^^^^^^^^^^ `CaretGeometryEvidence` does not have this field
+   |
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `CaretGeometryEvidence` has no field named `selection_bounds`
+  --> tests/compile_fail/text_geometry_raw_vec_bypass.rs:28:9
+   |
+28 |         selection_bounds: Vec::new(),
+   |         ^^^^^^^^^^^^^^^^ `CaretGeometryEvidence` does not have this field
+   |
+   = note: all struct fields are already assigned

@@ -1,6 +1,6 @@
 [package]
 name = "slipway-debug-renderer"
-version = "0.1.6"
+version = "0.1.7"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 ab_glyph = "0.2.32"
 png = "0.18.1"
-slipway-core = { version = "0.1.6", path = "../slipway-core" }
+slipway-core = { version = "0.1.7", path = "../slipway-core" }
 
 [lints]
 workspace = true

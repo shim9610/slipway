@@ -5295,16 +5295,11 @@ mod tests {
             local: &Self::LocalState,
         ) -> TextSelectionPolicyDeclaration {
             let text_len = local.text.chars().count();
-            TextSelectionPolicyDeclaration {
-                target: self.id.clone(),
-                selection: None,
-                carets: CaretSet {
-                    carets: vec![text_len],
-                    primary: Some(text_len),
-                },
-                editable: true,
-                diagnostics: Vec::new(),
-            }
+            TextSelectionPolicyDeclaration::editable_text(
+                self.id.clone(),
+                None,
+                CaretSet::single(text_len),
+            )
         }
     }
 
@@ -5331,13 +5326,17 @@ mod tests {
             _local: &Self::LocalState,
             _measurement: Option<&slipway_core::TextMeasurementEvidence>,
         ) -> CaretGeometryEvidence {
-            CaretGeometryEvidence {
-                target: self.id.clone(),
-                caret_bounds: Vec::new(),
-                selection_bounds: Vec::new(),
-                measurement_request_ids: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            CaretGeometryEvidence::measured(
+                self.id.clone(),
+                slipway_core::NonEmptyTextRects::one(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 1.0,
+                        height: 16.0,
+                    },
+                }),
+                slipway_core::TextSelectionGeometry::no_selection(),
+            )
         }
     }
 
@@ -5432,7 +5431,9 @@ mod tests {
                 line_clamp: None,
                 allow_ellipsis: false,
                 baseline: None,
-                caret_bounds: Vec::new(),
+                caret_bounds: slipway_core::TextCaretGeometry::unavailable(
+                    "text flow policy does not claim caret bounds",
+                ),
                 viewport: None,
             }
         }
@@ -7915,7 +7916,9 @@ mod tests {
                                 },
                                 baseline: None,
                                 line_count: Some(1),
-                                caret_bounds: Vec::new(),
+                                caret_bounds: slipway_core::TextCaretGeometry::unavailable(
+                                    "text flow policy does not claim caret bounds",
+                                ),
                             },
                             request,
                         },

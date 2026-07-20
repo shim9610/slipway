@@ -1034,7 +1034,7 @@ pub struct TextFlowPolicy {
     pub line_clamp: Option<usize>,
     pub allow_ellipsis: bool,
     pub baseline: Option<f32>,
-    pub caret_bounds: Vec<Rect>,
+    pub caret_bounds: TextCaretGeometry,
     pub viewport: Option<TextViewport>,
 }
 
@@ -1663,7 +1663,7 @@ pub struct TextMeasurementFacts {
     pub content_bounds: Rect,
     pub baseline: Option<f32>,
     pub line_count: Option<usize>,
-    pub caret_bounds: Vec<Rect>,
+    pub caret_bounds: TextCaretGeometry,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2234,8 +2234,34 @@ pub struct TextSelectionRange {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaretSet {
-    pub carets: Vec<usize>,
-    pub primary: Option<usize>,
+    carets: Vec<usize>,
+    primary: usize,
+}
+
+impl CaretSet {
+    pub fn single(primary: usize) -> Self {
+        Self {
+            carets: vec![primary],
+            primary,
+        }
+    }
+
+    pub fn with_secondary<I>(primary: usize, secondary: I) -> Self
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut carets = vec![primary];
+        carets.extend(secondary);
+        Self { carets, primary }
+    }
+
+    pub fn carets(&self) -> &[usize] {
+        &self.carets
+    }
+
+    pub fn primary(&self) -> usize {
+        self.primary
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3012,10 +3038,61 @@ pub struct TextBufferSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextSelectionPolicyDeclaration {
     pub target: WidgetId,
-    pub selection: Option<TextSelectionRange>,
-    pub carets: CaretSet,
-    pub editable: bool,
-    pub diagnostics: Vec<Diagnostic>,
+    selection: Option<TextSelectionRange>,
+    carets: CaretSet,
+    editable: bool,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl TextSelectionPolicyDeclaration {
+    pub fn editable_text(
+        target: WidgetId,
+        selection: Option<TextSelectionRange>,
+        carets: CaretSet,
+    ) -> Self {
+        Self {
+            target,
+            selection,
+            carets,
+            editable: true,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn read_only_text(
+        target: WidgetId,
+        selection: Option<TextSelectionRange>,
+        carets: CaretSet,
+    ) -> Self {
+        Self {
+            target,
+            selection,
+            carets,
+            editable: false,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: Vec<Diagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    pub fn selection(&self) -> Option<&TextSelectionRange> {
+        self.selection.as_ref()
+    }
+
+    pub fn carets(&self) -> &CaretSet {
+        &self.carets
+    }
+
+    pub fn editable(&self) -> bool {
+        self.editable
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3028,12 +3105,155 @@ pub struct ImeCompositionPolicyDeclaration {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct NonEmptyTextRects {
+    rects: Vec<Rect>,
+}
+
+impl NonEmptyTextRects {
+    pub fn one(rect: Rect) -> Self {
+        Self { rects: vec![rect] }
+    }
+
+    pub fn with_more<I>(first: Rect, rest: I) -> Self
+    where
+        I: IntoIterator<Item = Rect>,
+    {
+        let mut rects = vec![first];
+        rects.extend(rest);
+        Self { rects }
+    }
+
+    pub fn as_slice(&self) -> &[Rect] {
+        &self.rects
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextCaretGeometry {
+    Bounds(NonEmptyTextRects),
+    Unavailable { reason: String },
+}
+
+impl TextCaretGeometry {
+    pub fn bounds(bounds: NonEmptyTextRects) -> Self {
+        Self::Bounds(bounds)
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn bounds_slice(&self) -> &[Rect] {
+        match self {
+            Self::Bounds(bounds) => bounds.as_slice(),
+            Self::Unavailable { .. } => &[],
+        }
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Unavailable { .. })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextSelectionGeometry {
+    NoSelection,
+    Bounds(NonEmptyTextRects),
+    Unavailable { reason: String },
+}
+
+impl TextSelectionGeometry {
+    pub fn no_selection() -> Self {
+        Self::NoSelection
+    }
+
+    pub fn bounds(bounds: NonEmptyTextRects) -> Self {
+        Self::Bounds(bounds)
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn bounds_slice(&self) -> &[Rect] {
+        match self {
+            Self::Bounds(bounds) => bounds.as_slice(),
+            Self::NoSelection | Self::Unavailable { .. } => &[],
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct CaretGeometryEvidence {
     pub target: WidgetId,
-    pub caret_bounds: Vec<Rect>,
-    pub selection_bounds: Vec<Rect>,
-    pub measurement_request_ids: Vec<String>,
-    pub diagnostics: Vec<Diagnostic>,
+    caret: TextCaretGeometry,
+    selection: TextSelectionGeometry,
+    measurement_request_ids: Vec<String>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl CaretGeometryEvidence {
+    pub fn measured(
+        target: WidgetId,
+        caret: NonEmptyTextRects,
+        selection: TextSelectionGeometry,
+    ) -> Self {
+        Self {
+            target,
+            caret: TextCaretGeometry::bounds(caret),
+            selection,
+            measurement_request_ids: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn unavailable(target: WidgetId, reason: impl Into<String>) -> Self {
+        Self {
+            target,
+            caret: TextCaretGeometry::unavailable(reason),
+            selection: TextSelectionGeometry::unavailable("caret geometry unavailable"),
+            measurement_request_ids: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn with_measurement_request_ids(mut self, request_ids: Vec<String>) -> Self {
+        self.measurement_request_ids = request_ids;
+        self
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: Vec<Diagnostic>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    pub fn caret_bounds(&self) -> &[Rect] {
+        self.caret.bounds_slice()
+    }
+
+    pub fn selection_bounds(&self) -> &[Rect] {
+        self.selection.bounds_slice()
+    }
+
+    pub fn caret_geometry(&self) -> &TextCaretGeometry {
+        &self.caret
+    }
+
+    pub fn selection_geometry(&self) -> &TextSelectionGeometry {
+        &self.selection
+    }
+
+    pub fn measurement_request_ids(&self) -> &[String] {
+        &self.measurement_request_ids
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8084,7 +8304,7 @@ fn validate_text_edit_region(
     validate_selection_range(
         &target,
         "view_contract.text_edit_selection_out_of_bounds",
-        text_edit.selection.selection.as_ref(),
+        text_edit.selection.selection(),
         char_len,
         diagnostics,
     );
@@ -8116,7 +8336,29 @@ fn validate_text_edit_region(
         ));
     }
 
-    if text_edit.selection.editable {
+    if text_edit.selection.editable() && text_edit.caret.caret_geometry().is_unavailable() {
+        diagnostics.push(Diagnostic::warning(
+            target.clone(),
+            "view_contract.text_edit_caret_geometry_unavailable",
+            "Editable text regions must report caret geometry as measured bounds or explicit unavailable evidence; empty geometry is not a valid proof",
+        ));
+    }
+
+    if let Some(selection) = text_edit.selection.selection()
+        && selection.anchor != selection.focus
+        && !matches!(
+            text_edit.caret.selection_geometry(),
+            TextSelectionGeometry::Bounds(_)
+        )
+    {
+        diagnostics.push(Diagnostic::warning(
+            target.clone(),
+            "view_contract.text_edit_selection_geometry_missing",
+            "Non-collapsed text selections must report measured selection bounds or explicit unavailable evidence; empty selection geometry is not a valid proof",
+        ));
+    }
+
+    if text_edit.selection.editable() {
         let has_insert = text_edit
             .edit_commands
             .iter()
@@ -13547,7 +13789,9 @@ mod tests {
                     line_clamp: Some(1),
                     allow_ellipsis: true,
                     baseline: None,
-                    caret_bounds: Vec::new(),
+                    caret_bounds: TextCaretGeometry::unavailable(
+                        "text flow policy does not claim caret bounds",
+                    ),
                     viewport: None,
                 }),
                 purposes: vec![
@@ -13609,7 +13853,9 @@ mod tests {
                     }),
                     baseline: Some(14.0),
                     line_count: Some(1),
-                    caret_bounds: Vec::new(),
+                    caret_bounds: TextCaretGeometry::unavailable(
+                        "text flow policy does not claim caret bounds",
+                    ),
                 },
                 source: self.text_metric_source(),
                 request,
@@ -15586,16 +15832,11 @@ mod tests {
                 revision: Vec::new(),
                 diagnostics: Vec::new(),
             },
-            selection: TextSelectionPolicyDeclaration {
-                target: target.clone(),
-                selection: None,
-                carets: CaretSet {
-                    carets: vec![0],
-                    primary: Some(0),
-                },
-                editable: true,
-                diagnostics: Vec::new(),
-            },
+            selection: TextSelectionPolicyDeclaration::editable_text(
+                target.clone(),
+                None,
+                CaretSet::single(0),
+            ),
             composition: ImeCompositionPolicyDeclaration {
                 target: target.clone(),
                 active: false,
@@ -15603,13 +15844,17 @@ mod tests {
                 cursor_range: None,
                 diagnostics: Vec::new(),
             },
-            caret: CaretGeometryEvidence {
-                target: target.clone(),
-                caret_bounds: Vec::new(),
-                selection_bounds: Vec::new(),
-                measurement_request_ids: Vec::new(),
-                diagnostics: Vec::new(),
-            },
+            caret: CaretGeometryEvidence::measured(
+                target.clone(),
+                NonEmptyTextRects::one(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 1.0,
+                        height: 16.0,
+                    },
+                }),
+                TextSelectionGeometry::no_selection(),
+            ),
             visual_style: TextInputVisualStyleDeclaration::explicit(
                 target.clone(),
                 test_rgb(15, 23, 42),
@@ -16246,19 +16491,14 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
         ) -> TextSelectionPolicyDeclaration {
-            TextSelectionPolicyDeclaration {
-                target: self.id.clone(),
-                selection: Some(TextSelectionRange {
+            TextSelectionPolicyDeclaration::editable_text(
+                self.id.clone(),
+                Some(TextSelectionRange {
                     anchor: 0,
                     focus: 8,
                 }),
-                carets: CaretSet {
-                    carets: vec![8],
-                    primary: Some(8),
-                },
-                editable: true,
-                diagnostics: Vec::new(),
-            }
+                CaretSet::single(8),
+            )
         }
     }
 
@@ -16285,19 +16525,18 @@ mod tests {
             _local: &Self::LocalState,
             _measurement: Option<&TextMeasurementEvidence>,
         ) -> CaretGeometryEvidence {
-            CaretGeometryEvidence {
-                target: self.id.clone(),
-                caret_bounds: vec![Rect {
+            CaretGeometryEvidence::measured(
+                self.id.clone(),
+                NonEmptyTextRects::one(Rect {
                     origin: Point { x: 4.0, y: 4.0 },
                     size: Size {
                         width: 1.0,
                         height: 16.0,
                     },
-                }],
-                selection_bounds: Vec::new(),
-                measurement_request_ids: vec!["title".to_string()],
-                diagnostics: Vec::new(),
-            }
+                }),
+                TextSelectionGeometry::no_selection(),
+            )
+            .with_measurement_request_ids(vec!["title".to_string()])
         }
     }
 
@@ -16520,13 +16759,13 @@ mod tests {
                 line_clamp: Some(2),
                 allow_ellipsis: true,
                 baseline: Some(18.0),
-                caret_bounds: vec![Rect {
+                caret_bounds: TextCaretGeometry::bounds(NonEmptyTextRects::one(Rect {
                     origin: Point { x: 4.0, y: 4.0 },
                     size: Size {
                         width: 1.0,
                         height: 16.0,
                     },
-                }],
+                })),
                 viewport: Some(TextViewport {
                     scroll_x: 0.0,
                     scroll_y: 0.0,
@@ -22093,7 +22332,7 @@ mod tests {
         );
         assert_eq!(styles[0].state, InteractionState::Hover);
         assert_eq!(text_buffer.text, "Official metric wrapper");
-        assert_eq!(text_selection.carets.primary, Some(8));
+        assert_eq!(text_selection.carets().primary(), 8);
         assert_eq!(route_policy.route.path, vec![WidgetId::from("root")]);
         assert!(disposition.final_disposition.handled);
         assert_eq!(container.kind, ContainerLayoutKind::Column);

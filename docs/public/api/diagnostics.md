@@ -71,6 +71,8 @@ Severity is `error` (blocking) for every row except the four marked `warn`.
 | `view_contract.text_edit_composition_cursor_out_of_bounds` | composition cursor range exceeds the buffer length | clamp the range in `SlipwayImeCompositionPolicy` |
 | `view_contract.text_edit_viewport_range_out_of_bounds` | text viewport visible range exceeds the buffer length | clamp the range in `SlipwayTextFlowPolicy` |
 | `view_contract.text_edit_single_line_contains_newline` | `SingleLine` buffer contains `\n`/`\r` | strip newlines, or declare multi-line via `SlipwayTextFlowPolicy` |
+| `view_contract.text_edit_caret_geometry_unavailable` (warn) | editable text region returned explicit unavailable caret geometry | provide measured caret bounds with `CaretGeometryEvidence::measured(...)` and `NonEmptyTextRects`, or keep the explicit unavailable evidence when the backend-native editor owns caret presentation |
+| `view_contract.text_edit_selection_geometry_missing` (warn) | non-collapsed selection exists but no measured selection bounds were declared | provide `TextSelectionGeometry::bounds(NonEmptyTextRects::...)`, or return explicit unavailable evidence and do not claim block-selection geometry |
 | `view_contract.text_edit_missing_insert_command` | editable region without an enabled `InsertText` command | declare it in `SlipwayTextEditCommandPolicy::text_edit_commands` |
 | `view_contract.text_edit_missing_delete_command` | editable region without a delete command | declare `DeleteBackward`/`DeleteForward` commands |
 | `view_contract.text_edit_missing_replace_buffer_command` | editable region without an enabled `ReplaceBuffer` command | declare it (native backend text widgets replace the buffer) |

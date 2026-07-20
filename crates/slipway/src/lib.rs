@@ -386,13 +386,14 @@ pub mod prelude {
     // Text-input policy traits and their declaration types (consumed by
     // text_edit_focus_region_from_capability).
     pub use slipway_core::{
-        CaretGeometryEvidence, ImeCompositionPolicyDeclaration, SlipwayCachedTextMeasurementPolicy,
-        SlipwayCaretGeometryPolicy, SlipwayFocusTraversal, SlipwayImeCompositionPolicy,
-        SlipwayTextBufferPolicy, SlipwayTextEditCommandPolicy, SlipwayTextFlowPolicy,
-        SlipwayTextInputTypographyPolicy, SlipwayTextInputVisualStylePolicy,
+        CaretGeometryEvidence, ImeCompositionPolicyDeclaration, NonEmptyTextRects,
+        SlipwayCachedTextMeasurementPolicy, SlipwayCaretGeometryPolicy, SlipwayFocusTraversal,
+        SlipwayImeCompositionPolicy, SlipwayTextBufferPolicy, SlipwayTextEditCommandPolicy,
+        SlipwayTextFlowPolicy, SlipwayTextInputTypographyPolicy, SlipwayTextInputVisualStylePolicy,
         SlipwayTextMeasurementCachePolicy, SlipwayTextMeasurementPolicy,
-        SlipwayTextSelectionPolicy, SlipwayTextUndoRedoPolicy, TextBufferSnapshot, TextFlowPolicy,
-        TextInputTypographyDeclaration, TextInputVisualStyleDeclaration, TextMeasurementEvidence,
+        SlipwayTextSelectionPolicy, SlipwayTextUndoRedoPolicy, TextBufferSnapshot,
+        TextCaretGeometry, TextFlowPolicy, TextInputTypographyDeclaration,
+        TextInputVisualStyleDeclaration, TextMeasurementEvidence, TextSelectionGeometry,
         TextSelectionPolicyDeclaration, TextUndoRedoEvidence,
     };
     // Input-event payloads and their kind enums. `InputEvent` (exported

@@ -1,0 +1,24 @@
+error[E0451]: fields `carets` and `primary` of struct `CaretSet` are private
+ --> tests/compile_fail/text_selection_private_bypass.rs:7:9
+  |
+6 |     let _carets = CaretSet {
+  |                   -------- in this type
+7 |         carets: Vec::new(),
+  |         ^^^^^^ private field
+8 |         primary: 0,
+  |         ^^^^^^^ private field
+
+error[E0451]: fields `selection`, `carets`, `editable` and `diagnostics` of struct `TextSelectionPolicyDeclaration` are private
+  --> tests/compile_fail/text_selection_private_bypass.rs:13:9
+   |
+11 |     let _selection = TextSelectionPolicyDeclaration {
+   |                      ------------------------------ in this type
+12 |         target,
+13 |         selection: None,
+   |         ^^^^^^^^^ private field
+14 |         carets: CaretSet::single(0),
+   |         ^^^^^^ private field
+15 |         editable: true,
+   |         ^^^^^^^^ private field
+16 |         diagnostics: Vec::new(),
+   |         ^^^^^^^^^^^ private field

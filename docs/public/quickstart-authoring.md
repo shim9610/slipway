@@ -15,7 +15,7 @@ announced.
 Prefer `cargo add`:
 
 ```powershell
-cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.6 --features iced
+cargo add slipway --git https://github.com/shim9610/slipway.git --tag v0.1.7 --features iced
 ```
 
 Use `--features egui` for egui, or `--features all-backends` only when the

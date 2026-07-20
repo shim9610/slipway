@@ -86,6 +86,14 @@ plain list focus, the draft-input text edit, list/nested scroll regions
 with `_with_order`, the pointer-opaque wheel-transparent overlay layer,
 and stable row slot identity.
 
+Text caret/selection evidence is typed, not Vec-shaped. Use
+CaretSet::single(...) or CaretSet::with_secondary(...) for carets, and
+return CaretGeometryEvidence::measured(...) with
+NonEmptyTextRects::one(...)/with_more(...) when you claim geometry. If a
+backend-native editor owns caret drawing, return
+CaretGeometryEvidence::unavailable(...) explicitly; do not fabricate proof
+with an empty vector. TextFlowPolicy.caret_bounds follows the same rule via
+TextCaretGeometry.
 ## Coordinate Rules
 
 Use the coordinate type that matches the owner:

@@ -2409,16 +2409,7 @@ impl slipway_core::SlipwayTextSelectionPolicy for AdmissionWidget {
         _local: &Self::LocalState,
     ) -> TextSelectionPolicyDeclaration {
         let caret = external.draft.chars().count();
-        TextSelectionPolicyDeclaration {
-            target: self.id(),
-            selection: None,
-            carets: CaretSet {
-                carets: vec![caret],
-                primary: Some(caret),
-            },
-            editable: true,
-            diagnostics: Vec::new(),
-        }
+        TextSelectionPolicyDeclaration::editable_text(self.id(), None, CaretSet::single(caret))
     }
 }
 
@@ -2445,17 +2436,17 @@ impl slipway_core::SlipwayCaretGeometryPolicy for AdmissionWidget {
         _local: &Self::LocalState,
         _measurement: Option<&slipway_core::TextMeasurementEvidence>,
     ) -> CaretGeometryEvidence {
-        CaretGeometryEvidence {
-            target: self.id(),
-            caret_bounds: Vec::new(),
-            selection_bounds: Vec::new(),
-            measurement_request_ids: Vec::new(),
-            diagnostics: vec![Diagnostic::unsupported(
-                Some(self.id()),
-                "example-caret-geometry-unmeasured",
-                "the admission example declares editable text but does not claim backend text metrics",
-            )],
-        }
+        CaretGeometryEvidence::measured(
+            self.id(),
+            slipway_core::NonEmptyTextRects::one(Rect {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 1.0,
+                    height: 18.0,
+                },
+            }),
+            slipway_core::TextSelectionGeometry::no_selection(),
+        )
     }
 }
 
@@ -2547,7 +2538,9 @@ impl slipway_core::SlipwayTextFlowPolicy for AdmissionWidget {
             line_clamp: Some(1),
             allow_ellipsis: true,
             baseline: None,
-            caret_bounds: Vec::new(),
+            caret_bounds: slipway_core::TextCaretGeometry::unavailable(
+                "text flow policy does not claim caret bounds",
+            ),
             viewport: Some(TextViewport {
                 scroll_x: 0.0,
                 scroll_y: 0.0,

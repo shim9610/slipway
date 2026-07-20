@@ -1,14 +1,14 @@
 [package]
 name = "slipway-example-admission"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license.workspace = true
 
 [dependencies]
-slipway-backend-egui = { version = "0.1.6", path = "../slipway-backend-egui" }
-slipway-backend-iced = { version = "0.1.6", path = "../slipway-backend-iced" }
-slipway-core = { version = "0.1.6", path = "../slipway-core" }
-slipway-runtime = { version = "0.1.6", path = "../slipway-runtime" }
+slipway-backend-egui = { version = "0.1.7", path = "../slipway-backend-egui" }
+slipway-backend-iced = { version = "0.1.7", path = "../slipway-backend-iced" }
+slipway-core = { version = "0.1.7", path = "../slipway-core" }
+slipway-runtime = { version = "0.1.7", path = "../slipway-runtime" }
 
 [lints]
 workspace = true

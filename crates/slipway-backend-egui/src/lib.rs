@@ -6555,7 +6555,7 @@ fn allocate_text_edit_region_without_font_policy(
     let target_origin = egui_point(view_origin, target_rect.origin);
     let target_bounds = target_local_bounds(target_rect);
     let rect = egui_rect(target_origin, focus.bounds.into_rect());
-    let editable = focus.enabled && text_edit.selection.editable;
+    let editable = focus.enabled && text_edit.selection.editable();
     let mut text = text_edit.buffer.text.clone();
     let before = text.clone();
     push_egui_frame_timing(
@@ -6627,7 +6627,7 @@ fn allocate_text_edit_region_without_font_policy(
         Some(EguiTextEditChange {
             before,
             after: text,
-            selection_before: text_edit.selection.selection.clone(),
+            selection_before: text_edit.selection.selection().cloned(),
             selection_after: None,
         })
     } else {
@@ -9867,7 +9867,9 @@ impl slipway_core::SlipwayTextMetricProvider for EguiTextMetricProvider<'_> {
                 },
                 baseline: None,
                 line_count: Some(galley.rows.len()),
-                caret_bounds: Vec::new(),
+                caret_bounds: slipway_core::TextCaretGeometry::unavailable(
+                    "text flow policy does not claim caret bounds",
+                ),
             },
             request,
         })
@@ -11164,16 +11166,11 @@ mod tests {
             _external: &Self::ExternalState,
             _local: &Self::LocalState,
         ) -> TextSelectionPolicyDeclaration {
-            TextSelectionPolicyDeclaration {
-                target: self.id.clone(),
-                selection: None,
-                carets: CaretSet {
-                    carets: vec![0],
-                    primary: Some(0),
-                },
-                editable: true,
-                diagnostics: Vec::new(),
-            }
+            TextSelectionPolicyDeclaration::editable_text(
+                self.id.clone(),
+                None,
+                CaretSet::single(0),
+            )
         }
     }
 
@@ -11200,13 +11197,17 @@ mod tests {
             _local: &Self::LocalState,
             _measurement: Option<&slipway_core::TextMeasurementEvidence>,
         ) -> CaretGeometryEvidence {
-            CaretGeometryEvidence {
-                target: self.id.clone(),
-                caret_bounds: Vec::new(),
-                selection_bounds: Vec::new(),
-                measurement_request_ids: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            CaretGeometryEvidence::measured(
+                self.id.clone(),
+                slipway_core::NonEmptyTextRects::one(Rect {
+                    origin: Point { x: 0.0, y: 0.0 },
+                    size: Size {
+                        width: 1.0,
+                        height: 16.0,
+                    },
+                }),
+                slipway_core::TextSelectionGeometry::no_selection(),
+            )
         }
     }
 
@@ -11301,7 +11302,9 @@ mod tests {
                 line_clamp: None,
                 allow_ellipsis: false,
                 baseline: None,
-                caret_bounds: Vec::new(),
+                caret_bounds: slipway_core::TextCaretGeometry::unavailable(
+                    "text flow policy does not claim caret bounds",
+                ),
                 viewport: None,
             }
         }
